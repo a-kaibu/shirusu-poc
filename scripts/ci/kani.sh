@@ -3,6 +3,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 export PATH="$HOME/.cargo/bin:$PATH"
+export TAR_OPTIONS=--no-same-owner
 if ! cargo kani --version >/dev/null 2>&1; then
   cargo install kani-verifier --locked || { echo "KANI_UNAVAILABLE: cargo-kani を導入できませんでした"; exit 0; }
   cargo kani setup || { echo "KANI_SETUP_FAILED"; exit 0; }

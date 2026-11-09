@@ -48,6 +48,7 @@ pub struct EventDescriptor {
 - 固定幅整数と明示的なアラインメントだけを使い、32bit Agentと64bit Hostが同じレイアウトで読めるようにする。`size_of`と`offset_of`を両ターゲットで静的に検査する。
 - Process IDとThread IDはRingの管理情報に持ち、イベントごとには持たない。
 - `payload_position`は対象プロセスのポインタではなく、Payload Ring内の単調増加する論理オフセットである。
+- `payload_position`は、overview.md の言う「内部転送用の一時的なPayload ID」も兼ねる（A72 の決定）。格納済み Payload は互いに重ならない区間 `[position, position + len)` を占めるため、同一 Ring 内では格納済み Payload を一意に識別できる。Host は BLAKE3 を計算して Blob を保存した後、この ID を公開形式の Blob ID に置き換える。落とした Payload（格納長 0）は書き込み位置を進めないため後続イベントと位置を共有するが、Blob を作らないので ID は不要。専用フィールドは設けず、`reserved` は将来の拡張用に 0 のまま残す。
 - Cursorは64bitの単調増加値とし、8バイト境界に置く。i686での64bitアトミック操作（`cmpxchg8b`等で実現される）のコストが問題になれば、32bitの折り返しカウンタに切り替える。
 
 ## イベントの確定とPayloadの管理

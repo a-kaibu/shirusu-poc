@@ -1,0 +1,10 @@
+[package]
+name = "shirusu-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+[dependencies]
+shirusu-transport = { path = "../shirusu-transport" }
+shirusu-transport-win = { path = "../shirusu-transport-win" }
+[lints]
+workspace = true

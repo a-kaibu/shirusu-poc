@@ -1,0 +1,217 @@
+# トレーサビリティ / 網羅チェックリスト
+
+この文書が進捗の分母である。各項目の状態は次で数える。
+
+- `未着手`: コードもテストも無い。
+- `実装済み未検証`: コード（またはテスト）はあるが、ローカル＋CI（Windows 項目は GHA windows-latest）の両方で通過を確認していない。
+- `検証済み`: ローカルと CI の両方で通過を確認した。
+
+進捗率 = 検証済み項目数 ÷ 全項目数。項目を追加したら分母が増えたことをここに記録する。
+現時点の自己申告: 全体で約 3%（仕様読解・接続・CI 配置・push 疎通・骨格着手まで。検証済みはまだほぼ無い）。
+
+最終更新: 2026-11-09 09:29（A72・D57・D58 を実装。A72: `payload_position` を一時 Payload ID とする決定を `EventDescriptor::temporary_payload_id()` として実装し、spec-transport.md・overview.md に記録。D57: fuzz target 3 本に受理データの不変条件アサートを追加。validate_control の fuzz が Payload 位置の後退を受理する穴を見つけたため、validate_control に前像との Payload 位置の単調性チェックを追加し回帰テスト化。修正後の fuzz: validate_control 約 1,060 万 runs / decode_descriptor 約 540 万 runs / decode_payload 約 490 万 runs、いずれもクラッシュなし。D58: CI に macos-latest ジョブ `macos-validation` を追加（`cargo test -p shirusu-transport`）。ローカル検証: cargo test --workspace 204 件通過、clippy/fmt clean。CI 未確認のため検証済みはまだ 0）
+
+## A. spec.md（Agent–Host 転送仕様 v0.4）条項
+
+| ID | 項目 | 実装 | 状態 |
+|---|---|---|---|
+| A01 | EventDescriptor 64B 固定・repr(C, align(64))・フィールド配置が spec 通り | transport/descriptor.rs | 実装済み未検証 |
+| A02 | size_of / offset_of の静的アサーション（x86/x64 同一レイアウト） | transport/descriptor.rs | 実装済み未検証 |
+| A03 | Process/Thread ID をイベントごとに持たず Ring 管理情報に持つ | transport/layout.rs (owner_thread_id) | 実装済み未検証 |
+| A04 | payload_position は生ポインタでなく単調論理オフセット、位置 = position % capacity | transport/layout.rs, ring.rs | 実装済み未検証 |
+| A05 | Cursor は 64bit 単調増加・8 バイト境界 | transport/layout.rs | 実装済み未検証 |
+| A06 | Control: writer 更新値と reader 更新値を別キャッシュライン (64B) に分離 | transport/layout.rs | 実装済み未検証 |
+| A07 | Descriptor Ring 初期容量 4096 件 / Payload Ring 1MiB（本番既定） | RingConfig::PRODUCTION | 実装済み未検証 |
+| A08 | 容量可変（テスト用に容量 2 等の小さい構成が可能） | RingConfig::new | 実装済み未検証 |
+| A09 | 公開契約: Payload コピー→Descriptor 書込→write_cursor Release 更新の単一公開点 | transport/ring.rs publish() | 実装済み未検証 |
+| A10 | 読取契約: write_cursor Acquire→確定分だけコピー→検証→read_cursor/payload_read_position Release 更新 | transport/ring.rs drain() | 実装済み未検証 |
+| A11 | Payload の終端またぎ分割コピー | transport/ring.rs copy_payload_write/read | 実装済み未検証 |
+| A12 | 大きな Snapshot: Fragment 分割・個別公開・SnapshotComplete | transport/snapshot.rs | 実装済み未検証 |
+| A13 | Snapshot は全部取れたときだけ Captured、途中不足/読取エラーは取得分を残し Truncated/Unreadable | transport/snapshot.rs | 実装済み未検証 |
+| A14 | Snapshot の同時点性が保証されない制約を型/フィールドで記録 | SnapshotOutcome.simultaneity_guaranteed | 実装済み未検証 |
+| A15 | data_ready はプロセス単位 auto-reset 前提の通知ロジック（OS 非依存部） | transport/notify.rs | 実装済み未検証 |
+| A16 | Host は既定 2ms 周期で再確認する（ReCheckPolicy） | transport/notify.rs | 実装済み未検証 |
+| A17 | 書き手は公開後にフラグをフェンスなしで読み、立っていれば通知 | notify + ring publish | 実装済み未検証 |
+| A18 | 使用率が閾値 (50%) を下から上へ越えたときだけ一度通知 | PublishNotifyTracker | 実装済み未検証 |
+| A19 | 通常経路に全順序フェンスを入れない（コード構造） | ring.rs / notify.rs | 実装済み未検証 |
+| A20 | space_available は Ring 単位（transport-win 側 Event） | transport-win | 実装済み未検証 |
+| A21 | 状態機械 NORMAL→BOUNDED_WAIT→OVERFLOW の遷移条件 | transport/ring.rs | 実装済み未検証 |
+| A22 | BOUNDED_WAIT 上限既定 1ms、0 = 待たない | WriterPolicy.max_wait | 実装済み未検証 |
+| A23 | Loader Lock 等の危険経路は待機禁止フラグ | WriterPolicy.no_wait_dangerous_path | 実装済み未検証 |
+| A24 | OVERFLOW 復帰は使用率が復帰閾値（例 50%）を下回るまで | WriterPolicy.resume_threshold_percent | 実装済み未検証 |
+| A25 | Overflow 劣化 (1): Payload だけ落として Descriptor を残す | ring.rs degrade() | 実装済み未検証 |
+| A26 | Overflow 劣化 (2): Descriptor も無理ならイベントを捨てる | ring.rs degrade() | 実装済み未検証 |
+| A27 | CallEnter を捨てた呼出の CallLeave も捨てる（writer 側追跡） | ring.rs dropped_enter_calls | 実装済み未検証 |
+| A28 | Enter あり Leave 欠落は Host 側で「欠落により終了不明」として扱う | host | 実装済み未検証 |
+| A29 | Sequence は失敗したイベントにも割り当て、欠番を欠落根拠にする | ring.rs write() / drain gaps | 実装済み未検証 |
+| A30 | 待機時間は QPC 相当を Clock 抽象で実測・記録（仮想時計差替え可能） | clock.rs + ring last_wait_ns | 実装済み未検証 |
+| A31 | Loss カウンタ群 (dropped_events / dropped_payload_bytes / degraded_events) 単調増加・Relaxed・リセットなし | layout.rs LossCounters | 実装済み未検証 |
+| A32 | 値ごとの取得結果 6 状態 (Captured/MemoryUnreadable/CaptureLimitExceeded/DroppedByBackpressure/Truncated/Unsupported) を区別 | CaptureState | 実装済み未検証 |
+| A33 | Payload を落とした呼出は L1 扱いしない旨を型で表す | CaptureState::is_l1_eligible | 実装済み未検証 |
+| A34 | Host は欠落を Loss Event として生成する | host | 実装済み未検証 |
+| A35 | Slot 状態遷移 FREE→CLAIMED→ACTIVE→DRAINING→RECLAIMABLE→FREE、取得時のみ CAS | transport/slot.rs | 実装済み未検証 |
+| A36 | Slot は Generation 付き、古い handle は無効 | transport/slot.rs | 実装済み未検証 |
+| A37 | 初期 Pool 32、低水位（残り 8）で拡張要求だけ立てる（Hook 中で登録しない） | SlotPool | 実装済み未検証 |
+| A38 | Slot 不足時は記録せずプロセス共通カウンタ (fetch_add のみ) を更新し Capture Coverage 欠落 | SlotPool.process_missing_calls | 実装済み未検証 |
+| A39 | DETACH は DRAINING 移行のみ。再利用は Host がスレッド終了確認＋回収完了した後だけ | slot.rs host_confirm_ended_and_drained | 実装済み未検証 |
+| A40 | DETACH 後の呼出は記録せず欠落カウント | slot.rs note_call_after_detach | 実装済み未検証 |
+| A41 | 予備 Queue は実装しない（v0.4 の判断を README に明記） | README | 実装済み未検証 |
+| A42 | 再入ガードは公開区間だけの短いガード、元の API 呼出前には外す | transport/context.rs PublishGuard | 実装済み未検証 |
+| A43 | Agent 自身の呼出は記録しない／アプリ由来の入れ子は記録する (writer context) | context.rs should_record | 実装済み未検証 |
+| A44 | Host 停止は異常経路でのみ生存確認し、停止確認後は記録無効化して素通し | context.rs HostMonitor | 実装済み未検証 |
+| A45 | Host 再接続は初版対象外と明記 | README | 実装済み未検証 |
+| A46 | Host 検証: 共有メモリ上の設定値を信用せず Host 既知の範囲だけを読む | transport/validate.rs KnownConfig | 実装済み未検証 |
+| A47 | Host 検証: Cursor 後退・容量超過を検出する（Payload 位置の前像に対する後退も validate_control で弾く。D57 の fuzz が発見） | validate_cursor_pair / validate_control | 実装済み未検証 |
+| A48 | Host 検証: コピーしてから検証し、読み直さない | ValidatingReader | 実装済み未検証 |
+| A49 | Host 検証: 矛盾したら Ring 停止＋Event Integrity 喪失として報告 | ValidatingReader.stopped / host | 実装済み未検証 |
+| A50 | Host 検証: 範囲外コピーを絶対にしない | decode_payload | 実装済み未検証 |
+| A51 | writer 用 API と Host 検証モジュールを分離する（同じ抽象 API にまとめない） | ring.rs vs validate.rs | 実装済み未検証 |
+| A52 | CRC32C 実装とテストベクタ | transport/crc32c.rs | 実装済み未検証 |
+| A53 | 名前付きでない File Mapping を Host が作り DuplicateHandle で渡す前提の API 形 | transport-win | 実装済み未検証 |
+| A54 | MapView と Event Object (data_ready: プロセス単位 auto-reset / space_available: Ring 単位) | transport-win | 実装済み未検証 |
+| A55 | transport-win の 2ms 再確認付き待機 | transport-win | 実装済み未検証 |
+| A56 | Agent: スレッド毎 Ring 取得・書込、再入ガード適用、Host 生存確認、DETACH 通知 API | agent | 実装済み未検証 |
+| A57 | Host: Ring 毎に単一 Drain Worker 前提の取出し | host | 実装済み未検証 |
+| A58 | Host: Enter/Leave 対応付けと終了不明判定 | host | 実装済み未検証 |
+| A59 | Host: スレッド終了確認後の Slot 解放 | host | 実装済み未検証 |
+| A60 | Host: 完全性（Capture/Event/Semantic 相当の transport 範囲）報告 | host | 実装済み未検証 |
+| A61 | 空き待ち経路: 待機の意思表示（Control の writer_waiting フラグ）→全順序フェンス→空き再確認。Host は回収で空きができ書き手が待機中なら space_available を SetEvent（`drain_with_space_notify` / `notify_space_if_writer_waiting`） | transport/layout・ring・host・transport-win | 実装済み未検証 |
+| A62 | 共有メモリセクションのアクセス制御: Host と対象プロセス以外から開けない DACL（現在ユーザーの SID にだけ GENERIC_ALL を許可）を付けて File Mapping を作成（`SharedMapping::create_restricted`） | transport-win | 実装済み未検証 |
+| A63 | Slot Pool の総メモリ上限を設定できる（`with_memory_limit` / `total_memory_bytes` / `can_add_slot`） | transport/slot.rs | 実装済み未検証 |
+| A64 | Host 突然終了時: Finalization が無い Trace は完全性を確定できないものとして扱う（`IntegrityLevel::Unknown` / `IntegrityReport::finalized` / `mark_unfinalized`。既知の Degraded/Lost は残す） | host | 実装済み未検証 |
+| A65 | 待機方式（スピン / Yield / Event）のベンチマークによる選定 | e2e/src/bin/shirusu-wait-bench.rs（50 ラウンドで Event を選定。中央値 14µs / p95 24µs） | 実装済み未検証 |
+| A66 | Host プロセス側の RingNotify–DrainWorker 配線：回収と space_available 通知の結線を `NotifyingDrainWorker` に集約し、E2E シナリオ `space_available_notify` で書き手の待機→回収→再開を end-to-end で確認する | host（NotifyingDrainWorker）・e2e | 実装済み未検証 |
+| A67 | 待機方式の選定結果（Event）を書き手が使える形にする：`space_available` を待つ `EventClock`（`Clock` 実装）。Linux スタブの EventObject は 1ms ポーリングだったため condvar ベースの真のブロッキング待機に変更 | transport-win（EventClock・stub EventObject） | 実装済み未検証 |
+| A68 | Agent が Host から space_available ハンドルを受け取り EventClock で書く（プロセス間受け渡し。Windows 実機＋GHA で確認） | agent（attach_space_available / attach_space_available_notify）・transport-win（EventObject/RingNotify の duplicate_to_process）・host（NotifyingDrainWorker::duplicate_space_to_process）・e2e（agent_space_available_handoff: event_waits=3・16/16・4.4ms） | 実装済み未検証 |
+| A69 | Loader Lock 保持の判定不能時に待機上限を 0ms へ切り替える設定（spec:「判定できない場合に0msへ切り替える設定も用意する」。A23 は既知の危険経路の待機禁止フラグのみで、判定不能時の自動切替設定は WriterPolicy に無い） | transport/ring.rs WriterPolicy::zero_wait_when_loader_lock_unknown（既定 true）＋ LoaderLockState（NotHeld/Held/Unknown）＋ RingWriter::set_loader_lock_state。Held は常に待機せず、Unknown はポリシーに従い 0ms へ（既定で待たない）。Windows の Agent 側からの申告呼び出しは Hook 実装時（PoC 第1スコープ外）に接続する | 実装済み未検証 |
+| A70 | 低水位時の非同期 Mapping 追加フロー（Host が非同期に新しい Mapping を作り、Handle と情報を Agent へ渡し、Agent の管理スレッドが登録を完了して初めて使える。Hook の中では登録しない。A37 は低水位フラグ立てのみ、C11 は追加中の Host 停止時の継続のみ） | agent・host・transport-win | 未着手 |
+| A71 | コピー済み Descriptor のフィールド検証（長さ・オフセット・Sequence・Generation。spec Host 検証手順 4。現状 decode_descriptor は Kind/reserved/payload_len のみ検証し、Sequence/Generation の照合が無い） | transport/validate.rs decode_descriptor_checked / DescriptorExpectation / ValidatingReader。Sequence は下限照合（欠番は許す。書き手は 1 から振るため確定済みスロットの 0 は SequenceRegressed）。オフセットは payload_write_position による上限＋前件終端との連続性を照合（落とした Payload は格納長 0 で位置を再利用）。Generation は EventDescriptor にフィールドが無く（spec の Descriptor 定義にも無い）、Control 領域の世代として validate_control / ValidatingReader で照合済み | 実装済み未検証 |
+| A72 | 転送用の一時 Payload ID の扱いの決定（決定: `payload_position` を一時 ID として用いる。格納済み Payload は同一 Ring 内で位置が重ならないため一意に識別できる。落とした Payload は Blob を作らないので ID は不要。専用フィールドは設けず `reserved` は 0 のまま。overview.md の「一時的な Payload ID を付ける」と spec の Descriptor 定義の不整合を解消） | EventDescriptor::temporary_payload_id()・docs/spec-transport.md・overview.md（決定の記録） | 実装済み未検証 |
+| A73 | 転送の調整値（Ring 容量・Slot 数・待機上限・再確認周期・復帰閾値）の測定による決定と根拠の記録（spec 冒頭「測定で調整する値」。A65 は待機方式の選定のみで、他の調整値の測定決定を追跡する項目が無かった） | e2e/src/bin/shirusu-wait-bench.rs 等・README | 未着手 |
+
+## B. spec.md 不変条件 9 項目
+
+| ID | 項目 | 検証方法 | 状態 |
+|---|---|---|---|
+| B01 | Host は公開前の Descriptor/Payload を読まない | Unit/PBT/loom/TLA | 実装済み未検証 |
+| B02 | 書き手は Host が回収していない領域を上書きしない | PBT/loom/TLA | 実装済み未検証 |
+| B03 | 通常の記録ではプロセス共通ロックも全順序フェンスも使わない | コード構造レビュー＋テスト | 実装済み未検証 |
+| B04 | Agent は Host を無期限に待たない。Host も通知を無期限に待たない | Unit (bounded wait / recheck) | 実装済み未検証 |
+| B05 | イベントを失った Trace を完全なものとして扱わない | host 完全性報告 | 実装済み未検証 |
+| B06 | スレッド終了後も Host が回収するまで Ring を再利用しない | Unit/PBT/TLA | 実装済み未検証 |
+| B07 | 32bit Agent と 64bit Host が同じレイアウトで解釈する | 静的アサーション＋GHA WoW64 | 実装済み未検証 |
+| B08 | 対象アプリのクラッシュ時に確定済みのイベントだけを回収する | E2E | 実装済み未検証 |
+| B09 | 共有メモリが壊されても Host は崩れず欠落として報告する | Fuzz/統合テスト | 実装済み未検証 |
+
+## C. spec.md テスト表 19 項目
+
+| ID | テスト | 状態 |
+|---|---|---|
+| C01 | 1 スレッドで大量書き込み（順序・重複・破損なし） | 実装済み未検証 |
+| C02 | 64 スレッド同時書き込み（Ring 間混線なし、Slot 不足は Coverage 欠落） | 実装済み未検証 |
+| C03 | 書き手が Payload を書いた直後に停止（公開前を読まない） | 実装済み未検証 |
+| C04 | 書き手が Descriptor 公開直前にクラッシュ（未確定を回収しない） | 実装済み未検証 |
+| C05 | Host を一時停止（待機上限後、Payload 劣化を経て欠落記録） | 実装済み未検証 |
+| C06 | Payload だけ容量不足（API ID/Call ID が残り値は DroppedByBackpressure） | 実装済み未検証 |
+| C07 | Enter を捨てた後に Leave が発生（対応関係を壊さず欠落記録） | 実装済み未検証 |
+| C08 | Host が Loss Counter を読む最中に更新（カウンタが壊れない） | 実装済み未検証 |
+| C09 | DLL_THREAD_DETACH 後に Hook 対象 API（再利用されず欠落カウント） | 実装済み未検証 |
+| C10 | Host を強制終了（対象アプリが続行できる） | 実装済み未検証 |
+| C11 | Mapping 追加中に Host が停止（既存 Ring で継続） | 実装済み未検証 |
+| C12 | Agent を記録途中で終了（確定済みだけ回収） | 実装済み未検証 |
+| C13 | 通知の取りこぼし（再確認で回収） | 実装済み未検証 |
+| C14 | Payload の終端をまたぐ書き込み（折り返し復元） | 実装済み未検証 |
+| C15 | 大きな Snapshot（Fragment 結合と欠落検出） | 実装済み未検証 |
+| C16 | Thread ID 再利用と Slot 再利用（Generation 越え混線なし） | 実装済み未検証 |
+| C17 | x86 Agent ＋ x64 Host（レイアウトとアトミック動作の一致、GHA WoW64 で実行） | 実装済み未検証 |
+| C18 | Hook の入れ子（アプリ由来を正しく記録） | 実装済み未検証 |
+| C19 | 共有メモリの破壊・異常な Cursor（範囲外コピーせず Host が崩れない） | 実装済み未検証 |
+
+## D. test.md 手法別項目
+
+| ID | 項目 | 状態 |
+|---|---|---|
+| D01 | Unit: Cursor 計算 | 実装済み未検証 |
+| D02 | Unit: 容量判定 | 実装済み未検証 |
+| D03 | Unit: Descriptor | 実装済み未検証 |
+| D04 | Unit: CRC32C | 実装済み未検証 |
+| D05 | Unit: 状態遷移（Overflow / Slot） | 実装済み未検証 |
+| D06 | PBT: Ring 操作列と VecDeque 参照モデル比較 | 実装済み未検証 |
+| D07 | PBT: Fragment | 実装済み未検証 |
+| D08 | PBT: Overflow | 実装済み未検証 |
+| D09 | PBT: Slot 再利用 | 実装済み未検証 |
+| D10 | PBT/DST: 故障操作（仮想時計進行・Host 停止再開・通知欠落・スレッド終了）を混ぜた操作列 | 実装済み未検証 |
+| D11 | PBT: 失敗 Seed 保存の方針を文書化 | 実装済み未検証 |
+| D12 | loom: 公開/回収の Release/Acquire 網羅検査（小容量、実行して通す） | 実装済み未検証 |
+| D13 | loom: 通常メモリも UnsafeCell で追跡するモデル | 実装済み未検証 |
+| D14 | Kani: Cursor 演算 harness | 実装済み未検証 |
+| D15 | Kani: Host 範囲検証 harness | 実装済み未検証 |
+| D16 | Kani を実際に実行する（導入できなければ CI 設定＋未実行の明記） | 実装済み未検証 |
+| D17 | Fuzz target: validate_control | 実装済み未検証 |
+| D18 | Fuzz target: decode_descriptor | 実装済み未検証 |
+| D19 | Fuzz target: decode_payload | 実装済み未検証 |
+| D20 | Fuzz: シードコーパスを用意する | 実装済み未検証 |
+| D21 | Fuzz を短時間でも実際に実行する（無理なら CI 設定＋未実行の明記） | 実装済み未検証 |
+| D22 | Fuzz 対象外 (decode_compact / recover_trace は Trace Reader 対象) の理由を文書化 | 実装済み未検証 |
+| D23 | TLA+: SPSC Ring ＋ Slot 再利用＋スレッド終了モデル（容量 2、書手 1〜2、読手 1） | 実装済み未検証 |
+| D24 | TLA+: セルの所有/状態/Generation/公開有無を扱う | 実装済み未検証 |
+| D25 | TLA+: DETACH 後呼出をモデルに含める | 実装済み未検証 |
+| D26 | TLA+ 不変条件 NoUnpublishedRead | 実装済み未検証 |
+| D27 | TLA+ 不変条件 NoOverwriteBeforeRelease | 実装済み未検証 |
+| D28 | TLA+ 不変条件 ExclusiveCellOwnership | 実装済み未検証 |
+| D29 | TLA+ 不変条件 NoStaleProducerWrite | 実装済み未検証 |
+| D30 | TLA+ 不変条件 SequenceConsistency | 実装済み未検証 |
+| D31 | TLA+ 不変条件 NoPermanentBlocking（進行性: 容量不足なら欠落として前に進む） | 実装済み未検証 |
+| D32 | TLA+/TLC を実際に実行する（無理なら週次 CI 設定＋未実行の明記） | 実装済み未検証 |
+| D33 | Windows E2E: Test Supervisor が専用プログラムを起動する実コード | 実装済み未検証 |
+| D34 | Windows E2E: 同期ポイントはテスト用に有効化でき本番では無効 | 実装済み未検証 |
+| D35 | Windows E2E: x86 Agent ＋ x64 Host の別プロセス間 File Mapping 実テスト（GHA） | 実装済み未検証 |
+| D36 | Windows E2E: 強制終了シナリオ（Host/Agent/書き手） | 実装済み未検証 |
+| D37 | Windows E2E: 通知欠落シナリオ | 実装済み未検証 |
+| D38 | Windows E2E: Ring 再利用シナリオ | 実装済み未検証 |
+| D39 | CI PR: fmt/clippy/unit/PBT/短 loom/Kani 主要/Fuzz 短/Windows x86・x64 E2E のジョブ構成 | 実装済み未検証 |
+| D40 | CI Nightly/週次: 長時間版・多数 Seed・TLA+ のジョブ構成 | 実装済み未検証 |
+| D41 | CI を push して全ジョブの結果を確認し、失敗を直すフィードバックループ | 未着手 |
+| D42 | Mutation 的観点: テストが本当に検出できるかの確認（任意の弱体化で落ちること） | 実装済み未検証 |
+| D43 | テスト大増強: カバレッジ測定 (cargo-llvm-cov) と中核モジュール行 90% 以上化、未達行の理由明記 | 実装済み未検証 |
+| D44 | テスト大増強: 境界スイート (Cursor/Payload/Descriptor/BOUNDED_WAIT/容量の体系的境界、tests/boundary.rs) | 実装済み未検証 |
+| D45 | テスト大増強: PBT 増強 (主要 1024 cases・DST 512、保存則/Snapshot 故障/通知意味論/Slot 影モデル/Enter-Leave の新規 6 プロパティ) | 実装済み未検証 |
+| D46 | テスト大増強: loom 増強 (11 件: Claim 競合・再利用・世代ガード・Dekker 回復性モデル等) | 実装済み未検証 |
+| D47 | テスト大増強: Kani 増強 (14 harness: Payload 範囲/Fragment 境界/Cursor 占有/損失差分/Descriptor 安全性) | 実装済み未検証 |
+| D48 | テスト大増強: Miri 実行 (transport lib + boundary) と検出 UB の修正 (SharedRegion provenance、画像整列) | 実装済み未検証 |
+| D49 | テスト大増強: cargo-mutants 全件実行 (554 件) と中核サバイバーの kill・等価 mutant の理由明記 | 実装済み未検証 |
+| D50 | テスト大増強: Fuzz 増強 (4 target × 600 秒、Snapshot Fragment 列の 4 本目追加、成長コーパスの hex 種書き戻し) | 実装済み未検証 |
+| D51 | テスト大増強: E2E 増強 (Host 再起動/Producer 公開途中 kill/32 スレッドストーム/100 万ソーク会計/破壊注入/DETACH ストーム、全 16 シナリオ) | 実装済み未検証 |
+| D52 | テスト大増強: Stress 増強 (release 1000 万 ops ソーク、env で規模可変) | 実装済み未検証 |
+| D53 | DST/PBT 失敗時の証跡保存と縮小ケースの回帰テスト化（verification.md: 失敗時に Seed・リビジョン・テスト構成・操作列・注入故障を保存し、縮小したものを回帰テストに加える。D11 は方針の文書化のみ、loom 失敗スケジュールの回帰化も未実施。Fuzz の最小入力も含む） | 未着手 |
+| D54 | Application Verifier の併用（verification.md E2E 節・CI 表リリース前。D33〜D40 に言及なし。Windows E2E での併用と CI への組み込み） | 未着手 |
+| D55 | 異なる Windows 環境での確認（verification.md CI 表リリース前「異なる Windows 環境での確認」。D39/D40 は windows-latest のみ） | 未着手 |
+| D56 | TLA+ モデルと PBT 参照モデルの実装の独立性（verification.md: 両者は同じ不変条件を共有するが実装は独立させ、実装のバグを参照モデルに写し込まない。D06/D23〜D31 には独立性の担保・確認項目が無い） | 未着手 |
+| D57 | Fuzz で受理したデータの不変条件チェック（verification.md: クラッシュしないことに加え、受理したデータが公開 Trace の不変条件を満たすかも確かめる。validate_control: 占有量上限（Descriptor・Payload 両 Ring）＋前後像の単調性（Cursor・Payload 位置・Loss カウンタ）。decode_descriptor: 既知 Kind・reserved 0・長さ上限・64B 像への忠実な再符号化。decode_payload: 落とした Payload は空、それ以外は長さどおりで折り返しを考慮した領域コピーとバイト単位で一致。実装中に fuzz が validate_control の Payload 位置後退の受理という本物の穴を発見し、validate_control に前像との Payload 位置の単調性チェックを追加して回帰テスト化。修正後の短時間 fuzz: validate_control 約 1,060 万 runs / decode_descriptor 約 540 万 runs / decode_payload 約 490 万 runs、クラッシュなし） | 実装済み未検証 |
+| D58 | Host 検証ロジック（純粋関数）の macOS での実行（verification.md: 検証ロジックは純粋関数に分け、Linux や macOS でも実行する。CI に macos-latest ジョブ `macos-validation` を追加し、`cargo test -p shirusu-transport` を回す。transport クレートは OS 依存コードを持たない。ローカル VM は Linux のため macOS での実行確認は CI 待ち） | .github/workflows/ci.yml | 実装済み未検証 |
+| D59 | Miri で spec_table c01/c08 を小規模で実行する（2026-11-09 08:29 に原因判明・解決: Miri は既定でホストの環境変数を転送しないため `SHIRUSU_SPEC_TABLE_C01_OPS=1 cargo +nightly miri test` は既定の 100,000 件で回っており、「OPS=1 でも 100 秒超」は測定アーティファクトだった。`-Zmiri-env-forward` で転送すると c01 は OPS=200 で 1.86 秒・c08 は OPS=20 で 0.52 秒で通過し、UB 検出なし。誤解を招く doc コメントも修正済み） | 実装済み未検証 |
+
+## E. ドキュメント
+
+| ID | 項目 | 状態 |
+|---|---|---|
+| E01 | docs/ に元仕様 3 ファイルを保持 | 実装済み未検証 |
+| E02 | README（日本語）: 概要・構成・使い方・テストの回し方 | 実装済み未検証 |
+| E03 | README: 検証状況表（ローカル未実行／CI windows で実行の区別、未検証は未検証と書く） | 実装済み未検証 |
+| E04 | README: 「実装して感じたこと」を dated エントリで複数残す | 実装済み未検証 |
+| E05 | 本チェックリストの状態を実装の節目ごとに更新する | 実装済み未検証 |
+
+## 集計
+
+- 全項目数: A 73 + B 9 + C 19 + D 59 + E 5 = **165 項目**（固定。追加したらここを更新する）
+  - 2026-11-09 01:39 に A61〜A65 を追加し、分母が 135→140 に増えた。理由: 仕様再読でチェックリストの漏れ（空き待ちフェンス、セクション ACL、総メモリ上限、Finalization 不在の扱い、待機方式のベンチマーク選定）を発見したため。
+  - 2026-11-09 02:52 に A66〜A68 を追加し、分母が 140→143 に増えた。理由: A61 の配線がライブラリ単位に留まっていたこと（A66）、ベンチ選定の結果を書き手が使う手段が無かったこと（A67）、Agent への space_available 受け渡しが未設計だったこと（A68）。
+  - 2026-11-09 に D43〜D52 を追加し、分母が 143→153 に増えた。理由: ユーザーから「テストが全然足らない」との指摘を受け、カバレッジ・境界・PBT・loom・Kani・Miri・ミューテーション・Fuzz・E2E・Stress の各手法の増強を個別項目として追跡するため。いずれもローカルでは実施・通過済みだが、CI 未実施のため状態は「実装済み未検証」とする。
+  - 2026-11-09 07:29 に A69〜A73・D53〜D58 を追加し、分母が 153→164 に増えた。理由: 仕様 3 文書の再読監査で見つけた漏れ（Loader Lock 判定不能時の 0ms 切替設定、非同期 Mapping 追加フロー、Descriptor の Sequence/Generation 検証、一時 Payload ID の文書間不整合、調整値の測定決定、DST/PBT 失敗証跡の回帰化、Application Verifier、異なる Windows 環境での確認、TLA+/PBT モデルの独立性、Fuzz 受理データの不変条件チェック、macOS での検証ロジック実行）。いずれも未着手。
+  - 2026-11-09 07:29 の Miri 調査で D59 を追加し、分母が 164→165 に増えた。理由: spec_table c01/c08 の Miri 実行がテスト大増強の D48（lib + boundary）に含まれておらず、c01 は現行 VM で小規模でも異常に遅いため個別に追跡する必要があるため。
+  - 2026-11-09 08:29 に A69・A71 を実装し、D59 を解決したため、未着手が 13→10 項目に減った（残りは D41、A70、A72、A73、D53〜D58）。あわせて集計行の「0/164」という D59 追加後の記載漏れを「0/165」に修正した。分母は 165 のまま変わらない。
+  - 2026-11-09 09:29 に A72・D57 を実装し、未着手が 10→8 項目に減った（残りは D41、A70、A73、D53〜D56、D58）。D57 の実装中に fuzz が validate_control の Payload 位置後退の受理という本物の穴を発見し、修正して回帰テスト化した。分母は 165 のまま変わらない。
+  - 2026-11-09 09:29 に D58 も実装し、未着手が 8→7 項目に減った（残りは D41、A70、A73、D53〜D56）。CI に macos-latest ジョブ `macos-validation` を追加。分母は 165 のまま変わらない。
+- 検証済み: 0 項目（2026-11-09 時点。ローカル通過のみの項目は検証済みに数えない）
+- 実装済み未検証: 158 項目 / 未着手: 7 項目（D41 CI フィードバックループ、A70、A73、D53〜D56）
+- 進捗率: 検証済み 0 / 165 = 0%。作業量ベースの自己申告は約 3%（仕様読解等の前段を含む）。

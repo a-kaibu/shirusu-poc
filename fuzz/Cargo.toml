@@ -1,0 +1,42 @@
+[package]
+name = "shirusu-fuzz"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+shirusu-transport = { path = "../crates/shirusu-transport" }
+
+[workspace]
+
+[[bin]]
+name = "validate_control"
+path = "fuzz_targets/validate_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_descriptor"
+path = "fuzz_targets/decode_descriptor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_payload"
+path = "fuzz_targets/decode_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_fragments"
+path = "fuzz_targets/snapshot_fragments.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,33 @@
+# fuzz
+
+`shirusu-transport` の Host 検証まわりに対する cargo-fuzz ターゲット群。
+
+| ターゲット | 入力 | 検証 |
+| --- | --- | --- |
+| `validate_control` | Cursor・容量・Generation のバイト列 | 占有量判定のオーバーフローや誤判定がない |
+| `decode_descriptor` | 64バイトの Descriptor | 未知の Kind や異常な長さを安全に扱う |
+| `decode_payload` | Descriptor と Payload | 参照範囲と折り返しを正しく検証する |
+
+## 種（コーパス）の保持方法
+
+正の種は **`seeds/<target>/<name>.hex`**（16進テキスト、64桁折り返し）で保持する。
+`corpus/` は生成物であり、git には入れない（`.gitignore` 済み）。
+
+理由：このリポジトリの配布経路（GitHub API 経由のスナップショット push）が
+UTF-8 テキストしか扱えず、バイナリ種をそのまま置くと push 全体が拒否されたため（2026-11-09 に実測）。
+種の内容自体はバイナリのままが本質なので、テキスト化は保持形式だけの都合であり、
+生成時に完全復元できることを往復ハッシュで確認している。
+
+使い方：
+
+```sh
+# 種から corpus/ を生成してから fuzz を回す（CI の scripts/ci/fuzz-short.sh は自動で行う）
+fuzz/materialize-corpus.sh
+cd fuzz && cargo +nightly fuzz run decode_descriptor -- -max_total_time=60
+
+# 新しい種が出たら、corpus/ に置いてから hex へ書き戻してコミットする
+fuzz/encode-seeds.sh
+```
+
+`decode_compact` と `recover_trace` は Trace Reader が対象であり、
+転送 PoC の範囲外のためここには無い（docs/traceability.md の D 項目を参照）。

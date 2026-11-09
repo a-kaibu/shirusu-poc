@@ -4,3 +4,7 @@
 /fuzz/artifacts
 *.pdb
 .DS_Store
+/tla/states/
+/tla/*.jar
+/tla/*_TTrace_*
+/fuzz/corpus/

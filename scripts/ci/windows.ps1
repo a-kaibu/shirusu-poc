@@ -3,4 +3,5 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..\..")
 cargo test --workspace --target x86_64-pc-windows-msvc
-cargo run -p shirusu-e2e --target x86_64-pc-windows-msvc --bin shirusu-e2e-supervisor -- --all
+cargo build --workspace --target x86_64-pc-windows-msvc
+.\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --all

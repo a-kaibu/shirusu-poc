@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shirusu-transport",
+    "crates/shirusu-transport-win",
+    "crates/shirusu-agent",
+    "crates/shirusu-host",
+    "crates/shirusu-loom-tests",
+    "e2e",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.74"
+
+[workspace.lints.clippy]
+all = "warn"
