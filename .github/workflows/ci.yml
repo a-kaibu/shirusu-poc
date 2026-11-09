@@ -42,12 +42,12 @@ jobs:
           else
             echo "scripts/ci/plan.sh not found; using built-in fallback matrix" >&2
             jq -cn '{include: [
-              {name:"linux", os:"ubuntu-latest", toolchain:"stable", targets:"", components:"rustfmt, clippy", java:false, shell:"bash", run:"bash scripts/ci/linux.sh", allow_failure:false, timeout:30},
-              {name:"windows-x64", os:"windows-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc", components:"", java:false, shell:"pwsh", run:"./scripts/ci/windows.ps1", allow_failure:false, timeout:60},
-              {name:"windows-x86-wow64", os:"windows-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc, i686-pc-windows-msvc", components:"", java:false, shell:"pwsh", run:"./scripts/ci/windows-x86.ps1", allow_failure:false, timeout:60},
-              {name:"windows-check-targets", os:"ubuntu-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc, i686-pc-windows-msvc", components:"", java:false, shell:"bash", run:"cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target i686-pc-windows-msvc", allow_failure:false, timeout:30},
-              {name:"macos-validation", os:"macos-latest", toolchain:"stable", targets:"", components:"", java:false, shell:"bash", run:"cargo test -p shirusu-transport", allow_failure:false, timeout:30},
-              {name:"tla", os:"ubuntu-latest", toolchain:"stable", targets:"", components:"", java:true, shell:"bash", run:"bash scripts/ci/tla.sh", allow_failure:false, timeout:30}
+              {name:"linux", os:"ubuntu-latest", toolchain:"stable", targets:"", components:"rustfmt, clippy", java:false, run:"bash scripts/ci/linux.sh", allow_failure:false, timeout:30},
+              {name:"windows-x64", os:"windows-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc", components:"", java:false, run:"pwsh -NoProfile -File scripts/ci/windows.ps1", allow_failure:false, timeout:60},
+              {name:"windows-x86-wow64", os:"windows-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc, i686-pc-windows-msvc", components:"", java:false, run:"pwsh -NoProfile -File scripts/ci/windows-x86.ps1", allow_failure:false, timeout:60},
+              {name:"windows-check-targets", os:"ubuntu-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc, i686-pc-windows-msvc", components:"", java:false, run:"cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target i686-pc-windows-msvc", allow_failure:false, timeout:30},
+              {name:"macos-validation", os:"macos-latest", toolchain:"stable", targets:"", components:"", java:false, run:"cargo test -p shirusu-transport", allow_failure:false, timeout:30},
+              {name:"tla", os:"ubuntu-latest", toolchain:"stable", targets:"", components:"", java:true, run:"bash scripts/ci/tla.sh", allow_failure:false, timeout:30}
             ]}' > /tmp/matrix.json
             echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
           fi
@@ -77,7 +77,9 @@ jobs:
         with:
           key: ${{ matrix.name }}
       - name: ${{ matrix.name }}
-        shell: ${{ matrix.shell }}
+        # shell は検証規則で matrix 参照が使えないため bash に固定する。
+        # Windows 向けスクリプトは matrix 側のコマンドで pwsh を起動して実行する。
+        shell: bash
         run: ${{ matrix.run }}
 
   done:
