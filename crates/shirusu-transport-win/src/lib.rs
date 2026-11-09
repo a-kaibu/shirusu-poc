@@ -580,6 +580,12 @@ impl ProcessNotify {
         self.data_ready.set()
     }
     /// 2ms 再確認付きで待つ。通知を取りこぼしても再確認で必ず戻る。
+    ///
+    /// 1 回の待機スライスは「その反復で待つ長さ」であり、毎回
+    /// `policy.interval` を上限に、残り時間で切り取る (R4)。累積経過を
+    /// `ReCheckPolicy::wait_timeout` (待機開始からの経過に対する残り) に
+    /// 渡すと、interval 経過後にスライスが 0 になり、ゼロ待機の
+    /// ビジーループになるため、ここでは使わない。
     pub fn wait_with_recheck(
         &self,
         policy: ReCheckPolicy,
@@ -595,7 +601,7 @@ impl ProcessNotify {
             if waited >= total_timeout {
                 return recheck();
             }
-            let slice = policy.wait_timeout(waited).min(total_timeout - waited);
+            let slice = policy.interval.min(total_timeout - waited);
             if self.data_ready.wait_timeout(slice) && recheck() {
                 return true;
             }
@@ -683,6 +689,71 @@ impl shirusu_transport::Clock for EventClock {
     }
 }
 
+/// 本物の QPC を返すイベント時刻源 (レビュー第2回・項目8)。
+///
+/// Descriptor の `timestamp_qpc` はプロセス間で比較できることが仕様の
+/// 要求であり、Windows では `QueryPerformanceCounter` の値そのものが
+/// それに当たる。周波数は `QueryPerformanceFrequency` で取得して保持
+/// する (起動後に変わらない値)。待機実測用の `Clock` とは別系統で、
+/// Agent は Writer 構築時にこちらを `TimestampSource` として渡す。
+/// Windows 以外では transport の既定時刻源へ委譲する (API 形のスタブ)。
+pub struct QpcTimestampSource {
+    frequency: u64,
+    #[cfg(not(windows))]
+    fallback: shirusu_transport::SystemTimestampSource,
+}
+impl QpcTimestampSource {
+    pub fn new() -> Self {
+        Self {
+            frequency: qpc_frequency(),
+            #[cfg(not(windows))]
+            fallback: shirusu_transport::SystemTimestampSource::new(),
+        }
+    }
+}
+impl Default for QpcTimestampSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[cfg(windows)]
+fn qpc_frequency() -> u64 {
+    use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
+    let mut f: i64 = 0;
+    let ok = unsafe { QueryPerformanceFrequency(&mut f) };
+    if ok != 0 && f > 0 {
+        f as u64
+    } else {
+        // QPF が失敗する環境は実質無いが、0 除算を避けるための保険。
+        1_000_000_000
+    }
+}
+#[cfg(not(windows))]
+fn qpc_frequency() -> u64 {
+    1_000_000_000
+}
+impl shirusu_transport::TimestampSource for QpcTimestampSource {
+    fn now_qpc(&self) -> u64 {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
+            let mut v: i64 = 0;
+            let ok = unsafe { QueryPerformanceCounter(&mut v) };
+            if ok != 0 && v > 0 {
+                return v as u64;
+            }
+            return 0;
+        }
+        #[cfg(not(windows))]
+        {
+            shirusu_transport::TimestampSource::now_qpc(&self.fallback)
+        }
+    }
+    fn frequency(&self) -> u64 {
+        self.frequency
+    }
+}
+
 #[cfg(all(windows, test))]
 mod tests {
     use super::*;
@@ -733,6 +804,21 @@ mod tests {
 mod portable_tests {
     use super::*;
     #[test]
+    fn qpc_timestamp_source_is_monotonic_with_stable_frequency() {
+        use shirusu_transport::TimestampSource as _;
+        let src = QpcTimestampSource::new();
+        let freq = src.frequency();
+        assert!(freq > 0);
+        assert_eq!(src.frequency(), freq, "frequency must be stable");
+        let a = src.now_qpc();
+        let b = src.now_qpc();
+        assert!(b >= a, "QPC stamps must be monotonic: {b} < {a}");
+        // 別のインスタンスでも同じ時刻系 (プロセス間で比較可能な前提)。
+        let other = QpcTimestampSource::new();
+        assert_eq!(other.frequency(), freq);
+        assert!(other.now_qpc() >= a);
+    }
+    #[test]
     fn wait_with_recheck_recovers_missed_notification() {
         let notify = ProcessNotify::new().unwrap();
         let mut calls = 0;
@@ -745,6 +831,32 @@ mod portable_tests {
             Duration::from_millis(50),
         );
         assert!(found);
+    }
+    #[test]
+    fn wait_with_recheck_does_not_busy_loop() {
+        // R4: 累積経過時間を ReCheckPolicy::wait_timeout (interval - waited) に
+        // 渡すと、2ms 経過後はスライスが 0 になり、ゼロ待機のまま
+        // total_timeout まで再確認だけが猛烈に回る (ビジーループ)。
+        // 修正後は反復ごとに interval を上限に待つため、再確認は
+        // 約 total/interval 回 (100ms / 2ms = 約 50 回) に収まる。
+        let notify = ProcessNotify::new().unwrap();
+        let calls = AtomicU64::new(0);
+        let start = std::time::Instant::now();
+        let found = notify.wait_with_recheck(
+            ReCheckPolicy::default(),
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+            Duration::from_millis(100),
+        );
+        assert!(!found, "no data and no notification -> false after timeout");
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "must wait out the total timeout"
+        );
+        let n = calls.load(Ordering::Relaxed);
+        assert!(n < 200, "recheck called {n} times in 100ms: busy loop");
     }
     #[test]
     fn stub_mapping_has_requested_len() {

@@ -1,11 +1,20 @@
-//! QPC 相当の単調時計の抽象。待機時間の実測と、DST/PBT での仮想時計差替えに使う。
+//! 時計の抽象は責務で 2 つに分ける (レビュー第2回・項目8)。
+//!
+//! - `Clock`: 待機時間の実測・再確認・ベンチマーク用。差し替え可能で、
+//!   DST/PBT では仮想時計 (ManualClock) に替える。原点はインスタンス
+//!   ごとの相対値でよく、イベント時刻には使わない。
+//! - `TimestampSource`: イベント時刻専用。Descriptor の `timestamp_qpc`
+//!   に刻む値と、その周波数を返す。仕様 (overview / spec) はイベント時刻を
+//!   QPC 値と周波数で記録し、プロセス間で比較可能にすることを定めるため、
+//!   待機用 Clock を差し替えても原点が動いてはならない。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 pub trait Clock: Send + Sync {
-    /// QPC tick 相当の単調増加値。
+    /// 待機実測用の単調増加値。原点はインスタンス相対でよい
+    /// (イベント時刻の刻印には使わない。そちらは [`TimestampSource`])。
     fn now_ticks(&self) -> u64;
     /// 1 秒あたりの tick 数。
     fn ticks_per_second(&self) -> u64;
@@ -86,6 +95,83 @@ impl Clock for ManualClock {
 
 pub fn system_clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock::default())
+}
+
+/// イベント時刻の供給源。`now_qpc` の値は同じプロセス内では単調で、
+/// 周波数 (`frequency`) と組にして解釈する。Windows では
+/// `shirusu-transport-win` の QPC 実装が本物の QueryPerformanceCounter
+/// 値を返し、プロセス間でそのまま比較できる。待機制御には使わない
+/// (そちらは [`Clock`])。
+pub trait TimestampSource: Send + Sync {
+    /// QPC 相当の単調増加値 (イベント時刻の刻印用)。
+    fn now_qpc(&self) -> u64;
+    /// 1 秒あたりの tick 数 (`now_qpc` の周波数)。
+    fn frequency(&self) -> u64;
+}
+
+/// 既定のイベント時刻源 (std のみ・ポータブル)。
+///
+/// 原点はプロセス全体で 1 つだけ (初回利用時に確定する `OnceLock`)。
+/// `SystemClock` と違いインスタンス生成タイミングに原点が依存しない
+/// ため、Writer ごとに作っても同じ時刻系になる。単調性は `Instant`
+/// 由来。真の QPC ではないのでプロセス間比較は Windows の QPC 実装が
+/// 担い、こちらはフォールバックと位置づける (README 所感参照)。
+pub struct SystemTimestampSource {
+    _private: (),
+}
+impl SystemTimestampSource {
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+}
+impl Default for SystemTimestampSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+static TIMESTAMP_ORIGIN: OnceLock<Instant> = OnceLock::new();
+impl TimestampSource for SystemTimestampSource {
+    fn now_qpc(&self) -> u64 {
+        TIMESTAMP_ORIGIN
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos() as u64
+    }
+    fn frequency(&self) -> u64 {
+        1_000_000_000
+    }
+}
+
+/// テスト用のイベント時刻源。値を明示的に設定・前進させる。
+pub struct ManualTimestampSource {
+    ticks: AtomicU64,
+    frequency: u64,
+}
+impl ManualTimestampSource {
+    pub fn new(ticks: u64, frequency: u64) -> Self {
+        Self {
+            ticks: AtomicU64::new(ticks),
+            frequency,
+        }
+    }
+    pub fn set(&self, ticks: u64) {
+        self.ticks.store(ticks, Ordering::Relaxed);
+    }
+    pub fn advance(&self, ticks: u64) {
+        self.ticks.fetch_add(ticks, Ordering::Relaxed);
+    }
+}
+impl TimestampSource for ManualTimestampSource {
+    fn now_qpc(&self) -> u64 {
+        self.ticks.load(Ordering::Relaxed)
+    }
+    fn frequency(&self) -> u64 {
+        self.frequency
+    }
+}
+
+pub fn system_timestamp_source() -> Arc<dyn TimestampSource> {
+    Arc::new(SystemTimestampSource::new())
 }
 
 #[cfg(test)]

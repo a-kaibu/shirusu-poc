@@ -1,0 +1,160 @@
+{
+  "comment": "CI ジョブ定義。.github/workflows/ci.yml（汎用ランナー）が plan.sh 経由で読み、行列を生成する。ジョブの追加・変更はこのファイルと scripts/ci/*.sh|ps1 の編集だけで完結し、workflow ファイルは触らない。全ジョブが全フィールドを持つこと（plan.sh が固定フィールドで射影するため）。",
+  "jobs": [
+    {
+      "allow_failure": false,
+      "components": "rustfmt, clippy",
+      "java": false,
+      "name": "linux",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/linux.sh",
+      "suites": [
+        "ci"
+      ],
+      "targets": "",
+      "timeout": 30,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "windows-x64",
+      "os": "windows-latest",
+      "run": "pwsh -NoProfile -File scripts/ci/windows.ps1",
+      "suites": [
+        "ci"
+      ],
+      "targets": "x86_64-pc-windows-msvc",
+      "timeout": 60,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "windows-x86-wow64",
+      "os": "windows-latest",
+      "run": "pwsh -NoProfile -File scripts/ci/windows-x86.ps1",
+      "suites": [
+        "ci"
+      ],
+      "targets": "x86_64-pc-windows-msvc, i686-pc-windows-msvc",
+      "timeout": 60,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "windows-check-targets",
+      "os": "ubuntu-latest",
+      "run": "cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target i686-pc-windows-msvc",
+      "suites": [
+        "ci"
+      ],
+      "targets": "x86_64-pc-windows-msvc, i686-pc-windows-msvc",
+      "timeout": 30,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "macos-validation",
+      "os": "macos-latest",
+      "run": "cargo test -p shirusu-transport",
+      "suites": [
+        "ci"
+      ],
+      "targets": "",
+      "timeout": 30,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "msrv",
+      "os": "ubuntu-latest",
+      "run": "cargo check --workspace",
+      "suites": [
+        "ci"
+      ],
+      "targets": "",
+      "timeout": 30,
+      "toolchain": "1.77"
+    },
+    {
+      "allow_failure": true,
+      "components": "",
+      "java": false,
+      "name": "kani",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/kani.sh",
+      "suites": [
+        "ci"
+      ],
+      "targets": "",
+      "timeout": 60,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": true,
+      "components": "",
+      "java": false,
+      "name": "fuzz-short",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/fuzz-short.sh",
+      "suites": [
+        "ci"
+      ],
+      "targets": "",
+      "timeout": 30,
+      "toolchain": "nightly"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": true,
+      "name": "tla",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/tla.sh",
+      "suites": [
+        "ci",
+        "nightly"
+      ],
+      "targets": "",
+      "timeout": 30,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "long-verification",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/nightly.sh",
+      "suites": [
+        "nightly"
+      ],
+      "targets": "",
+      "timeout": 120,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": true,
+      "components": "",
+      "java": false,
+      "name": "long-fuzz",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/fuzz-long.sh",
+      "suites": [
+        "weekly"
+      ],
+      "targets": "",
+      "timeout": 90,
+      "toolchain": "nightly"
+    }
+  ]
+}

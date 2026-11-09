@@ -7,11 +7,13 @@ use shirusu_transport::validate::{decode_descriptor, KnownConfig};
 // 64 バイトの任意 Descriptor で、不明な Kind や異常な長さを安全に扱う。
 // D57: 受理した Descriptor が公開 Trace の不変条件（既知の Kind・reserved 0・
 // 長さ上限・64 バイト像への忠実な再符号化）を満たすかも確かめる。
+// R6: 長さ上限は格納長に対するもの。PAYLOAD_DROPPED の payload_len は
+// 落とした元の長さであり、容量と比較しない (u32 の範囲内なら受理する)。
 fuzz_target!(|data: &[u8]| {
     let cfg = RingConfig::new(64, 4096);
     let known = KnownConfig::new(cfg, cfg.required_len());
     if let Ok(d) = decode_descriptor(data, &known) {
-        assert!(d.payload_len <= 4096);
+        assert!(d.payload_dropped() || d.payload_len <= 4096);
         assert!(d.reserved == 0);
         assert!(d.kind_enum().is_some());
         assert_ne!(d.kind, 0);

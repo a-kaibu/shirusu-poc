@@ -166,9 +166,8 @@ fn run_round(strategy: Strategy) -> RoundResult {
     }
     // 書き手が待機の最中であることを確定させてから回収する。
     std::thread::sleep(Duration::from_millis(10));
-    let reader = unsafe { region.reader() };
-    let mut host =
-        NotifyingDrainWorker::new(DrainWorker::new(reader), Arc::clone(&notify), &region);
+    let worker = unsafe { DrainWorker::new(region.base(), cfg, 1) };
+    let mut host = NotifyingDrainWorker::new(worker, Arc::clone(&notify), &region);
     let mut drained = host.drain_all().events.len();
     let drain_done = Instant::now();
     let (published, dropped) = producer.join().unwrap_or((0, total));

@@ -218,13 +218,13 @@ pub fn scenario_space_available_notify() -> ScenarioReport {
         let _ = tx.send((published, dropped));
     });
     // Host 側の配線: NotifyingDrainWorker が回収と space_available 通知を結ぶ。
-    let reader = unsafe { region.reader() };
+    // 回収は検証付き経路 (DrainWorker) を通る (R2)。
+    let worker = unsafe { shirusu_host::DrainWorker::new(region.base(), cfg, 1) };
     let notify = match RingNotify::new() {
         Ok(n) => Arc::new(n),
         Err(e) => return report("space_available_notify", false, format!("RingNotify: {e}")),
     };
-    let mut host =
-        NotifyingDrainWorker::new(shirusu_host::DrainWorker::new(reader), notify, &region);
+    let mut host = NotifyingDrainWorker::new(worker, notify, &region);
     // 書き手が空き待ちに入るたびに回収する。Ring 4 件に対し 16 件書くので、
     // 書き手は 5・9・13 件目で待機に入る（最大 3 エピソード）。
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -300,7 +300,8 @@ pub fn scenario_agent_space_available_handoff() -> ScenarioReport {
             )
         }
     };
-    let clock = match agent.attach_space_available_notify(Arc::clone(&notify)) {
+    // R7: 通知は Ring 単位。スレッド 1 の Ring に結ぶ。
+    let clock = match agent.attach_space_available_notify(1, Arc::clone(&notify)) {
         Some(c) => c,
         None => {
             return report(
@@ -310,12 +311,11 @@ pub fn scenario_agent_space_available_handoff() -> ScenarioReport {
             )
         }
     };
-    // Host 側: Agent の領域を Reader として読む。領域は Agent が thread_begin
-    // で作り、thread_forget まで生きる。
-    assert!(agent.thread_begin(1).is_some());
+    // Host 側: Agent の領域を検証付き経路 (DrainWorker) で読む。領域は Agent
+    // が thread_begin で作り、thread_forget まで生きる。
+    let handle = agent.thread_begin(1).expect("thread_begin");
     let base = unsafe { agent.thread_region_base(1) }.expect("region base");
-    let reader = unsafe { RingReader::new(base, cfg) };
-    let mut host = shirusu_host::DrainWorker::new(reader);
+    let mut host = unsafe { shirusu_host::DrainWorker::new(base, cfg, handle.generation) };
     let total = 16u64;
     let (tx, rx) = mpsc::channel();
     let producer_agent = Arc::clone(&agent);

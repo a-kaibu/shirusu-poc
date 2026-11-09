@@ -1,15 +1,33 @@
 //! shirusu-agent: 書き手側。スレッド毎 Ring の取得と書込み、再入ガード、Host 生存確認、DETACH 通知。
 //! Hook 自体は実装範囲外（spec のクレート構成表）。ここは転送層への書込みまでを担う。
+//!
+//! 並行性 (R1): 記録の通常経路は全体ロックを取らない。書き手は Ring ごとに
+//! 1 つで、各 OS スレッドは直前に使った書き手を TLS にキャッシュする。
+//! 同じ論理スレッドの記録同士だけが書き手ごとの Mutex で直列化され
+//! (SPSC の単一書き手の保証)、満杯 Ring の待機が他スレッドの記録を
+//! 止めることはない。Slot の取得・登録・引退といった管理操作だけが
+//! 登録表 (RwLock) を使い、ロックは取得・登録の間だけ保持する。
+//!
+//! 低水位時の非同期 Mapping 追加 (A70) は [`expansion`] モジュールの
+//! 管理スレッドが担う。記録経路は登録も待機もしない。
 
-use shirusu_transport::clock::{system_clock, Clock};
+pub mod expansion;
+
+pub use expansion::{ExpansionManager, ExpansionManagerHandle, ExpansionStats};
+
+use shirusu_transport::clock::{system_clock, system_timestamp_source, Clock, TimestampSource};
 use shirusu_transport::context::{should_record, CallOrigin, HostMonitor, PublishGuard};
 use shirusu_transport::descriptor::{CaptureState, EventKind};
+use shirusu_transport::expansion::{ExpansionDelivery, EXPANDED_SLOT_GENERATION};
+use shirusu_transport::layout;
 use shirusu_transport::ring::{EventInput, RingWriter, SharedRegion, WriteOutcome, WriterPolicy};
 use shirusu_transport::slot::{SlotHandle, SlotPool};
 use shirusu_transport::RingConfig;
-use shirusu_transport_win::{EventClock, EventObject, HandleValue, RingNotify};
+use shirusu_transport_win::{EventClock, EventObject, HandleValue, RingNotify, SharedMapping};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordResult {
@@ -26,35 +44,124 @@ pub enum RecordResult {
 
 /// Agent 全体。SlotPool と、Slot ごとの共有領域・書き手を管理する。
 pub struct Agent {
+    /// TLS キャッシュの照合用 ID (Agent インスタンスごとに一意)。
+    id: u64,
     pool: Arc<SlotPool>,
     config: RingConfig,
     policy: WriterPolicy,
-    /// 書き手が使う Clock。`attach_space_available_*` で EventClock へ差し替える
-    /// ため Mutex 越しに持つ（書き手は thread_begin 時に Arc を複製して保持する）。
-    clock: Mutex<Arc<dyn Clock>>,
-    /// Host から受け取った space_available 通知（A68）。受け取り後に保持し、
-    /// EventClock と同じ OS イベントを指し続ける。
-    space_notify: Mutex<Option<Arc<RingNotify>>>,
+    /// 書き手の既定 Clock (Ring ごとの `space_available` が結ばれていない
+    /// Ring で使う)。`with_clock` で構築時に設定し、以後は不変。
+    default_clock: Arc<dyn Clock>,
+    /// イベント時刻専用の時刻源 (レビュー第2回・項目8)。待機用 Clock とは
+    /// 分離し、全 Ring の刻印で共有する。既定は transport の
+    /// `system_timestamp_source`。Windows の Agent は
+    /// `with_timestamp_source` で QPC 実装に差し替える。
+    timestamps: Arc<dyn TimestampSource>,
+    /// Ring (論理スレッド) ごとに結ばれた `space_available` の EventClock
+    /// (R7)。Host から受け取った Ring 単位の通知はここに保持し、その Ring の
+    /// 書き手はこの Clock で待つ。他 Ring の書き手とは共有しない (auto-reset
+    /// Event の取り違えを防ぐ)。書き手生成前なら保留し、生成時に結び、
+    /// 生成後なら即座に書き手の Clock を差し替える。
+    space_clocks: RwLock<HashMap<u64, Arc<EventClock>>>,
     host_monitor: Arc<HostMonitor>,
-    threads: Mutex<HashMap<u64, ThreadSlotState>>,
+    /// 管理パス専用の登録表。record の通常経路はこのロックを取らない
+    /// (TLS キャッシュで完結する)。低速経路でも読みロックは取得の間だけ。
+    threads: RwLock<HashMap<u64, Arc<ThreadSlotState>>>,
+    /// 追加 Slot (A70) へ紐付けた Mapping の登録表 (Slot index → Mapping)。
+    /// 管理スレッドだけが書き込む。ThreadSlotState が drop されても
+    /// (thread_forget / Slot 再利用)、Slot への紐付けは残る。
+    /// フィールドの破棄順に注意: `threads` より後に宣言し、書き手状態が
+    /// 先に破棄されてから Mapping の保持を解く。
+    expanded_regions: Arc<Mutex<HashMap<usize, ExpandedRegion>>>,
 }
+
+/// 追加 Slot (A70) へ紐付けた Mapping。Slot の index ごとに Agent が保持する。
+enum ExpandedRegion {
+    /// プロセス内: Host の Mapping の base を借りる。Mapping 自体は Host の
+    /// ExpansionService が保持する間だけ有効。
+    Borrowed { base: *mut u8 },
+    /// Windows プロセス間: duplicate されたハンドルから作った自分の写像。
+    Owned(SharedMapping),
+}
+// SAFETY: `Borrowed` の base は Host が保持する Mapping の有効なビューで、
+// Agent が登録を終えた後も Host のサービスが生存する間は有効。
+// `Owned` の SharedMapping は Send である。紐付け表は Mutex の内側でのみ
+// 触り、base へのアクセスは SPSC の公開プロトコル経由に限る。
+unsafe impl Send for ExpandedRegion {}
+
+/// スレッドの Ring の裏付け。初期 Slot は Agent が作るローカル領域、
+/// 追加 Slot は Host から配送された Mapping (A70)。
+enum RegionBacking {
+    /// Agent が確保したローカル領域 (初期 Slot)。
+    Owned(Box<SharedRegion>),
+    /// 追加 Slot の Mapping のビュー。実体は Agent の登録表
+    /// (`expanded_regions`) または Host のサービスが保持する。
+    /// `init_control` は claim 時に済ませてある。
+    Mapped { base: *mut u8 },
+}
+impl RegionBacking {
+    fn base(&self) -> *mut u8 {
+        match self {
+            Self::Owned(r) => r.base(),
+            Self::Mapped { base } => *base,
+        }
+    }
+    /// # Safety
+    /// `base` は config 分の共有領域を指し、この裏付けの存続期間中有効で
+    /// あること (呼び出し側は `begin_thread_state` の契約で保証する)。
+    unsafe fn writer(
+        &self,
+        config: RingConfig,
+        policy: WriterPolicy,
+        clock: Arc<dyn Clock>,
+        timestamps: Arc<dyn TimestampSource>,
+    ) -> RingWriter {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe { RingWriter::new_with_timestamps(self.base(), config, policy, clock, timestamps) }
+    }
+}
+// SAFETY: `Mapped` の base が指す共有メモリへのアクセスは、書き手側の
+// SPSC 公開プロトコル (単一書き手) と Host 側の検証付き読取りに限る。
+// `Owned` の SharedRegion と同格のモデルである。
+unsafe impl Send for RegionBacking {}
+unsafe impl Sync for RegionBacking {}
+
+/// スレッド (Ring) ごとの書き手状態。`Arc` で共有し、TLS キャッシュと
+/// 登録表の両方から指す。
 struct ThreadSlotState {
     handle: SlotHandle,
     // SharedRegion は writer より長生きさせるためここに保持する。
-    _region: Box<SharedRegion>,
-    writer: RingWriter,
+    region: RegionBacking,
+    /// 書き手は Ring ごとに 1 つだけ。競合するのは同じ論理スレッドの
+    /// 記録同士だけであり、それは SPSC の単一書き手を保証するために必要。
+    writer: Mutex<RingWriter>,
+    /// thread_forget で引退済みにされたか。TLS キャッシュや取得途中の
+    /// 状態が、引退後の領域へ書き続けないための印。
+    retired: AtomicBool,
+}
+
+static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// OS スレッドごとに「直前に使った書き手」を 1 件だけキャッシュする。
+    /// (Agent ID, 論理スレッド ID, 状態)。借用は取得・格納の瞬間だけ。
+    static TLS_STATE: RefCell<Option<(u64, u64, Arc<ThreadSlotState>)>> =
+        const { RefCell::new(None) };
 }
 
 impl Agent {
     pub fn new(pool: Arc<SlotPool>, config: RingConfig, host_monitor: Arc<HostMonitor>) -> Self {
         Self {
+            id: NEXT_AGENT_ID.fetch_add(1, Ordering::Relaxed),
             pool,
             config,
             policy: WriterPolicy::default(),
-            clock: Mutex::new(system_clock()),
-            space_notify: Mutex::new(None),
+            default_clock: system_clock(),
+            timestamps: system_timestamp_source(),
+            space_clocks: RwLock::new(HashMap::new()),
             host_monitor,
-            threads: Mutex::new(HashMap::new()),
+            threads: RwLock::new(HashMap::new()),
+            expanded_regions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub fn with_policy(mut self, policy: WriterPolicy) -> Self {
@@ -62,33 +169,52 @@ impl Agent {
         self
     }
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = Mutex::new(clock);
+        self.default_clock = clock;
         self
     }
-    /// Host から `space_available` を受け取る（A68）。`notify` は Host 側の
-    /// `RingNotify` と同じ OS イベントを指すもの（プロセス内共有の場合は同じ
-    /// `Arc`、プロセス間の場合は Host が `duplicate_space_to_process` で渡した
-    /// ハンドルから `attach_space_available` で作ったもの）であること。
-    /// 受け取りに成功すると、以後 `thread_begin` で作る書き手は `EventClock`
-    /// （Host の SetEvent で即起きる待機）で書く。返した `EventClock` は
-    /// `sleep_calls()` で待機の実績を観測できる。
-    /// スレッドが既に書き始めている場合は差し替えできない（既存の書き手が
-    /// 古い Clock を保持したままになるため）ので `None` を返す。
+    /// イベント時刻源を設定する (レビュー第2回・項目8)。Windows では
+    /// `shirusu_transport_win::QpcTimestampSource` を渡し、刻印を本物の
+    /// QPC 値にする。待機用 Clock の設定 (`with_clock`) とは独立。
+    pub fn with_timestamp_source(mut self, timestamps: Arc<dyn TimestampSource>) -> Self {
+        self.timestamps = timestamps;
+        self
+    }
+    /// Host からその Ring の `space_available` を受け取る（A68 + R7）。
+    /// `notify` は Host 側の `RingNotify` と同じ OS イベントを指すもの
+    /// （プロセス内共有の場合は同じ `Arc`、プロセス間の場合は Host が
+    /// `duplicate_space_to_process` で渡したハンドルから
+    /// `attach_space_available` で作ったもの）であること。
+    ///
+    /// 通知は Ring 単位なので、受け取りも Ring (論理スレッド) ごとに行う。
+    /// 返した `EventClock` はその Ring の書き手専用のもので、`sleep_calls()`
+    /// で待機の実績を観測できる。書き手が既にあれば即座に Clock を差し替え、
+    /// 無ければ保留して生成時に結ぶ。他の Ring には影響しない。
     pub fn attach_space_available_notify(
         &self,
+        thread_id: u64,
         notify: Arc<RingNotify>,
     ) -> Option<Arc<EventClock>> {
-        if !self.threads.lock().unwrap().is_empty() {
-            return None;
+        let clock = Arc::new(EventClock::new(notify));
+        self.space_clocks
+            .write()
+            .unwrap()
+            .insert(thread_id, Arc::clone(&clock));
+        let state = self.threads.read().unwrap().get(&thread_id).cloned();
+        if let Some(state) = state {
+            if !state.retired.load(Ordering::Acquire) {
+                state
+                    .writer
+                    .lock()
+                    .unwrap()
+                    .set_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+            }
         }
-        let clock = Arc::new(EventClock::new(Arc::clone(&notify)));
-        *self.clock.lock().unwrap() = Arc::clone(&clock) as Arc<dyn Clock>;
-        *self.space_notify.lock().unwrap() = Some(notify);
         Some(clock)
     }
-    /// Host から `space_available` ハンドルを受け取る（A68、プロセス間経路）。
-    /// `handle_value` はこのプロセスで有効な Event ハンドルであること
-    /// （Host が `NotifyingDrainWorker::duplicate_space_to_process` で渡した値、
+    /// Host からその Ring の `space_available` ハンドルを受け取る
+    /// （A68、プロセス間経路）。`handle_value` はこのプロセスで有効な
+    /// Event ハンドルであること（Host が
+    /// `NotifyingDrainWorker::duplicate_space_to_process` で渡した値、
     /// または継承で受け取った値）。`space_available` は auto-reset 前提。
     ///
     /// # Safety
@@ -99,16 +225,17 @@ impl Agent {
     /// が担う）。
     pub unsafe fn attach_space_available(
         &self,
+        thread_id: u64,
         handle_value: HandleValue,
     ) -> Option<Arc<EventClock>> {
         let notify = Arc::new(RingNotify {
             space_available: EventObject::from_handle_value(handle_value, true),
         });
-        self.attach_space_available_notify(notify)
+        self.attach_space_available_notify(thread_id, notify)
     }
-    /// Host から `space_available` を受け取り済みかどうか。
-    pub fn space_available_attached(&self) -> bool {
-        self.space_notify.lock().unwrap().is_some()
+    /// その Ring に `space_available` を受け取り済みかどうか。
+    pub fn space_available_attached(&self, thread_id: u64) -> bool {
+        self.space_clocks.read().unwrap().contains_key(&thread_id)
     }
     pub fn pool(&self) -> &Arc<SlotPool> {
         &self.pool
@@ -117,25 +244,142 @@ impl Agent {
         &self.host_monitor
     }
 
-    /// スレッドが初めて記録するときに Slot と Ring を取得する。
-    pub fn thread_begin(&self, thread_id: u64) -> Option<SlotHandle> {
-        let mut map = self.threads.lock().unwrap();
+    /// スレッドの書き手状態を得る。高速経路は TLS キャッシュ (全体ロック
+    /// なし)、低速経路は登録表の読みロック (取得の間だけ)、どちらにも
+    /// 無ければ管理パスで Slot と Ring を作る。Slot が取れなければ None。
+    fn state_for(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
+        let cached = TLS_STATE.with(|c| {
+            let c = c.borrow();
+            match &*c {
+                Some((agent, tid, state))
+                    if *agent == self.id
+                        && *tid == thread_id
+                        && !state.retired.load(Ordering::Acquire) =>
+                {
+                    Some(Arc::clone(state))
+                }
+                _ => None,
+            }
+        });
+        if let Some(s) = cached {
+            return Some(s);
+        }
+        let state = self.state_for_slow(thread_id)?;
+        TLS_STATE.with(|c| {
+            *c.borrow_mut() = Some((self.id, thread_id, Arc::clone(&state)));
+        });
+        Some(state)
+    }
+    fn state_for_slow(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
+        if let Some(s) = self.threads.read().unwrap().get(&thread_id).cloned() {
+            if !s.retired.load(Ordering::Acquire) {
+                return Some(s);
+            }
+        }
+        self.begin_thread_state(thread_id)
+    }
+    /// 管理スレッド専用: Host から配送された Mapping を SlotPool へ登録する
+    /// (A70)。記録経路はこのメソッドを呼ばない。
+    ///
+    /// 手順: まず配送を解決する (base を借りるか、ハンドル値から自分の写像を
+    /// 作る)。解決できなければ Slot は追加しない。次に Slot を追加し
+    /// (上限を超えれば Err)、Mapping を Slot の index へ紐付ける。紐付けが
+    /// 完了した Slot だけが、以後の claim で Mapping の Ring を使う。
+    /// 追加 Slot は generation 0・FREE から始まる。
+    pub(crate) fn register_expanded_mapping(
+        &self,
+        delivery: ExpansionDelivery,
+    ) -> Result<usize, ()> {
+        if delivery.generation != EXPANDED_SLOT_GENERATION {
+            return Err(());
+        }
+        if delivery.len < self.config.required_len() {
+            return Err(());
+        }
+        let region = match (delivery.base, delivery.handle_value) {
+            (Some(base), _) => ExpandedRegion::Borrowed { base },
+            (None, Some(handle)) => {
+                // Windows プロセス間: duplicate されたハンドルから自分の写像を
+                // 作る。スタブでは Unsupported で失敗する。
+                // SAFETY: handle は Host が duplicate して渡した有効な
+                // File Mapping ハンドルであること (呼び出し側の契約)。
+                match unsafe { SharedMapping::from_handle_value(handle, delivery.len) } {
+                    Ok(mapping) => ExpandedRegion::Owned(mapping),
+                    Err(_) => return Err(()),
+                }
+            }
+            (None, None) => return Err(()),
+        };
+        let index = self.pool.add_slot().ok_or(())?;
+        self.expanded_regions.lock().unwrap().insert(index, region);
+        Ok(index)
+    }
+    /// 管理パス: Slot を取得し、共有領域と書き手を作って登録する。
+    /// 登録表の書きロックはこの初期化の間だけ保持する (記録経路ではない)。
+    fn begin_thread_state(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
+        let mut map = self.threads.write().unwrap();
         if let Some(s) = map.get(&thread_id) {
-            return Some(s.handle);
+            if !s.retired.load(Ordering::Acquire) {
+                return Some(Arc::clone(s));
+            }
         }
         let handle = self.pool.claim(thread_id)?;
-        let region = Box::new(SharedRegion::new(self.config, handle.generation, thread_id));
-        let clock = self.clock.lock().unwrap().clone();
-        let writer = unsafe { region.writer(self.policy.clone(), clock) };
-        map.insert(
-            thread_id,
-            ThreadSlotState {
-                handle,
-                _region: region,
-                writer,
-            },
-        );
-        Some(handle)
+        // 追加 Slot に Mapping が紐付いていればそれを使い、無ければローカル
+        // 領域を作る。Mapping の Control 領域はここで初期化する (生成者は
+        // Agent)。紐付けは Slot の index に残るため、再利用時も同じ
+        // Mapping を使う。
+        let region = {
+            let expanded = self.expanded_regions.lock().unwrap();
+            match expanded.get(&handle.index) {
+                Some(ExpandedRegion::Borrowed { base }) => {
+                    let base = *base;
+                    layout::init_control(base, self.config, handle.generation, thread_id);
+                    RegionBacking::Mapped { base }
+                }
+                Some(ExpandedRegion::Owned(mapping)) => {
+                    let base = mapping.as_ptr();
+                    layout::init_control(base, self.config, handle.generation, thread_id);
+                    RegionBacking::Mapped { base }
+                }
+                None => RegionBacking::Owned(Box::new(SharedRegion::new(
+                    self.config,
+                    handle.generation,
+                    thread_id,
+                ))),
+            }
+        };
+        // Ring ごとの space_available が結ばれていればその EventClock を、
+        // 無ければ既定 Clock を使う (R7)。
+        let clock = self
+            .space_clocks
+            .read()
+            .unwrap()
+            .get(&thread_id)
+            .map(|c| Arc::clone(c) as Arc<dyn Clock>)
+            .unwrap_or_else(|| Arc::clone(&self.default_clock));
+        // SAFETY: region の base は config 分の共有領域を指し、
+        // ThreadSlotState の生存期間中有効である。
+        let writer = unsafe {
+            region.writer(
+                self.config,
+                self.policy.clone(),
+                clock,
+                Arc::clone(&self.timestamps),
+            )
+        };
+        let state = Arc::new(ThreadSlotState {
+            handle,
+            region,
+            writer: Mutex::new(writer),
+            retired: AtomicBool::new(false),
+        });
+        map.insert(thread_id, Arc::clone(&state));
+        Some(state)
+    }
+
+    /// スレッドが初めて記録するときに Slot と Ring を取得する。
+    pub fn thread_begin(&self, thread_id: u64) -> Option<SlotHandle> {
+        self.state_for(thread_id).map(|s| s.handle)
     }
 
     /// テスト/Host 連携用: スレッドの共有領域ベースポインタを返す。
@@ -143,8 +387,8 @@ impl Agent {
     /// # Safety
     /// 返したポインタは ThreadSlotState が保持する領域を指す。thread_end で解放された後は使えない。
     pub unsafe fn thread_region_base(&self, thread_id: u64) -> Option<*mut u8> {
-        let map = self.threads.lock().unwrap();
-        map.get(&thread_id).map(|s| s._region.base())
+        let map = self.threads.read().unwrap();
+        map.get(&thread_id).map(|s| s.region.base())
     }
     pub fn thread_config(&self) -> RingConfig {
         self.config
@@ -152,6 +396,10 @@ impl Agent {
 
     /// 呼び出しを記録する。再入ガードは公開区間だけに適用される（ring の publish 内相当を
     /// ここでも明示し、元の API 呼出に相当する処理の前には外れていることを型で示す）。
+    ///
+    /// 通常経路は全体ロックを取らない (R1): 書き手の取得は TLS キャッシュ
+    /// または登録表の短い読みロックで済み、書き込み中はその Ring の書き手
+    /// Mutex だけを保持する。満杯 Ring の待機が他スレッドを止めることはない。
     pub fn record(&self, thread_id: u64, origin: CallOrigin, input: EventInput) -> RecordResult {
         if !should_record(origin) {
             return RecordResult::SkippedAgentInternal;
@@ -159,25 +407,18 @@ impl Agent {
         if !self.host_monitor.recording_enabled() {
             return RecordResult::PassthroughHostStopped;
         }
-        let mut map = self.threads.lock().unwrap();
-        let slot_state = match map.get_mut(&thread_id) {
-            Some(s) => s,
-            None => {
-                drop(map);
-                if self.thread_begin(thread_id).is_none() {
-                    return RecordResult::NoSlot;
-                }
-                map = self.threads.lock().unwrap();
-                map.get_mut(&thread_id).expect("just inserted")
-            }
+        let Some(state) = self.state_for(thread_id) else {
+            return RecordResult::NoSlot;
         };
-        if slot_state.writer.is_detached() {
-            self.pool.note_call_after_detach(&slot_state.handle);
-            return RecordResult::AfterDetach;
-        }
         let outcome = {
+            let mut writer = state.writer.lock().unwrap();
+            if writer.is_detached() {
+                drop(writer);
+                self.pool.note_call_after_detach(&state.handle);
+                return RecordResult::AfterDetach;
+            }
             let _guard = PublishGuard::enter(); // 公開区間だけのガード
-            slot_state.writer.write(input)
+            writer.write(input)
         };
         // 容量不足などの異常経路でのみ Host 生存確認する。通常経路では確認しない。
         if matches!(
@@ -238,20 +479,26 @@ impl Agent {
     }
 
     /// DLL_THREAD_DETACH 相当: DRAINING へ移行するだけ（待たない）。領域は Host 回収まで保持する。
+    /// 管理操作であり、対象 Ring の書き手 Mutex だけを短く取る (全体ロックは使わない)。
     pub fn thread_detach(&self, thread_id: u64) -> bool {
-        let mut map = self.threads.lock().unwrap();
-        if let Some(s) = map.get_mut(&thread_id) {
-            s.writer.mark_detached();
-            let handle = s.handle;
-            drop(map);
-            return self.pool.begin_detach(&handle);
+        let state = self.threads.read().unwrap().get(&thread_id).map(Arc::clone);
+        if let Some(s) = state {
+            s.writer.lock().unwrap().mark_detached();
+            return self.pool.begin_detach(&s.handle);
         }
         false
     }
 
     /// Host が回収を終えた後に Agent 側の保持を解く（通常は Host 主導）。
+    /// 対象スレッドは終了済みであることが前提。引退印を付けてから登録表を
+    /// 外し、進行中の記録があればその Ring の書き手ロックで完了を待つ。
+    /// TLS キャッシュは引退印の確認で自動的に無効化される。
     pub fn thread_forget(&self, thread_id: u64) {
-        self.threads.lock().unwrap().remove(&thread_id);
+        let removed = self.threads.write().unwrap().remove(&thread_id);
+        if let Some(state) = removed {
+            state.retired.store(true, Ordering::Release);
+            let _in_flight_done = state.writer.lock().unwrap();
+        }
     }
 }
 
@@ -318,30 +565,40 @@ mod tests {
     fn attach_space_available_before_first_write() {
         use shirusu_transport_win::RingNotify;
         let a = agent(2);
-        assert!(!a.space_available_attached());
+        assert!(!a.space_available_attached(1));
         let notify = Arc::new(RingNotify::new().unwrap());
-        let clock = a.attach_space_available_notify(Arc::clone(&notify));
+        let clock = a.attach_space_available_notify(1, Arc::clone(&notify));
         assert!(clock.is_some());
-        assert!(a.space_available_attached());
+        assert!(a.space_available_attached(1));
+        assert!(!a.space_available_attached(2), "attach is per-ring (R7)");
         assert_eq!(clock.unwrap().sleep_calls(), 0);
         // 受け取り後に書き始めたスレッドは EventClock で書く。
         assert!(matches!(
             a.record_enter(1, 10, 20, 100, 0, b"args"),
             RecordResult::Written(_)
         ));
-        // 書き始め後の差し替えはできない（既存の書き手が古い Clock を持つため）。
+        // 別 Ring への受け取りは、他 Ring が書き始めた後でも独立に行える。
+        // (R7 以前の全体共有 Clock では、どれか 1 Ring が書き始めると
+        // 全体への差し替えができなくなっていた。)
         let notify2 = Arc::new(RingNotify::new().unwrap());
-        assert!(a.attach_space_available_notify(notify2).is_none());
-        assert!(a.space_available_attached());
+        assert!(a.attach_space_available_notify(2, notify2).is_some());
+        assert!(a.space_available_attached(2));
     }
     #[test]
-    fn attach_space_available_after_thread_begin_is_rejected() {
+    fn attach_space_available_after_thread_begin_swaps_clock() {
         use shirusu_transport_win::RingNotify;
         let a = agent(2);
         assert!(a.thread_begin(1).is_some());
+        // R7: Ring ごとに結ぶため、書き始めた後でもその Ring の書き手の
+        // Clock を差し替えられる。他 Ring には影響しない。
         let notify = Arc::new(RingNotify::new().unwrap());
-        assert!(a.attach_space_available_notify(notify).is_none());
-        assert!(!a.space_available_attached());
+        assert!(a.attach_space_available_notify(1, notify).is_some());
+        assert!(a.space_available_attached(1));
+        assert!(!a.space_available_attached(2));
+        assert!(matches!(
+            a.record_enter(1, 10, 20, 100, 0, b"args"),
+            RecordResult::Written(_)
+        ));
     }
     #[test]
     fn attach_space_available_from_handle_value_shape() {
@@ -350,9 +607,9 @@ mod tests {
         // の実証は Windows 実機の duplicate テストが担う）。それでも Agent は
         // EventClock で書けること。
         let a = agent(2);
-        let clock = unsafe { a.attach_space_available(0) };
+        let clock = unsafe { a.attach_space_available(1, 0) };
         assert!(clock.is_some());
-        assert!(a.space_available_attached());
+        assert!(a.space_available_attached(1));
         assert!(matches!(
             a.record_enter(1, 10, 20, 100, 0, b"args"),
             RecordResult::Written(_)

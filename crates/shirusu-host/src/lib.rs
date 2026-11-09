@@ -1,15 +1,19 @@
 //! shirusu-host: 読み手側。Ring 毎に単一 Drain Worker 前提の取出し、検証、Loss Event 生成、
 //! Enter/Leave 対応付けと終了不明判定、スレッド終了確認後の Slot 解放、完全性報告。
 
+pub mod expansion;
+
 use shirusu_transport::descriptor::EventKind;
-use shirusu_transport::layout::LossCounters;
-use shirusu_transport::ring::{DrainBatch, ReceivedEvent, RingReader, SharedRegion};
+use shirusu_transport::layout::{self, LossCounters};
+use shirusu_transport::ring::{DrainBatch, ReceivedEvent, SharedRegion};
 use shirusu_transport::slot::{SlotHandle, SlotPool};
 use shirusu_transport::validate::{IntegrityError, KnownConfig, ValidatingReader};
+use shirusu_transport::RingConfig;
 use shirusu_transport_win::{notify_space_if_writer_waiting, RingNotify};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// Host が生成する Loss Event（公開 Trace の Loss Event に対応する transport 表現）。
@@ -72,29 +76,171 @@ impl IntegrityReport {
     }
 }
 
+/// Host が管理するプロセス実例の識別子。OS の PID そのものではなく、
+/// 同じ PID の再利用やプロセス再起動を別実例として区別するため、Host が
+/// Capture Session 内で一意に採番する値（A72）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProcessInstanceId(pub u64);
+
+/// Host が管理する Ring の識別子。Capture Session 内で一意に Host が採番する
+/// 値であり、転送 ABI には現れない（A72）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RingId(pub u64);
+
+/// Host が回収対象の Ring に付ける識別情報。`ring_id` と `generation` は
+/// Host が管理する値を使う（A72 確定仕様）。`generation` は Ring 再利用の
+/// たびに Host が増やす世代であり、Control 領域の Generation
+/// （`ValidatingReader` が `expected_generation` として照合する値）に対応する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RingIdentity {
+    pub process_id: ProcessInstanceId,
+    pub ring_id: RingId,
+    pub generation: u64,
+}
+impl RingIdentity {
+    pub fn new(process_id: ProcessInstanceId, ring_id: RingId, generation: u64) -> Self {
+        Self {
+            process_id,
+            ring_id,
+            generation,
+        }
+    }
+    /// Ring 再利用時の次世代の識別情報。識別子の他の要素は保ち、世代だけ進める。
+    pub fn next_generation(&self) -> Self {
+        Self {
+            generation: self.generation.wrapping_add(1),
+            ..*self
+        }
+    }
+    /// 検証済み Descriptor を持つ回収イベントについて、格納済み Payload が
+    /// ある場合にだけ一時キーを生成する。欠落した Payload（ドロップ、または
+    /// 格納バイトが無い）にはキーを生成しない。欠落の事実と理由は Loss
+    /// カウンタ／Loss Event 側に残る（A72 確定仕様 5）。
+    pub fn payload_key(&self, event: &ReceivedEvent) -> Option<TemporaryPayloadKey> {
+        if event.descriptor.payload_dropped() || event.payload.is_empty() {
+            return None;
+        }
+        Some(TemporaryPayloadKey {
+            process_id: self.process_id,
+            ring_id: self.ring_id,
+            generation: self.generation,
+            sequence: event.descriptor.sequence,
+            payload_position: event.descriptor.payload_position,
+        })
+    }
+}
+
+/// Host 内部の一時キー（A72 確定仕様、kota 2026-11-09）。
+///
+/// Payload は Agent–Host 間で独立した ID を持たない。Host は検証済みの
+/// Ring 識別情報・Generation・Sequence・Payload の論理オフセットから
+/// このキーを回収時に生成し、内部管理（Blob 化待ちの突き合わせ等）に使う。
+/// `sequence + payload_position` だけでは別 Ring や Ring 再利用で重複する
+/// ため、Host 管理の `process_id` / `ring_id` / `generation` を含める。
+/// Host が BLAKE3 を計算して Blob を保存した後、公開 Trace では Blob ID を
+/// 参照する。このキーは Host 内部だけで使用し、公開 Trace 形式には含めない。
+/// 対象範囲は Capture Session 内であり、別 Session と統合する場合は
+/// Session ID を呼び出し側で組み合わせる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TemporaryPayloadKey {
+    pub process_id: ProcessInstanceId,
+    pub ring_id: RingId,
+    pub generation: u64,
+    pub sequence: u64,
+    pub payload_position: u64,
+}
+
 /// Ring 1 本分の Drain Worker。単一読み手を前提とし、複数 Worker で同じ Ring を扱わない。
+///
+/// 回収は必ず検証付き経路を通る (R2): 共有領域を Host 側バッファへコピーし
+/// (copy)、`ValidatingReader` で検証しながら取り出し (validate)、成功した
+/// 場合にだけ共有メモリの read_cursor / payload_read_position を前進させる
+/// (advance)。矛盾を見つけたら Ring を止め、`integrity_lost` と
+/// `LossEvent::IntegrityLost` を記録して、以後は空のバッチを返す。
+/// 無検証の `RingReader` は通常経路では使わない (テスト／信頼済み内部専用
+/// として transport 側に残してある)。
 pub struct DrainWorker {
-    reader: RingReader,
+    base: *mut u8,
+    reader: ValidatingReader,
+    /// Host 側のコピー先バッファ。検証はこの像に対してだけ行い、共有メモリを
+    /// 読み直さない。
+    image: Vec<u8>,
     prev_loss: LossCounters,
     open_calls: HashMap<u64, u64>, // call_id -> enter sequence
     closed_calls: HashSet<u64>,
+    identity: Option<RingIdentity>,
+    /// 回収した格納済み Payload の一時キー（A72）。`identity` を設定した
+    /// 場合にだけ生成する。欠落 Payload には生成されない。
+    pub payload_keys: Vec<TemporaryPayloadKey>,
     pub loss_events: Vec<LossEvent>,
     pub unknown_terminations: Vec<u64>,
     pub total_events: u64,
+    /// 共有メモリの矛盾で Ring を停止したかどうか。
+    pub integrity_lost: bool,
     degraded_seen: u64,
 }
+// SAFETY: base はコンストラクタの契約により Worker の生存期間中有効であり、
+// Ring ごとに単一 Worker で使う前提 (SPSC の読み手側) のため、所有権の移動は安全。
+unsafe impl Send for DrainWorker {}
 impl DrainWorker {
-    pub fn new(reader: RingReader) -> Self {
+    /// # Safety
+    /// `base` は `cfg` 分の共有領域を指し、この Worker が破棄されるまで有効
+    /// であること。`expected_generation` は Control 領域の Generation と
+    /// 一致する Host 管理の値であること。
+    pub unsafe fn new(base: *mut u8, cfg: RingConfig, expected_generation: u64) -> Self {
+        let known = KnownConfig::new(cfg, cfg.required_len());
         Self {
-            reader,
+            base,
+            reader: ValidatingReader::new(known, expected_generation),
+            image: vec![0u8; cfg.required_len()],
             prev_loss: LossCounters::default(),
             open_calls: HashMap::new(),
             closed_calls: HashSet::new(),
+            identity: None,
+            payload_keys: Vec::new(),
             loss_events: Vec::new(),
             unknown_terminations: Vec::new(),
             total_events: 0,
+            integrity_lost: false,
             degraded_seen: 0,
         }
+    }
+    /// 共有メモリの矛盾で Ring を停止したかどうか。
+    pub fn is_stopped(&self) -> bool {
+        self.reader.is_stopped()
+    }
+    /// Host 再起動後の引き継ぎ: 共有側の読み位置を正として検証状態を同期
+    /// する (`ValidatingReader::resume_from_image`)。同期に失敗したら Ring
+    /// は止まった状態になり、`integrity_lost` が立つ。以後は
+    /// `drain_*` は空のバッチを返す。
+    pub fn resume_from_shared(&mut self) {
+        // SAFETY: base はコンストラクタの契約で有効。image は同じ長さ。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base as *const u8,
+                self.image.as_mut_ptr(),
+                self.image.len(),
+            );
+        }
+        if let Err(e) = self.reader.resume_from_image(&self.image) {
+            self.integrity_lost = true;
+            self.loss_events.push(LossEvent::IntegrityLost {
+                reason: format!("{e:?}"),
+            });
+        }
+    }
+    fn writer_waiting(&self) -> bool {
+        // 空き通知の要否判断にだけ使う助言フラグ。検証対象ではない
+        // (書き手は通知が無くても待機上限で必ず前に進む)。
+        layout::writer_waiting(self.base)
+    }
+    /// 回収対象 Ring の識別情報を設定する（A72）。設定後は回収のたびに
+    /// 格納済み Payload の一時キーを `payload_keys` に生成する。
+    pub fn set_identity(&mut self, identity: RingIdentity) {
+        self.identity = Some(identity);
+    }
+    pub fn identity(&self) -> Option<RingIdentity> {
+        self.identity
     }
     pub fn drain_once(&mut self, max: usize) -> DrainBatch {
         self.drain_once_with_space_notify(max, || {})
@@ -111,20 +257,69 @@ impl DrainWorker {
         notify_space: impl Fn(),
     ) -> DrainBatch {
         let batch = self.drain_once_inner(max);
-        if !batch.events.is_empty() && self.reader.writer_waiting() {
+        if !batch.events.is_empty() && self.writer_waiting() {
             notify_space();
         }
         batch
     }
     pub fn drain_all_with_space_notify(&mut self, notify_space: impl Fn()) -> DrainBatch {
         let batch = self.drain_once_inner(usize::MAX);
-        if !batch.events.is_empty() && self.reader.writer_waiting() {
+        if !batch.events.is_empty() && self.writer_waiting() {
             notify_space();
         }
         batch
     }
     fn drain_once_inner(&mut self, max: usize) -> DrainBatch {
-        let batch = self.reader.drain(max);
+        if self.reader.is_stopped() {
+            return DrainBatch::default();
+        }
+        // 1. copy: 共有領域を Host 側バッファへ写す。以後はこの像だけを見る。
+        // SAFETY: base はコンストラクタの契約で有効。image は同じ長さで確保した。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base as *const u8,
+                self.image.as_mut_ptr(),
+                self.image.len(),
+            );
+        }
+        // 2. validate + take: 検証済みの範囲だけを取り出す。矛盾したら
+        // Ring を止め、完全性喪失として記録する (バッチは返さない)。
+        let events = match self.reader.drain_image_up_to(&self.image, max) {
+            Ok(events) => events,
+            Err(e) => {
+                self.integrity_lost = true;
+                self.loss_events.push(LossEvent::IntegrityLost {
+                    reason: format!("{e:?}"),
+                });
+                return DrainBatch::default();
+            }
+        };
+        // 3. advance: 検証済みの分だけ共有メモリの読み位置を前進させる。
+        // Sequence 欠番は検証側 (ValidatingReader) が数えた分を使う
+        // (resume で引き継いだ期待値とも一貫する単一の数え手)。
+        let batch = DrainBatch {
+            events,
+            sequence_gaps: self.reader.take_sequence_gaps(),
+            // Host の検証経路は破損を integrity_lost 側で扱うため、バッチ側の
+            // 多層防御エラーは常に None (RingReader 専用の報告経路)。
+            integrity_error: None,
+        };
+        if !batch.events.is_empty() {
+            // 前進は検証済み範囲に限る (layout の原子操作は base の有効性が前提)。
+            layout::store(
+                self.base,
+                layout::OFF_PAYLOAD_READ_POSITION,
+                self.reader.payload_read_position(),
+                Ordering::Release,
+            );
+            layout::store(
+                self.base,
+                layout::OFF_READ_CURSOR,
+                self.reader.read_cursor(),
+                Ordering::Release,
+            );
+            layout::fetch_add(self.base, layout::OFF_HOST_DRAIN_COUNT, 1);
+        }
         self.process_batch(&batch);
         batch
     }
@@ -140,8 +335,19 @@ impl DrainWorker {
             if e.descriptor.payload_dropped() {
                 self.degraded_seen += 1;
             }
+            if let Some(id) = &self.identity {
+                if let Some(key) = id.payload_key(e) {
+                    self.payload_keys.push(key);
+                }
+            }
         }
-        let now = self.reader.loss_counters();
+        // Loss カウンタは検証済み Control スナップショットから読む
+        // (共有メモリを直接読み直さない)。
+        let now = self
+            .reader
+            .control_snapshot()
+            .map(|s| s.loss)
+            .unwrap_or(self.prev_loss);
         if let Some(diff) = now.diff_since(&self.prev_loss) {
             if diff.dropped_events > 0 || diff.dropped_payload_bytes > 0 || diff.degraded_events > 0
             {
@@ -336,6 +542,11 @@ impl<'r> NotifyingDrainWorker<'r> {
 /// 検証付きで共有メモリ像を読む Host 経路。矛盾したら Ring 停止 + IntegrityLost を記録する。
 pub struct ValidatingHost {
     reader: ValidatingReader,
+    identity: Option<RingIdentity>,
+    /// 回収した格納済み Payload の一時キー（A72）。`set_identity` で識別情報を
+    /// 設定した場合にだけ生成する。identity の generation は
+    /// `expected_generation` と一致させること（Host が管理する同じ世代）。
+    pub payload_keys: Vec<TemporaryPayloadKey>,
     pub loss_events: Vec<LossEvent>,
     pub integrity_lost: bool,
 }
@@ -343,13 +554,28 @@ impl ValidatingHost {
     pub fn new(known: KnownConfig, expected_generation: u64) -> Self {
         Self {
             reader: ValidatingReader::new(known, expected_generation),
+            identity: None,
+            payload_keys: Vec::new(),
             loss_events: Vec::new(),
             integrity_lost: false,
         }
     }
+    /// 回収対象 Ring の識別情報を設定する（A72）。
+    pub fn set_identity(&mut self, identity: RingIdentity) {
+        self.identity = Some(identity);
+    }
     pub fn drain_image(&mut self, image: &[u8]) -> Result<Vec<ReceivedEvent>, IntegrityError> {
         match self.reader.drain_image(image) {
-            Ok(events) => Ok(events),
+            Ok(events) => {
+                if let Some(id) = &self.identity {
+                    for e in &events {
+                        if let Some(key) = id.payload_key(e) {
+                            self.payload_keys.push(key);
+                        }
+                    }
+                }
+                Ok(events)
+            }
             Err(e) => {
                 self.integrity_lost = true;
                 self.loss_events.push(LossEvent::IntegrityLost {
@@ -358,6 +584,40 @@ impl ValidatingHost {
                 Err(e)
             }
         }
+    }
+    /// 実 File Mapping のビューに対する回収 (R2): copy→検証→Cursor 前進を
+    /// 1 回で行う。`drain_image` は渡された像のコピーを検証するだけで共有側
+    /// の読み位置は進めないため、実 Mapping を相手にする場合はこちらを使う。
+    /// 前進は検証に成功した範囲に限り、失敗時は共有側を一切変更しない。
+    ///
+    /// # Safety
+    /// `base` は `len` バイトの共有領域を指し、呼び出し中有効であること。
+    /// `len` が検証側の要求長に満たない場合は `ImageTooSmall` で失敗する。
+    pub unsafe fn drain_shared(
+        &mut self,
+        base: *mut u8,
+        len: usize,
+    ) -> Result<Vec<ReceivedEvent>, IntegrityError> {
+        // SAFETY: 呼び出し側の契約 (base は len バイト有効) に従う。
+        let image = unsafe { std::slice::from_raw_parts(base as *const u8, len) }.to_vec();
+        let events = self.drain_image(&image)?;
+        if !events.is_empty() {
+            // 前進は検証済み範囲に限る (base の契約は呼び出し側が保証する)。
+            layout::store(
+                base,
+                layout::OFF_PAYLOAD_READ_POSITION,
+                self.reader.payload_read_position(),
+                Ordering::Release,
+            );
+            layout::store(
+                base,
+                layout::OFF_READ_CURSOR,
+                self.reader.read_cursor(),
+                Ordering::Release,
+            );
+            layout::fetch_add(base, layout::OFF_HOST_DRAIN_COUNT, 1);
+        }
+        Ok(events)
     }
     pub fn is_stopped(&self) -> bool {
         self.reader.is_stopped()
@@ -424,8 +684,8 @@ mod tests {
                 clock,
             )
         };
-        let r = unsafe { region.reader() };
-        (region, w, DrainWorker::new(r))
+        let worker = unsafe { DrainWorker::new(region.base(), cfg, 1) };
+        (region, w, worker)
     }
     fn ev(kind: EventKind, call: u64, payload: &[u8]) -> EventInput<'_> {
         EventInput {
@@ -627,8 +887,7 @@ mod tests {
                 clock,
             )
         };
-        let r = unsafe { region.reader() };
-        let mut host = DrainWorker::new(r);
+        let mut host = unsafe { DrainWorker::new(region.base(), cfg, 1) };
         for i in 0..4u64 {
             w.write(ev(EventKind::CallEnter, i, b"x"));
         }
@@ -726,6 +985,213 @@ mod tests {
         assert_eq!(
             pool.slot(h.index).state(),
             shirusu_transport::SlotState::Free
+        );
+    }
+
+    fn received(seq: u64, pos: u64, payload: &[u8], dropped: bool) -> ReceivedEvent {
+        let mut d = shirusu_transport::EventDescriptor::new(EventKind::CallEnter, seq);
+        d.payload_position = pos;
+        d.payload_len = payload.len() as u32;
+        if dropped {
+            d.flags |= shirusu_transport::descriptor::flags::PAYLOAD_DROPPED;
+        }
+        ReceivedEvent {
+            descriptor: d,
+            payload: payload.to_vec(),
+        }
+    }
+    #[test]
+    fn validating_host_drain_shared_advances_shared_cursors() {
+        // R2: 実 Mapping 向けの copy→検証→前進。検証成功分だけ共有側の
+        // read_cursor が進み、破損時は進まない。
+        use shirusu_transport::layout::{load, OFF_READ_CURSOR};
+        use std::sync::atomic::Ordering as AOrd;
+        let cfg = RingConfig::new(8, 256);
+        let region = SharedRegion::new(cfg, 3, 1);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        w.write(ev(EventKind::CallEnter, 1, b"hello"));
+        w.write(ev(EventKind::CallLeave, 1, b"world"));
+        let mut host = ValidatingHost::new(KnownConfig::new(cfg, cfg.required_len()), 3);
+        let len = cfg.required_len();
+        let evs = unsafe { host.drain_shared(region.base(), len) }.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(load(region.base(), OFF_READ_CURSOR, AOrd::Relaxed), 2);
+        // 続きは無いので 2 回目は空で、Cursor も動かない。
+        let evs = unsafe { host.drain_shared(region.base(), len) }.unwrap();
+        assert!(evs.is_empty());
+        assert_eq!(load(region.base(), OFF_READ_CURSOR, AOrd::Relaxed), 2);
+        // 破損した像では失敗し、Cursor は前進しない。
+        w.write(ev(EventKind::CallEnter, 2, b"again"));
+        let mut image = AlignedImage::copy_of(region.as_slice());
+        shirusu_transport::layout::store(
+            image.as_mut_ptr(),
+            shirusu_transport::layout::OFF_WRITE_CURSOR,
+            u64::MAX - 3,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(host.drain_image(image.as_slice()).is_err());
+        assert_eq!(load(region.base(), OFF_READ_CURSOR, AOrd::Relaxed), 2);
+    }
+    #[test]
+    fn drain_worker_resume_continues_from_shared_cursors() {
+        // Host 再起動: 新しい Worker が resume_from_shared で読み位置を
+        // 引き継ぎ、回収済みイベントを二重に取り込まず続きから読む。
+        let (region, mut w, mut host) = setup();
+        w.write(ev(EventKind::CallEnter, 1, b"a"));
+        w.write(ev(EventKind::CallEnter, 2, b"b"));
+        assert_eq!(host.drain_all().events.len(), 2);
+        let cfg = region.config;
+        let mut host2 = unsafe { DrainWorker::new(region.base(), cfg, 1) };
+        host2.resume_from_shared();
+        assert!(!host2.integrity_lost);
+        assert!(
+            host2.drain_all().events.is_empty(),
+            "no replay after resume"
+        );
+        w.write(ev(EventKind::CallEnter, 3, b"c"));
+        let b = host2.drain_all();
+        assert_eq!(b.events.len(), 1);
+        assert_eq!(b.events[0].payload, b"c");
+        assert_eq!(b.sequence_gaps, 0, "resume keeps sequence continuity");
+        assert_eq!(host2.total_events, 1);
+    }
+
+    #[test]
+    fn temporary_key_components_distinguish_keys() {
+        // A72: sequence + payload_position が同じでも、Host 管理の要素が
+        // どれか 1 つでも違えばキーは異なる。同一入力では決定的に同じ。
+        let e = received(7, 100, b"payload", false);
+        let base = RingIdentity::new(ProcessInstanceId(1), RingId(2), 3);
+        let k = base.payload_key(&e).unwrap();
+        assert_eq!(
+            k,
+            TemporaryPayloadKey {
+                process_id: ProcessInstanceId(1),
+                ring_id: RingId(2),
+                generation: 3,
+                sequence: 7,
+                payload_position: 100,
+            }
+        );
+        assert_eq!(base.payload_key(&e), Some(k), "deterministic");
+        let other_ring = RingIdentity::new(ProcessInstanceId(1), RingId(9), 3);
+        assert_ne!(other_ring.payload_key(&e), Some(k), "ring_id differs");
+        let other_process = RingIdentity::new(ProcessInstanceId(8), RingId(2), 3);
+        assert_ne!(other_process.payload_key(&e), Some(k), "process differs");
+        let other_gen = RingIdentity::new(ProcessInstanceId(1), RingId(2), 4);
+        assert_ne!(other_gen.payload_key(&e), Some(k), "generation differs");
+        // 同一 Ring でも sequence / position が違えば異なる。
+        assert_ne!(
+            base.payload_key(&received(8, 100, b"payload", false)),
+            Some(k)
+        );
+        assert_ne!(
+            base.payload_key(&received(7, 107, b"payload", false)),
+            Some(k)
+        );
+    }
+    #[test]
+    fn temporary_key_not_generated_for_dropped_or_empty_payload() {
+        // A72 確定仕様 5: 欠落 Payload にはキーを生成しない。
+        let id = RingIdentity::new(ProcessInstanceId(1), RingId(2), 3);
+        assert_eq!(id.payload_key(&received(7, 100, b"", true)), None);
+        // ドロップ扱いの Descriptor は、仮にバイトが付いていても生成しない。
+        assert_eq!(id.payload_key(&received(7, 100, b"bytes", true)), None);
+        // 格納済みでも長さ 0 なら Blob 化する対象が無いので生成しない。
+        assert_eq!(id.payload_key(&received(7, 100, b"", false)), None);
+        assert!(id.payload_key(&received(7, 100, b"x", false)).is_some());
+    }
+    #[test]
+    fn drain_worker_generates_payload_keys_with_identity() {
+        let (_rg, mut w, mut host) = setup();
+        // identity 未設定では従来どおりキーを生成しない。
+        w.write(ev(EventKind::CallEnter, 1, b"aaa"));
+        host.drain_all();
+        assert!(host.payload_keys.is_empty());
+        // identity を設定すると、格納済み Payload にだけキーが付く。
+        host.set_identity(RingIdentity::new(ProcessInstanceId(7), RingId(3), 1));
+        let mut dropped = ev(EventKind::CallEnter, 2, b"dddd");
+        dropped.capture_state = CaptureState::DroppedByBackpressure;
+        w.write(dropped);
+        w.write(ev(EventKind::CallEnter, 3, b"e"));
+        host.drain_all();
+        // seq 1 は identity 前に回収済み。seq 2 は欠落（キーなし、理由は
+        // Degraded として残る）。seq 3 は位置 3（欠落分は位置を進めない）。
+        assert_eq!(
+            host.payload_keys,
+            vec![TemporaryPayloadKey {
+                process_id: ProcessInstanceId(7),
+                ring_id: RingId(3),
+                generation: 1,
+                sequence: 3,
+                payload_position: 3,
+            }]
+        );
+        assert_eq!(host.total_events, 3);
+        let report = host.integrity_report(0, false);
+        assert_eq!(report.semantic_completeness, IntegrityLevel::Degraded);
+    }
+    #[test]
+    fn ring_reuse_old_key_does_not_collide_with_new_payload() {
+        // A72: Ring 再利用で sequence と payload_position が同じ値に戻っても、
+        // generation が進むため古いキーは新しい Payload のキーと一致しない。
+        let e = received(1, 0, b"x", false);
+        let gen1 = RingIdentity::new(ProcessInstanceId(1), RingId(2), 1);
+        let old_key = gen1.payload_key(&e).unwrap();
+        let gen2 = gen1.next_generation();
+        assert_eq!(gen2.generation, 2);
+        let new_key = gen2.payload_key(&e).unwrap();
+        assert_ne!(old_key, new_key);
+        assert_eq!(old_key.sequence, new_key.sequence);
+        assert_eq!(old_key.payload_position, new_key.payload_position);
+    }
+    #[test]
+    fn validating_host_generates_payload_keys_with_identity() {
+        let cfg = RingConfig::new(8, 256);
+        let region = SharedRegion::new(cfg, 3, 1);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        w.write(ev(EventKind::CallEnter, 1, b"hello"));
+        w.write(ev(EventKind::CallLeave, 1, b"world"));
+        let mut host = ValidatingHost::new(KnownConfig::new(cfg, cfg.required_len()), 3);
+        host.set_identity(RingIdentity::new(ProcessInstanceId(9), RingId(4), 3));
+        let evs = host.drain_image(region.as_slice()).unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(
+            host.payload_keys,
+            vec![
+                TemporaryPayloadKey {
+                    process_id: ProcessInstanceId(9),
+                    ring_id: RingId(4),
+                    generation: 3,
+                    sequence: 1,
+                    payload_position: 0,
+                },
+                TemporaryPayloadKey {
+                    process_id: ProcessInstanceId(9),
+                    ring_id: RingId(4),
+                    generation: 3,
+                    sequence: 2,
+                    payload_position: 5,
+                },
+            ]
         );
     }
 }

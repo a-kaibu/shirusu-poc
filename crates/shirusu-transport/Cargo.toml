@@ -3,6 +3,7 @@ name = "shirusu-transport"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "shirusu Agent-Host transport: SPSC ring, descriptor/control layout, overflow, slots, host-side validation (OS-independent)"
 
 [dev-dependencies]

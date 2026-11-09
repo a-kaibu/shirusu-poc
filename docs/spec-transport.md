@@ -48,7 +48,7 @@ pub struct EventDescriptor {
 - 固定幅整数と明示的なアラインメントだけを使い、32bit Agentと64bit Hostが同じレイアウトで読めるようにする。`size_of`と`offset_of`を両ターゲットで静的に検査する。
 - Process IDとThread IDはRingの管理情報に持ち、イベントごとには持たない。
 - `payload_position`は対象プロセスのポインタではなく、Payload Ring内の単調増加する論理オフセットである。
-- `payload_position`は、overview.md の言う「内部転送用の一時的なPayload ID」も兼ねる（A72 の決定）。格納済み Payload は互いに重ならない区間 `[position, position + len)` を占めるため、同一 Ring 内では格納済み Payload を一意に識別できる。Host は BLAKE3 を計算して Blob を保存した後、この ID を公開形式の Blob ID に置き換える。落とした Payload（格納長 0）は書き込み位置を進めないため後続イベントと位置を共有するが、Blob を作らないので ID は不要。専用フィールドは設けず、`reserved` は将来の拡張用に 0 のまま残す。
+- PayloadはAgent–Host間で独立したIDを持たない。Hostは検証済みのRing識別情報、Generation、Sequence、Payloadの論理オフセットから内部管理用の一時キーを生成する。HostがPayloadのBLAKE3を計算してBlobを保存した後、公開TraceではBlob IDを参照する。一時キーは公開形式に含めない（A72 の確定仕様）。一時キーは shirusu-host の `TemporaryPayloadKey`（`process_id: ProcessInstanceId`、`ring_id: RingId`、`generation: u64`、`sequence: u64`、`payload_position: u64`）として実装する。`ring_id` と `generation` は Host が管理する値を用い、Capture Session 内で使う（別 Session と統合する場合は Session ID も含める）。欠落した Payload には一時キーを生成せず、欠落理由を Loss として保持する。`reserved` は 0 のままで、検証も維持する。
 - Cursorは64bitの単調増加値とし、8バイト境界に置く。i686での64bitアトミック操作（`cmpxchg8b`等で実現される）のコストが問題になれば、32bitの折り返しカウンタに切り替える。
 
 ## イベントの確定とPayloadの管理

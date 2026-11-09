@@ -70,6 +70,9 @@ impl ReCheckPolicy {
         waited >= self.interval
     }
     /// 次の再確認までの待機時間（Event 待機のタイムアウトに使う）。
+    /// `waited` は「待機開始からの経過」であり、返る値はその経過時点から
+    /// 次の再確認時刻までの残り。ループの各反復のスライス計算には使わない
+    /// こと (反復ごとに interval から数え直す。R4)。
     pub fn wait_timeout(&self, waited: Duration) -> Duration {
         self.interval.saturating_sub(waited)
     }

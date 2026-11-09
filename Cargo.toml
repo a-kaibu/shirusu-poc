@@ -13,7 +13,10 @@ exclude = ["fuzz"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-rust-version = "1.74"
+# MSRV: descriptor.rs のレイアウト静的検査で core::mem::offset_of! (安定化
+# 1.77) を使うため 1.77 が下限 (R5: 以前は 1.74 と宣言しながら使っており
+# 不一致だった)。各クレートは rust-version.workspace = true で継承する。
+rust-version = "1.77"
 
 [workspace.lints.clippy]
 all = "warn"

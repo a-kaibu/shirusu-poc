@@ -1,12 +1,21 @@
-//! Ring Slot 管理: FREE→CLAIMED→ACTIVE→DRAINING→RECLAIMABLE→FREE。
+//! Ring Slot 管理: FREE→CLAIMED→ACTIVE→DRAINING→RECLAIMABLE→RECLAIMING→FREE。
+//! RECLAIMING は Host の回収処理中だけ現れる過渡状態で、この間は誰も
+//! claim できない。Generation と所有者を RECLAIMING の間に更新し、FREE の
+//! 公開を最後にすることで、新しい claimer が旧 Generation を読む競合を
+//! 断つ (レビュー指摘 R3)。
 //! - 共有アトミック操作が要るのは取得時（CAS）のみ。
 //! - Generation 付き。再利用は「Host がスレッド終了を確認し回収完了した後」だけ。
 //! - 低水位では拡張要求イベントを立てるだけ（Hook 中で登録しない。登録は管理側の非同期処理）。
 //! - Slot 不足時は記録せず、プロセス共通カウンタ（fetch_add のみ）を更新して Capture Coverage 欠落とする。
 //! - 予備 Queue は実装しない（spec v0.4 の判断）。
+//! - 拡張 (A70): 管理スレッドだけが [`SlotPool::add_slot`] で Slot を追加できる。
+//!   追加 Slot は generation 0・FREE から始まり、既存 Slot の generation/owner
+//!   には影響しない。追加は総メモリ上限 (`can_add_slot`) の範囲内でのみ行う。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 
+use crate::expansion::EXPANDED_SLOT_GENERATION;
 use crate::layout::RingConfig;
 
 /// Slot 1 本あたりの共有メモリ量（本番既定構成: Control 256B + Descriptor 256KiB + Payload 1MiB）。
@@ -17,6 +26,8 @@ pub const SLOT_CLAIMED: u8 = 1;
 pub const SLOT_ACTIVE: u8 = 2;
 pub const SLOT_DRAINING: u8 = 3;
 pub const SLOT_RECLAIMABLE: u8 = 4;
+/// 回収中 (Host が Generation/所有者を更新している間)。claim はできない。
+pub const SLOT_RECLAIMING: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
@@ -25,6 +36,7 @@ pub enum SlotState {
     Active,
     Draining,
     Reclaimable,
+    Reclaiming,
 }
 impl SlotState {
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -34,6 +46,7 @@ impl SlotState {
             SLOT_ACTIVE => Self::Active,
             SLOT_DRAINING => Self::Draining,
             SLOT_RECLAIMABLE => Self::Reclaimable,
+            SLOT_RECLAIMING => Self::Reclaiming,
             _ => return None,
         })
     }
@@ -44,6 +57,7 @@ impl SlotState {
             Self::Active => SLOT_ACTIVE,
             Self::Draining => SLOT_DRAINING,
             Self::Reclaimable => SLOT_RECLAIMABLE,
+            Self::Reclaiming => SLOT_RECLAIMING,
         }
     }
 }
@@ -55,9 +69,14 @@ pub struct Slot {
 }
 impl Slot {
     fn new() -> Self {
+        Self::with_generation(1)
+    }
+    /// 指定した Generation で Slot を作る。追加 Slot (A70) は generation 0
+    /// から始める (「まだ誰も使っていない」ことを表す)。
+    fn with_generation(generation: u64) -> Self {
         Self {
             state: AtomicU8::new(SLOT_FREE),
-            generation: AtomicU64::new(1),
+            generation: AtomicU64::new(generation),
             owner_thread_id: AtomicU64::new(0),
         }
     }
@@ -80,7 +99,11 @@ pub struct SlotHandle {
 }
 
 pub struct SlotPool {
-    slots: Vec<Slot>,
+    /// Slot 本体は `Arc` で共有する。`slot()` は `Arc<Slot>` を返し、追加で
+    /// Vec が伸びても既存 Slot の同一性は保たれる。Vec 自体の伸長 (追加)
+    /// だけが書きロックを取り、Slot の状態遷移は従来どおり原子操作で行う
+    /// (追加中も既存 Slot の claim / 回収は止めない)。
+    slots: RwLock<Vec<Arc<Slot>>>,
     /// プロセス共通の欠落カウンタ。Slot 不足と DETACH 後呼出を数える（fetch_add のみ）。
     pub process_missing_calls: AtomicU64,
     /// 拡張要求が出ているか（登録はしない。非同期拡張側が消費する）。
@@ -100,7 +123,7 @@ impl SlotPool {
     }
     pub fn with_low_watermark(capacity: usize, low_watermark: usize) -> Self {
         Self {
-            slots: (0..capacity).map(|_| Slot::new()).collect(),
+            slots: RwLock::new((0..capacity).map(|_| Arc::new(Slot::new())).collect()),
             process_missing_calls: AtomicU64::new(0),
             expansion_requested: AtomicBool::new(false),
             expansion_request_count: AtomicU64::new(0),
@@ -116,30 +139,51 @@ impl SlotPool {
     }
     /// 現在の Pool が消費する共有メモリの概算（Slot 数 × 本番既定 1 Slot 分）。
     pub fn total_memory_bytes(&self) -> u64 {
-        self.slots.len() as u64 * SLOT_MEMORY_BYTES
+        self.slots.read().unwrap().len() as u64 * SLOT_MEMORY_BYTES
     }
     /// もう 1 Slot 追加しても総メモリ上限に収まるか。上限なしなら常に true。
     pub fn can_add_slot(&self) -> bool {
+        self.can_add_slot_with_len(self.slots.read().unwrap().len())
+    }
+    fn can_add_slot_with_len(&self, len: usize) -> bool {
         match self.memory_limit_bytes {
             None => true,
-            Some(limit) => (self.slots.len() as u64 + 1) * SLOT_MEMORY_BYTES <= limit,
+            Some(limit) => (len as u64 + 1) * SLOT_MEMORY_BYTES <= limit,
         }
     }
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
+    /// 拡張で Slot を 1 本追加する (A70)。管理スレッドだけが呼ぶ。
+    /// 追加 Slot は generation 0・FREE から始まり、既存 Slot の
+    /// generation/owner には影響しない。追加された Slot の index を返す。
+    /// 総メモリ上限を超える場合は追加せず None を返す (既存 Slot は不変)。
+    pub fn add_slot(&self) -> Option<usize> {
+        let mut slots = self.slots.write().unwrap();
+        if !self.can_add_slot_with_len(slots.len()) {
+            return None;
+        }
+        slots.push(Arc::new(Slot::with_generation(EXPANDED_SLOT_GENERATION)));
+        Some(slots.len() - 1)
     }
-    pub fn slot(&self, index: usize) -> &Slot {
-        &self.slots[index]
+    pub fn capacity(&self) -> usize {
+        self.slots.read().unwrap().len()
+    }
+    /// Slot 本体を共有する。返した `Arc<Slot>` は追加で Vec が伸びても同じ
+    /// Slot を指し続ける (状態・generation は原子操作で読む)。
+    pub fn slot(&self, index: usize) -> Arc<Slot> {
+        Arc::clone(&self.slots.read().unwrap()[index])
     }
     pub fn free_count(&self) -> usize {
         self.slots
+            .read()
+            .unwrap()
             .iter()
             .filter(|s| s.state() == SlotState::Free)
             .count()
     }
     /// FREE→CLAIMED→ACTIVE。CAS はこの取得時だけ。低水位では拡張要求だけ立てる。
     pub fn claim(&self, thread_id: u64) -> Option<SlotHandle> {
-        for (i, s) in self.slots.iter().enumerate() {
+        // 1 つの読みロックで走査と低水位判定を済ませる (再ロックしない)。
+        let slots = self.slots.read().unwrap();
+        for (i, s) in slots.iter().enumerate() {
             if s.state
                 .compare_exchange(SLOT_FREE, SLOT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -151,7 +195,11 @@ impl SlotPool {
                     generation: s.generation(),
                     thread_id,
                 };
-                if self.free_count() < self.low_watermark
+                let free = slots
+                    .iter()
+                    .filter(|s| s.state() == SlotState::Free)
+                    .count();
+                if free < self.low_watermark
                     && !self.expansion_requested.swap(true, Ordering::Relaxed)
                 {
                     self.expansion_request_count.fetch_add(1, Ordering::Relaxed);
@@ -165,7 +213,8 @@ impl SlotPool {
     }
     /// DETACH は DRAINING への移行のみ（Loader Lock 中でも待たない）。
     pub fn begin_detach(&self, handle: &SlotHandle) -> bool {
-        let s = &self.slots[handle.index];
+        let slots = self.slots.read().unwrap();
+        let s = &slots[handle.index];
         if s.generation() != handle.generation {
             return false;
         }
@@ -180,7 +229,8 @@ impl SlotPool {
     }
     /// DETACH 後の呼出は記録せず欠落として数える。
     pub fn note_call_after_detach(&self, handle: &SlotHandle) -> bool {
-        let s = &self.slots[handle.index];
+        let slots = self.slots.read().unwrap();
+        let s = &slots[handle.index];
         if s.state() == SlotState::Draining || s.state() == SlotState::Reclaimable {
             let _ = handle;
             self.process_missing_calls.fetch_add(1, Ordering::Relaxed);
@@ -199,7 +249,8 @@ impl SlotPool {
         if !thread_ended || !drained {
             return false;
         }
-        let s = &self.slots[handle.index];
+        let slots = self.slots.read().unwrap();
+        let s = &slots[handle.index];
         if s.generation() != handle.generation {
             return false;
         }
@@ -212,27 +263,36 @@ impl SlotPool {
             )
             .is_ok()
     }
-    /// RECLAIMABLE→FREE。Generation を進めてから解放する（古い handle を無効化）。
+    /// RECLAIMABLE→(RECLAIMING)→FREE。Generation を進めてから解放する（古い handle を無効化）。
+    ///
+    /// 順序が要 (R3): まず RECLAIMABLE→RECLAIMING の CAS で回収権を排他
+    /// 取得する。RECLAIMING の間は FREE ではないので誰も claim できず、
+    /// Generation の加算と所有者のクリアを安全に行える。最後に FREE を
+    /// Release で公開する。claim 側の Acquire CAS と対になるため、FREE を
+    /// 見て claim した側は進んだ Generation を必ず観測する。
+    /// 以前の実装は FREE への CAS を先に行っており、公開直後に claim した
+    /// 新 Producer が旧 Generation を読む競合があった。
     pub fn host_reclaim(&self, handle: &SlotHandle) -> bool {
-        let s = &self.slots[handle.index];
+        let slots = self.slots.read().unwrap();
+        let s = &slots[handle.index];
         if s.generation() != handle.generation {
             return false;
         }
         if s.state
             .compare_exchange(
                 SLOT_RECLAIMABLE,
-                SLOT_FREE,
+                SLOT_RECLAIMING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_err()
         {
-            s.generation.fetch_add(1, Ordering::Relaxed);
-            s.owner_thread_id.store(0, Ordering::Relaxed);
-            true
-        } else {
-            false
+            return false;
         }
+        s.generation.fetch_add(1, Ordering::AcqRel);
+        s.owner_thread_id.store(0, Ordering::Release);
+        s.state.store(SLOT_FREE, Ordering::Release);
+        true
     }
     pub fn take_expansion_request(&self) -> bool {
         self.expansion_requested.swap(false, Ordering::Relaxed)
@@ -287,6 +347,74 @@ mod tests {
         pool.begin_detach(&h);
         assert!(pool.note_call_after_detach(&h));
         assert_eq!(pool.missing_calls(), 1);
+    }
+    #[test]
+    fn add_slot_starts_free_with_generation_zero() {
+        // A70: 追加 Slot は generation 0・FREE から始まり、既存 Slot には影響しない。
+        let pool = SlotPool::new(2);
+        let h = pool.claim(111).unwrap();
+        assert_eq!(pool.capacity(), 2);
+        let idx = pool.add_slot().unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(pool.capacity(), 3);
+        assert_eq!(pool.slot(idx).state(), SlotState::Free);
+        assert_eq!(pool.slot(idx).generation(), 0);
+        assert_eq!(pool.slot(idx).owner_thread_id(), 0);
+        // 既存 Slot の generation/owner は不変。
+        assert_eq!(pool.slot(h.index).generation(), h.generation);
+        assert_eq!(pool.slot(h.index).owner_thread_id(), 111);
+        assert_eq!(pool.slot(h.index).state(), SlotState::Active);
+        // 追加 Slot は通常どおり claim できる。
+        let h2 = pool.claim(222).unwrap();
+        assert_eq!(h2.index, 1, "free initial slot is claimed first");
+        let h3 = pool.claim(333).unwrap();
+        assert_eq!(h3.index, idx);
+        assert_eq!(h3.generation, 0);
+    }
+    #[test]
+    fn add_slot_respects_memory_limit() {
+        // 総メモリ上限を超える場合は追加せず、既存 Slot は不変。
+        let pool = SlotPool::new(2).with_memory_limit(2 * SLOT_MEMORY_BYTES);
+        assert!(!pool.can_add_slot());
+        assert_eq!(pool.add_slot(), None);
+        assert_eq!(pool.capacity(), 2);
+        // 1 本分の余裕があれば追加できる。
+        let roomy = SlotPool::new(2).with_memory_limit(3 * SLOT_MEMORY_BYTES);
+        assert!(roomy.can_add_slot());
+        assert_eq!(roomy.add_slot(), Some(2));
+        assert!(!roomy.can_add_slot());
+        assert_eq!(roomy.add_slot(), None);
+        assert_eq!(roomy.capacity(), 3);
+    }
+    #[test]
+    fn added_slot_full_lifecycle_and_reuse() {
+        // 追加 Slot も初期 Slot と同じ生命環 (DETACH→回収→再利用) をたどる。
+        // 再利用では generation が 0→1 に進む。
+        let pool = SlotPool::new(1);
+        let idx = pool.add_slot().unwrap();
+        let h = pool.claim(7).unwrap();
+        assert_eq!(h.index, 0, "initial slot is claimed first");
+        let h2 = pool.claim(8).unwrap();
+        assert_eq!(h2.index, idx);
+        assert_eq!(h2.generation, 0);
+        assert!(pool.begin_detach(&h2));
+        assert!(pool.host_confirm_ended_and_drained(&h2, true, true));
+        assert!(pool.host_reclaim(&h2));
+        assert_eq!(pool.slot(idx).state(), SlotState::Free);
+        assert_eq!(pool.slot(idx).generation(), 1);
+        let h3 = pool.claim(9).unwrap();
+        assert_eq!(h3.index, idx);
+        assert_eq!(h3.generation, 1);
+    }
+    #[test]
+    fn add_slot_after_exhaustion_unblocks_claim() {
+        let pool = SlotPool::new(1);
+        assert!(pool.claim(1).is_some());
+        assert!(pool.claim(2).is_none());
+        assert_eq!(pool.add_slot(), Some(1));
+        let h = pool.claim(2).unwrap();
+        assert_eq!(h.index, 1);
+        assert_eq!(h.generation, 0);
     }
     #[test]
     fn memory_limit_gates_expansion() {

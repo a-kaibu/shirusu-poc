@@ -477,6 +477,8 @@ dependencies = [
 name = "shirusu-host"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "shirusu-agent",
  "shirusu-transport",
  "shirusu-transport-win",
 ]

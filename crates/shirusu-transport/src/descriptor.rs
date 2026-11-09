@@ -136,20 +136,6 @@ impl EventDescriptor {
     pub fn payload_dropped(&self) -> bool {
         self.flags & flags::PAYLOAD_DROPPED != 0
     }
-    /// 内部転送用の一時的な Payload ID（A72 の決定）。
-    ///
-    /// overview.md は「Payload には内部転送用の一時的な Payload ID を付ける」と
-    /// 言うが、spec の EventDescriptor に専用フィールドは無い（reserved: u64 のみ）。
-    /// 決定: `payload_position` を一時 ID として用いる。書き手が単調に振る論理
-    /// オフセットであり、格納済み Payload は互いに重ならない区間
-    /// `[position, position + len)` を占めるため、同一 Ring 内では格納済み
-    /// Payload を一意に識別できる。Host は BLAKE3 を計算して Blob を保存した後、
-    /// この ID を公開形式の Blob ID に置き換える。落とした Payload（格納長 0）は
-    /// 書き込み位置を進めないため後続イベントと位置を共有するが、Blob を作らない
-    /// ので ID は不要。`reserved` は将来の拡張用に 0 のまま残す。
-    pub fn temporary_payload_id(&self) -> u64 {
-        self.payload_position
-    }
     /// リトルエンディアンで 64 バイトへ符号化する（Host 検証モジュールと共有）。
     pub fn to_bytes(&self) -> [u8; 64] {
         let mut b = [0u8; 64];
@@ -224,14 +210,6 @@ mod tests {
         let b = d.to_bytes();
         assert_eq!(EventDescriptor::from_bytes(&b), Some(d));
         assert_eq!(EventDescriptor::from_bytes(&b[..63]), None);
-    }
-    #[test]
-    fn temporary_payload_id_is_payload_position() {
-        // A72: 一時 Payload ID は payload_position そのもの（専用フィールドは無い）。
-        let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
-        d.payload_position = 123_456;
-        assert_eq!(d.temporary_payload_id(), 123_456);
-        assert_eq!(d.temporary_payload_id(), d.payload_position);
     }
     #[test]
     fn capture_state_flags_roundtrip_and_l1() {

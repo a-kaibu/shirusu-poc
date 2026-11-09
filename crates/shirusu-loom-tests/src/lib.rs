@@ -420,4 +420,114 @@ mod tests {
             assert_eq!(generation.load(Ordering::Relaxed), 2);
         });
     }
+
+    // ---- R3: Slot host_reclaim と claim の操作順序 (slot.rs の転写モデル) ----
+    // slot.rs の claim / host_reclaim が行う原子操作を、同じ順序・同じ
+    // Ordering で loom 原子へ転写したモデル。実装の順序を変えたら転写も
+    // 合わせること (転写の忠実さがこのモデルの前提であり、MiniRing のような
+    // 抽象モデルでは R3 の競合は原理的に検出できない)。
+    struct MiniSlot {
+        state: AtomicU64,
+        generation: AtomicU64,
+        owner: AtomicU64,
+    }
+    const MINI_FREE: u64 = 0;
+    const MINI_CLAIMED: u64 = 1;
+    const MINI_ACTIVE: u64 = 2;
+    const MINI_RECLAIMABLE: u64 = 4;
+    const MINI_RECLAIMING: u64 = 5;
+
+    impl MiniSlot {
+        fn new_reclaimable() -> Self {
+            Self {
+                state: AtomicU64::new(MINI_RECLAIMABLE),
+                generation: AtomicU64::new(1),
+                owner: AtomicU64::new(42),
+            }
+        }
+        /// slot.rs の claim の転写: FREE→CLAIMED の CAS 成功後に所有者を
+        /// 書き、ACTIVE を Release で公開し、Generation を読んで handle にする。
+        fn claim(&self, thread_id: u64) -> Option<u64> {
+            if self
+                .state
+                .compare_exchange(MINI_FREE, MINI_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.owner.store(thread_id, Ordering::Relaxed);
+                self.state.store(MINI_ACTIVE, Ordering::Release);
+                Some(self.generation.load(Ordering::Acquire))
+            } else {
+                None
+            }
+        }
+        /// slot.rs の host_reclaim の転写 (R3 修正後の順序): RECLAIMING で
+        /// 回収権を排他取得し、Generation と所有者を更新してから、最後に
+        /// FREE を Release で公開する。
+        fn host_reclaim(&self, gen: u64) -> bool {
+            if self.generation.load(Ordering::Acquire) != gen {
+                return false;
+            }
+            if self
+                .state
+                .compare_exchange(
+                    MINI_RECLAIMABLE,
+                    MINI_RECLAIMING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.owner.store(0, Ordering::Release);
+            self.state.store(MINI_FREE, Ordering::Release);
+            true
+        }
+    }
+
+    #[test]
+    fn loom_slot_reclaim_publishes_generation_before_free() {
+        // R3 の性質: FREE が公開された後に claim した側は、回収で進んだ
+        // Generation を必ず観測しなければならない。進む前の Generation を
+        // 読むと、古い handle と新しい handle が同じ (index, generation) を
+        // 持ち、世代ガードが無力化する。
+        loom::model(|| {
+            let slot = Arc::new(MiniSlot::new_reclaimable());
+            let s2 = slot.clone();
+            let reclaimer = loom::thread::spawn(move || s2.host_reclaim(1));
+            let claimed_gen = slot.claim(777);
+            let reclaimed = reclaimer.join().unwrap();
+            assert!(reclaimed, "sole reclaimer must succeed");
+            if let Some(g) = claimed_gen {
+                assert_eq!(
+                    g, 2,
+                    "claimer must observe the advanced generation, never the reclaimed one"
+                );
+                assert_eq!(slot.owner.load(Ordering::Relaxed), 777);
+            }
+        });
+    }
+
+    #[test]
+    fn loom_slot_reclaim_excludes_concurrent_reclaimers() {
+        // R3: RECLAIMING への CAS で回収権は 1 者だけが取り、Generation は
+        // ちょうど 1 回だけ進む。2 者が両方成功すると Generation が二重に
+        // 進んだり、FREE 公開と更新が交錯したりする。
+        loom::model(|| {
+            let slot = Arc::new(MiniSlot::new_reclaimable());
+            let s2 = slot.clone();
+            let other = loom::thread::spawn(move || s2.host_reclaim(1));
+            let mine = slot.host_reclaim(1);
+            let theirs = other.join().unwrap();
+            assert!(mine ^ theirs, "exactly one reclaimer wins");
+            assert_eq!(
+                slot.generation.load(Ordering::Relaxed),
+                2,
+                "generation advances exactly once"
+            );
+            assert_eq!(slot.state.load(Ordering::Relaxed), MINI_FREE);
+            assert_eq!(slot.owner.load(Ordering::Relaxed), 0);
+        });
+    }
 }

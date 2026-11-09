@@ -11,10 +11,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::clock::Clock;
+use crate::clock::{system_timestamp_source, Clock, TimestampSource};
 use crate::descriptor::{flags, CaptureState, EventDescriptor, EventKind};
 use crate::layout::*;
 use crate::notify::{NotifySignal, PublishNotifyTracker};
+use crate::validate::{IntegrityError, MAX_DROPPED_ORIGINAL_LEN};
 
 /// 満杯ポリシーの状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,8 +149,23 @@ impl SharedRegion {
     pub unsafe fn writer(&self, policy: WriterPolicy, clock: Arc<dyn Clock>) -> RingWriter {
         RingWriter::new(self.base(), self.config, policy, clock)
     }
+    /// イベント時刻源を指定して書き手を作る (Windows の QPC 実装用)。
+    ///
+    /// # Safety
+    /// 返した writer が生きている間、この領域を破棄・移動してはならない。
+    pub unsafe fn writer_with_timestamps(
+        &self,
+        policy: WriterPolicy,
+        clock: Arc<dyn Clock>,
+        timestamps: Arc<dyn TimestampSource>,
+    ) -> RingWriter {
+        RingWriter::new_with_timestamps(self.base(), self.config, policy, clock, timestamps)
+    }
     /// # Safety
     /// 返した reader が生きている間、この領域を破棄・移動してはならない。
+    ///
+    /// 注意: 返る `RingReader` は検証なしの信頼済み内部用である (R2)。
+    /// Host の通常回収経路では使わず、`shirusu-host` の検証付き経路を使うこと。
     pub unsafe fn reader(&self) -> RingReader {
         RingReader::new(self.base(), self.config)
     }
@@ -221,11 +237,22 @@ unsafe fn copy_payload_read(
     out
 }
 
+/// Descriptor の `payload_len` (u32) への変換。落とした元の長さを格納する
+/// ため、u32 を超える場合は切り捨てて小さく見せず u32::MAX へ飽和させる
+/// (R6: Host 側の受理上限 MAX_DROPPED_ORIGINAL_LEN と対になる決め)。
+/// 正確な欠落バイト数は u64 の Loss カウンタで別途数える。
+fn payload_len_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 pub struct RingWriter {
     base: *mut u8,
     cfg: RingConfig,
     policy: WriterPolicy,
     clock: Arc<dyn Clock>,
+    /// イベント時刻専用の時刻源 (レビュー第2回・項目8)。待機用 `clock`
+    /// とは分離し、Clock を差し替えても刻印の原点は動かない。
+    timestamps: Arc<dyn TimestampSource>,
     next_sequence: u64,
     payload_write_position: u64,
     state: OverflowState,
@@ -251,11 +278,26 @@ impl RingWriter {
         policy: WriterPolicy,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::new_with_timestamps(base, cfg, policy, clock, system_timestamp_source())
+    }
+    /// イベント時刻源を指定する構築。Windows では transport-win の QPC
+    /// 実装を渡し、プロセス間で比較可能な刻印にする。
+    ///
+    /// # Safety
+    /// `base` は cfg 分の共有領域を指し、Ring の存続期間中有効であること。
+    pub unsafe fn new_with_timestamps(
+        base: *mut u8,
+        cfg: RingConfig,
+        policy: WriterPolicy,
+        clock: Arc<dyn Clock>,
+        timestamps: Arc<dyn TimestampSource>,
+    ) -> Self {
         Self {
             base,
             cfg,
             policy,
             clock,
+            timestamps,
             next_sequence: 1,
             payload_write_position: load(base, OFF_PAYLOAD_WRITE_POSITION, Ordering::Relaxed),
             state: OverflowState::Normal,
@@ -270,6 +312,22 @@ impl RingWriter {
     }
     pub fn state(&self) -> OverflowState {
         self.state
+    }
+    /// 待機に使う Clock を差し替える。Host からその Ring の
+    /// `space_available` を受け取ったときに、Agent が Ring ごとに
+    /// EventClock へ切り替えるために使う (R7: 通知は Ring 単位であり、
+    /// Clock も書き手ごとに結びつける)。
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+    /// イベント時刻源を差し替える。待機用 Clock の差し替え (R7 の
+    /// EventClock 化) とは独立で、刻印だけに効く。
+    pub fn set_timestamp_source(&mut self, timestamps: Arc<dyn TimestampSource>) {
+        self.timestamps = timestamps;
+    }
+    /// この書き手が刻印に使うイベント時刻源の周波数。
+    pub fn timestamp_frequency(&self) -> u64 {
+        self.timestamps.frequency()
     }
     /// 現在の Loader Lock 保持状態の申告を変える。DllMain に入る・出る等、
     /// 呼び出し側が文脈を知った時点で呼ぶ。
@@ -354,7 +412,8 @@ impl RingWriter {
         extra_flags: u16,
     ) -> EventDescriptor {
         let mut d = EventDescriptor::new(input.kind, seq);
-        d.timestamp_qpc = self.clock.now_ticks();
+        // 刻印はイベント時刻専用の源から取る (待機用 Clock ではない)。
+        d.timestamp_qpc = self.timestamps.now_qpc();
         d.call_id = input.call_id;
         d.parent_call_id = input.parent_call_id;
         d.api_id = input.api_id;
@@ -461,11 +520,11 @@ impl RingWriter {
             None // 取得できていない値は Payload として格納しない
         };
         let len_for_desc = if stored.is_some() {
-            input.payload.len() as u32
+            payload_len_u32(input.payload.len())
         } else if input.capture_state == CaptureState::Captured {
             0
         } else {
-            input.payload.len() as u32 // 落とした元の長さを残す（PAYLOAD_DROPPED 系フラグで区別）
+            payload_len_u32(input.payload.len()) // 落とした元の長さを残す（PAYLOAD_DROPPED 系フラグで区別）
         };
         let extra = if stored.is_none() && input.capture_state != CaptureState::Captured {
             flags::PAYLOAD_DROPPED
@@ -491,7 +550,7 @@ impl RingWriter {
                 seq,
                 input,
                 pos,
-                input.payload.len() as u32,
+                payload_len_u32(input.payload.len()),
                 flags::PAYLOAD_DROPPED | CaptureState::DroppedByBackpressure.to_flags(),
             );
             let notify = self.publish(d, None);
@@ -534,12 +593,36 @@ pub struct DrainBatch {
     pub events: Vec<ReceivedEvent>,
     /// Sequence 欠番として検出した欠落数。
     pub sequence_gaps: u64,
+    /// 多層防御の検証で破損を検出した場合の理由 (レビュー第2回・項目5)。
+    /// `Some` のとき、その Descriptor 以降は取り出しておらず、Cursor も
+    /// 検証が通った分までしか進んでいない。Reader は破損として停止し、
+    /// 以後の drain も同じ理由を返し続ける。
+    pub integrity_error: Option<IntegrityError>,
 }
 
+/// 検証付き経路と分離された読み手 (信頼済み内部／テスト専用。R2 で格下げ)。
+///
+/// 共有メモリは Host から見て信頼できないデータであり、**Host の通常回収
+/// 経路では使ってはならない**。通常経路は `shirusu-host` の `DrainWorker` /
+/// `ValidatingHost` (copy→検証→前進) を使うこと。
+/// この型は、書き手と読み手が同じプロセス内で信頼できるテスト・ベンチ・
+/// E2E の簡易確認のためにだけ残している。
+///
+/// 多層防御 (レビュー第2回・項目5): 直接呼ばれた場合に備え、drain は
+/// コピーの前に `ValidatingReader` と同等の最低限の検証 (種別・予約領域・
+/// 格納長と容量・Payload 位置の範囲と連続性・Sequence の後退) を行い、
+/// 破損した Descriptor を生ポインタのコピーへ届かせない。検証失敗時は
+/// コピーせず、その Ring の破損として停止する (`DrainBatch::integrity_error`)。
+/// ただし Control 全体の検証や世代照合までは行わないため、本番の代替には
+/// ならない。
 pub struct RingReader {
     base: *mut u8,
     cfg: RingConfig,
     expected_sequence: u64,
+    /// 次に期待する Payload 論理位置 (None は未確立＝初めて見る Descriptor)。
+    expected_payload_position: Option<u64>,
+    /// 一度検出した破損。以後は drain が即座に同じ理由を返す (Ring 停止)。
+    integrity_error: Option<IntegrityError>,
 }
 unsafe impl Send for RingReader {}
 
@@ -551,6 +634,8 @@ impl RingReader {
             base,
             cfg,
             expected_sequence: 1,
+            expected_payload_position: None,
+            integrity_error: None,
         }
     }
     pub fn write_cursor(&self) -> u64 {
@@ -564,16 +649,31 @@ impl RingReader {
         crate::layout::writer_waiting(self.base)
     }
     /// 確定済みイベントを取り出す（最大 max 件）。契約どおりコピーしてから Release で解放する。
+    /// コピーの前に多層防御の最小検証を行い、破損を検出したらその Descriptor
+    /// 以降は取り出さず Cursor も進めない (型の doc を参照)。
     pub fn drain(&mut self, max: usize) -> DrainBatch {
+        let mut batch = DrainBatch::default();
+        if let Some(e) = &self.integrity_error {
+            batch.integrity_error = Some(e.clone());
+            return batch;
+        }
         let wc = self.write_cursor(); // Acquire: これが唯一の確定境界
         let rc = self.read_cursor();
         let avail = wc.saturating_sub(rc);
         let n = core::cmp::min(avail, max as u64);
-        let mut batch = DrainBatch::default();
+        // 検証の上限は書き手が Control に公開した書込み済み位置。write_cursor を
+        // Acquire で読んだ後なので、確定分についてはこの値以下に収まる。
+        let payload_write_position = load(self.base, OFF_PAYLOAD_WRITE_POSITION, Ordering::Acquire);
+        let mut processed: u64 = 0;
         let mut last_payload_end: Option<u64> = None;
         for i in 0..n {
             let cursor = rc + i;
             let desc = unsafe { read_descriptor_at(self.base, self.cfg, cursor) };
+            if let Err(e) = self.check_descriptor(&desc, payload_write_position) {
+                batch.integrity_error = Some(e.clone());
+                self.integrity_error = Some(e);
+                break;
+            }
             if desc.sequence > self.expected_sequence {
                 batch.sequence_gaps += desc.sequence - self.expected_sequence;
             }
@@ -601,15 +701,79 @@ impl RingReader {
                 descriptor: desc,
                 payload,
             });
+            processed += 1;
         }
-        if n > 0 {
+        if processed > 0 {
             if let Some(end) = last_payload_end {
                 store(self.base, OFF_PAYLOAD_READ_POSITION, end, Ordering::Release);
             }
-            store(self.base, OFF_READ_CURSOR, rc + n, Ordering::Release);
+            store(
+                self.base,
+                OFF_READ_CURSOR,
+                rc + processed,
+                Ordering::Release,
+            );
             fetch_add(self.base, OFF_HOST_DRAIN_COUNT, 1);
         }
         batch
+    }
+    /// 多層防御の最小検証 (ValidatingReader の `decode_descriptor_checked`
+    /// と同じ契約)。通れば期待 Payload 位置をこの Descriptor の終端へ進める。
+    fn check_descriptor(
+        &mut self,
+        desc: &EventDescriptor,
+        payload_write_position: u64,
+    ) -> Result<(), IntegrityError> {
+        if EventKind::from_u16(desc.kind).is_none() || desc.kind == EventKind::Unknown as u16 {
+            return Err(IntegrityError::UnknownKind(desc.kind));
+        }
+        if desc.reserved != 0 {
+            return Err(IntegrityError::ReservedNonZero);
+        }
+        if desc.sequence < self.expected_sequence {
+            return Err(IntegrityError::SequenceRegressed {
+                expected_at_least: self.expected_sequence,
+                found: desc.sequence,
+            });
+        }
+        let stored = if desc.payload_dropped() {
+            if desc.payload_len as u64 > MAX_DROPPED_ORIGINAL_LEN {
+                return Err(IntegrityError::PayloadTooLarge {
+                    len: desc.payload_len as u64,
+                    capacity: MAX_DROPPED_ORIGINAL_LEN,
+                });
+            }
+            0
+        } else {
+            if desc.payload_len as u64 > self.cfg.payload_capacity as u64 {
+                return Err(IntegrityError::PayloadTooLarge {
+                    len: desc.payload_len as u64,
+                    capacity: self.cfg.payload_capacity as u64,
+                });
+            }
+            desc.payload_len as u64
+        };
+        let end = desc
+            .payload_position
+            .checked_add(stored)
+            .ok_or(IntegrityError::PayloadRangeInvalid)?;
+        if end > payload_write_position {
+            return Err(IntegrityError::PayloadPositionOutOfRange {
+                position: desc.payload_position,
+                end,
+                write_position: payload_write_position,
+            });
+        }
+        if let Some(expected) = self.expected_payload_position {
+            if desc.payload_position != expected {
+                return Err(IntegrityError::PayloadPositionNotContiguous {
+                    expected,
+                    found: desc.payload_position,
+                });
+            }
+        }
+        self.expected_payload_position = Some(end);
+        Ok(())
     }
     pub fn drain_all(&mut self) -> DrainBatch {
         self.drain(usize::MAX)
@@ -659,10 +823,11 @@ mod tests {
     }
 
     #[test]
-    fn temporary_payload_id_is_unique_among_stored_payloads() {
-        // A72: 一時 Payload ID（= payload_position）は格納済み Payload 同士で
-        // 重ならない。落とした Payload は格納長 0 で位置を再利用するが、
-        // Blob を作らないので ID は不要。
+    fn stored_payload_positions_do_not_overlap() {
+        // 転送レベルの事実: 格納済み Payload の payload_position は互いに
+        // 重ならない区間を占める。落とした Payload は格納長 0 で位置を
+        // 再利用する。A72 の一時キーはこの位置に Host 側の識別情報を
+        // 組み合わせて作る（shirusu-host の TemporaryPayloadKey で検証）。
         let (_r, mut w, mut rd) = test_writer_reader(8, 256);
         w.write(input(EventKind::CallEnter, 1, b"aaa"));
         w.write(input(EventKind::CallEnter, 2, b"bbbbb"));
@@ -680,22 +845,22 @@ mod tests {
         w.write(input(EventKind::CallEnter, 5, b"e"));
         let b = rd.drain_all();
         assert_eq!(b.events.len(), 5);
-        let ids: Vec<u64> = b
+        let positions: Vec<u64> = b
             .events
             .iter()
-            .map(|e| e.descriptor.temporary_payload_id())
+            .map(|e| e.descriptor.payload_position)
             .collect();
         // 格納済み 3, 5, 1 バイトで位置は 0, 3, 8, 9。落とした件は 9 を再利用し、
         // 次の格納済みも 9 から始まる。
-        assert_eq!(ids, vec![0, 3, 8, 9, 9]);
+        assert_eq!(positions, vec![0, 3, 8, 9, 9]);
         assert!(b.events[3].descriptor.payload_dropped());
         assert_eq!(b.events[3].payload.len(), 0);
-        // 格納済み同士の一時 ID はすべて異なる。
+        // 格納済み同士の開始位置はすべて異なる。
         let stored: Vec<u64> = b
             .events
             .iter()
             .filter(|e| !e.descriptor.payload_dropped())
-            .map(|e| e.descriptor.temporary_payload_id())
+            .map(|e| e.descriptor.payload_position)
             .collect();
         assert_eq!(stored, vec![0, 3, 8, 9]);
     }

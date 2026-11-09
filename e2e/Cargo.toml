@@ -3,6 +3,7 @@ name = "shirusu-e2e"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 [dependencies]
 shirusu-transport = { path = "../crates/shirusu-transport" }
 shirusu-agent = { path = "../crates/shirusu-agent" }

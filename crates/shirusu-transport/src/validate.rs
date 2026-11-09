@@ -164,7 +164,23 @@ pub fn validate_control(
     Ok(snap)
 }
 
+/// 落とした Payload の「元の長さ」として受理する上限 (R6)。
+///
+/// Descriptor の `payload_len` は u32 で、書き手は元の長さが u32 を超える
+/// 場合は切り捨てず u32::MAX へ飽和させて格納する (ring.rs の
+/// `payload_len_u32`)。したがって受理上限はフィールドの表現最大値その
+/// ものであり、これを超える値は型の上でも現れない。元の長さは情報として
+/// のみ使い、正確な欠落バイト数は u64 の Loss カウンタ
+/// (`LossCounters::dropped_payload_bytes`) で数える。
+pub const MAX_DROPPED_ORIGINAL_LEN: u64 = u32::MAX as u64;
+
 /// 64 バイトの Descriptor コピーを検証して復号する。
+///
+/// 長さの検証は「格納長」に対して行う: `PAYLOAD_DROPPED` のとき
+/// `payload_len` は落とした元の長さであり格納長は 0 なので、容量とは
+/// 比較しない (元の長さには `MAX_DROPPED_ORIGINAL_LEN` の上限が別にある)。
+/// 以前はフラグ無関係に容量と比較していたため、容量を超える Payload を
+/// 落とした正規の劣化イベントを破損として誤拒否していた (R6)。
 pub fn decode_descriptor(
     bytes: &[u8],
     known: &KnownConfig,
@@ -179,7 +195,14 @@ pub fn decode_descriptor(
     if d.reserved != 0 {
         return Err(IntegrityError::ReservedNonZero);
     }
-    if d.payload_len as u64 > known.payload_capacity {
+    if d.payload_dropped() {
+        if d.payload_len as u64 > MAX_DROPPED_ORIGINAL_LEN {
+            return Err(IntegrityError::PayloadTooLarge {
+                len: d.payload_len as u64,
+                capacity: MAX_DROPPED_ORIGINAL_LEN,
+            });
+        }
+    } else if d.payload_len as u64 > known.payload_capacity {
         return Err(IntegrityError::PayloadTooLarge {
             len: d.payload_len as u64,
             capacity: known.payload_capacity,
@@ -285,7 +308,9 @@ pub struct ValidatingReader {
     known: KnownConfig,
     prev: Option<ControlSnapshot>,
     read_cursor: u64,
+    payload_read_position: u64,
     expected_sequence: u64,
+    sequence_gaps: u64,
     expected_generation: u64,
     /// 次に期待する Payload 論理位置（None は未確立＝初めて見る Descriptor）。
     expected_payload_position: Option<u64>,
@@ -297,7 +322,9 @@ impl ValidatingReader {
             known,
             prev: None,
             read_cursor: 0,
+            payload_read_position: 0,
             expected_sequence: 1,
+            sequence_gaps: 0,
             expected_generation,
             expected_payload_position: None,
             stopped: false,
@@ -309,23 +336,106 @@ impl ValidatingReader {
     pub fn control_snapshot(&self) -> Option<ControlSnapshot> {
         self.prev
     }
+    /// ここまで読み終えた Descriptor Cursor。実 Mapping への書き戻し
+    /// (copy→検証→前進の「前進」) に使う。検証に成功した分だけ進む。
+    pub fn read_cursor(&self) -> u64 {
+        self.read_cursor
+    }
+    /// ここまで読み終えた Payload 論理位置 (最後に取り出した Descriptor の
+    /// 格納済み終端)。read_cursor と対で実 Mapping へ書き戻す。
+    pub fn payload_read_position(&self) -> u64 {
+        self.payload_read_position
+    }
+    /// 前回呼び出し以降に検出した Sequence 欠番の合計を取り出す (読み取りで
+    /// リセット)。欠番は「保存に失敗したイベントにも Sequence を割り当てる」
+    /// 仕様どおり正規の欠落であり、検証エラーではない。Host 再起動で
+    /// resume した場合は引き継いだ期待値から数える。
+    pub fn take_sequence_gaps(&mut self) -> u64 {
+        std::mem::take(&mut self.sequence_gaps)
+    }
     /// 像全体を受け取り、確定分を検証しながら取り出す。矛盾したら Ring を止める。
     pub fn drain_image(
         &mut self,
         image: &[u8],
     ) -> Result<Vec<crate::ring::ReceivedEvent>, IntegrityError> {
+        self.drain_image_up_to(image, usize::MAX)
+    }
+    /// `drain_image` の件数制限版。検証と内部 Cursor の前進は取る分だけ行い、
+    /// 残りは次回の像で続ける。Control の検証は件数によらず毎回行う。
+    pub fn drain_image_up_to(
+        &mut self,
+        image: &[u8],
+        max: usize,
+    ) -> Result<Vec<crate::ring::ReceivedEvent>, IntegrityError> {
         if self.stopped {
             return Err(IntegrityError::RingStopped);
         }
-        let result = self.drain_inner(image);
+        let result = self.drain_inner(image, max);
         if result.is_err() {
             self.stopped = true; // 矛盾を見つけたらその Ring を止める
         }
         result
     }
+    /// Host 再起動時の引き継ぎ: 共有側の read_cursor / payload_read_position
+    /// を正として、検証状態 (Cursor・Sequence・Payload 位置の期待値) を同期
+    /// する。以後の `drain_image` はその続きから検証する。同期元の像も検証
+    /// 対象であり、直前 Descriptor の格納終端が payload_read_position と
+    /// 一致しない等の矛盾があれば失敗し、Ring は止まる。
+    /// 通常の生成直後に呼ぶ必要はない (読み位置 0 から始まる初回回収用)。
+    pub fn resume_from_image(&mut self, image: &[u8]) -> Result<(), IntegrityError> {
+        if self.stopped {
+            return Err(IntegrityError::RingStopped);
+        }
+        let result = self.resume_inner(image);
+        if result.is_err() {
+            self.stopped = true;
+        }
+        result
+    }
+    fn resume_inner(&mut self, image: &[u8]) -> Result<(), IntegrityError> {
+        let cfg = self.known.ring_cfg();
+        if image.len() < cfg.required_len() || self.known.mapping_len < cfg.required_len() {
+            return Err(IntegrityError::ImageTooSmall);
+        }
+        let control_copy = image[..CONTROL_SIZE].to_vec();
+        let snap = validate_control(&control_copy, &self.known, self.prev.as_ref())?;
+        if snap.generation != self.expected_generation {
+            return Err(IntegrityError::GenerationMismatch {
+                expected: self.expected_generation,
+                found: snap.generation,
+            });
+        }
+        // Sequence の期待値は、直前に読み終えた Descriptor から引き継ぐ。
+        // その Descriptor の格納終端が payload_read_position と一致する
+        // ことも併せて確認し、像の内部矛盾を弾く。
+        let expected_sequence = if snap.read_cursor == 0 {
+            1
+        } else {
+            let idx = slot_index(snap.read_cursor - 1, self.known.descriptor_capacity) as usize;
+            let off = cfg.descriptors_offset() + idx * 64;
+            let desc = decode_descriptor(&image[off..off + 64], &self.known)?;
+            let stored_end = desc.payload_position + stored_payload_len(&desc);
+            if stored_end != snap.payload_read_position {
+                return Err(IntegrityError::PayloadPositionNotContiguous {
+                    expected: snap.payload_read_position,
+                    found: stored_end,
+                });
+            }
+            desc.sequence
+                .checked_add(1)
+                .ok_or(IntegrityError::PayloadRangeInvalid)?
+        };
+        self.prev = Some(snap);
+        self.read_cursor = snap.read_cursor;
+        self.payload_read_position = snap.payload_read_position;
+        self.expected_payload_position = Some(snap.payload_read_position);
+        self.expected_sequence = expected_sequence;
+        Ok(())
+    }
     fn drain_inner(
         &mut self,
         image: &[u8],
+        max: usize,
     ) -> Result<Vec<crate::ring::ReceivedEvent>, IntegrityError> {
         let cfg = self.known.ring_cfg();
         if image.len() < cfg.required_len() || self.known.mapping_len < cfg.required_len() {
@@ -350,7 +460,7 @@ impl ValidatingReader {
                 which: "host read beyond write",
             });
         }
-        while cursor < snap.write_cursor {
+        while cursor < snap.write_cursor && events.len() < max {
             let idx = slot_index(cursor, self.known.descriptor_capacity) as usize;
             let off = cfg.descriptors_offset() + idx * 64;
             let desc_copy = image[off..off + 64].to_vec();
@@ -362,11 +472,15 @@ impl ValidatingReader {
                 payload_write_position: snap.payload_write_position,
             };
             let desc = decode_descriptor_checked(&desc_copy, &self.known, &expectation)?;
+            if desc.sequence > self.expected_sequence {
+                self.sequence_gaps += desc.sequence - self.expected_sequence;
+            }
             if desc.sequence >= self.expected_sequence {
                 self.expected_sequence = desc.sequence + 1;
             }
-            self.expected_payload_position =
-                Some(desc.payload_position + stored_payload_len(&desc));
+            let stored_end = desc.payload_position + stored_payload_len(&desc);
+            self.expected_payload_position = Some(stored_end);
+            self.payload_read_position = stored_end;
             // 3. 有効範囲に限って Payload をコピー
             let payload_region =
                 &image[cfg.payload_offset()..cfg.payload_offset() + cfg.payload_capacity];
@@ -488,8 +602,9 @@ mod proofs {
         }
     }
 
-    /// Descriptor 解釈の安全性: 受理されるのは既知 Kind・reserved 0・
-    /// 長さが容量以内のものだけ (全フィールド任意入力)。
+    /// Descriptor 解釈の安全性: 受理されるのは既知 Kind・reserved 0 のもの
+    /// だけであり、格納長は容量以内 (落とした Payload は格納長 0 で、元の
+    /// 長さは u32 の表現範囲内であることだけを見る。R6)。
     #[kani::proof]
     fn decode_descriptor_accepts_only_safe_descriptors() {
         let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
@@ -505,7 +620,7 @@ mod proofs {
             assert!(EventKind::from_u16(ok.kind).is_some());
             assert!(ok.kind != EventKind::Unknown as u16);
             assert!(ok.reserved == 0);
-            assert!(ok.payload_len <= 64);
+            assert!(ok.payload_len <= 64 || ok.payload_dropped());
         }
     }
 }
