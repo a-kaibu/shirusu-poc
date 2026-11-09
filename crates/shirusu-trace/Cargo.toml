@@ -1,0 +1,18 @@
+[package]
+name = "shirusu-trace"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "shirusu 公開 Trace 形式 v1: Block Container + Protobuf メタデータ + Compact Binary + BLAKE3 Blob + Zstd チャンク"
+
+[dependencies]
+# pure: 既定の blake3 は Windows ターゲット向けにアセンブリ (ml64.exe) を
+# 要求し、この VM からも CI の ubuntu ジョブからも check できない。
+# 純 Rust 実装に固定する（ハッシュ値の仕様は同一）。
+blake3 = { version = "1", features = ["pure"] }
+ruzstd = "0.8"
+shirusu-transport = { path = "../shirusu-transport" }
+
+[dev-dependencies]
+proptest = "1"

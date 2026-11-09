@@ -27,6 +27,19 @@ ShuttleとVerusは、対象が複雑になった段階で追加する。Miriは`
 
 実際のWindowsスレッドを乱数で動かすだけでは、スケジューラが実行順序を決めるのでDSTにはならない。失敗時には、Seed、コードのリビジョン、テスト構成、実際に選ばれた操作列と注入した故障を保存し、縮小したものを回帰テストに加える。
 
+### 失敗時の証跡と回帰化（D53）
+
+失敗の種類ごとに、保存先と回帰化の形を決めている。
+
+| 失敗の種類 | 保存されるもの | 回帰化の形 |
+| --- | --- | --- |
+| PBT（proptest! マクロ版） | Seed と縮小ケースが `*.proptest-regressions` に自動保存される | そのままチェックインし、毎回の実行で先に再実行される。実績: host の recorder PBT で 1 件 (`ops = [AddRing]` への縮小) が保存・再実行されている |
+| DST（TestRunner 版 `dst_fault_mix_invariants`） | 証跡 JSON（テスト名・リビジョン・Seed 参照・テスト構成・操作列・注入故障の一覧）を `SHIRUSU_FAILURE_EVIDENCE_DIR`（無ければ `target/shirusu-failure-evidence/`）へ保存する | 証跡の操作列は `tests/common/evidence.rs` の決定的再実行器 `replay_dst` でそのまま再生できる。縮小したケースは `tests/failure_evidence.rs` に固定する（実施済み: Host 停止を含む縮小ケースと溢れケースの 2 件） |
+| Fuzz | クラッシュ入力は最小化のうえ `fuzz/seeds/<target>/*.hex` へ書き戻す（`fuzz/encode-seeds.sh`、形式は fuzz/README.md） | 種として CI の短時間 Fuzz で毎回通す。コードの穴だった場合は単体テストも併せて固定する。実績: D57 の Payload 位置後退の受理は `validate_control_rejects_payload_position_regression` と matrix の `vc_prev_payload_*` で固定済み |
+| loom | スケジュールそのものは保存できないため、性質を破る側の実装形（旧順序モデル）を残す | 旧順序モデルが性質テストで落ちることを `#[should_panic]` で固定する。実績: `loom_slot_reclaim_old_order_is_detected`（R3 の旧順序。TLA+ 側の変種モデル D75 と対になる） |
+
+リビジョンは `SHIRUSU_EVIDENCE_REVISION` → `GITHUB_SHA` → `git rev-parse HEAD` → `unknown` の順に解決する。証跡の保存に失敗しても、元のテスト失敗はそのまま報告される（保存は失敗の報告を隠さない）。
+
 ### 役割分担の限定（レビューでのメタ指摘を受けて、正直な範囲）
 
 各手法が「何を保証しないか」も明記する。
@@ -61,6 +74,23 @@ Slot の再利用は、実装の原子操作列に合わせて段階に分けて
 - 変種モデル: `Invariant ClaimedGenerationIsCurrent is violated` を 924 状態生成時点で検出（期待どおりの違反）。
 
 進行性には公平性の前提が要る。有限のバッファでは「Hostが永久に止まっても全部保存する」は成り立たないので、「容量不足なら欠落として前に進む」ことを検証する。TLA+の状態機械とPBTの参照モデルは同じ不変条件を共有するが、実装は独立させ、実装のバグを参照モデルに写し込まないようにする。
+
+### モデルの独立性の担保と確認（D56）
+
+独立性は宣言だけでは担保にならないため、監査と実証の両方で確認する。
+
+監査（2026-11-09、コード再読）:
+
+- VecDeque 参照モデル（`proptest_ring.rs`）と Slot 影モデル（`proptest_properties.rs`）、A72 のキー照合モデル（`proptest_keys.rs`）は、期待値の計算に実装の検証モジュール（`validate`）を一切使っていない。使うのは公開された書込/回収 API と、その観測可能な出力（受信イベント・カウンタ・Slot 状態）だけである。
+- 影モデルは状態遷移を仕様文書の状態機械から書き起こしており、実装の内部定数や分岐を参照していない。Overflow の PBT は完全一致を要求せず不変条件だけを見る形にし、参照モデル側へ実装の劣化規則を写し込まないようにしている。
+- 唯一残っていた弱い依存（通知閾値テストが割合計算に `layout::usage_percent` を流用）は切り離し、仕様の定義式をテスト側で直接計算する形に変えた。`usage_percent` 自体の正しさは算術行列（D60）が定義式との照合で別途担う。
+- TLA+ モデルは PlusCal の手書きであり、実装コードからの生成ではない。実装の原子操作列を問題にする箇所だけ、段階分割として意図的に寄せている（D75）が、それは「同じ不変条件を共有する」範囲であり、遷移の書き方はモデル側の表現である。
+
+実証（mutation、`scripts/ci/model-independence.sh`、nightly で実行）:
+
+- 実装の占有量計算（`layout::occupancy`）の被減数を入れ替えると、`ring_matches_vecdeque_model` が失敗する。参照モデルが占有量を自前で数えていなければ検出できない。
+- 実装の回収処理（`slot.rs` の `host_reclaim`）で Generation を進めなくすると、`slot_lifecycle_interleavings_match_shadow_model` が失敗する。影モデルの世代管理が独立である証跡になる。
+- 2026-11-09 のローカル実行では、無変更で両モデルが成功し、2 件の mutation がいずれも対象 PBT の失敗として検出された。スクリプトは mutation の対象文字列が見つからない場合も陳腐化として失敗する。
 
 ## Fuzzの対象
 

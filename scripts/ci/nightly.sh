@@ -5,3 +5,5 @@ cd "$(dirname "$0")/../.."
 export PATH="$HOME/.cargo/bin:$PATH"
 PROPTEST_CASES=4096 cargo test --workspace --release
 cargo test -p shirusu-loom-tests --release
+# D56: 参照モデルが実装に追随していないことを mutation で実証する
+bash scripts/ci/model-independence.sh

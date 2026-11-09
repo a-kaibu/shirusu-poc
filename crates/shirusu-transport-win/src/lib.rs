@@ -31,6 +31,14 @@ pub type Result<T> = std::result::Result<T, WinError>;
 /// OS ハンドルの数値表現（プロセス間受け渡し用）。共有メモリに置く値ではない。
 pub type HandleValue = usize;
 
+/// 起動したプロセスのハンドル一式（CREATE_SUSPENDED 起動用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnedProcess {
+    pub process: HandleValue,
+    pub thread: HandleValue,
+    pub pid: u32,
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -446,6 +454,301 @@ mod imp {
         }
         Some(code)
     }
+
+    /// CREATE_SUSPENDED で起動する。メインスレッドは止まったままで、
+    /// 呼び手が `resume_main_thread` するまで対象のコードは動かない
+    /// （Agent の初期化完了を Host が確認してから再開する、overview の手順）。
+    pub fn spawn_suspended(cmdline: &str) -> Result<SpawnedProcess> {
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+        let mut cmd: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_SUSPENDED,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok == 0 {
+            return Err(last_err("CreateProcessW(suspended)"));
+        }
+        Ok(SpawnedProcess {
+            process: hv(pi.hProcess),
+            thread: hv(pi.hThread),
+            pid: pi.dwProcessId,
+        })
+    }
+
+    /// 停止中のメインスレッドを再開する。戻り値は直前のサスペンド数。
+    pub fn resume_main_thread(thread: HandleValue) -> Result<u32> {
+        use windows_sys::Win32::System::Threading::ResumeThread;
+        let prev = unsafe { ResumeThread(h(thread)) };
+        if prev == u32::MAX {
+            return Err(last_err("ResumeThread"));
+        }
+        Ok(prev)
+    }
+
+    /// DLL 注入に必要な権限（スレッド作成・VM 操作・複製）でプロセスを開く。
+    pub fn open_process_for_injection(pid: u32) -> Result<HandleValue> {
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
+        let access = PROCESS_CREATE_THREAD
+            | PROCESS_QUERY_INFORMATION
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_DUP_HANDLE;
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            return Err(last_err("OpenProcess(inject)"));
+        }
+        Ok(hv(handle))
+    }
+
+    /// プロセスが終了済みかどうか（待たない確認）。
+    pub fn process_exited(process: HandleValue) -> bool {
+        unsafe { WaitForSingleObject(h(process), 0) == 0 }
+    }
+
+    pub fn close_handle_value(v: HandleValue) {
+        if v != 0 {
+            unsafe { CloseHandle(h(v)) };
+        }
+    }
+
+    /// 任意のハンドルを対象プロセスへ複製する（Host プロセスへの
+    /// ハンドルを生存確認用に渡すなど、型付き API が無いものの受け渡し）。
+    pub fn duplicate_handle_to_process(
+        handle_value: HandleValue,
+        target_pid: u32,
+    ) -> Result<HandleValue> {
+        let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, target_pid) };
+        if target.is_null() {
+            return Err(last_err("OpenProcess"));
+        }
+        let mut dup: HANDLE = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                h(handle_value),
+                target,
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        unsafe { CloseHandle(target) };
+        if ok == 0 {
+            return Err(last_err("DuplicateHandle"));
+        }
+        Ok(hv(dup))
+    }
+
+    pub fn write_process_memory(
+        process: HandleValue,
+        dest: usize,
+        src: *const u8,
+        len: usize,
+    ) -> Result<()> {
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        let mut written: usize = 0;
+        let ok = unsafe {
+            WriteProcessMemory(
+                h(process),
+                dest as *const c_void,
+                src as *const c_void,
+                len,
+                &mut written,
+            )
+        };
+        if ok == 0 || written != len {
+            return Err(last_err("WriteProcessMemory"));
+        }
+        Ok(())
+    }
+
+    /// 対象プロセスで `start(param)` をリモートスレッドで実行し、戻り値
+    /// （スレッド終了コード）を返す。30 秒で打ち切る。
+    pub fn remote_call(process: HandleValue, start: usize, param: usize) -> Result<u32> {
+        use windows_sys::Win32::System::Threading::{
+            CreateRemoteThread, GetExitCodeThread, LPTHREAD_START_ROUTINE,
+        };
+        // SAFETY: start は対象プロセス内で有効な関数アドレスであること
+        // （呼び出し側が LoadLibrary 済みモジュールのベース + RVA で保証する）。
+        let routine: LPTHREAD_START_ROUTINE =
+            unsafe { std::mem::transmute(start as *const c_void) };
+        let thread = unsafe {
+            CreateRemoteThread(
+                h(process),
+                std::ptr::null(),
+                0,
+                routine,
+                param as *mut c_void,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if thread.is_null() {
+            return Err(last_err("CreateRemoteThread"));
+        }
+        let waited = unsafe { WaitForSingleObject(thread, 30_000) };
+        if waited != 0 {
+            unsafe { CloseHandle(thread) };
+            return Err(WinError::OsError {
+                api: "remote_call wait",
+                code: waited,
+            });
+        }
+        let mut code: u32 = 0;
+        let ok = unsafe { GetExitCodeThread(thread, &mut code) };
+        unsafe { CloseHandle(thread) };
+        if ok == 0 {
+            return Err(last_err("GetExitCodeThread"));
+        }
+        Ok(code)
+    }
+
+    /// 対象プロセスで `LoadLibraryW(dll_path)` を実行する。
+    /// 前提： 対象と同一ビットネス（自プロセスの kernel32 の
+    /// LoadLibraryW アドレスが対象でも有効。同一ブート・同一
+    /// ビットネスの system DLL はプロセス間で同じベースを持つ）。
+    pub fn remote_load_library(process: HandleValue, dll_path: &str) -> Result<()> {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        use windows_sys::Win32::System::Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let proc_handle = h(process);
+        let wide: Vec<u16> = dll_path.encode_utf16().chain([0]).collect();
+        let bytes = wide.len() * 2;
+        let remote = unsafe {
+            VirtualAllocEx(
+                proc_handle,
+                std::ptr::null(),
+                bytes,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if remote.is_null() {
+            return Err(last_err("VirtualAllocEx"));
+        }
+        let result = (|| -> Result<()> {
+            write_process_memory(process, remote as usize, wide.as_ptr() as *const u8, bytes)?;
+            let k32_name: Vec<u16> = "kernel32.dll".encode_utf16().chain([0]).collect();
+            let k32 = unsafe { GetModuleHandleW(k32_name.as_ptr()) };
+            if k32.is_null() {
+                return Err(last_err("GetModuleHandleW"));
+            }
+            let load = unsafe { GetProcAddress(k32, c"LoadLibraryW".as_ptr() as *const u8) };
+            let Some(load) = load else {
+                return Err(WinError::OsError {
+                    api: "GetProcAddress(LoadLibraryW)",
+                    code: 0,
+                });
+            };
+            let code = remote_call(process, load as usize, remote as usize)?;
+            if code == 0 {
+                return Err(WinError::OsError {
+                    api: "LoadLibraryW(remote) returned NULL",
+                    code: 0,
+                });
+            }
+            Ok(())
+        })();
+        unsafe { VirtualFreeEx(proc_handle, remote, 0, MEM_RELEASE) };
+        result
+    }
+
+    /// 対象プロセスのモジュール一覧から、名前でモジュールのベースを引く。
+    pub fn module_base(pid: u32, module_name: &str) -> Result<usize> {
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
+            TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
+        };
+        let snap =
+            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+        if snap == INVALID_HANDLE_VALUE {
+            return Err(last_err("CreateToolhelp32Snapshot"));
+        }
+        let mut entry: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut result = Err(WinError::InvalidArgument("module not loaded in target"));
+        unsafe {
+            if Module32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    let name_len = entry
+                        .szModule
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szModule.len());
+                    let name = String::from_utf16_lossy(&entry.szModule[..name_len]);
+                    if name.eq_ignore_ascii_case(module_name) {
+                        result = Ok(entry.modBaseAddr as usize);
+                        break;
+                    }
+                    if Module32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        result
+    }
+
+    /// 対象プロセス内にメモリを確保する（Bootstrap の受け渡し用）。
+    pub fn remote_alloc(process: HandleValue, len: usize) -> Result<usize> {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let addr = unsafe {
+            VirtualAllocEx(
+                h(process),
+                std::ptr::null(),
+                len,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if addr.is_null() {
+            return Err(last_err("VirtualAllocEx(bootstrap)"));
+        }
+        Ok(addr as usize)
+    }
+
+    /// `remote_alloc` で確保したメモリを解放する。
+    pub fn remote_free(process: HandleValue, addr: usize) {
+        use windows_sys::Win32::System::Memory::{VirtualFreeEx, MEM_RELEASE};
+        if addr != 0 {
+            unsafe { VirtualFreeEx(h(process), addr as *mut c_void, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// プロセスを終了させる。起動に失敗した対象の後始末専用
+    /// （他人のプロセスに使わないこと）。
+    pub fn terminate_process(process: HandleValue, exit_code: u32) -> Result<()> {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        let ok = unsafe { TerminateProcess(h(process), exit_code) };
+        if ok == 0 {
+            return Err(last_err("TerminateProcess"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
@@ -562,9 +865,57 @@ mod imp {
     pub fn wait_process(_h: HandleValue, _t: Duration) -> Option<u32> {
         None
     }
+    pub fn spawn_suspended(_cmdline: &str) -> Result<SpawnedProcess> {
+        Err(WinError::Unsupported)
+    }
+    pub fn resume_main_thread(_thread: HandleValue) -> Result<u32> {
+        Err(WinError::Unsupported)
+    }
+    pub fn open_process_for_injection(_pid: u32) -> Result<HandleValue> {
+        Err(WinError::Unsupported)
+    }
+    pub fn process_exited(_process: HandleValue) -> bool {
+        false
+    }
+    pub fn close_handle_value(_v: HandleValue) {}
+    pub fn duplicate_handle_to_process(
+        _handle_value: HandleValue,
+        _target_pid: u32,
+    ) -> Result<HandleValue> {
+        Err(WinError::Unsupported)
+    }
+    pub fn write_process_memory(
+        _process: HandleValue,
+        _dest: usize,
+        _src: *const u8,
+        _len: usize,
+    ) -> Result<()> {
+        Err(WinError::Unsupported)
+    }
+    pub fn remote_call(_process: HandleValue, _start: usize, _param: usize) -> Result<u32> {
+        Err(WinError::Unsupported)
+    }
+    pub fn remote_load_library(_process: HandleValue, _dll_path: &str) -> Result<()> {
+        Err(WinError::Unsupported)
+    }
+    pub fn module_base(_pid: u32, _module_name: &str) -> Result<usize> {
+        Err(WinError::Unsupported)
+    }
+    pub fn remote_alloc(_process: HandleValue, _len: usize) -> Result<usize> {
+        Err(WinError::Unsupported)
+    }
+    pub fn remote_free(_process: HandleValue, _addr: usize) {}
+    pub fn terminate_process(_process: HandleValue, _exit_code: u32) -> Result<()> {
+        Err(WinError::Unsupported)
+    }
 }
 
-pub use imp::{spawn_inheriting, wait_process, EventObject, SharedMapping};
+pub use imp::{
+    close_handle_value, duplicate_handle_to_process, module_base, open_process_for_injection,
+    process_exited, remote_alloc, remote_call, remote_free, remote_load_library,
+    resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process, wait_process,
+    write_process_memory, EventObject, SharedMapping,
+};
 
 /// プロセス単位の通知イベント群。data_ready は auto-reset。
 pub struct ProcessNotify {

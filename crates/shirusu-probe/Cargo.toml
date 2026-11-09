@@ -1,0 +1,21 @@
+[package]
+name = "shirusu-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "shirusu Probe 生成: shirusu-compare の差分候補から、回帰テスト用バンドル（ブリーフ＋shirusu-test ルール＋トリム済み Trace ペア）を生成する"
+
+[dependencies]
+shirusu-analysis = { path = "../shirusu-analysis" }
+shirusu-compare = { path = "../shirusu-compare" }
+shirusu-test = { path = "../shirusu-test" }
+shirusu-trace = { path = "../shirusu-trace" }
+
+[dev-dependencies]
+shirusu-conformance = { path = "../shirusu-conformance" }
+shirusu-emit = { path = "../shirusu-emit" }
+
+[[bin]]
+name = "shirusu-probe"
+path = "src/bin/shirusu-probe.rs"

@@ -1,0 +1,24 @@
+file: sample.trace
+container: version=1 schema=1 session=42
+environment:
+  created_by: cli-test
+  os: Windows 11 (build 0)
+  cpu_arch: x86_64 pointer_width: 64
+  session_qpc_frequency: 10000000
+events: 4 in 1 batches, 1 threads
+blobs: 0 stored, 0 bytes
+schemas: 4 registered
+integrity:
+  capture_coverage: Complete (0)
+  event_integrity: Complete (0)
+  semantic_completeness: Complete (0)
+  finalized_cleanly: yes
+  loss_records: none
+  dropped_payloads: 0 events, 0 bytes
+  degraded_events: 0
+  missing_blob_refs: 0
+  recovery_issues: 0
+  index: matches scan
+api:
+  kernel32!CloseHandle enter=1 leave=1
+  kernel32!CreateFileW enter=1 leave=1

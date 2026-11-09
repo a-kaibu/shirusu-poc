@@ -1,12 +1,15 @@
 # fuzz
 
-`shirusu-transport` の Host 検証まわりに対する cargo-fuzz ターゲット群。
+`shirusu-transport` の Host 検証まわりと、`shirusu-trace` の公開 Trace
+復号に対する cargo-fuzz ターゲット群。
 
 | ターゲット | 入力 | 検証 |
 | --- | --- | --- |
 | `validate_control` | Cursor・容量・Generation のバイト列 | 占有量判定のオーバーフローや誤判定がない |
 | `decode_descriptor` | 64バイトの Descriptor | 未知の Kind や異常な長さを安全に扱う |
 | `decode_payload` | Descriptor と Payload | 参照範囲と折り返しを正しく検証する |
+| `decode_compact` | SchemaSet (Protobuf) と値列 | Compact Binary 復号が panic せず、成功時は再符号化と冪等 |
+| `recover_trace` | Trace ファイル全体のバイト列 | 回復読みが panic せず、受理時は sequence 単調性などの不変条件を満たす |
 
 ## 種（コーパス）の保持方法
 
@@ -29,5 +32,7 @@ cd fuzz && cargo +nightly fuzz run decode_descriptor -- -max_total_time=60
 fuzz/encode-seeds.sh
 ```
 
-`decode_compact` と `recover_trace` は Trace Reader が対象であり、
-転送 PoC の範囲外のためここには無い（docs/traceability.md の D 項目を参照）。
+`decode_compact` と `recover_trace` は Phase 2（Trace 永続化）で対象に
+入った（docs/traceability.md の F 項目を参照）。test.md が挙げる 5 本の
+fuzz ターゲット（validate_control / decode_descriptor / decode_payload /
+decode_compact / recover_trace）はこれで全て揃った。

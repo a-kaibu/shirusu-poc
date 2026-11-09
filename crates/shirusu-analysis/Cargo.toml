@@ -1,0 +1,10 @@
+[package]
+name = "shirusu-analysis"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "shirusu 公開 Trace の解析用ビュー: イベント復号・表示・完全性サマリ・JSON 出力（解析 CLI 群の共有基盤）"
+
+[dependencies]
+shirusu-trace = { path = "../shirusu-trace" }

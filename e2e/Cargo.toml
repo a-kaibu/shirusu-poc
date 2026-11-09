@@ -7,7 +7,9 @@ rust-version.workspace = true
 [dependencies]
 shirusu-transport = { path = "../crates/shirusu-transport" }
 shirusu-agent = { path = "../crates/shirusu-agent" }
+shirusu-hook = { path = "../crates/shirusu-hook" }
 shirusu-host = { path = "../crates/shirusu-host" }
+shirusu-trace = { path = "../crates/shirusu-trace" }
 shirusu-transport-win = { path = "../crates/shirusu-transport-win" }
 [lints]
 workspace = true

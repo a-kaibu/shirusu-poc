@@ -484,6 +484,31 @@ mod tests {
             self.state.store(MINI_FREE, Ordering::Release);
             true
         }
+
+        /// R3 修正前の旧順序 (FREE 公開 → Generation 更新) の転写。
+        /// 性質を満たさないことが分かっている実装であり、検出側の回帰
+        /// (loom_slot_reclaim_old_order_is_detected) 専用に残す。
+        /// 実装 (slot.rs) へ戻してはいけない。
+        fn host_reclaim_old_order(&self, gen: u64) -> bool {
+            if self.generation.load(Ordering::Acquire) != gen {
+                return false;
+            }
+            if self
+                .state
+                .compare_exchange(
+                    MINI_RECLAIMABLE,
+                    MINI_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.owner.store(0, Ordering::Release);
+            true
+        }
     }
 
     #[test]
@@ -528,6 +553,30 @@ mod tests {
             );
             assert_eq!(slot.state.load(Ordering::Relaxed), MINI_FREE);
             assert_eq!(slot.owner.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "claimer must observe the advanced generation")]
+    fn loom_slot_reclaim_old_order_is_detected() {
+        // D53 (loom 失敗スケジュールの回帰化): R3 修正前の旧順序では、
+        // FREE 公開と Generation 更新の間に claim が割り込むと、取得者が
+        // 回収前の Generation を観測するスケジュールが存在する。その
+        // スケジュールで上の性質テストと同じ表明が落ちることを、失敗
+        // そのものを回帰として固定する (TLA+ 側の変種モデル D75 と対)。
+        loom::model(|| {
+            let slot = Arc::new(MiniSlot::new_reclaimable());
+            let s2 = slot.clone();
+            let reclaimer = loom::thread::spawn(move || s2.host_reclaim_old_order(1));
+            let claimed_gen = slot.claim(777);
+            let reclaimed = reclaimer.join().unwrap();
+            assert!(reclaimed, "sole reclaimer must succeed");
+            if let Some(g) = claimed_gen {
+                assert_eq!(
+                    g, 2,
+                    "claimer must observe the advanced generation, never the reclaimed one"
+                );
+            }
         });
     }
 }

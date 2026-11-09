@@ -2,6 +2,10 @@
 //! Enter/Leave 対応付けと終了不明判定、スレッド終了確認後の Slot 解放、完全性報告。
 
 pub mod expansion;
+pub mod recorder;
+#[cfg(windows)]
+pub mod recorder_launch;
+pub mod trace_convert;
 
 use shirusu_transport::descriptor::EventKind;
 use shirusu_transport::layout::{self, LossCounters};

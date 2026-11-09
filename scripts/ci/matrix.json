@@ -33,6 +33,20 @@
       "allow_failure": false,
       "components": "",
       "java": false,
+      "name": "windows-x64-win2022",
+      "os": "windows-2022",
+      "run": "pwsh -NoProfile -File scripts/ci/windows.ps1",
+      "suites": [
+        "ci"
+      ],
+      "targets": "x86_64-pc-windows-msvc",
+      "timeout": 60,
+      "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
       "name": "windows-x86-wow64",
       "os": "windows-latest",
       "run": "pwsh -NoProfile -File scripts/ci/windows-x86.ps1",
@@ -49,7 +63,7 @@
       "java": false,
       "name": "windows-check-targets",
       "os": "ubuntu-latest",
-      "run": "cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target i686-pc-windows-msvc",
+      "run": "cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-hook -p shirusu-agent-dll -p shirusu-analysis -p shirusu-cli -p shirusu-compare -p shirusu-test -p shirusu-emit -p shirusu-conformance -p shirusu-probe --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-hook -p shirusu-agent-dll -p shirusu-analysis -p shirusu-cli -p shirusu-compare -p shirusu-test -p shirusu-emit -p shirusu-conformance -p shirusu-probe --target i686-pc-windows-msvc",
       "suites": [
         "ci"
       ],
@@ -77,7 +91,7 @@
       "java": false,
       "name": "msrv",
       "os": "ubuntu-latest",
-      "run": "cargo check --workspace",
+      "run": "bash scripts/ci/msrv.sh",
       "suites": [
         "ci"
       ],

@@ -2,6 +2,7 @@
 //! 使い方:
 //!   shirusu-e2e-supervisor --all          プロセス内シナリオ + 子プロセス起動スモーク
 //!   shirusu-e2e-supervisor --cross-arch   (Windows) i686 producer + x64 host のプロセス間実テスト
+//!   shirusu-e2e-supervisor --production-path (Windows, D77) 本番経路: 実 Agent → Event 待機 → 検証付き Host → Slot 再利用
 //!   shirusu-e2e-supervisor --list
 
 use shirusu_e2e::{run_all_in_process, ScenarioReport};
@@ -185,6 +186,186 @@ fn cross_arch() -> ScenarioReport {
     }
 }
 
+/// D77: Windows 実プロセス間での本番経路そのもの。
+/// producer が実 `shirusu_agent::Agent` (DLL と同じ構築手順) で共有メモリへ
+/// 書き、Host (本プロセス) は `data_ready` Event を 2ms 再確認付きで
+/// 待ちながら、検証付き `DrainWorker` で回収する。producer の DETACH と
+/// 回収完了を確認してから Slot 再利用を許可し (reclaim-ok イベント)、
+/// 次の Generation で producer が同じ Slot へ書くところまでを通す。
+///
+/// 既存シナリオとの違い: cross_arch は生 RingWriter + 生 RingReader +
+/// ポーリングで、capture-e2e は Hook + Recorder + Trace の経路であり、
+/// どちらもこの組み合わせ (Agent ライブラリ / Event 待機 / 検証付き
+/// 回収 / Slot 再利用) を含まない。
+#[cfg(windows)]
+fn production_path() -> ScenarioReport {
+    use shirusu_host::{DrainWorker, ProcessInstanceId, RingId, RingIdentity};
+    use shirusu_transport::notify::ReCheckPolicy;
+    use shirusu_transport::RingConfig;
+    use shirusu_transport_win::{
+        spawn_inheriting, wait_process, EventObject, ProcessNotify, SharedMapping,
+    };
+    use std::time::Duration;
+
+    let name = "production_path_interprocess";
+    let producer_path = std::env::var("SHIRUSU_E2E_PRODUCER").unwrap_or_else(|_| {
+        let exe = std::env::current_exe().unwrap();
+        exe.parent()
+            .unwrap()
+            .join("shirusu-e2e-producer.exe")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let count1 = 1500u64;
+    let count2 = 700u64;
+    let cfg = RingConfig::new(4096, 1024 * 1024);
+    let len = cfg.required_len();
+    let fail = |detail: String| ScenarioReport {
+        name,
+        passed: false,
+        detail,
+    };
+    let mapping = match SharedMapping::create(len) {
+        Ok(m) => m,
+        Err(e) => return fail(format!("mapping: {e}")),
+    };
+    let notify = match ProcessNotify::new() {
+        Ok(n) => n,
+        Err(e) => return fail(format!("process notify: {e}")),
+    };
+    let phase_done = match EventObject::new(true, false) {
+        Ok(e) => e,
+        Err(e) => return fail(format!("phase-done event: {e}")),
+    };
+    let reclaim_ok = match EventObject::new(true, false) {
+        Ok(e) => e,
+        Err(e) => return fail(format!("reclaim-ok event: {e}")),
+    };
+    let inheritable = mapping
+        .make_inheritable()
+        .and_then(|_| notify.data_ready.make_inheritable())
+        .and_then(|_| phase_done.make_inheritable())
+        .and_then(|_| reclaim_ok.make_inheritable());
+    if let Err(e) = inheritable {
+        return fail(format!("inheritable: {e}"));
+    }
+    let cmdline = format!(
+        "\"{}\" --agent-path --mapping {} --len {} --count1 {} --count2 {} --data-ready {} --phase-done {} --reclaim-ok {}",
+        producer_path,
+        mapping.handle_value(),
+        len,
+        count1,
+        count2,
+        notify.data_ready.handle_value(),
+        phase_done.handle_value(),
+        reclaim_ok.handle_value(),
+    );
+    let proc = match spawn_inheriting(&cmdline) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("spawn: {e}")),
+    };
+    let base = mapping.as_ptr();
+
+    // 回収ヘルパ: data_ready を待ってから Worker を作り (Control の初期化は
+    // producer の最初の公開と対になる)、2ms 再確認付きで目標件数まで回収する。
+    let drain_phase = |generation: u64,
+                       from: u64,
+                       count: u64,
+                       notify: &ProcessNotify|
+     -> Result<(Vec<u64>, usize, bool), String> {
+        if !notify.data_ready.wait_timeout(Duration::from_secs(30)) {
+            return Err("data_ready was never signaled".to_string());
+        }
+        // SAFETY: base は mapping の生存期間中は有効で、cfg 分の領域を指す。
+        let mut worker = unsafe { DrainWorker::new(base, cfg, generation) };
+        worker.set_identity(RingIdentity::new(
+            ProcessInstanceId(1),
+            RingId(0),
+            generation,
+        ));
+        let mut got: Vec<u64> = Vec::new();
+        let reached = notify.wait_with_recheck(
+            ReCheckPolicy::default(),
+            || {
+                let batch = worker.drain_all();
+                for e in batch.events {
+                    if !e.descriptor.payload_dropped() {
+                        got.push(u64::from_le_bytes(e.payload.try_into().unwrap()));
+                    }
+                }
+                got.len() as u64 >= count
+            },
+            Duration::from_secs(60),
+        );
+        if !reached {
+            return Err(format!(
+                "drain timed out at generation {generation}: got {}/{count}",
+                got.len()
+            ));
+        }
+        let want: Vec<u64> = (from..from + count).collect();
+        if got != want {
+            return Err(format!(
+                "payload mismatch at generation {generation}: first divergence in {got:?} vs {want:?}"
+            ));
+        }
+        Ok((got, worker.payload_keys.len(), worker.integrity_lost))
+    };
+
+    // フェーズ 1: Generation 0 で count1 件を検証付きで回収する。
+    let (got1, keys1, lost1) = match drain_phase(0, 0, count1, &notify) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = wait_process(proc, Duration::from_secs(5));
+            return fail(format!("phase 1: {e}"));
+        }
+    };
+    // producer の DETACH 完了を確認してから再利用を許可する。
+    if !phase_done.wait_timeout(Duration::from_secs(30)) {
+        return fail("phase 1: producer did not signal detach".to_string());
+    }
+    if lost1 || keys1 as u64 != count1 {
+        return fail(format!(
+            "phase 1: integrity_lost={lost1} payload_keys={keys1} (want {count1})"
+        ));
+    }
+    if let Err(e) = reclaim_ok.set() {
+        return fail(format!("reclaim-ok set: {e}"));
+    }
+
+    // フェーズ 2: 再利用後の Generation 1 で count2 件を回収する。
+    let (got2, keys2, lost2) = match drain_phase(1, count1, count2, &notify) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = wait_process(proc, Duration::from_secs(5));
+            return fail(format!("phase 2: {e}"));
+        }
+    };
+    if !phase_done.wait_timeout(Duration::from_secs(30)) {
+        return fail("phase 2: producer did not signal detach".to_string());
+    }
+    let exit_code = wait_process(proc, Duration::from_secs(30));
+    let passed = exit_code == Some(0) && !lost2 && keys2 as u64 == count2;
+    ScenarioReport {
+        name,
+        passed,
+        detail: format!(
+            "producer={producer_path} exit={exit_code:?} phase1={} keys={keys1} phase2={} keys={keys2} integrity_lost={lost2}",
+            got1.len(),
+            got2.len()
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn production_path() -> ScenarioReport {
+    ScenarioReport {
+        name: "production_path_interprocess",
+        passed: false,
+        detail: "SKIP: Windows 専用。GHA windows-latest で実行する".into(),
+    }
+}
+
 #[cfg(not(windows))]
 fn cross_arch() -> ScenarioReport {
     ScenarioReport {
@@ -197,7 +378,7 @@ fn cross_arch() -> ScenarioReport {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list") {
-        println!("basic, host_pause_overflow, notification_loss_recheck, space_available_notify, agent_space_available_handoff, host_killed_passthrough, writer_stops_midway, slot_reuse_generation, corrupted_memory, host_restart_resume, producer_killed_mid_publish, producer_storm_32_threads, soak_1m_loss_accounting, corruption_injection_stops_ring, detach_publish_storm, subprocess_smoke, cross_arch_interprocess");
+        println!("basic, host_pause_overflow, notification_loss_recheck, space_available_notify, agent_space_available_handoff, host_killed_passthrough, writer_stops_midway, slot_reuse_generation, corrupted_memory, host_restart_resume, producer_killed_mid_publish, producer_storm_32_threads, soak_1m_loss_accounting, corruption_injection_stops_ring, detach_publish_storm, subprocess_smoke, cross_arch_interprocess, production_path_interprocess");
         return;
     }
     if args.iter().any(|a| a == "--cross-arch") {
@@ -207,11 +388,18 @@ fn main() {
         // Windows では必須、他 OS では SKIP を成功として扱う (CI の OS 別ジョブ前提)
         std::process::exit(if passed || !cfg!(windows) { 0 } else { 1 });
     }
+    if args.iter().any(|a| a == "--production-path") {
+        let r = production_path();
+        let passed = r.passed;
+        print_reports(&[r]);
+        std::process::exit(if passed || !cfg!(windows) { 0 } else { 1 });
+    }
     // --all (既定)
     let mut reports = run_all_in_process();
     reports.push(subprocess_smoke(1000));
     if cfg!(windows) {
         reports.push(cross_arch());
+        reports.push(production_path());
     }
     let ok = print_reports(&reports);
     std::process::exit(if ok { 0 } else { 1 });

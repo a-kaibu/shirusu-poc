@@ -1,0 +1,15 @@
+[package]
+name = "shirusu-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "shirusu 解析 CLI: inspect（メタデータ・完全性・API 集計）/ dump（イベント表示・検索）/ export（JSONL）"
+
+[dependencies]
+shirusu-analysis = { path = "../shirusu-analysis" }
+shirusu-trace = { path = "../shirusu-trace" }
+
+[[bin]]
+name = "shirusu"
+path = "src/main.rs"

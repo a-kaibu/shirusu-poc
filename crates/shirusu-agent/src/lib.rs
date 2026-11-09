@@ -314,6 +314,13 @@ impl Agent {
         self.expanded_regions.lock().unwrap().insert(index, region);
         Ok(index)
     }
+    /// 管理パス: Host から配送された Mapping を Slot として登録する公開
+    /// 入口（本体は A70 の管理スレッド経路と同じ `register_expanded_mapping`）。
+    /// Agent DLL の Bootstrap 初期化が使う。記録経路からは呼ばない。
+    /// 登録できれば Slot の index、配送が不正なら None を返す。
+    pub fn register_slot_mapping(&self, delivery: ExpansionDelivery) -> Option<usize> {
+        self.register_expanded_mapping(delivery).ok()
+    }
     /// 管理パス: Slot を取得し、共有領域と書き手を作って登録する。
     /// 登録表の書きロックはこの初期化の間だけ保持する (記録経路ではない)。
     fn begin_thread_state(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {

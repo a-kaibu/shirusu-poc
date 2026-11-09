@@ -15,10 +15,14 @@ shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC
 | `crates/shirusu-transport` | 共有メモリレイアウト、SPSC Ring、Payload、Overflow 状態機械、Slot、通知ロジック、Host 検証、CRC32C | なし |
 | `crates/shirusu-transport-win` | File Mapping（名前なし）、DuplicateHandle、Event Object（data_ready: プロセス単位 auto-reset / space_available: Ring 単位）、2ms 再確認付き待機、継承ハンドル付き子プロセス起動 | あり（他 OS はスタブ） |
 | `crates/shirusu-agent` | 書き手側。スレッド毎 Ring 取得・書込、再入ガード、Host 生存確認、DETACH 通知 | transport-win 経由 |
-| `crates/shirusu-host` | 読み手側。Drain Worker、検証付き読み、Loss Event 生成、Enter/Leave 対応付け、終了不明判定、完全性報告 | transport-win 経由 |
+| `crates/shirusu-host` | 読み手側。Drain Worker、検証付き読み、Loss Event 生成、Enter/Leave 対応付け、終了不明判定、完全性報告、公開 Trace 変換（A72） | transport-win 経由 |
+| `crates/shirusu-trace` | 公開 Trace 形式 v1（`docs/trace-format.md`）。Block Container + Protobuf メタデータ（手書きワイヤ形式）+ Compact Binary + BLAKE3 Blob + Zstd チャンク、Trace Writer / Reader（回復意味論） | なし |
+| `crates/shirusu-emit` | 外部レコーダ向けエミッタキット（Phase 5）。shirusu 本体以外の実装（sake 等）が公開 Trace 仕様に適合した Trace を出すための高水準 API：セッション管理、共有 API セットの Schema 登録、sequence / call_id の自動採番、Enter/Leave 対応の保証 | なし |
+| `crates/shirusu-conformance` | 外部生成 Trace の適合性チェッカ（Phase 5）。形式仕様＋compare/test が依存する規約を 9 項目で検査する lib + CLI | なし |
+| `crates/shirusu-probe` | 差分→Probe 最小化（Phase 5）。compare の候補から回帰バンドル（ブリーフ＋shirusu-test ルール＋トリム済み Trace ペア）を生成する lib + CLI。契約は `docs/ippai-integration.md` | なし |
 | `crates/shirusu-loom-tests` | loom による公開/回収プロトコルの網羅検査モデル | なし |
 | `e2e/` | Test Supervisor / producer / consumer。同期ポイント経由のシナリオ群と、Windows でのプロセス間実テスト | 一部 |
-| `fuzz/` | cargo-fuzz ターゲット 3 件（validate_control / decode_descriptor / decode_payload）とシードコーパス | なし |
+| `fuzz/` | cargo-fuzz ターゲット 6 件（validate_control / decode_descriptor / decode_payload / snapshot_fragments / decode_compact / recover_trace）とシードコーパス | なし |
 | `tla/` | TLA+ モデル（SPSC Ring + Slot 再利用 + スレッド終了、容量 2・書手 2・読手 1）と TLC 設定 | なし |
 
 転送の核となる契約は 1 つです。
@@ -38,8 +42,8 @@ cargo test --workspace
 cargo test -p shirusu-loom-tests
 
 # Windows ターゲットのコンパイル確認 (Linux から)
-cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target x86_64-pc-windows-msvc
-cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target i686-pc-windows-msvc
+cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-trace --target x86_64-pc-windows-msvc
+cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-trace --target i686-pc-windows-msvc
 
 # E2E シナリオ (プロセス内 + 子プロセス起動スモーク)
 cargo build --workspace
@@ -61,7 +65,7 @@ CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1`
 |---|---|---|
 | Unit / 統合 / 仕様テスト表 19 項目 + 境界スイート 69 件 | 通過（下記テスト総数参照） | 初回 push で確認予定 |
 | PBT (参照モデル / Overflow / Fragment / Slot / DST 故障混入 + 損失会計保存則 / Snapshot 故障モデル / 通知意味論 / Slot 影モデル / Enter-Leave 対応付けの新規 6 プロパティ) | 通過（主要プロパティ 1024 cases、DST 512 cases。`SHIRUSU_PBT_CASES` で調整可） | 初回 push で確認予定 |
-| loom (小容量モデル、13 件: Claim 競合 / Slot 再利用 / 世代ガード / 待機インテント回復性 / Slot 回収の操作列転写モデル (R3) など) | 通過 | 初回 push で確認予定 |
+| loom (小容量モデル、14 件: Claim 競合 / Slot 再利用 / 世代ガード / 待機インテント回復性 / Slot 回収の操作列転写モデル (R3) / 旧順序 should_panic 回帰 (D53)) | 通過 | 初回 push で確認予定 |
 | ストレステスト (SPSC 並行ソーク、release で 1000 万 ops・整合性確認済み、破壊耐性など。規模は `SHIRUSU_STRESS_OPS` で調整可) | 通過 | 初回 push で確認予定 |
 | E2E シナリオ (16 件: Host 再起動再開 / 公開途中 kill / 32 スレッドストーム / 100 万イベント会計突合 / 共有メモリ破壊注入 / DETACH ストーム等) | 通過 (supervisor `--all`、同期ポイントのみで同期) | 初回 push で確認予定 |
 | Windows x64 / i686 の cargo check | 通過 (この VM から両ターゲット。README の手順どおりの `-p shirusu-transport-win -p shirusu-agent -p shirusu-host` は x64・i686 とも通過。`--workspace` での i686 は loom-tests 経由の第三者クレート `generator 0.8.12` が i686 用 asm を持たず失敗する既存の問題で、自クレートは `--exclude shirusu-loom-tests` で通過。CI の i686 ジョブでは loom-tests の除外が必要——所感参照） | 初回 push で確認予定 |
@@ -72,27 +76,37 @@ CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1`
 | cargo-mutants (shirusu-transport 全件) | **実施済み**: 554 件中 caught 431 / missed 75 / unviable 41 / timeout 7。missed のうち 50 件は `#[cfg(kani)]` 証明本体内で cargo test からは原理的に倒せず (Kani が担当)、数件は等価 mutant と判断 (理由を所感に明記)。倒せる中核 mutant はテスト追加で kill 済み (追試で確認) | CI ジョブなし（長時間のためローカルで回すもの） |
 | コードカバレッジ (cargo-llvm-cov) | **測定済み**: 中核モジュールは全て行 96% 以上 (clock/context/crc32c/descriptor/layout/notify/slot は 100%、ring 99.6%、validate 98.9%、snapshot 96.1%)。e2e 除き全体 98.5%。未達行は到達不能な防御分岐・スタブの失敗経路等で、内訳は所感に明記。e2e は supervisor 実行のため本測定では 0% になる (別途 16 シナリオ通過で確認) | CI ジョブなし（ローカルで回すもの） |
 | cargo-fuzz 4 targets (10 分ずつ) | **長時間実行済み・クラッシュなし**: validate_control 15,132,063 runs/600s、decode_descriptor 16,332,921 runs/600s、decode_payload 12,909,484 runs/600s、snapshot_fragments (4 本目として追加) 404,754 runs/600s、合計約 4478 万 runs。成長したコーパスは hex 種 79 件に書き戻し済み | CI ジョブあり (continue-on-error、短時間版) |
+| Phase 2: Trace 形式の単体・PBT・回復意味論テスト (shirusu-trace 69 件 + host 変換 9 件) | **通過**（往復・前方参照禁止・チャンク分割・回復意味論は形式仕様の表の各行に対応するケーステスト、手組みバイト列のテストベクター、破壊入力 PBT） | 初回 push で確認予定 |
+| Phase 2: cargo-fuzz 2 targets (decode_compact / recover_trace) | **実行済み・クラッシュなし**: decode_compact 5,843,310 runs/75s、recover_trace 1,120,017 runs/75s（2026-11-09 ローカル）。test.md の 5 ターゲットが全て揃った | CI ジョブあり (continue-on-error、短時間版) |
+| Phase 2: Windows x64 / i686 の cargo check (shirusu-trace / shirusu-host) | **通過**（この VM から両ターゲット。blake3 は `pure` フィーチャで純 Rust 実装に固定——所感参照） | 初回 push で確認予定 |
+| Phase 5: ippai 連携基盤のテスト (emit 8 + conformance 12 + probe 8 = 28 件) | **通過**（エミッタ往復、規約違反注入→該当項目のみ Fail、通しシナリオ「emit→適合→compare→バンドル→ルールが左 pass / 右 fail を再現」、CLI 終了コード。sake 側の実装は本 repo に無く、対象外——所感参照） | 初回 push で確認予定 |
+| Phase 5: Windows x64 / i686 の cargo check (shirusu-emit / shirusu-conformance / shirusu-probe) | **通過**（この VM から両ターゲット。windows-check-targets に matrix.json の最小変更で追加済み） | 初回 push で確認予定 |
 | TLA+ / TLC | **実行済み・エラーなし**: 990,889 状態生成 / 310,249 相異状態 / 深さ 28 / 13s（MaxCursor=4、Generation<=2 の制約下。全 7 不変条件が成立）。Slot 再利用は段階分割（ReclaimBegin → PublishFree）でモデル化し、旧順序の変種モデルでは `ClaimedGenerationIsCurrent` の違反を 924 状態で検出（モデルが競合を表現できる証跡。詳細は docs/verification.md） | CI ジョブあり |
 | 待機方式ベンチマーク (shirusu-wait-bench) | **実行済み・選定あり**: 50 ラウンドで event を選定（中央値 14µs / p95 24µs、sleep 方式は中央値 48µs / p95 97µs）。spin / yield は遅延は小さいが CPU を焼くため不採用 | CI ジョブなし（参考計測。ローカルで回すもの） |
 | 調整値ベンチマーク (shirusu-tuning-bench, A73) | **実行済み・全既定値を維持**: Ring 容量・BOUNDED_WAIT 上限・再確認周期・復帰閾値・Slot 数を掃引測定し、現行既定値（4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8）を維持と決定。詳細は「調整値の測定による決定」節 | CI ジョブなし（参考計測。ローカルで回すもの） |
 
-- Fuzz 対象外について: `decode_compact` と `recover_trace` は Trace Reader（公開 Trace 形式）の
-  対象であり、転送 PoC の範囲外なので fuzz ターゲットを作っていません（test.md の対象表のうち
-  転送に属する 3 件が対象です）。
+- Fuzz 対象について: 転送側 4 ターゲットに加え、Phase 2 で `decode_compact` と
+  `recover_trace`（公開 Trace 形式の復号）を追加し、test.md の対象表 5 件が
+  全て揃った。長時間実行の結果は上の表と traceability の F13 / F14 を参照。
 
 ### テスト総数（ローカル実測）
 
-`cargo test --workspace` で **1559 件**（transport lib 52 + 境界スイート 69 + 仕様表 19 +
+`cargo test --workspace` で **1749 件**（1559 件 + Phase 2 の 78 件
+（shirusu-trace 69（proto 16 + container/compact 16 + blob/schema 9 + writer/reader 7 +
+回復意味論 14 + テストベクター 3 + PBT 4）+ host 変換 9）+ Phase 3 の 36 件 + Phase 4 の 40 件
++ Phase 5 の 28 件 + 転送層残項目の 8 件）がローカルで通過（2026-11-09 15:29 JST に再実行し
+1,749 passed / 0 failed を確認）。
+内訳は従来分：transport lib 52 + 境界スイート 69 + 仕様表 19 +
 PBT 12（参照モデル系 6 + 新規プロパティ 6）+ ストレス 5 + agent 13 + host 21 +
 host PBT/DST 3（一時キーの一意性・参照整合性）+ loom 13 +
 transport-win 14 + 行列スイート 1304（crc32c 290 + layout 507 + descriptor 163 +
 validate 94 + ring 62 + snapshot 55 + slot 28 + notify/clock/context 60 +
 host 25 + agent 20）+ レビュー回帰・統合 19（R1 1 + R7 2 + R2 2 + R3 1 + R6 2 +
 Agent→検証 Host E2E 2 + レビュー第2回デルタ 9（Reader 多層防御 4 + Clock 分離 5））+ A70 拡張フロー 19（transport Slot 追加 4 + agent 管理スレッド 9 +
-host サービス 4 + 往復 E2E 2））がローカルで通過（全実行 約 40 秒）。行列スイートは
+host サービス 4 + 往復 E2E 2））がローカルで通過（全実行 約 40 秒）。なお transport lib 52 件には A70 の Slot 追加 4 件が含まれており、A70 拡張フロー 19 件との重複 4 件を除くと内訳の合計は 1559 件になる（総数 1749 件は cargo test の実測と一致）。行列スイートは
 拡充第2弾（2026-11-09）で追加したもので、各ケースが境界・状態・エラー経路の
 実在の違いを参照式や遷移表と照合する。E2E supervisor のシナリオはプロセス内 15 件 + 子プロセススモーク 1 件の
-全 16 件がローカル (Linux) で通過（Windows プロセス間の 1 件は CI 待ち）。
+全 16 件がローカル (Linux) で通過（Windows プロセス間の 2 件＝cross_arch と production_path は CI 待ち）。
 失敗したテストを緑に見せることはしません。落ちたら原因と直し方を所感に残します。
 
 ## 調整値の測定による決定 (A73)
@@ -752,6 +766,198 @@ Cursor を進めず DrainBatch::integrity_error で返す。格下げ
 位置をずらした改竄テストは最初「連続性で捕まえる」つもりが
 「範囲で捕まった」——テスト側の期待を組み直す一幕があった。
 検査順序も契約の一部だと改めて思う。
+
+### 2026-11-09 — Phase 2（Trace 永続化）: 形式は「決める」より「裏取りする」ほうが長かった
+
+公開 Trace 形式 v1 を確定し（docs/trace-format.md）、shirusu-trace
+（Container / Protobuf / Compact / Blob / Writer / Reader）と
+Host 変換を実装した。テストは +78 件で総数 1637 件、fuzz は
+decode_compact 5,843,310 runs / recover_trace 1,120,017 runs
+（各 75 秒、クラッシュ 0）。
+
+引き継いだスキャフォールドは各モジュールの質が高かった一方、
+lib.rs が無くコンパイル自体が通らない状態で、Writer / Reader は
+未着手だった。監査で直したのは parse_header の CRC 欄ゼロ化
+（スライス代入の型エラー）、decode_compact のエラー流用の是正、
+schema content_hash の正規化バイト列の文書との不一致（実装側の
+区切り入り連結を仕様に明記して一致させた）。
+
+依存判断では前任の実測記録が 1 件誤っていた。blake3 は「cc を
+要する経路が既定で無効」ではなく、Windows ターゲット向けに
+ml64.exe（MSVC アセンブラ）を要求して check が落ちた。
+`pure` フィーチャで純 Rust 実装に固定して解決し、判断表の記録も
+訂正した。「この VM から Windows ターゲットを check できる」ことは
+本プロジェクトの最終ゲートそのものなので、依存はすべてこの
+物差しで測り直す必要がある。ruzstd の採用（符号化は Fastest /
+Uncompressed のみ）と Protobuf の手書きワイヤ形式は実測どおり
+成立した。
+
+Writer の不変条件では 1 件、自分の厳しさを仕様に合わせて緩めた。
+当初「未登録 Schema への参照は拒否」としたが、schema_id は
+Agent が番号として渡すだけで定義登録は別経路であり、実際の
+E2E で即座に詰まった。欠落 Blob と同じく「保持して、引けない
+ことを Reader 側で明示する」が形式の一貫した方針だった。
+逆に Blob の前方参照禁止と sequence 後退の拒否は維持した
+（順序の保証は Writer にしかできない）。
+
+A72 の変換は「キーを出さない」ことを型と経路の両方で守った。
+変換層は TemporaryPayloadKey を一切受け取らず、格納済み
+Payload はその場で Blob 化され、落ちた Payload は理由だけが
+残る。テストでは payload_position に特徴的な値を入れ、その
+LE 表現が Trace バイト列に現れないことまで確認した。
+
+### 2026-11-09 — Phase 3（フック＋レコーダ）: 「記録できる」と「記録できたと言える」は別の仕事だった
+
+フック方式は IAT フックを選んだ。初期 API セット（CreateFileW /
+ReadFile / WriteFile / CloseHandle）が通常インポートで足りる以上、
+インライン フックの命令デコードと巻き戻しの危険を今は買う理由が
+ない。副作用として、計画・スキーマ・キャプチャの全部が
+プラットフォーム非依存になり、Windows 実機なしで単体テストを
+厚くできた。捕捉できない経路（GetProcAddress・DLL 内直接呼び
+出し）は「静かに欠ける」のではなく、計画の missing として
+Coverage に出す形にした。
+
+セッション実装で時間を食ったのは正常系ではなく境界だった。
+未初期化 Ring（ゼロ埋め領域は BadMagic で検証に落ちる）を
+「エラー」ではなく「まだ Agent が来ていない保留」として扱う
+ために、Worker 生成を Magic 確認後へ遅延させた。対象が途中で
+死ぬ・共有メモリが壊れる、は異常系というより通常の終わり方で、
+回収済み分を Trace に残し Integrity に正直に刻むのが本体の
+仕事だった。破損注入テストで write cursor を壊すと Ring が
+停止し、既回収 6 件が残って Event Integrity が Lost になる
+ところまで確認した。
+
+正直な限界も 2 つ残した。第一にスロットは 1 回限り： Host から
+Agent へ「回収済み」を返すプロセス間チャネルが無く、スレッドが
+大量に生滅する対象では枯渇しうる。Agent 内では数えているが
+Host からは見えないので、Coverage の注記として総括に残した。
+第二に、Windows 実動（実フック・注入・E2E）はこの環境では
+1 行も実行できていない。check は両ターゲットで通したが、
+「動く」と言うのは CI（windows-x64 ジョブの capture-e2e）が
+緑になってからだ。テスト +36 件で総数 1673 件、traceability は
+G01〜G14 を追加して 215 項目。
+
+### 2026-11-09 — Phase 4（解析＋差分＋テスト基礎）: 「比べる」と「判定する」をコードの形で分けた
+
+Phase 4 は解析側の 4 クレート（analysis / cli / compare / test）。
+検査 CLI は overview の表どおり `shirusu inspect / dump /
+export` にし、フィルタは独自クエリ言語を作らず CLI オプションの
+組にした。ダンプ出力はゴールデンテストで固定してあるので、
+表示形式を変えたら必ず差分として現れる。
+
+差分エンジンで一番大事にしたのは、レビュー第3回 §4 の線引き
+――「記録することと正しさを判定することは別」――を、注意書き
+ではなく出力形式そのもので守ることだった。出てくるのは
+「候補」で、種別と重要度と根拠イベントへの参照だけを持ち、
+違反かどうかは言わない。留保文（CANDIDATE_NOTICE）は人間向け
+にも JSON にも常時付け、終了コード 1 も「候補あり」であって
+「違反確定」ではないと明記した。判定が欲しくなったら
+shirusu-test のルールとして人が書く、という役割分担である。
+
+対応づけは overview の指定どおり、呼び出し列の単純照合では
+なくオブジェクトを主軸にした。ハンドルは「生成した CallLeave
+の return」から相関させ、同一性は (生成 API, 生成序数) で
+持つ。おかげで Trace 全体のハンドル再番号付けは PBT でも
+候補ゼロになる。逆に一番危ういのは正規化の前提のほうで、
+「U64 フィールドはハンドル/ポインタ級」という Schema 規約への
+依存は残る。個数を U64 で返すような API が将来入ったら、
+生成と誤認しないための例外表が要る。これは H05/H06 に
+前提として明記した。
+
+正直な限界も残した。スレッドの対応は出現順の序数であり、
+スレッド生成順が環境で変われば非対象呼び出しの整列は崩れる
+（オブジェクト操作の比較はスレッドに依存しないので主軸は
+保たれる）。親子 call の構造比較は未実装。巨大な操作列では
+LCS の DP が上限（4M セル）を超えると貪欲整列に劣化し、
+結果が変わりうることも H13 に書いた。テストは +40 件で
+総数 1713 件、新規クレートは Windows 両ターゲットの check も
+通過。traceability は H01〜H13 を追加して 228 項目。
+
+### 2026-11-09 — Phase 5（ippai 連携基盤）: 「相手が従う契約」を先に固定した
+
+Phase 5 はレビュー第3回が描いた構図――Windows と sake の
+両側から同形式の Trace を取り、差分を最小の Probe にして
+ippai の回帰テストへ――の、shirusu 側で用意できる半分である。
+ippai / sake のコードはこのワークスペースに無い。だから
+成果物は「動く統合」ではなく、(1) 外部レコーダ向けの
+エミッタキット shirusu-emit、(2) 適合性チェッカ
+shirusu-conformance、(3) 差分→Probe バンドル生成
+shirusu-probe、(4) ippai 側が従う契約 docs/ippai-integration.md
+の 4 点に絞り、境界は文書の冒頭に明記した。統合があるかの
+ように書くことが、この Phase では一番やってはいけない嘘になる。
+
+エミッタキットで意識したのは、生の TraceWriter が保証する
+「形式の不変条件」と、compare が前提とする「規約」は別物だ
+ということ。前方参照禁止やチャンク分割は形式の話だが、
+sequence の単調性、Enter/Leave の対応、生成イベントによる
+オブジェクト相関、Finalization の存在は、書き手が自前で
+守らないと静かに崩れる。崩れても Trace としては読めてしまう
+のが厄介で、だからキットは採番と対応づけを肩代わりし、
+適合性チェッカは 9 項目で外から点検できるようにした。
+共有 API セットの同一性は content_hash で決まるので、
+「同じ API を記録している」はハッシュ一致という機械的な
+事実に帰着する。本体のフック表との照合テストも入れたので、
+定義が drift したらテストが落ちる。
+
+ルール生成は「推測でルールを書かない」を徹底した。種別ごとに
+戦略を用意し、両 Trace で実際に評価して「左 pass・右 fail」が
+成立したものだけを採用する。おかげで、v1 ルール形式では
+表現できない候補（Payload の内容差分など）は「ルール化
+できない」と正直に落ちる。落ちた理由（試した戦略と棄却理由）
+は manifest に残るので、ルール形式 v2 を検討するときの
+材料になる。途中で面白い発見もあった：shirusu-test の JSON
+パーサは正の整数を U64 に正規化するため、生成した仕様の
+「往復」は構造一致では測れず、「読み戻しても識別が成立する」
+こと自体を不変条件にする必要があった。
+
+トリミングは再解釈ではなく抜き出しに徹した。sequence・
+引数・Blob ID は元のまま、完全性 3 指標も元の申告を引き継ぎ、
+「セッション全体の記録ではない」ことを Trace 内の notes と
+ブリーフの両方に残す。テストは +28 件で総数 1741 件。
+残りは全部 ippai 側：sake 側エミッタの実装、記録ペアの運用、
+バンドルの取り込み、そして候補が本当に違反かの判定である。
+
+### 2026-11-09 — 転送層の残項目: 「未着手」は 5 種類の違う仕事だった
+
+チェックリストに残った未着手 8 件（A74・A75・D53〜D56・D77。D41 は
+CI ループそのもの）を片付けた。並べてみると、同じ「未着手」でも
+中身が全部違う。測定（A74）、検討（A75）、証跡の仕組み化（D53）、
+独立性の実証（D56）、プロセス間 E2E の組み合わせ（D77）、そして
+CI の配線だけのもの（D54・D55）。分けて考えるまでが仕事だった。
+
+A74 は測定器（shirusu-atomic-bench）を作り、切替判断の基準を
+先に文章で固定した。手元では x86_64 の参考値しか取れず
+（i686 は 32bit ローダが無く実行自体が不能）、本命の WoW64 実測は
+CI に置いた。「測れないものは測れない」と書くのが測定の一部だと
+改めて思う。A75 は書かない決定の記録である。分割コピーのコストは
+コピー回数だけで総量は同じ、という見積もりが立つと、二重マッピングは
+「速くする案」ではなく「互換性を切り替える案」だと分かる。
+結論は条件付き保留で、再検討の条件を 3 つ固定した。
+
+D53 は「失敗したときに何が残るか」を仕組みにした。proptest の
+regressions が Seed と縮小を担い、DST は証跡 JSON（リビジョン・
+構成・操作列・注入故障）を持ち、決定的再実行器で再生できる。
+loom の失敗スケジュールは保存できないので、旧順序モデルが
+落ちること自体を should_panic で固定した。「回帰テストに加える」
+は、失敗の種類ごとに形が違う。
+
+D56 は独立性の「宣言」を「実証」に変えた。監査では、参照モデルが
+期待値計算に validate を使っていないことと、唯一残っていた
+usage_percent の流用を切り離した。実証は mutation で、占有量計算と
+Generation 加算を壊したコピーで参照モデル側のテストが実際に
+落ちることを確認した。モデルが実装に追随していたら落ちない、
+というのがこの確認の肝である。
+
+D77 は既存 E2E との突き合わせから始めた。capture-e2e は Hook と
+Trace の経路、cross_arch は生 RingWriter とポーリングで、どちらも
+「実 Agent → Event 待機 → 検証付き Host → Slot 再利用」の
+組み合わせではなかった。新シナリオ production_path_interprocess は、
+producer が DLL と同じ手順で Agent を組み、Host が
+wait_with_recheck で待ち、DrainWorker で検証しながら回収し、
+DETACH 確認の後にだけ再利用を許可する。Windows 実走は CI 待ち。
+
+テストは +8 件で総数 1749 件（failure_evidence 7 + loom 旧順序 1）。
+未着手は D41（CI フィードバックループ）のみになった。
 
 ## ライセンス
 

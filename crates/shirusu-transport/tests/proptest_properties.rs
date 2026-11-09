@@ -4,7 +4,6 @@
 
 use proptest::prelude::*;
 use shirusu_transport::clock::ManualClock;
-use shirusu_transport::layout::usage_percent;
 use shirusu_transport::notify::{NotifySignal, PublishNotifyTracker};
 use shirusu_transport::ring::*;
 use shirusu_transport::slot::{SlotHandle, SlotPool, SlotState};
@@ -206,8 +205,12 @@ proptest! {
             let before = used;
             let after = *target % (capacity + 1);
             let sig = tracker.after_publish(before, after, capacity, threshold, *host_waiting);
-            let crossed = usage_percent(before, capacity) < threshold
-                && usage_percent(after, capacity) >= threshold;
+            // 期待値の割合は仕様の定義式から自前で計算する (実装の
+            // layout::usage_percent を流用しない: D56 の独立性)。
+            // capacity は 1..200 で 0 にはならず、before/after は
+            // capacity 以下なので、ここでは素朴な式で等価になる。
+            let crossed = (before * 100) / capacity < threshold
+                && (after * 100) / capacity >= threshold;
             let want = if crossed {
                 NotifySignal::ThresholdCrossing
             } else if *host_waiting {

@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+shirusu-trace = { path = "../crates/shirusu-trace" }
 shirusu-transport = { path = "../crates/shirusu-transport" }
 
 [workspace]
@@ -37,6 +38,20 @@ bench = false
 [[bin]]
 name = "snapshot_fragments"
 path = "fuzz_targets/snapshot_fragments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_compact"
+path = "fuzz_targets/decode_compact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recover_trace"
+path = "fuzz_targets/recover_trace.rs"
 test = false
 doc = false
 bench = false

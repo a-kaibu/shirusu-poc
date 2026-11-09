@@ -8,6 +8,6 @@ description = "Windows backend: File Mapping, handle duplication, Event objects"
 [dependencies]
 shirusu-transport = { path = "../shirusu-transport" }
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation","Win32_System_Memory","Win32_System_Threading","Win32_Security","Win32_System_Performance"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation","Win32_System_Memory","Win32_System_Threading","Win32_Security","Win32_System_Performance","Win32_System_Diagnostics_Debug","Win32_System_Diagnostics_ToolHelp","Win32_System_LibraryLoader"] }
 [lints]
 workspace = true

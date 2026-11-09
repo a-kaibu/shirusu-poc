@@ -9,7 +9,7 @@
 進捗率 = 検証済み項目数 ÷ 全項目数。項目を追加したら分母が増えたことをここに記録する。
 現時点の自己申告: 全体で約 3%（仕様読解・接続・CI 配置・push 疎通・骨格着手まで。検証済みはまだほぼ無い）。
 
-最終更新: 2026-11-09（A73 を実装: 調整値の掃引測定（shirusu-tuning-bench）で全既定値を維持と決定。4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8。Linux VM で 3 回測定し同じ傾向を確認。A72 の修正実装は 10:10 の記録を参照）
+最終更新: 2026-11-09（転送層の残項目 A74・A75・D53〜D56・D77 を実施し、未着手は D41 のみになった。測定ハーネス・検討記録・証跡/回帰化・モデルの独立性実証・本番経路 E2E と、D54/D55 の CI 配線。詳細は集計の残項目ワークストリーム記録を参照。前回: Phase 3（フック＋レコーダ）を実装し G01〜G14 を追加。IAT フック基盤 shirusu-hook、Agent DLL、Capture Session（recorder）と Windows 起動ドライバ、引数付き変換、Windows E2E シナリオと CI 配線。ローカルテスト総数 1673 件。Windows 実動部は CI 待ち。前回: Phase 2（Trace 永続化）を実装し F01〜F16 を追加。公開 Trace 形式 v1 の確定（docs/trace-format.md）、shirusu-trace の新設、Host 変換（A72）、fuzz 2 件、Windows 両ターゲット check 通過。ローカルテスト総数 1637 件。詳細は集計の F 追加記録を参照。さらに前回: A73 を実装: 調整値の掃引測定（shirusu-tuning-bench）で全既定値を維持と決定。4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8。Linux VM で 3 回測定し同じ傾向を確認。A72 の修正実装は 10:10 の記録を参照）
 
 ## A. spec.md（Agent–Host 転送仕様 v0.4）条項
 
@@ -88,8 +88,8 @@
 | A71 | コピー済み Descriptor のフィールド検証（長さ・オフセット・Sequence・Generation。spec Host 検証手順 4。現状 decode_descriptor は Kind/reserved/payload_len のみ検証し、Sequence/Generation の照合が無い） | transport/validate.rs decode_descriptor_checked / DescriptorExpectation / ValidatingReader。Sequence は下限照合（欠番は許す。書き手は 1 から振るため確定済みスロットの 0 は SequenceRegressed）。オフセットは payload_write_position による上限＋前件終端との連続性を照合（落とした Payload は格納長 0 で位置を再利用）。Generation は EventDescriptor にフィールドが無く（spec の Descriptor 定義にも無い）、Control 領域の世代として validate_control / ValidatingReader で照合済み | 実装済み未検証 |
 | A72 | 転送用の一時 Payload ID の扱いの決定（設計決定済み、kota 2026-11-09。当初案「`payload_position` を一時 ID とする」を修正: Payload は Agent–Host 間で独立した ID を持たない。Host は検証済み Descriptor と Ring 情報から内部管理用の一時キー `TemporaryPayloadKey { process_id: ProcessInstanceId, ring_id: RingId, generation: u64, sequence: u64, payload_position: u64 }` を回収時に生成する。ring_id と generation は Host が管理する値で、Capture Session 内で使う。欠落した Payload にはキーを生成せず、欠落理由を保持する。一時キーは Host 内部だけで使用し公開 Trace には含めず、Blob 保存後は公開 Trace で Blob ID を参照する。EventDescriptor の 64B レイアウト変更なし、`reserved = 0` の検証も維持） | host（TemporaryPayloadKey / RingIdentity / ProcessInstanceId / RingId、DrainWorker・ValidatingHost の配線）・Unit 5 件（要素ごとの区別・決定的生成・欠落時非生成・再利用時の非衝突）・PBT/DST（host/tests/proptest_keys.rs: 複数 Ring・再利用・位置折り返しでの一意性と参照整合性、Host 再起動混入）・docs/spec-transport.md・overview.md（確定文の記録） | 実装済み未検証 |
 | A73 | 転送の調整値（Ring 容量・Slot 数・待機上限・再確認周期・復帰閾値）の測定による決定と根拠の記録（spec 冒頭「測定で調整する値」。A65 は待機方式の選定のみで、他の調整値の測定決定を追跡する項目が無かった） | e2e/src/bin/shirusu-tuning-bench.rs（S1 容量掃引・S2 待機上限・S3 再確認周期・S4 復帰閾値・S5 Slot 数）・README「調整値の測定による決定」節。結論は全既定値を維持（4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8）。Linux VM で 3 回測定し同じ傾向を確認。通知閾値は掃引対象外として記録。Windows 実機分は CI 待ち | 実装済み未検証 |
-| A74 | i686 での 64bit アトミック操作のコスト測定と、問題があれば 32bit の折り返しカウンタへの切替判断（spec Cursor 節:「i686での64bitアトミック操作（cmpxchg8b等で実現される）のコストが問題になれば、32bitの折り返しカウンタに切り替える」。現行は 64bit Cursor のままコスト未測定） | Windows i686 実機・CI での測定 | 未着手 |
-| A75 | Payload 終端またぎ分割コピーの最適化検討（VirtualAlloc2＋MapViewOfFile3 による同一領域の二重マッピング。spec:「Windows 7 対応と両立しないので、初版は分割コピーとし、後から最適化として検討する」。初版対象外・将来検討。検討自体が未実施） | 検討記録 | 未着手 |
+| A74 | i686 での 64bit アトミック操作のコスト測定と、問題があれば 32bit の折り返しカウンタへの切替判断（spec Cursor 節:「i686での64bitアトミック操作（cmpxchg8b等で実現される）のコストが問題になれば、32bitの折り返しカウンタに切り替える」） | e2e/src/bin/shirusu-atomic-bench.rs（fetch_add/load/store/CAS の単スレッドレイテンシ、SPSC Cursor パターン、4 スレッド競合を U64/U32 同条件で測定。切替判断の基準: fetch_add が 32bit の 2 倍超、または SPSC が 32bit の 70% 未満なら検討開始）。CI 配線: windows.ps1 で x64 対照値、windows-x86.ps1 で i686 (WoW64) 実測を実行。ローカル参考値 (Linux x86_64、10M ops × 3 rounds): 全項目の比率 0.90〜1.00 で同等。この VM は 32bit ローダ/開発ファイルが無く i686 の実行・リンク自体が不能なため、i686 実測は CI 待ち | 実装済み未検証 |
+| A75 | Payload 終端またぎ分割コピーの最適化検討（VirtualAlloc2＋MapViewOfFile3 による同一領域の二重マッピング。spec:「Windows 7 対応と両立しないので、初版は分割コピーとし、後から最適化として検討する」） | docs/double-mapping-review.md に検討記録を作成し、結論は **条件付き保留**（現行の分割コピーを正とする）。理由: Win7 対応という前提を変える製品判断が無く、利得はコピー呼び出し回数の削減のみで記録経路のボトルネックでもなく、フォールバックを含むと複雑さは増える。再検討の条件は (1) Win7/8/8.1 をサポートから外す決定 (2) 実測で有意な割合 (目安 5% 超) の実証 (3) 単一経路化または二重経路の維持コスト受容、の全てが揃うこと | 実装済み未検証 |
 
 ## B. spec.md 不変条件 9 項目
 
@@ -185,10 +185,10 @@
 | D50 | テスト大増強: Fuzz 増強 (4 target × 600 秒、Snapshot Fragment 列の 4 本目追加、成長コーパスの hex 種書き戻し) | 実装済み未検証 |
 | D51 | テスト大増強: E2E 増強 (Host 再起動/Producer 公開途中 kill/32 スレッドストーム/100 万ソーク会計/破壊注入/DETACH ストーム、全 16 シナリオ) | 実装済み未検証 |
 | D52 | テスト大増強: Stress 増強 (release 1000 万 ops ソーク、env で規模可変) | 実装済み未検証 |
-| D53 | DST/PBT 失敗時の証跡保存と縮小ケースの回帰テスト化（verification.md: 失敗時に Seed・リビジョン・テスト構成・操作列・注入故障を保存し、縮小したものを回帰テストに加える。D11 は方針の文書化のみ、loom 失敗スケジュールの回帰化も未実施。Fuzz の最小入力も含む） | 未着手 |
-| D54 | Application Verifier の併用（verification.md E2E 節・CI 表リリース前。D33〜D40 に言及なし。Windows E2E での併用と CI への組み込み） | 未着手 |
-| D55 | 異なる Windows 環境での確認（verification.md CI 表リリース前「異なる Windows 環境での確認」。D39/D40 は windows-latest のみ） | 未着手 |
-| D56 | TLA+ モデルと PBT 参照モデルの実装の独立性（verification.md: 両者は同じ不変条件を共有するが実装は独立させ、実装のバグを参照モデルに写し込まない。D06/D23〜D31 には独立性の担保・確認項目が無い） | 未着手 |
+| D53 | DST/PBT 失敗時の証跡保存と縮小ケースの回帰テスト化（verification.md: 失敗時に Seed・リビジョン・テスト構成・操作列・注入故障を保存し、縮小したものを回帰テストに加える） | 実装済み: 証跡形式と決定的再実行器を tests/common/evidence.rs に置き、DST (dst_fault_mix_invariants) を TestRunner 化して失敗時に証跡 JSON (リビジョン・構成・操作列・注入故障) を保存する。マクロ版 PBT の Seed/縮小は proptest regressions が担い (実績: recorder の 1 件が保存・再実行中)、縮小済み回帰ケース 2 件を tests/failure_evidence.rs に固定。loom の失敗スケジュールは R3 旧順序モデルを should_panic で回帰化 (loom 13→14 件)。Fuzz の最小入力は seeds への書き戻し運用 (fuzz/README) で、D57 の実例は単体テストで固定済み。手順の全体は verification.md「失敗時の証跡と回帰化」に明文化 | 実装済み未検証 |
+| D54 | Application Verifier の併用（verification.md E2E 節・CI 表リリース前） | 配線済み: windows.ps1 の capture-e2e 実行で対象プロセス shirusu-hook-target.exe に Application Verifier (Heaps/Handles/Locks) を有効化し、finally で設定解除とログ削除を行う。appverif.exe が無い環境では注記して従来どおり実行する。実走確認は CI 待ち | 実装済み未検証 |
+| D55 | 異なる Windows 環境での確認（verification.md CI 表リリース前「異なる Windows 環境での確認」。D39/D40 は windows-latest のみ） | 配線済み: matrix.json に windows-x64-win2022 ジョブ (os: windows-2022、windows-x64 と同じ windows.ps1) を追加し、windows-latest (2025 世代) と異なる環境で x64 のテスト+E2E を回す。plan.sh の射影に含まれることを確認 (ci 9→10 ジョブ)。実走確認は CI 待ち | 実装済み未検証 |
+| D56 | TLA+ モデルと PBT 参照モデルの実装の独立性（verification.md: 両者は同じ不変条件を共有するが実装は独立させ、実装のバグを参照モデルに写し込まない） | 担保済み: 監査で、参照モデル群 (VecDeque / Slot 影 / A72 キー照合) が期待値計算に実装の validate を使わず公開 API の観測可能な出力だけを見ることを確認。唯一の弱い依存 (通知閾値テストの layout::usage_percent 流用) を切り離し仕様の定義式へ変更。独立性の実証として scripts/ci/model-independence.sh を新設 (nightly 配線): 実装への mutation 2 件 (占有量の被減数入替、回収時の Generation 静止) がいずれも対象 PBT の失敗として検出されることを、無変更での成功と併せて確認する。2026-11-09 ローカルで実証済み。根拠は verification.md「モデルの独立性の担保と確認」 | 実装済み未検証 |
 | D57 | Fuzz で受理したデータの不変条件チェック（verification.md: クラッシュしないことに加え、受理したデータが公開 Trace の不変条件を満たすかも確かめる。validate_control: 占有量上限（Descriptor・Payload 両 Ring）＋前後像の単調性（Cursor・Payload 位置・Loss カウンタ）。decode_descriptor: 既知 Kind・reserved 0・長さ上限・64B 像への忠実な再符号化。decode_payload: 落とした Payload は空、それ以外は長さどおりで折り返しを考慮した領域コピーとバイト単位で一致。実装中に fuzz が validate_control の Payload 位置後退の受理という本物の穴を発見し、validate_control に前像との Payload 位置の単調性チェックを追加して回帰テスト化。修正後の短時間 fuzz: validate_control 約 1,060 万 runs / decode_descriptor 約 540 万 runs / decode_payload 約 490 万 runs、クラッシュなし） | 実装済み未検証 |
 | D58 | Host 検証ロジック（純粋関数）の macOS での実行（verification.md: 検証ロジックは純粋関数に分け、Linux や macOS でも実行する。CI に macos-latest ジョブ `macos-validation` を追加し、`cargo test -p shirusu-transport` を回す。transport クレートは OS 依存コードを持たない。ローカル VM は Linux のため macOS での実行確認は CI 待ち） | .github/workflows/ci.yml | 実装済み未検証 |
 | D59 | Miri で spec_table c01/c08 を小規模で実行する（2026-11-09 08:29 に原因判明・解決: Miri は既定でホストの環境変数を転送しないため `SHIRUSU_SPEC_TABLE_C01_OPS=1 cargo +nightly miri test` は既定の 100,000 件で回っており、「OPS=1 でも 100 秒超」は測定アーティファクトだった。`-Zmiri-env-forward` で転送すると c01 は OPS=200 で 1.86 秒・c08 は OPS=20 で 0.52 秒で通過し、UB 検出なし。誤解を招く doc コメントも修正済み） | 実装済み未検証 |
@@ -209,7 +209,7 @@
 | D74 | レビュー第2回・項目8: Clock の責務分離。待機実測用の Clock (差し替え可能・インスタンス相対原点) が Descriptor の timestamp_qpc の刻印を兼ねていたのを分離し、イベント時刻専用の TimestampSource (now_qpc / frequency) を新設。RingWriter の刻印は時刻源から取り、既定実装 SystemTimestampSource は原点をプロセス全体で 1 つの OnceLock に固定する。transport-win に本物の QPC 実装 QpcTimestampSource (QueryPerformanceCounter/Frequency の FFI) を追加し、Agent は with_timestamp_source で差し替え可能に。A30 (待機時間の QPC 実測) の意味は不変。matrix_ring の ts_* ケースは旧性格付け (刻印＝待機 Clock) を時刻源差し替えへ意図的に追随 | crates/shirusu-transport/src/clock.rs・ring.rs、crates/shirusu-transport-win/src/lib.rs (QpcTimestampSource)、crates/shirusu-agent/src/lib.rs (with_timestamp_source)、crates/shirusu-transport/tests/regression_clock_split.rs (原点共有・単調性・周波数一貫性・Clock 差替え不変。旧 API のみの行動回帰は HEAD で赤を確認)、crates/shirusu-agent/tests/regression_clock_split.rs | 実装済み未検証 |
 | D75 | レビュー第2回・項目6: TLA+ モデルの Slot 再利用を段階分割。Reclaim を ReclaimBegin (RECLAIMING の間に Generation 加算と終了フラグのクリア) と PublishFree (FREE 公開) に分け、Claim が観測した Generation を slotClaimGen に記録。不変条件 ClaimedGenerationIsCurrent を追加。TLC 結果 (2026-11-09、tla2tools v1.8.0): 主モデルは全 7 不変条件が成立 (990,889 状態生成 / 310,249 相異 / 深さ 28)。旧順序 (FREE 公開 → Generation 更新) の変種モデル ShirusuTransportBuggy では TLC が ClaimedGenerationIsCurrent の違反を 924 状態で検出し、モデルが競合を表現できることを実証。scripts/ci/tla.sh は両方向を主張する | tla/ShirusuTransport.tla・ShirusuTransport.cfg、tla/ShirusuTransportBuggy.tla・ShirusuTransportBuggy.cfg、scripts/ci/tla.sh、docs/verification.md「Slot 再利用の段階分割と旧順序の変種」 | 実装済み未検証 |
 | D76 | レビュー第2回・項目5 (後半): RingReader::drain の多層防御。本番経路は検証付きに統一済みで RingReader はテスト専用に格下げ済みだったが、drain 自体は payload_len / payload_position を検証せずコピーしていた。コピー前に ValidatingReader と同等の最小検証 (種別・予約領域・格納長と容量・Payload 位置の範囲と連続性・Sequence 後退) を行い、失敗時はコピーせず Cursor も進めず、DrainBatch::integrity_error で破損として報告し Reader は停止する。格下げ表記は維持 | crates/shirusu-transport/src/ring.rs (check_descriptor)、crates/shirusu-transport/tests/regression_reader_hardening.rs (破損 len/position/連続性の回帰 4 件、赤→緑)、crates/shirusu-host/src/lib.rs (DrainBatch 構築の追随) | 実装済み未検証 |
-| D77 | レビュー第2回・項目7 の残り: Windows 実プロセス間で、本番経路そのもの (実 Agent::record → 共有メモリ → data_ready Event での待機 → 検証付き Host の回収・Slot 再利用) を end-to-end で確認する E2E。現行の D35 は File Mapping と生 RingReader によるプロセス間確認、D72 は同一プロセス (Linux) の API 経路、A68 は space_available 受け渡しに留まるため、本番経路の組み合わせは未登録だった。Windows 実機と CI が必要なため未着手 | e2e (supervisor シナリオ追加)・CI | 未着手 |
+| D77 | レビュー第2回・項目7 の残り: Windows 実プロセス間で、本番経路そのもの (実 Agent::record → 共有メモリ → data_ready Event での待機 → 検証付き Host の回収・Slot 再利用) を end-to-end で確認する E2E | 実装済み: capture-e2e との突き合わせでは、capture-e2e は Hook + Recorder + Trace の経路で本項目の組み合わせを含まず、cross_arch は生 RingWriter + 生 RingReader + ポーリングだった。新規シナリオ production_path_interprocess を追加: producer は実 Agent を DLL と同じ手順で構築して record ごとに data_ready を通知し、supervisor は wait_with_recheck (2ms 再確認) で待ちながら検証付き DrainWorker (A72 identity 付き) で回収する。DETACH と回収完了の確認後にだけ Slot 再利用を許可し (reclaim-ok はテスト用同期ポイント)、次 Generation での再記録までを通す。両フェーズで内容の連番一致・payload_keys 数・integrity_lost 無しを検証。CI: windows-x64 の --all (x64 同士) と windows-x86.ps1 の --production-path (x64 Host × i686 Producer) で実行。Windows 実走は CI 待ち | e2e (supervisor シナリオ追加)・CI | 実装済み未検証 |
 
 ## E. ドキュメント
 
@@ -221,9 +221,89 @@
 | E04 | README: 「実装して感じたこと」を dated エントリで複数残す | 実装済み未検証 |
 | E05 | 本チェックリストの状態を実装の節目ごとに更新する | 実装済み未検証 |
 
+## F. Phase 2: Trace 永続化（公開形式 v1、docs/trace-format.md）
+
+| ID | 項目 | 実装 | 状態 |
+|---|---|---|---|
+| F01 | 公開 Trace 形式仕様 v1 の確定（Container / Schema の二重バージョン、前方参照禁止、Index / Finalization 省略可、回復意味論と上限の決定） | docs/trace-format.md | 実装済み未検証 |
+| F02 | Block Container: 32B 固定ヘッダー、CRC32C（CRC 欄 0 化したヘッダー＋payload）、stored_len 512MiB / raw_len 256MiB 上限、未知 block_type の読み飛ばし、未知 compression の破損扱い、File Header の二重 Magic | trace/container.rs | 実装済み未検証 |
+| F03 | Protobuf メタデータの手書きワイヤ形式（prost / protoc 非依存、未知フィールド読み飛ばし、proto3 既定値省略、CaptureEnvironment / SchemaSet / BatchHeader / LossRecord / BlockIndex / Finalization の全メッセージ往復） | trace/proto.rs | 実装済み未検証 |
+| F04 | Compact Binary 値列: 全 13 型タグ、LEB128 / zigzag、取得状態 5 種、NaN ペイロード保持、未知タグ Schema での復号拒否、個数・型不一致と末尾余剰の検出 | trace/compact.rs, schema.rs | 実装済み未検証 |
+| F05 | Compact Binary イベント列: Batch Header 長先行、seq / ts 差分符号化、payload_tag 4 種（None / Blob / Inline / Dropped＋理由）、args_tag、event_count 不一致・末尾余剰・未知タグの破損検出 | trace/compact.rs | 実装済み未検証 |
+| F06 | チャンク単位 Zstd: 純 Rust ruzstd、符号化は Fastest / Uncompressed のみ、展開後長と raw_len の照合と読み取り打ち切り、圧縮で膨らむ場合は無圧縮格納、辞書なし | trace/container.rs | 実装済み未検証 |
+| F07 | Blob ストア: BLAKE3 ID、`<root>/<先頭2hex>/<全体hex>` 配置、重複排除、再オープン時の走査による既出集合の再構築、get_verified のハッシュ照合 | trace/blob.rs | 実装済み未検証 |
+| F08 | Schema レジストリと正規化ハッシュ: content_hash 検証、schema_id 0 の拒否、異なる内容の再定義拒否、同一内容の再登録冪等（Checkpoint 複製）、別 Trace 間同一性は ID 非依存のハッシュで判定 | trace/schema.rs | 実装済み未検証 |
+| F09 | Trace Writer: Header / Environment の先行書出し、Blob の前方参照禁止（参照 Event Chunk 直前へのフラッシュ）、セッション内重複排除、Event / Blob Chunk の 256KiB 目安分割、Index と Finalization の書出し、finish しない場合は未完 Trace として読める、sequence 後退・未追加 Blob 参照・セッション不一致の拒否 | trace/writer.rs | 実装済み未検証 |
+| F10 | 依存判断の実測記録: blake3 は `pure` フィーチャ必須（既定では Windows ターゲットで ml64.exe を要求し check 不能。当初の「cc 経路は既定で無効」という記録は誤りとして訂正）、zstd-sys 不採用（lib.exe 要求）、ruzstd 採用と符号化レベルの制約、prost 不採用（protoc 依存）、CRC32C は transport の検証済み実装を再利用 | docs/trace-format.md「依存クレートの判断」、trace/Cargo.toml | 実装済み未検証 |
+| F11 | Trace Reader 回復意味論（recover_trace）: 先頭 Header 不成立は全体拒否、末尾切断は TruncatedTail、CRC 不一致は payload 長を信用せず再同期（SBLK 探索＋完全検証でのみ受理）、Zstd / Protobuf / Compact の失敗は Block 単位で隔離、重複 Blob の報告、欠落 Blob の明示（イベントは保持）、Index 不一致時は走査結果を正とする、Finalization 無しは完全性不確定、Block 100 万 / イベント 1 億 / Blob 1000 万の上限 | trace/reader.rs | 実装済み未検証 |
+| F12 | Host 変換と A72: 公開 Trace は Blob ID のみ（TemporaryPayloadKey は変換の入出力に現れず、payload_position の LE 表現が Trace バイト列に無いことをテストで確認）、欠落 Payload は Dropped { 元長, 理由 } のみ、Loss 全種の写像、IntegrityReport 3 指標の Finalization 写像、実 Agent → 検証付き Host → Recorder の通し経路 | host/trace_convert.rs | 実装済み未検証 |
+| F13 | fuzz ターゲット decode_compact: SchemaSet + 値列、復号成功時の再符号化冪等性を主張。2026-11-09 ローカル 75 秒 5,843,310 runs、クラッシュ 0 | fuzz/fuzz_targets/decode_compact.rs | 実装済み未検証 |
+| F14 | fuzz ターゲット recover_trace: 任意バイト列の回復読み、受理時の不変条件（Batch 内 sequence 単調性、上限、Payload 解決の安全性）を主張。2026-11-09 ローカル 75 秒 1,120,017 runs、クラッシュ 0 | fuzz/fuzz_targets/recover_trace.rs | 実装済み未検証 |
+| F15 | 言語非依存テストベクター: 最小 Trace を Writer / Protobuf 実装を経由せずバイト列で手組みし、期待復号結果と突き合わせる（Header のみ / 最小 Trace / CRC 破損の 3 件） | trace/tests/test_vectors.rs | 実装済み未検証 |
+| F16 | Windows ターゲット check: shirusu-trace と shirusu-host が x86_64-pc-windows-msvc / i686-pc-windows-msvc の両方で check 通過（この VM から stable cargo で実測） | trace, host | 実装済み未検証 |
+
+## G. Phase 3: フック＋レコーダ（「使える」最低線）
+
+| ID | 項目 | 実装 | 状態 |
+|---|---|---|---|
+| G01 | フック方式の決定: IAT フックを採用（overview の実装順序 1）。根拠: 初期 API セットは通常インポート経由で足り、命令デコードや巻き戻しが不要で安全、計画がプラットフォーム非依存で単体テスト可能。限界（GetProcAddress 経由・DLL 内直接呼び出しは捕捉できない）は Capture Coverage の欠落として扱う（G05） | crates/shirusu-hook（api/plan）、本節 | 実装済み未検証 |
+| G02 | 対象 API 表と決定的スキーマ ID: CreateFileW(1) / ReadFile(2) / WriteFile(3) / CloseHandle(4)、Schema ID は enter=2n−1・leave=2n（1–8）、Schema へ観測レベルの注釈を付け SchemaSet として Trace Writer へ登録。DLL 名照合は大文字小文字と拡張子を吸収、関数名は完全一致 | hook/api.rs | 実装済み未検証 |
+| G03 | 引数キャプチャ意味論: パスは UTF-16（上限 1024 ユニット、超過は Truncated、NULL は Unreadable、ユニット単位のサルベージ）、バッファ上限 4096 バイト。WriteFile は Enter で入力バッファ、ReadFile は Leave で実データと実バイト数、OVERLAPPED は Unsupported、失敗時はデータを付けない。全 Leave の末尾に last_error（U32） | hook/capture.rs | 実装済み未検証 |
+| G04 | PE パーサ: 境界検査付きでインポート（IAT RVA 付き）/ エクスポート / SizeOfImage / PE32+ 判定、ファイル→イメージ写像（セクション変換）。合成 PE での単体テスト | hook/pe.rs | 実装済み未検証 |
+| G05 | フック計画 build_plan: 名前照合で対象を選び IAT RVA で重複排除、表にあってモジュールに無い API は missing として返す（Coverage の明示） | hook/plan.rs | 実装済み未検証 |
+| G06 | フックエンジンと Detour（Windows）: VirtualQuery による可読性判定で安全に読む ProcessMemory、IAT 書き換え（VirtualProtect）と復元、原関数ポインタの保持、GetLastError の透過性（原関数復帰直後に取得し、呼び出し側へ戻る前に復元）。A69 の WriterPolicy は Agent 既定（ローダーロック下ゼロウェイト）のまま記録経路に適用 | hook/engine.rs | 実装済み未検証（Windows 実動は CI 待ち） |
+| G07 | Bootstrap 受け渡し構造: repr(C) 568 バイト、バージョン検証、Ring 本数上限 32。ハンドル値は対象プロセス内で有効な値として Host が複製して渡す（同一ビットネス前提を明記） | hook/bootstrap.rs | 実装済み未検証 |
+| G08 | Agent への外部 Mapping 登録口 register_slot_mapping（ExpansionDelivery の公開ラッパ）と、登録した Mapping へ記録して Host 側で読み戻す往復テスト | agent, agent/tests/bootstrap_mapping.rs | 実装済み未検証 |
+| G09 | Agent DLL: cdylib。DllMain は DisableThreadLibraryCalls のみ（Loader Lock 遵守、実初期化は Host 駆動の shirusu_agent_init エクスポート）、ステータスコード、Host プロセス生存監視による自己停止、QPC タイムスタンプ。制約: スロットは 1 回限り（プロセス間 再確保チャネルは Phase 3 の範囲外。枯渇は Agent 内カウントのみで Host から不可視） | crates/shirusu-agent-dll | 実装済み未検証（Windows 実動は CI 待ち） |
+| G10 | Host の引数付き変換 record_batch_with_args: 登録済みフック Schema の Payload だけを Compact Binary から復号して Args 化し、未登録・復号失敗時は Blob のまま保全する（統計 args_attached / args_fallback_blob）。セッション総括ではフォールバック有無を Semantic Completeness へ反映 | host/trace_convert.rs | 実装済み未検証 |
+| G11 | Capture Session 中核: 状態機械（Created→Recording→Stopped、違法操作は InvalidTransition）、Ring の遅延 Worker 化（Magic 確認まで保留し、初期化されない Ring はエラーにしない）、破損検出時の Ring 停止と Event Integrity Lost、対象途中終了でも回収済み分は Trace に残る、終了不明呼び出しの Loss 化。Unit（全通し/破損/終了不明/未初期化）＋ 状態機械 PBT | host/recorder.rs, host/tests/recorder.rs | 実装済み未検証 |
+| G12 | Windows 起動ドライバ: CREATE_SUSPENDED 起動とアタッチ、Mapping・イベントの作成と対象への複製、Bootstrap 書き込み＋ shirusu_agent_init のリモート呼び出し（x86 の stdcall 名デコレーション対応）、init_done 確認、終了まで回収ループ、起動失敗時の対象後始末 | host/recorder_launch.rs, transport-win プロセスヘルパ | 実装済み未検証（Windows 実動は CI 待ち） |
+| G13 | Windows E2E シナリオ: 対象プロセス（4 API を直接 FFI で呼ぶ）が書き読みする内容・パス・ハンドル相関を、生成 Trace の復号で検証。windows-x64 ジョブで実行（scripts/ci/windows.ps1）、i686 は hook テストと agent-dll ビルド（windows-x86.ps1）、check 対象へ hook / agent-dll を追加（matrix.json）。workflow ファイルは不変更 | e2e（shirusu-hook-target / shirusu-capture-e2e）, scripts/ci | 実装済み未検証（CI 待ち） |
+| G14 | 観測レベルの到達点: CreateFileW / ReadFile / WriteFile = L2（型付き引数＋バッファ内容）、CloseHandle = L1（ハンドル値の相関まで。Object ID 未導入のため L3 は部分的）、GetLastError は全 Leave で捕捉。L3 の完全到達（Object ID 導入）と L4 は後続 Phase の範囲 | hook/api.rs の注釈、本節 | 実装済み未検証 |
+
+## H. Phase 4: 解析 CLI＋差分エンジン＋shirusu-test 基礎
+
+| ID | 項目 | 実装 | 状態 |
+|---|---|---|---|
+| H01 | 解析系の構成決定: 共有ビュー `shirusu-analysis`、検査 CLI `shirusu-cli`（バイナリ `shirusu`）、差分 `shirusu-compare`、期待ルール `shirusu-test` の 4 クレートに分離（overview のコンポーネント表: 記録と解析は本体、比較とテスト生成は別コンポーネント）。解析側は OS 非依存で、Windows ターゲット（x86_64 / i686）でも check 通過 | crates/shirusu-{analysis,cli,compare,test} | 実装済み未検証 |
+| H02 | ビュー層: ReadTrace の平坦化、Schema レジストリによる引数復号、値の決定的表記（浮動小数点はビット列、U64 は 16 進）。取得できなかった値はダミー本体ではなく取得状態で表示し、復号失敗は args_error として隠さず残す | analysis/view.rs | 実装済み未検証 |
+| H03 | `shirusu inspect`: セッションメタデータ（CaptureEnvironment）、三つの完全性指標＋裏付け内訳（Loss Record 種別、落ちた Payload、劣化イベント、欠落 Blob、回復 issue、Index 照合）、Finalization 欠落時は「確定できない」と明示。API 別 Enter/Leave 集計。人間可読＋JSON | cli/main.rs | 実装済み未検証 |
+| H04 | `shirusu dump` / `export`: フィルタは CLI オプションの組（--api / --kind / --seq / --thread / --text / --limit。独自クエリ言語は作らない＝ overview の方針）。dump は人間可読＋JSON、export は JSONL。出力はゴールデンテストで固定 | cli/main.rs、cli/tests | 実装済み未検証 |
+| H05 | compare 正規化ルール（normalize.rs のモジュール文書が正）: (1) タイムスタンプ絶対値は不比較 (2) PID/プロセス/スレッドは出現順の序数化 (3) ハンドルは生成相関で ObjectKey 化 (4) 非相関ポインタは中身を消去（0 と全ビット1 は区別を残す） (5) 未取得値は取得状態で比較 (6) Payload は内容で比較し Inline/Blob の表現差を吸収 (7) 戻り値・last_error・意味値は正規化しない | compare/normalize.rs | 実装済み未検証 |
+| H06 | オブジェクト同一性: 生成は「CallLeave の return（U64・取得成功・0/INVALID 以外）」と定義し、同一性は (生成 API 名, 生成序数)。生値の再利用（Close 後の再生成）は参照位置より前の最新生成へ解決。生成帰属はイベント位置で正確に引く（既存ハンドルを返す API を生成と誤認しない） | compare/normalize.rs | 実装済み未検証 |
+| H07 | 状態遷移の比較: オブジェクトごとに対応づけ、「そのオブジェクトへの操作列」を整列して欠落/追加を検出。両側に同じ多重集合が残る場合は欠落+追加ではなく順序相違の候補 1 件にまとめる | compare/diff.rs | 実装済み未検証 |
+| H08 | オブジェクト非関与の呼び出しはスレッド（出現順対応）ごとに整列比較。Enter/Leave の揃い方の相違は CallShapeDifference、取得状態の相違は CaptureDifference として別種別で出す | compare/diff.rs | 実装済み未検証 |
+| H09 | 完全性メタデータの別枠比較: 三指標・Loss Record 内訳・落ちた Payload 数・欠落 Blob 数が片側だけ違う場合を IntegrityDifference とする（「比較以前に観測できていない」可能性の提示） | compare/diff.rs | 実装済み未検証 |
+| H10 | 「候補」の線引き: 出力種別は MissingCall / ExtraCall / ArgumentDifference / ReturnDifference / PayloadDifference / ObjectStateDifference / IntegrityDifference / CaptureDifference / CallShapeDifference。重要度は候補の分類であって違反判定ではない。CANDIDATE_NOTICE（断定ではない旨）を人間向け・JSON の両出力に常時付帯し、CLI 終了コード（0=候補なし / 1=候補あり / 2=エラー）も「違反確定」を意味しないことを文書化 | compare/diff.rs、compare/report.rs、bin | 実装済み未検証 |
+| H11 | compare の検証: シナリオ 10 件（完全一致→0、引数 1 つの変更→その候補のみ、全体の再番号付け→0、欠落→ MissingCall、戻り値失敗→ ReturnDifference（High）、操作順序違い→状態候補 1 件、完全性差分ほか）、再番号付け不変性と反射性の PBT（各 128 ケース）、CLI 統合（終了コード・JSON） | compare/tests | 実装済み未検証 |
+| H12 | shirusu-test 基礎: 期待ルールは言語非依存 JSON を正規形式（version 1）。ルールは api-called（フィールド equals/contains 条件つき）、no-integrity-loss、object-closed、event-count。JSON パーサは自前（整数のみ、位置つきエラー）。object-closed は compare の相関を再利用し、生成ゼロを空虚な真にせず失敗とする。評価は記録の範囲内の判定である旨を文書化（Phase 5 の Probe 生成の土台） | test/{spec,eval,json_parse}.rs、bin | 実装済み未検証 |
+| H13 | 整列の劣化経路: LCS の DP は積 4,000,000 セルを上限とし、超過時は貪欲整列へ切り替える（巨大 Trace でのメモリ爆発回避。結果が変わりうる劣化であることをここに明記する） | compare/diff.rs | 実装済み未検証 |
+
+## I. Phase 5: ippai 連携（shirusu 側基盤。契約の正は docs/ippai-integration.md）
+
+前提の明記: ippai / sake のリポジトリはこのワークスペースに無く、本節の成果物は「shirusu 側で用意できる半分」と「ippai 側実装者が従う契約」である。sake との統合が実在するかのような記述はしない。最終統合は kota が ippai 側で行う。
+
+| ID | 項目 | 実装 | 状態 |
+|---|---|---|---|
+| I01 | エミッタキット shirusu-emit: TraceWriter の上に薄く乗り、セッション管理（CaptureEnvironment の構築）と Finalization の必須化を担う。3 指標の値は記録側が決め、キットは値を発明しない。finish はオープン中の呼び出しが残っていれば失敗する | crates/shirusu-emit | 実装済み未検証 |
+| I02 | キットが肩代わりする規約: sequence はスレッドごとに 1 から単調増加で自動採番、call_id の自動採番と CallToken による Enter/Leave 対応（非同期完了のため end は非 LIFO を許容）、begin 時点のオープン中呼び出しからの parent_call_id 引継ぎ、終了しない呼び出しは Leave を捏造せず abandon_call で明示破棄（痕跡は Loss Record が正） | emit/emitter.rs | 実装済み未検証 |
+| I03 | 引数の Schema 照合: begin/end の値列は登録済み Schema の型列と個数・型を encode_values で照合してから符号化し、不一致（個数・型・未知 API・未知トークン・二重 end）はエラーとして返す | emit/emitter.rs | 実装済み未検証 |
+| I04 | 共有 API セット ApiSet: 登録順に api_id 1..=N、Schema は enter=2n−1 / leave=2n（本体フック表と同一規約）。基準形 file_io_api_set（CreateFileW / ReadFile / WriteFile / CloseHandle）は本体 API_TABLE と名前・フィールド列が一致し、Schema の content_hash 一致をテストで常時照合する（本体側の表が drift したら落ちる） | emit/api_set.rs | 実装済み未検証 |
+| I05 | エミッタの検証: 実セッション（開く→書く→読む→閉じる）の往復で Schema 登録・sequence 列・Blob 解決・Finalization 整合・ビュー層での API 名/値復元を確認。ネストとスレッド混在、エラー経路（未知 API、型/個数不一致、対応なし end、オープン中 finish）も単体で固定 | emit/tests/roundtrip.rs | 実装済み未検証 |
+| I06 | 適合性チェッカ shirusu-conformance: 9 項目（clean-scan / environment / finalization / finalization-counts / schemas-registered / sequence-monotonic / enter-leave-pairing / blob-refs-resolvable / integrity-consistent）。合否は Fail の有無で決め、sequence 重複は Warn に留める。各項目には「壊れると誰が困るか」をモジュール文書に明記。Capture Coverage の真偽は Trace 内から検証不能である旨も明記 | crates/shirusu-conformance | 実装済み未検証 |
+| I07 | 適合性チェッカの検証: エミッタ製 Trace は全項目パス。規約違反を注入した Trace（未登録 Schema、sequence 後退、対応しない Leave、未終了 Enter、欠落 Blob、Finalization 欠落/総数不一致、Complete 申告と損失記録の矛盾、匿名 environment）が該当項目でのみ落ちる。実バイト列（TraceWriter 製・切断 Trace）と CLI 終了コード（0/1/2）も固定 | conformance/{check.rs の単体, tests/bytes.rs, tests/cli.rs} | 実装済み未検証 |
+| I08 | ルール生成（差分→Probe の中核）: 種別ごとの戦略（MissingCall→api-called、Argument/ReturnDifference→左側の実値での equals、IntegrityDifference→no-integrity-loss、ObjectState/CallShape→object-closed、汎用フォールバックに api-called / event-count）を両 Trace で実際に評価し、「左 pass・右 fail」が成立した最小の 1 ルールを採用。推測でルールを作らない。JSON パーサの整数正規化（正数→U64）のため不変条件は構造一致ではなく読み戻し後の識別成立とする | probe/rules.rs、probe/bundle.rs | 実装済み未検証 |
+| I09 | ルール化の限界の正直な記録: v1 ルール形式で表現できない候補（Payload 内容差分、Capture 差分）はブリーフのみのバンドルとし、manifest に試した戦略と棄却理由を残す。ブリーフ自体にも「識別ルール化できなかった」旨を明記 | probe/{rules,brief,bundle}.rs、シナリオテスト | 実装済み未検証 |
+| I10 | Probe ブリーフ: 候補の種別/内容/関与オブジェクト/フィールド差分、関与呼び出し列（正規化済み引数つき。生ハンドル値は載せない）、両側の完全性サマリ、ルール化の結果と試した戦略、トリム結果、CANDIDATE_NOTICE、ippai 側での使い方を含む | probe/brief.rs | 実装済み未検証 |
+| I11 | トリミング: 関与オブジェクト/根拠イベントの呼び出しだけを、元の Batch 文脈・sequence・引数・Payload・Blob ID のまま再構成する（抜き出しであって再解釈ではない）。オブジェクト序数を保つため先行する同種の生成呼び出しも残す。Schema は使用分だけ元の登録順で、Loss Record は全て残し、完全性 3 指標は元の申告を引き継いで notes にトリムである旨を残す。生成後に compare を再実行して同じ候補が再現するか確認し、結果を manifest に記録 | probe/trim.rs | 実装済み未検証 |
+| I12 | 回帰バンドル形式 v1 と生成 CLI: ディレクトリ構成（manifest.json / brief.md / rules.json / left.trimmed.trace / right.trimmed.trace）を docs/ippai-integration.md に定義。CLI shirusu-probe の終了コードは 0=識別ルールあり / 1=候補なし / 2=使い方・入力エラー / 3=ブリーフのみ。書き出した rules.json は v1 パーサで読み戻せることを生成時に保証 | probe/{bundle.rs, bin}、docs/ippai-integration.md | 実装済み未検証 |
+| I13 | 通しシナリオ（本 Phase の最終ゲート）: エミッタで作った 2 Trace（ハンドル再番号付け＋片側だけ ReadFile 失敗）→ 両側とも適合 → compare が ReturnDifference（High）を検出 → バンドル生成 → バンドル内ルールが左 pass / 右 fail を再現、トリム済みペアでも候補が再現し適合性も維持。副シナリオ: 再番号付けのみのペアは候補ゼロ、CloseHandle 欠落は MissingCall バンドル化、Payload のみの差分はブリーフのみ | probe/tests/scenario.rs | 実装済み未検証 |
+| I14 | 契約ドキュメント docs/ippai-integration.md: 境界（ippai/sake のコードは本 repo に無いこと、統合は ippai 側の作業であること）を冒頭に明記し、エミッタ契約 C1〜C10（チェッカの検査 ID と対応）、共有 API セットの同一性（content_hash）と追加規則（末尾追加のみ）、バンドル形式、Probe 生成の仕組みと限界、ippai 側に残る作業 4 件を定義 | docs/ippai-integration.md | 実装済み未検証 |
+| I15 | 解析系への追加と CI 配線: 新規 3 クレート（emit / conformance / probe）はいずれも OS 非依存で、windows-check-targets（x86_64 / i686）に matrix.json の最小変更で追加。既存クレートの公開 API は不変更 | Cargo.toml、scripts/ci/matrix.json | 実装済み未検証 |
+
 ## 集計
 
-- 全項目数: A 75 + B 9 + C 19 + D 77 + E 5 = **185 項目**（固定。追加したらここを更新する）
+- 全項目数: A 75 + B 9 + C 19 + D 77 + E 5 + F 16 + G 14 + H 13 + I 15 = **243 項目**（固定。追加したらここを更新する）
   - 2026-11-09 01:39 に A61〜A65 を追加し、分母が 135→140 に増えた。理由: 仕様再読でチェックリストの漏れ（空き待ちフェンス、セクション ACL、総メモリ上限、Finalization 不在の扱い、待機方式のベンチマーク選定）を発見したため。
   - 2026-11-09 02:52 に A66〜A68 を追加し、分母が 140→143 に増えた。理由: A61 の配線がライブラリ単位に留まっていたこと（A66）、ベンチ選定の結果を書き手が使う手段が無かったこと（A67）、Agent への space_available 受け渡しが未設計だったこと（A68）。
   - 2026-11-09 に D43〜D52 を追加し、分母が 143→153 に増えた。理由: ユーザーから「テストが全然足らない」との指摘を受け、カバレッジ・境界・PBT・loom・Kani・Miri・ミューテーション・Fuzz・E2E・Stress の各手法の増強を個別項目として追跡するため。いずれもローカルでは実施・通過済みだが、CI 未実施のため状態は「実装済み未検証」とする。
@@ -239,6 +319,11 @@
   - 2026-11-09 11:29 に A74・A75 を追加し、分母が 179→181 に増えた。理由: 仕様再読で見つけた漏れ（A74: i686 の 64bit アトミック操作コスト測定と 32bit 折り返しカウンタへの切替判断、A75: VirtualAlloc2 二重マッピング最適化の将来検討。いずれも spec の条件・将来条項で、チェックリストに項目が無かった）。なお同 run で候補とした「64 スレッド同時書き込み」は C02 として既にあり、spec_table.rs の c02_64_threads テストが実在するため項目追加は見送った。
   - 2026-11-09 に A70 を実装し、未着手が 8→7 項目に減った（残りは D41、A74、A75、D53〜D56）。transport に ExpansionRequest / ExpansionDelivery と受け渡しトレイト、SlotPool::add_slot（追加 Slot は generation 0・FREE、上限超過時は追加しない）を追加。agent に ExpansionManager（管理スレッド: 要求フラグの消費・Host への要求・配送の登録。進行中 1 件の間は新規要求を出さない。Host 停止時は要求を破棄）、host に ExpansionService（非同期に SharedMapping を作成して配送。target_pid 付き要求には duplicate したハンドル値を配送）を追加。テストは新規 19 件（transport 4 + agent 9 + host サービス 4 + 往復 E2E 2）で、ローカル総数は 1530→1549 件。分母は 181 のまま変わらない。
   - 2026-11-09 に中間レビュー第2回 (対象は remote main 6005c4c、静的レビューのみ) の未対応デルタとして D74〜D77 を追加し、分母が 181→185 に増えた。D74 (Clock 責務分離)、D75 (TLA+ の Reclaim 段階分割と旧順序変種での違反検出)、D76 (RingReader::drain の多層防御) は回帰テスト先行で実装し、ローカルテスト総数は 1549→1559 件。D77 (Windows 実プロセス間での本番経路 E2E) は既存の D35/D72/A68 と重複しない組み合わせとして新規登録し、CI 依存のため未着手。いずれも CI 未実施のため、D74〜D76 は「実装済み未検証」。
+  - 2026-11-09 に Phase 2（Trace 永続化）の F01〜F16 を追加し、分母が 185→201 に増えた。理由: スコープ拡大（Phase 2）で公開 Trace 形式 v1 の確定・実装・回復意味論・Host 変換（A72）・fuzz 2 件・Windows ターゲット check を項目として追跡するため。いずれもローカル通過済みだが CI 未実施のため「実装済み未検証」。ローカルテスト総数は 1559→1637 件。なお F10 のとおり、blake3 の依存判断で前任の実測記録（既定で Windows check 通過）が誤っていたため pure フィーチャで是正した。
+  - 2026-11-09 に Phase 3（フック＋レコーダ）の G01〜G14 を追加し、分母が 201→215 に増えた。理由: スコープ拡大（Phase 3）で「実際に記録できる」最低線（IAT フック、Agent DLL、Capture Session、Windows E2E）を項目として追跡するため。プラットフォーム非依存部（API 表・キャプチャ・PE・計画・セッション中核）はローカル通過済み、Windows 実動部（エンジン実フック・DLL 注入・起動ドライバ・E2E）は CI 未実施のため、いずれも「実装済み未検証」。ローカルテスト総数は 1637→1673 件。
+  - 2026-11-09 に Phase 4（解析 CLI＋差分エンジン＋shirusu-test 基礎）の H01〜H13 を追加し、分母が 215→228 に増えた。理由: スコープ拡大（Phase 4）とレビュー第3回で採用した設計指針（shirusu-compare は正規化つき差分エンジンとし、出すのは契約違反の「候補」まで）を項目として追跡するため。新規 4 クレート（analysis / cli / compare / test）は全てローカル通過済み（テスト総数 1673→1713 件、Windows ターゲット check は x86_64 / i686 とも通過）だが CI 未実施のため「実装済み未検証」。
+  - 2026-11-09 に Phase 5（ippai 連携の shirusu 側基盤）の I01〜I15 を追加し、分母が 228→243 に増えた。理由: レビュー第3回で新設した Phase 5（sake 側 Trace エミッタ、差分の最小 Probe 化、ippai 回帰テストへの取り込み支援）のうち、shirusu 側で用意できる基盤（エミッタキット、適合性チェッカ、バンドル生成）と契約ドキュメントを項目として追跡するため。ippai / sake のコードは本 repo に無く、統合は ippai 側の残作業として契約文書に切り分けた。新規 3 クレート（emit / conformance / probe）はローカル通過済み（テスト総数は最終ゲートで確定し README に記録、Windows ターゲット check は x86_64 / i686 とも通過）だが CI 未実施のため「実装済み未検証」。
+  - 2026-11-09 に転送層の残項目ワークストリームとして A74・A75・D53〜D56・D77 を実施し、未着手が 8→1 項目（残りは D41 のみ）になった。分母は 243 のまま変わらない。A74: 測定ハーネス shirusu-atomic-bench と CI 配線（i686 実測は CI 待ち、x86_64 参考値は全項目比率 0.90〜1.00）。A75: 検討記録を作成し条件付き保留と結論。D53: 証跡形式＋決定的再実行器＋DST の TestRunner 化と失敗時保存、縮小回帰ケース 2 件、loom 旧順序の should_panic 回帰化（loom 14 件）。D54: windows.ps1 に AppVerifier 併用を配線。D55: windows-2022 ジョブを追加。D56: 参照モデルの監査と usage_percent 依存の切り離し、mutation 実証スクリプト（nightly 配線、ローカルで両 mutation 検出を確認）。D77: production_path_interprocess シナリオを追加（x64 同士は --all、x64×i686 は windows-x86.ps1）。いずれも CI 未実施のため「実装済み未検証」。ローカルテスト総数は最終ゲートで確定し README に記録。
 - 検証済み: 0 項目（2026-11-09 時点。ローカル通過のみの項目は検証済みに数えない）
-- 実装済み未検証: 177 項目 / 未着手: 8 項目（D41 CI フィードバックループ、A74、A75、D53〜D56、D77）
-- 進捗率: 検証済み 0 / 185 = 0%。作業量ベースの自己申告は約 3%（仕様読解等の前段を含む）。
+- 実装済み未検証: 242 項目 / 未着手: 1 項目（D41 CI フィードバックループ）
+- 進捗率: 検証済み 0 / 243 = 0%。作業量ベースの自己申告は約 3%（仕様読解等の前段を含む）。

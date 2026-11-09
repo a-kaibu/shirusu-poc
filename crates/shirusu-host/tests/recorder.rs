@@ -1,0 +1,354 @@
+//! Capture Session（recorder）の中核テスト。
+//!
+//! 実 Agent（同一プロセス）→ セッション回収 → Trace 読み戻しまでを通し、
+//! 状態機械・異常系（共有メモリ破損、終了不明）・未初期化 Ring の扱いを固める。
+//! Windows のプロセス間経路は recorder_launch と CI が担う。
+
+use shirusu_agent::{Agent, RecordResult};
+use shirusu_hook::api::{api_by_id, API_CLOSE_HANDLE, API_CREATE_FILE_W, API_WRITE_FILE};
+use shirusu_hook::capture::{self, MapMemory};
+use shirusu_host::recorder::{
+    CaptureSession, CaptureSessionConfig, RingSpec, SessionError, SessionState,
+};
+use shirusu_host::IntegrityLevel;
+use shirusu_trace::compact::decode_values;
+use shirusu_trace::proto::{loss_kind, CaptureEnvironment, SessionMetadata};
+use shirusu_trace::schema::TypedValue;
+use shirusu_transport::context::HostMonitor;
+use shirusu_transport::layout;
+use shirusu_transport::ring::{SharedRegion, WriterPolicy};
+use shirusu_transport::slot::SlotPool;
+use shirusu_transport::RingConfig;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+const SESSION: u64 = 99;
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temp_trace(tag: &str) -> std::path::PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "shirusu-recorder-{tag}-{}-{n}.trace",
+        std::process::id()
+    ))
+}
+
+fn config() -> CaptureSessionConfig {
+    CaptureSessionConfig {
+        session_id: SESSION,
+        ring_config: RingConfig::new(64, 4096),
+        environment: CaptureEnvironment {
+            session: SessionMetadata {
+                session_id: SESSION,
+                created_by: "shirusu-host test (recorder)".into(),
+                qpc_frequency: 10_000_000,
+            },
+            ..Default::default()
+        },
+        qpc_frequency: 10_000_000,
+    }
+}
+
+fn agent_and_region(tid: u64) -> (Arc<Agent>, u64, *mut u8) {
+    let cfg = RingConfig::new(64, 4096);
+    let pool = Arc::new(SlotPool::new(2));
+    let agent = Arc::new(
+        Agent::new(pool, cfg, Arc::new(HostMonitor::always_alive())).with_policy(WriterPolicy {
+            max_wait: std::time::Duration::ZERO,
+            ..Default::default()
+        }),
+    );
+    let handle = agent.thread_begin(tid).expect("slot");
+    let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+    (agent, handle.generation, base)
+}
+
+fn spec(generation: u64) -> RingSpec {
+    RingSpec {
+        process_id: 1,
+        raw_pid: 1234,
+        thread_id: 1,
+        expected_generation: generation,
+    }
+}
+
+/// フック Detour が作るのと同じ形の Payload で 3 API 分を記録する。
+fn record_file_io(agent: &Agent, tid: u64) {
+    let cf = api_by_id(API_CREATE_FILE_W).unwrap();
+    let wf = api_by_id(API_WRITE_FILE).unwrap();
+    let ch = api_by_id(API_CLOSE_HANDLE).unwrap();
+    let mut mem = MapMemory::new();
+    let units: Vec<u16> = "C:\\game\\save.dat".encode_utf16().chain([0]).collect();
+    mem.write_u16s(0x1000, &units);
+    mem.write(0x2000, b"hello-save");
+    let enter = capture::create_file_w_enter(&mem, 0x1000, 0xC000_0000, 0, 0, 2, 0x80, 0);
+    let payload = capture::encode_enter(cf, &enter).unwrap();
+    assert!(matches!(
+        agent.record_enter(tid, cf.api_id, cf.enter_schema_id(), 1, 0, &payload),
+        RecordResult::Written(_)
+    ));
+    let leave = capture::create_file_w_leave(0x2A4, 0);
+    let payload = capture::encode_leave(cf, &leave).unwrap();
+    agent.record_leave(tid, cf.api_id, cf.leave_schema_id(), 1, 0, &payload);
+    let enter = capture::write_file_enter(&mem, 0x2A4, 0x2000, 10);
+    let payload = capture::encode_enter(wf, &enter).unwrap();
+    agent.record_enter(tid, wf.api_id, wf.enter_schema_id(), 2, 0, &payload);
+    let leave = capture::write_file_leave(&mem, 1, 0, false, 0);
+    let payload = capture::encode_leave(wf, &leave).unwrap();
+    agent.record_leave(tid, wf.api_id, wf.leave_schema_id(), 2, 0, &payload);
+    let enter = capture::close_handle_enter(0x2A4);
+    let payload = capture::encode_enter(ch, &enter).unwrap();
+    agent.record_enter(tid, ch.api_id, ch.enter_schema_id(), 3, 0, &payload);
+    let leave = capture::close_handle_leave(1, 0);
+    let payload = capture::encode_leave(ch, &leave).unwrap();
+    agent.record_leave(tid, ch.api_id, ch.leave_schema_id(), 3, 0, &payload);
+}
+
+#[test]
+fn full_capture_in_process_produces_decodable_trace() {
+    let path = temp_trace("full");
+    let (agent, generation, base) = agent_and_region(11);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(
+                base,
+                RingConfig::new(64, 4096).required_len(),
+                spec(generation),
+            )
+            .unwrap();
+    }
+    session.start().unwrap();
+    record_file_io(&agent, 11);
+    let stats = session.poll_once().unwrap();
+    assert_eq!(stats.events, 6);
+    assert_eq!(stats.active_rings, 1);
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.total_events, 6);
+    assert_eq!(summary.rings_active, 1);
+    assert_eq!(summary.rings_stopped, 0);
+    assert_eq!(summary.args_attached, 6);
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.finalization.is_some());
+    let events: Vec<_> = trace.batches.iter().flat_map(|b| &b.events).collect();
+    assert_eq!(events.len(), 6);
+    // CreateFileW のパスが L2 で復元できる
+    let types = trace.registry.types(events[0].schema_id).unwrap();
+    let values = decode_values(&types, events[0].args.as_ref().unwrap()).unwrap();
+    match &values[0].value {
+        TypedValue::Str16(u) => assert_eq!(String::from_utf16_lossy(u), "C:\\game\\save.dat"),
+        other => panic!("path: {other:?}"),
+    }
+    // WriteFile の入力バッファ内容が復元できる
+    let types = trace.registry.types(events[2].schema_id).unwrap();
+    let values = decode_values(&types, events[2].args.as_ref().unwrap()).unwrap();
+    assert_eq!(values[1].value, TypedValue::Bytes(b"hello-save".to_vec()));
+    // CloseHandle の対象が CreateFileW の戻りハンドルと一致する（相関）
+    let types = trace.registry.types(events[4].schema_id).unwrap();
+    let values = decode_values(&types, events[4].args.as_ref().unwrap()).unwrap();
+    assert_eq!(values[0].value, TypedValue::U64(0x2A4));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn uninitialized_ring_is_pending_not_an_error() {
+    let path = temp_trace("pending");
+    let cfg = RingConfig::new(64, 4096);
+    // Agent が初期化していない（Magic が無い）領域
+    let region = SharedRegion::new(cfg, 0, 0);
+    // SharedRegion::new は Control を初期化してしまうので、Magic を消して
+    // 「まだ Agent が claim していない」状態を作る。
+    unsafe {
+        let p = region.base().add(layout::OFF_MAGIC) as *mut u64;
+        p.write_unaligned(0);
+    }
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(region.base(), cfg.required_len(), spec(0))
+            .unwrap();
+    }
+    session.start().unwrap();
+    let stats = session.poll_once().unwrap();
+    assert_eq!(stats.events, 0);
+    assert_eq!(stats.pending_rings, 1);
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.rings_never_initialized, 1);
+    assert_eq!(summary.total_events, 0);
+    let bytes = std::fs::read(&path).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.finalization.is_some(), "empty trace still finalizes");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn corrupted_ring_stops_and_marks_integrity_lost() {
+    let path = temp_trace("corrupt");
+    let (agent, generation, base) = agent_and_region(11);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(
+                base,
+                RingConfig::new(64, 4096).required_len(),
+                spec(generation),
+            )
+            .unwrap();
+    }
+    session.start().unwrap();
+    record_file_io(&agent, 11);
+    assert_eq!(session.poll_once().unwrap().events, 6);
+    // 共有メモリの破損を注入： write cursor をあり得ない値にする
+    unsafe {
+        let p = base.add(layout::OFF_WRITE_CURSOR) as *mut u64;
+        p.write_unaligned(u64::MAX - 3);
+    }
+    let stats = session.poll_once().unwrap();
+    assert_eq!(stats.stopped_rings, 1);
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.rings_stopped, 1);
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Lost);
+    // 破損前に回収した 6 件は Trace に残る
+    assert_eq!(summary.total_events, 6);
+    let bytes = std::fs::read(&path).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let n: usize = trace.batches.iter().map(|b| b.events.len()).sum();
+    assert_eq!(n, 6);
+    assert!(trace
+        .loss_records
+        .iter()
+        .any(|l| l.kind == loss_kind::INTEGRITY_LOST));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn unterminated_call_becomes_loss_record() {
+    let path = temp_trace("unterminated");
+    let (agent, generation, base) = agent_and_region(11);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(
+                base,
+                RingConfig::new(64, 4096).required_len(),
+                spec(generation),
+            )
+            .unwrap();
+    }
+    session.start().unwrap();
+    // Enter だけ記録して対象が死んだ状況（Leave が来ない）
+    let cf = api_by_id(API_CREATE_FILE_W).unwrap();
+    let mut mem = MapMemory::new();
+    let units: Vec<u16> = "X:\\a.bin".encode_utf16().chain([0]).collect();
+    mem.write_u16s(0x1000, &units);
+    let enter = capture::create_file_w_enter(&mem, 0x1000, 0, 0, 0, 1, 0, 0);
+    let payload = capture::encode_enter(cf, &enter).unwrap();
+    agent.record_enter(11, cf.api_id, cf.enter_schema_id(), 77, 0, &payload);
+    session.poll_once().unwrap();
+    let summary = session.stop().unwrap();
+    assert!(summary.total_loss_records >= 1);
+    let bytes = std::fs::read(&path).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace
+        .loss_records
+        .iter()
+        .any(|l| { l.kind == loss_kind::UNKNOWN_TERMINATION && l.call_id == 77 }));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn state_machine_rejects_illegal_operations() {
+    let path = temp_trace("sm");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    // 開始前の poll は不可
+    assert!(matches!(
+        session.poll_once(),
+        Err(SessionError::InvalidTransition { .. })
+    ));
+    session.start().unwrap();
+    // 二重 start は不可
+    assert!(matches!(
+        session.start(),
+        Err(SessionError::InvalidTransition { .. })
+    ));
+    // 開始後の Ring 追加は不可
+    let region = SharedRegion::new(RingConfig::new(64, 4096), 1, 0);
+    assert!(matches!(
+        session.add_local_ring(region, spec(1)),
+        Err(SessionError::InvalidTransition { .. })
+    ));
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.total_events, 0);
+    let _ = std::fs::remove_file(&path);
+
+    // 未開始のまま stop しても空の Trace が確定する
+    let path2 = temp_trace("sm2");
+    let session2 = CaptureSession::create_file(&path2, config()).unwrap();
+    assert_eq!(session2.state(), SessionState::Created);
+    let summary = session2.stop().unwrap();
+    assert_eq!(summary.total_events, 0);
+    let _ = std::fs::remove_file(&path2);
+}
+
+#[test]
+fn session_id_mismatch_is_config_error() {
+    let path = temp_trace("cfg");
+    let mut cfg = config();
+    cfg.session_id = SESSION + 1;
+    assert!(matches!(
+        CaptureSession::create_file(&path, cfg),
+        Err(SessionError::Config(_))
+    ));
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---- 状態機械の PBT： ランダムな操作列で不変条件が壊れないこと ----
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Op {
+    Start,
+    Poll,
+    AddRing,
+}
+
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+    #[test]
+    fn random_ops_respect_state_machine(
+        ops in prop::collection::vec(
+            prop_oneof![Just(Op::Start), Just(Op::Poll), Just(Op::AddRing)],
+            0..24,
+        )
+    ) {
+        let path = temp_trace("pbt");
+        let cfg = RingConfig::new(64, 4096); // セッション設定と一致させる
+        let mut session = CaptureSession::create_file(&path, config()).unwrap();
+        let mut started = false;
+        for op in ops {
+            match op {
+                Op::Start => {
+                    let r = session.start();
+                    prop_assert_eq!(r.is_ok(), !started);
+                    started = true;
+                }
+                Op::Poll => {
+                    let r = session.poll_once();
+                    prop_assert_eq!(r.is_ok(), started);
+                }
+                Op::AddRing => {
+                    let region = SharedRegion::new(cfg, 1, 0);
+                    let r = session.add_local_ring(region, spec(1));
+                    prop_assert_eq!(r.is_ok(), !started);
+                }
+            }
+        }
+        let summary = session.stop().unwrap();
+        prop_assert_eq!(summary.total_events, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+}

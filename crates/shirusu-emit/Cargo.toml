@@ -1,0 +1,14 @@
+[package]
+name = "shirusu-emit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "shirusu 外部レコーダ向けエミッタキット: 公開 Trace 仕様に適合した Trace を shirusu 本体以外の実装（sake 等）から出力するための高水準 API"
+
+[dependencies]
+shirusu-trace = { path = "../shirusu-trace" }
+
+[dev-dependencies]
+shirusu-analysis = { path = "../shirusu-analysis" }
+shirusu-hook = { path = "../shirusu-hook" }

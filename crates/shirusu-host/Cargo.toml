@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 [dependencies]
+shirusu-hook = { path = "../shirusu-hook" }
+shirusu-trace = { path = "../shirusu-trace" }
 shirusu-transport = { path = "../shirusu-transport" }
 shirusu-transport-win = { path = "../shirusu-transport-win" }
 [dev-dependencies]

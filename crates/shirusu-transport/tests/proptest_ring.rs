@@ -1,6 +1,8 @@
 //! PBT: VecDeque 参照モデル比較、Overflow 不変条件、Fragment、Slot 再利用、
-//! 故障操作を混ぜた DST-in-PBT。失敗時は proptest が Seed と縮小ケースを
-//! `proptest-regressions/` に保存する（方針は docs/traceability.md と README 参照）。
+//! 故障操作を混ぜた DST-in-PBT。失敗時の扱いは D53 の分担に従う: マクロ版
+//! PBT は proptest が Seed と縮小ケースを `*.proptest-regressions` に保存し、
+//! DST は TestRunner 版が証跡 JSON (リビジョン・構成・操作列・注入故障) を
+//! 保存する (tests/failure_evidence.rs と tests/common/evidence.rs)。
 
 use proptest::prelude::*;
 use shirusu_transport::clock::ManualClock;
@@ -207,82 +209,132 @@ proptest! {
     }
 }
 
-#[derive(Debug, Clone)]
-enum DstOp {
-    Write(u8),
-    Drain,
-    AdvanceClock,
-    HostStop,
-    HostResume,
-    DropNotification,
-    ThreadEnd,
+// DST は証跡保存 (D53) のため TestRunner で回す。操作の型と証跡の形式は
+// common/evidence.rs を failure_evidence.rs と共有する。
+#[path = "common/evidence.rs"]
+#[allow(dead_code)]
+mod evidence;
+use evidence::DstOp;
+use proptest::test_runner::{TestCaseError, TestError, TestRunner};
+
+fn dst_strategy() -> impl Strategy<Value = Vec<DstOp>> {
+    prop::collection::vec(
+        (0u8..8).prop_map(|k| match k {
+            0 => DstOp::Write(4),
+            1 => DstOp::Write(40),
+            2 => DstOp::Drain,
+            3 => DstOp::AdvanceClock,
+            4 => DstOp::HostStop,
+            5 => DstOp::HostResume,
+            6 => DstOp::ThreadEnd,
+            _ => DstOp::DropNotification,
+        }),
+        0..80,
+    )
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: pbt_cases(512), ..ProptestConfig::default() })]
-
-    /// DST-in-PBT: 故障操作 (仮想時計進行・Host 停止再開・通知欠落・スレッド終了) を
-    /// 混ぜても、公開済みイベントの順序と欠落の整合が壊れない。
-    #[test]
-    fn dst_fault_mix_invariants(
-        ops in prop::collection::vec(
-            (0u8..8).prop_map(|k| match k {
-                0 => DstOp::Write(4),
-                1 => DstOp::Write(40),
-                2 => DstOp::Drain,
-                3 => DstOp::AdvanceClock,
-                4 => DstOp::HostStop,
-                5 => DstOp::HostResume,
-                6 => DstOp::ThreadEnd,
-                _ => DstOp::DropNotification,
-            }),
-            0..80)
-    ) {
-        use shirusu_transport::context::HostMonitor;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let alive = Arc::new(AtomicBool::new(true));
-        let alive2 = alive.clone();
-        let monitor = HostMonitor::new(move || alive2.load(Ordering::Relaxed));
-        let clock = Arc::new(ManualClock::new());
-        let (_rg, mut w, mut rd) = {
-            let cfg = RingConfig::new(8, 256);
-            let region = SharedRegion::new(cfg, 1, 1);
-            let wc: Arc<dyn Clock> = clock.clone();
-            let w = unsafe { region.writer(WriterPolicy { max_wait: Duration::from_millis(1), ..Default::default() }, wc) };
-            let r = unsafe { region.reader() };
-            (region, w, r)
+/// DST-in-PBT の 1 ケース。proptest_ring.rs の旧マクロ版と意味論は同一。
+fn run_dst_case(ops: &[DstOp]) -> Result<(), TestCaseError> {
+    use shirusu_transport::context::HostMonitor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let alive = Arc::new(AtomicBool::new(true));
+    let alive2 = alive.clone();
+    let monitor = HostMonitor::new(move || alive2.load(Ordering::Relaxed));
+    let clock = Arc::new(ManualClock::new());
+    let (_rg, mut w, mut rd) = {
+        let cfg = RingConfig::new(8, 256);
+        let region = SharedRegion::new(cfg, 1, 1);
+        let wc: Arc<dyn Clock> = clock.clone();
+        let w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: Duration::from_millis(1),
+                    ..Default::default()
+                },
+                wc,
+            )
         };
-        let mut call = 0u64;
-        let mut last_seq = 0u64;
-        let mut thread_ended = false;
-        for op in &ops {
-            match op {
-                DstOp::Write(n) => {
-                    if thread_ended { continue; }
-                    call += 1;
-                    let payload = vec![7u8; *n as usize];
-                    if monitor.recording_enabled() {
-                        w.write(input(&payload, call));
-                    }
+        let r = unsafe { region.reader() };
+        (region, w, r)
+    };
+    let mut call = 0u64;
+    let mut last_seq = 0u64;
+    let mut thread_ended = false;
+    for op in ops {
+        match op {
+            DstOp::Write(n) => {
+                if thread_ended {
+                    continue;
                 }
-                DstOp::Drain => {
-                    for e in rd.drain_all().events {
-                        prop_assert!(e.descriptor.sequence > last_seq);
-                        last_seq = e.descriptor.sequence;
-                    }
+                call += 1;
+                let payload = vec![7u8; *n as usize];
+                if monitor.recording_enabled() {
+                    w.write(input(&payload, call));
                 }
-                DstOp::AdvanceClock => clock.advance(Duration::from_millis(3)),
-                DstOp::HostStop => { alive.store(false, Ordering::Relaxed); monitor.check_on_abnormal_path(); }
-                DstOp::HostResume => { alive.store(true, Ordering::Relaxed); /* 再接続は初版対象外: recording は戻らない */ }
-                DstOp::DropNotification => { /* 通知を落としても drain は watermark と独立 */ }
-                DstOp::ThreadEnd => { thread_ended = true; }
+            }
+            DstOp::Drain => {
+                for e in rd.drain_all().events {
+                    prop_assert!(e.descriptor.sequence > last_seq);
+                    last_seq = e.descriptor.sequence;
+                }
+            }
+            DstOp::AdvanceClock => clock.advance(Duration::from_millis(3)),
+            DstOp::HostStop => {
+                alive.store(false, Ordering::Relaxed);
+                monitor.check_on_abnormal_path();
+            }
+            DstOp::HostResume => {
+                alive.store(true, Ordering::Relaxed);
+                // 再接続は初版対象外: recording は戻らない
+            }
+            DstOp::DropNotification => {
+                // 通知を落としても drain は watermark と独立
+            }
+            DstOp::ThreadEnd => {
+                thread_ended = true;
             }
         }
-        // スレッド終了後も Host は残りを回収できる
-        for e in rd.drain_all().events {
-            prop_assert!(e.descriptor.sequence > last_seq);
-            last_seq = e.descriptor.sequence;
+    }
+    // スレッド終了後も Host は残りを回収できる
+    for e in rd.drain_all().events {
+        prop_assert!(e.descriptor.sequence > last_seq);
+        last_seq = e.descriptor.sequence;
+    }
+    let _ = call;
+    Ok(())
+}
+
+/// DST-in-PBT: 故障操作 (仮想時計進行・Host 停止再開・通知欠落・スレッド終了) を
+/// 混ぜても、公開済みイベントの順序と欠落の整合が壊れない。
+/// 失敗時は証跡 (リビジョン・構成・操作列・注入故障) を JSON で保存する
+/// (D53)。縮小と Seed の保存は proptest の regressions が担い、証跡側は
+/// 失敗ケースの値そのものを持つため、再実行器 (failure_evidence.rs の
+/// replay_dst) でそのまま再生できる。
+#[test]
+fn dst_fault_mix_invariants() {
+    let cases = pbt_cases(512);
+    let mut config = ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
+    };
+    config.failure_persistence = None; // 証跡 JSON が正。再現は操作列から行う
+    let mut runner = TestRunner::new(config);
+    let result = runner.run(&dst_strategy(), |ops| run_dst_case(&ops));
+    if let Err(err) = result {
+        if let TestError::Fail(_, ops) = &err {
+            let ev = evidence::FailureEvidence {
+                test: "dst_fault_mix_invariants".to_string(),
+                revision: evidence::current_revision(),
+                seed_reference: "none (TestRunner); ops in this file are the source of truth"
+                    .to_string(),
+                config: format!("cases={cases} desc=8 payload=256 max_wait_ms=1"),
+                ops: ops.clone(),
+            };
+            match evidence::save_evidence(&evidence::evidence_dir(), &ev) {
+                Ok(path) => eprintln!("D53: failure evidence saved to {}", path.display()),
+                Err(e) => eprintln!("D53: failed to save failure evidence: {e}"),
+            }
         }
-        let _ = call;
+        panic!("dst_fault_mix_invariants failed: {err:?}");
     }
 }
