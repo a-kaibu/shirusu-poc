@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "実行するスイート"
+        type: choice
+        options: [ci, nightly, weekly, all]
+        default: ci
+        required: true
+  schedule:
+    - cron: "17 3 * * *" # nightly
+    - cron: "23 4 * * 0" # weekly（日曜: nightly + 長時間 fuzz）
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          INPUT_SUITE: ${{ inputs.suite }}
+        run: |
+          if [ -f scripts/ci/plan.sh ]; then
+            bash scripts/ci/plan.sh
+          else
+            echo "scripts/ci/plan.sh not found; using built-in fallback matrix" >&2
+            jq -cn '{include: [
+              {name:"linux", os:"ubuntu-latest", toolchain:"stable", targets:"", components:"rustfmt, clippy", java:false, shell:"bash", run:"bash scripts/ci/linux.sh", allow_failure:false, timeout:30},
+              {name:"windows-x64", os:"windows-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc", components:"", java:false, shell:"pwsh", run:"./scripts/ci/windows.ps1", allow_failure:false, timeout:60},
+              {name:"windows-x86-wow64", os:"windows-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc, i686-pc-windows-msvc", components:"", java:false, shell:"pwsh", run:"./scripts/ci/windows-x86.ps1", allow_failure:false, timeout:60},
+              {name:"windows-check-targets", os:"ubuntu-latest", toolchain:"stable", targets:"x86_64-pc-windows-msvc, i686-pc-windows-msvc", components:"", java:false, shell:"bash", run:"cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host --target i686-pc-windows-msvc", allow_failure:false, timeout:30},
+              {name:"macos-validation", os:"macos-latest", toolchain:"stable", targets:"", components:"", java:false, shell:"bash", run:"cargo test -p shirusu-transport", allow_failure:false, timeout:30},
+              {name:"tla", os:"ubuntu-latest", toolchain:"stable", targets:"", components:"", java:true, shell:"bash", run:"bash scripts/ci/tla.sh", allow_failure:false, timeout:30}
+            ]}' > /tmp/matrix.json
+            echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+  run:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.targets }}
+          components: ${{ matrix.components }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: ${{ matrix.name }}
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.run }}
+
+  done:
+    name: done
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: check matrix result
+        run: |
+          result="${{ needs.run.result }}"
+          echo "matrix result: $result"
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            exit 1
+          fi
