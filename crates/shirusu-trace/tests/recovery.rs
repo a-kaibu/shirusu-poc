@@ -320,6 +320,64 @@ fn duplicate_blob_id_is_reported_first_wins() {
 }
 
 #[test]
+fn blob_with_mismatched_hash_is_rejected_even_with_valid_crc() {
+    // レビュー #4 の #5: Blob の内容だけを書き換え、Block の CRC32C を
+    // 再計算して整合させた入力。CRC は通るが、内容の BLAKE3 が ID と
+    // 一致しないため、Reader はその Blob を取り込んではいけない。
+    let (bytes, id) = base_trace();
+    let layout = block_layout(&bytes);
+    let (blob_off, _, blob_len) = layout
+        .iter()
+        .find(|(_, t, _)| *t == BlockType::BlobChunk)
+        .copied()
+        .unwrap();
+    let raw_header = parse_raw_header(&bytes[blob_off..]).unwrap();
+    let header = BlockHeader {
+        block_type: BlockType::BlobChunk,
+        compression: Compression::from_code(raw_header.compression_code).unwrap(),
+        sequence: raw_header.sequence,
+        stored_len: raw_header.stored_len,
+        raw_len: raw_header.raw_len,
+    };
+    let stored = &bytes[blob_off + 32..blob_off + 32 + blob_len];
+    let mut payload = shirusu_trace::container::decode_payload(&header, stored).unwrap();
+    // Blob エントリ: [ID 32][len 4][body]。body の 1 バイトだけ変える。
+    assert_eq!(&payload[..32], id.as_bytes());
+    payload[36] ^= 0xFF;
+    let tampered_body: Vec<u8> = payload[36..].to_vec();
+    let computed = BlobId::of_content(&tampered_body);
+    assert_ne!(computed, id);
+    // CRC は serialize_header が新しい payload で再計算する (整合する)。
+    let new_header = BlockHeader {
+        block_type: BlockType::BlobChunk,
+        compression: Compression::None,
+        sequence: raw_header.sequence,
+        stored_len: payload.len() as u32,
+        raw_len: payload.len() as u32,
+    };
+    let mut replaced = bytes[..blob_off].to_vec();
+    replaced.extend_from_slice(&serialize_header(&new_header, &payload));
+    replaced.extend_from_slice(&payload);
+    replaced.extend_from_slice(&bytes[blob_off + 32 + blob_len..]);
+    let trace = read_trace(&replaced).unwrap();
+    assert!(
+        trace
+            .issues
+            .contains(&RecoveryIssue::BlobHashMismatch { id, computed }),
+        "issues: {:?}",
+        trace.issues
+    );
+    // 取り込まれず、参照は欠落として明示される。他の内容は無事。
+    assert!(!trace.blobs.contains_key(&id));
+    let ev = &trace.batches[0].events[0];
+    assert_eq!(
+        trace.resolve_payload(ev),
+        PayloadResolution::MissingBlob(id)
+    );
+    assert_eq!(trace.total_events(), 3);
+}
+
+#[test]
 fn missing_blob_is_explicit() {
     let (bytes, id) = base_trace();
     let layout = block_layout(&bytes);

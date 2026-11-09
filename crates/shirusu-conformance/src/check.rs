@@ -34,6 +34,10 @@
 //! - blob-refs-resolvable: Payload / BlobRef の参照先 Blob が
 //!   ファイル内に実在すること。解決できない参照は Payload 比較を
 //!   「不明」にする。
+//! - blob-ids-match-content: 各 Blob の内容の BLAKE3 が、その ID と
+//!   一致すること。Blob ID は内容ハッシュそのものが設計であり、
+//!   CRC32C はこの同一性を保証しない (レビュー #4 の #5)。Reader も
+//!   取り込み時に照合するが、適合性検査でも独立に照合する。
 //! - integrity-consistent: 完全性 3 指標の自己申告が記録内容と
 //!   矛盾しないこと（Complete を名乗りながら損失が記録されて
 //!   いる、等）。Capture Coverage の真偽は Trace の中からは
@@ -41,6 +45,7 @@
 //!   ため、範囲外であることを明記するに留める。
 
 use shirusu_analysis::{JsonValue, Phase, TraceView};
+use shirusu_trace::blob::BlobId;
 use shirusu_trace::model::PayloadRef;
 use shirusu_trace::proto::integrity_level;
 use shirusu_trace::reader::{ReadTrace, RecoveryIssue};
@@ -171,6 +176,7 @@ pub fn check_trace(trace: &ReadTrace) -> ConformanceReport {
             check_sequence_monotonic(trace),
             check_enter_leave_pairing(&view),
             check_blob_refs(trace, &view),
+            check_blob_hashes(trace),
             check_integrity_consistency(trace, &view),
         ],
     }
@@ -187,6 +193,9 @@ fn check_clean_scan(trace: &ReadTrace) -> CheckFinding {
             }
             RecoveryIssue::TruncatedTail { offset } => Some(format!("truncated tail at {offset}")),
             RecoveryIssue::DuplicateBlob { id: blob } => Some(format!("duplicate blob {blob}")),
+            RecoveryIssue::BlobHashMismatch { id: blob, .. } => {
+                Some(format!("blob {blob} content does not match its id"))
+            }
             RecoveryIssue::IndexMismatch => Some("stored index does not match scan".into()),
             RecoveryIssue::LimitExceeded { what } => Some(format!("reader limit exceeded: {what}")),
             RecoveryIssue::Resync { .. } | RecoveryIssue::MissingBlob { .. } => None,
@@ -489,6 +498,38 @@ fn check_blob_refs(trace: &ReadTrace, view: &TraceView) -> CheckFinding {
     }
 }
 
+fn check_blob_hashes(trace: &ReadTrace) -> CheckFinding {
+    let id = "blob-ids-match-content";
+    // Reader は取り込み時に照合するため、不一致の Blob は通常ここへ
+    // 残らない (BlobHashMismatch の issue と MissingBlob になる)。
+    // それでも、ReadTrace を直接構築する経路や Reader の将来変更に
+    // 備え、適合性検査でも内容と ID の同一性を独立に照合する。
+    let mut bad: Vec<String> = Vec::new();
+    for (blob_id, body) in &trace.blobs {
+        if BlobId::of_content(body) != *blob_id {
+            bad.push(blob_id.to_string());
+        }
+    }
+    if bad.is_empty() {
+        CheckFinding::pass(
+            id,
+            format!(
+                "every blob's content hashes to its id ({} blob(s))",
+                trace.blobs.len()
+            ),
+        )
+    } else {
+        CheckFinding::fail(
+            id,
+            format!(
+                "{} blob(s) whose content does not match their id: {}",
+                bad.len(),
+                bad.join(", ")
+            ),
+        )
+    }
+}
+
 fn check_integrity_consistency(trace: &ReadTrace, view: &TraceView) -> CheckFinding {
     let id = "integrity-consistent";
     let Some(fin) = &trace.finalization else {
@@ -639,6 +680,28 @@ mod tests {
         for f in &report.findings {
             assert_eq!(f.status, CheckStatus::Pass, "{}: {}", f.id, f.detail);
         }
+    }
+
+    #[test]
+    fn blob_hash_mismatch_fails_only_hash_check() {
+        // 内容と ID が食い違う Blob を直接構築した Trace (Reader を
+        // 経由しない経路の模擬)。blob-ids-match-content だけが落ち、
+        // 参照解決 (blob-refs-resolvable) は「在る」ため通る。
+        let mut t = valid_trace();
+        let claimed = BlobId::of_content(b"claimed content");
+        t.blobs.insert(claimed, b"different content".to_vec());
+        t.batches[0].events[0].payload = PayloadRef::Blob(claimed);
+        let report = check_trace(&t);
+        assert!(!report.conformant());
+        assert_eq!(status(&report, "blob-ids-match-content"), CheckStatus::Fail);
+        assert_eq!(status(&report, "blob-refs-resolvable"), CheckStatus::Pass);
+        // 正しい組なら通る。
+        let mut t = valid_trace();
+        let id = BlobId::of_content(b"real content");
+        t.blobs.insert(id, b"real content".to_vec());
+        t.batches[0].events[0].payload = PayloadRef::Blob(id);
+        let report = check_trace(&t);
+        assert_eq!(status(&report, "blob-ids-match-content"), CheckStatus::Pass);
     }
 
     #[test]

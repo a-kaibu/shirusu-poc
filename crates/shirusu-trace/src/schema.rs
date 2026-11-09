@@ -65,6 +65,60 @@ impl Ty {
     }
 }
 
+/// フィールド値の意味種別（FieldDef.flags の bit2..=4 に格納する）。
+///
+/// 型 (Ty) だけでは「64bit 整数が個数なのか、ハンドルなのか、
+/// アドレスなのか」は決まらない。正規化や比較が型だけで推定すると
+/// スカラーの変化を見落とすため (レビュー #4 の #7)、Schema が
+/// 意味を宣言し、利用側はそれに従う。bit0/bit1 は形式仕様で
+/// inout / 省略可能に予約済みのため、種別は bit2 から置く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueKind {
+    /// 未指定（種別ビットが 0）。意味情報を持たない旧来の Schema 用。
+    /// 利用側は型からの推定にフォールバックする（推定の限界は
+    /// 利用側の文書に明記される）。
+    Unspecified,
+    /// 純粋なスカラー（個数・時刻・カウンタ・真理値など）。値を
+    /// そのまま比較する。U64 でもポインタとして扱ってはいけない。
+    Scalar,
+    /// メモリアドレス。中身は環境依存のため比較せず、存在と
+    /// Null/Invalid の区別だけを見る。
+    Pointer,
+    /// オブジェクトへのハンドル。生成イベントとの相関で同一性を
+    /// 解決し、相関できなければポインタ級として扱う。
+    Handle,
+    /// このフィールドの値が新しいオブジェクトの生成である
+    /// （生成 API の戻り値など）。相関の起点になる。
+    CreatedObject,
+}
+
+/// ValueKind を格納するフラグビット範囲 (bit2..=4)。
+pub const VALUE_KIND_SHIFT: u32 = 2;
+pub const VALUE_KIND_MASK: u32 = 0b111 << VALUE_KIND_SHIFT;
+
+impl ValueKind {
+    pub fn from_flags(flags: u32) -> Self {
+        match (flags & VALUE_KIND_MASK) >> VALUE_KIND_SHIFT {
+            1 => Self::Scalar,
+            2 => Self::Pointer,
+            3 => Self::Handle,
+            4 => Self::CreatedObject,
+            _ => Self::Unspecified,
+        }
+    }
+    /// flags へ埋め込む値（他のビットは含まない）。
+    pub fn flags(self) -> u32 {
+        let v = match self {
+            Self::Unspecified => 0,
+            Self::Scalar => 1,
+            Self::Pointer => 2,
+            Self::Handle => 3,
+            Self::CreatedObject => 4,
+        };
+        v << VALUE_KIND_SHIFT
+    }
+}
+
 /// 型付き値。生ビット列を保持する方針（浮動小数点はビットで保持し、
 /// NaN ペイロードを失わない）に従い、F32/F64 はビット表現で持つ。
 #[derive(Debug, Clone, PartialEq)]
@@ -288,5 +342,50 @@ pub fn make_schema(schema_id: u32, name: &str, fields: Vec<(String, Ty, u32)>) -
         content_hash: schema_content_hash(name, &fields),
         fields,
         annotation: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_kind_flags_roundtrip() {
+        for kind in [
+            ValueKind::Unspecified,
+            ValueKind::Scalar,
+            ValueKind::Pointer,
+            ValueKind::Handle,
+            ValueKind::CreatedObject,
+        ] {
+            assert_eq!(ValueKind::from_flags(kind.flags()), kind);
+            // 種別は bit0/bit1 (形式仕様の予約) に触れない
+            assert_eq!(kind.flags() & 0b11, 0);
+            // 他のビットと合成しても読み戻せる
+            assert_eq!(ValueKind::from_flags(kind.flags() | 0b11), kind);
+        }
+        // 未知の種別値は Unspecified として読む (前方互換)
+        assert_eq!(
+            ValueKind::from_flags(7 << VALUE_KIND_SHIFT),
+            ValueKind::Unspecified
+        );
+        assert_eq!(ValueKind::from_flags(0), ValueKind::Unspecified);
+    }
+
+    #[test]
+    fn value_kind_changes_content_hash() {
+        // 意味が違う Schema は別物として判定される (flags は
+        // content_hash の入力に含まれる)。
+        let scalar = make_schema(
+            1,
+            "a!B/leave",
+            vec![("return".into(), Ty::U64, ValueKind::Scalar.flags())],
+        );
+        let created = make_schema(
+            1,
+            "a!B/leave",
+            vec![("return".into(), Ty::U64, ValueKind::CreatedObject.flags())],
+        );
+        assert_ne!(scalar.content_hash, created.content_hash);
     }
 }

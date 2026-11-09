@@ -125,8 +125,13 @@ fn sample_trace_bytes() -> Vec<u8> {
 }
 
 /// 一時ディレクトリに sample.trace を置き、その中でバイナリを起動する。
+/// ディレクトリは呼び出しごとに一意にする: テストスレッドが並行に
+/// 同じ sample.trace を書き換え合うと、読んでいる途中の CLI が
+/// 不完全な Trace を掴んで失敗する競合があった。
 fn run_cli(args: &[&str]) -> (String, String, bool) {
-    let dir = std::env::temp_dir().join(format!("shirusu-cli-test-{}", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("shirusu-cli-test-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("sample.trace"), sample_trace_bytes()).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_shirusu"))
@@ -141,6 +146,14 @@ fn run_cli(args: &[&str]) -> (String, String, bool) {
     )
 }
 
+/// 改行コードを LF へ寄せる。golden のチェックアウト (Windows の
+/// autocrlf) や実行環境の差で CRLF が混ざっても、内容の比較が改行
+/// だけで落ちないようにする (レビュー #4 の隠れ失敗 (a))。
+/// .gitattributes でも golden は eol=lf に固定してある。
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn check_golden(name: &str, actual: &str) {
     let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "golden", name]
         .iter()
@@ -152,9 +165,21 @@ fn check_golden(name: &str, actual: &str) {
     let expected =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("golden {name} unreadable: {e}"));
     assert_eq!(
-        actual, expected,
+        normalize_newlines(actual),
+        normalize_newlines(&expected),
         "golden mismatch for {name}; rerun with UPDATE_GOLDEN=1 to refresh"
     );
+}
+
+#[test]
+fn golden_compare_ignores_newline_style_only() {
+    // 改行コードの差は無視するが、内容の差は検出する (正規化で
+    // 比較自体が空転していないことの固定)。
+    assert_eq!(
+        normalize_newlines("a\r\nb\rc\n"),
+        normalize_newlines("a\nb\nc\n")
+    );
+    assert_ne!(normalize_newlines("a\r\nb"), normalize_newlines("a\nc"));
 }
 
 #[test]

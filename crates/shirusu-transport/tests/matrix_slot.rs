@@ -29,7 +29,9 @@ state_num_case!(st_3_draining, 3, Some(SlotState::Draining));
 state_num_case!(st_4_reclaimable, 4, Some(SlotState::Reclaimable));
 // R3 で追加した過渡状態。回収処理中だけ現れ、claim はできない。
 state_num_case!(st_5_reclaiming, 5, Some(SlotState::Reclaiming));
-state_num_case!(st_6_invalid, 6, Option::<SlotState>::None);
+// レビュー #4 の #10 で追加した状態。追加直後・公開前だけ現れ、claim はできない。
+state_num_case!(st_6_preparing, 6, Some(SlotState::Preparing));
+state_num_case!(st_7_invalid, 7, Option::<SlotState>::None);
 state_num_case!(st_255_invalid, 255, Option::<SlotState>::None);
 
 // ---- 状態ごとの操作成否 ----

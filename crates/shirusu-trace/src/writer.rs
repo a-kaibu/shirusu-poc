@@ -17,7 +17,7 @@ use crate::blob::BlobId;
 use crate::compact;
 use crate::container::{
     BlockHeader, BlockType, Compression, FileHeader, DEFAULT_CHUNK_RAW_TARGET, HEADER_LEN,
-    MAX_STORED_LEN,
+    MAX_RAW_LEN, MAX_STORED_LEN,
 };
 use crate::error::{Result, TraceError};
 use crate::model::{EventBatch, PayloadRef, TraceEvent};
@@ -129,7 +129,21 @@ impl<W: Write> TraceWriter<W> {
     /// Payload 本体を受け取り Blob ID を返す。既出の内容なら格納せず
     /// 同じ ID を返す（重複排除）。新規 Blob はバッファし、参照する
     /// Event Chunk より前に Blob Chunk として書き出す。
+    ///
+    /// 1 Blob が 1 Block に収まらなければならないため、エントリ全体
+    /// (ID 32 + 長さ 4 + 本体) が Reader の上限 `MAX_RAW_LEN` を超える
+    /// Payload は明示的に拒否する (レビュー #4 の #6)。大きな Blob の
+    /// 分割保存は未仕様であり、黙って書くと Reader が読めない Trace
+    /// ができてしまう。
     pub fn add_payload(&mut self, data: &[u8]) -> Result<BlobId> {
+        if data.len() + 36 > MAX_RAW_LEN as usize {
+            return Err(TraceError::WriterInvariant(format!(
+                "payload of {} bytes exceeds the per-block raw limit ({} bytes incl. entry header); \
+                 blob splitting is not supported yet",
+                data.len(),
+                MAX_RAW_LEN
+            )));
+        }
         let id = BlobId::of_content(data);
         if self.seen_blobs.contains(&id) {
             return Ok(id);
@@ -299,6 +313,17 @@ impl<W: Write> TraceWriter<W> {
         payload: &[u8],
         compressible: bool,
     ) -> Result<()> {
+        // Writer/Reader 契約 (レビュー #4 の #6): Reader は raw_len
+        // (展開後サイズ) が MAX_RAW_LEN を超える Block を拒否する。
+        // Writer も同じ上限を守らなければ、書けるのに読めない Trace が
+        // できてしまう。stored (格納サイズ) の上限も従来どおり併せて守る。
+        if payload.len() > MAX_RAW_LEN as usize {
+            return Err(TraceError::WriterInvariant(format!(
+                "block payload {} exceeds raw_len limit {} (reader would reject it)",
+                payload.len(),
+                MAX_RAW_LEN
+            )));
+        }
         if payload.len() > MAX_STORED_LEN as usize {
             return Err(TraceError::WriterInvariant(format!(
                 "block payload {} exceeds stored_len limit",

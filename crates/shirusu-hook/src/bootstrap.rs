@@ -12,7 +12,9 @@
 
 use shirusu_transport::RingConfig;
 
-pub const BOOTSTRAP_VERSION: u32 = 1;
+/// v2: 初期化結果の書き戻し欄 (result_hooked_count /
+/// result_missing_count) を追加した。
+pub const BOOTSTRAP_VERSION: u32 = 2;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -35,6 +37,14 @@ pub struct AgentBootstrap {
     pub mapping_handles: [u64; MAX_BOOTSTRAP_RINGS],
     /// Ring ごとの space_available イベント（auto-reset）のハンドル値。
     pub space_handles: [u64; MAX_BOOTSTRAP_RINGS],
+    /// 初期化結果（DLL が init_done を立てる前に書き戻す。Host は
+    /// 初期化成功後に読み戻す）: メインモジュールへ実際に設置できた
+    /// フック対象 API の数。対象 API を 1 つもインポートしていない
+    /// 正常なアプリでは 0 になる (レビュー #4 の #8)。
+    pub result_hooked_count: u32,
+    /// 初期化結果: メインモジュールがインポートしておらず、フック
+    /// できなかった対象 API の数 (Capture Coverage の欠落)。
+    pub result_missing_count: u32,
 }
 
 impl Default for AgentBootstrap {
@@ -50,6 +60,8 @@ impl Default for AgentBootstrap {
             host_process_handle: 0,
             mapping_handles: [0; MAX_BOOTSTRAP_RINGS],
             space_handles: [0; MAX_BOOTSTRAP_RINGS],
+            result_hooked_count: 0,
+            result_missing_count: 0,
         }
     }
 }
@@ -110,6 +122,22 @@ impl AgentBootstrap {
     pub fn ring_space_handle(&self, index: usize) -> u64 {
         self.space_handles[index]
     }
+    /// DLL 側が初期化結果を書き戻すためのポインタ経由の記録。
+    ///
+    /// # Safety
+    /// `bootstrap` は Host が確保した書き込み可能な Bootstrap 領域を
+    /// 指し、初期化が終わるまで有効であること。
+    pub unsafe fn write_hook_outcome(bootstrap: *mut AgentBootstrap, hooked: u32, missing: u32) {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe {
+            (*bootstrap).result_hooked_count = hooked;
+            (*bootstrap).result_missing_count = missing;
+        }
+    }
+    /// Host 側: 初期化成功後に読み戻した結果。(設置数, 欠落数)。
+    pub fn hook_outcome(&self) -> (u32, u32) {
+        (self.result_hooked_count, self.result_missing_count)
+    }
 }
 
 #[cfg(test)]
@@ -152,7 +180,18 @@ mod tests {
         // repr(C) の固定レイアウトであること（プロセス間受け渡しの前提）
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2)
+            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4
         );
+    }
+
+    #[test]
+    fn hook_outcome_writeback_roundtrip() {
+        // DLL 側の書き戻しと Host 側の読み戻し (レビュー #4 の #8)。
+        let mut b = AgentBootstrap::default();
+        assert_eq!(b.hook_outcome(), (0, 0));
+        unsafe { AgentBootstrap::write_hook_outcome(&mut b, 0, 4) };
+        assert_eq!(b.hook_outcome(), (0, 4));
+        unsafe { AgentBootstrap::write_hook_outcome(&mut b, 3, 1) };
+        assert_eq!(b.hook_outcome(), (3, 1));
     }
 }

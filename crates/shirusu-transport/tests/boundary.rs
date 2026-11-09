@@ -1007,12 +1007,14 @@ fn slot_state_encoding_matrix() {
         SlotState::Reclaimable,
         // R3: 回収中だけ現れる過渡状態 (番号 5)
         SlotState::Reclaiming,
+        // レビュー #4 の #10: 追加直後・公開前だけ現れる状態 (番号 6)
+        SlotState::Preparing,
     ];
     for (i, s) in all.iter().enumerate() {
         assert_eq!(s.to_u8(), i as u8);
         assert_eq!(SlotState::from_u8(i as u8), Some(*s));
     }
-    assert_eq!(SlotState::from_u8(6), None);
+    assert_eq!(SlotState::from_u8(7), None);
     assert_eq!(SlotState::from_u8(255), None);
     // Pool 経由の Slot アクセサ: claim 前後で generation / owner が読める
     let pool = SlotPool::new(1);

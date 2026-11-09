@@ -282,10 +282,12 @@ impl Agent {
     /// (A70)。記録経路はこのメソッドを呼ばない。
     ///
     /// 手順: まず配送を解決する (base を借りるか、ハンドル値から自分の写像を
-    /// 作る)。解決できなければ Slot は追加しない。次に Slot を追加し
-    /// (上限を超えれば Err)、Mapping を Slot の index へ紐付ける。紐付けが
-    /// 完了した Slot だけが、以後の claim で Mapping の Ring を使う。
-    /// 追加 Slot は generation 0・FREE から始まる。
+    /// 作る)。解決できなければ Slot は追加しない。次に Slot を取得不能
+    /// (PREPARING) で追加し (上限を超えれば Err)、Mapping を Slot の
+    /// index へ紐付けてから、最後に FREE を公開する。公開前の Slot は
+    /// claim できないため、「Mapping 未登録の Slot を別スレッドが取得
+    /// してローカル領域で記録を始める」競合は起きない (レビュー #4
+    /// の #10)。追加 Slot は generation 0 から始まる。
     pub(crate) fn register_expanded_mapping(
         &self,
         delivery: ExpansionDelivery,
@@ -312,6 +314,12 @@ impl Agent {
         };
         let index = self.pool.add_slot().ok_or(())?;
         self.expanded_regions.lock().unwrap().insert(index, region);
+        if !self.pool.publish_slot(index) {
+            // 公開に失敗したら紐付けを取り消す (Slot は PREPARING のまま
+            // 残るため claim はされず、記録が誤って始まることはない)。
+            self.expanded_regions.lock().unwrap().remove(&index);
+            return Err(());
+        }
         Ok(index)
     }
     /// 管理パス: Host から配送された Mapping を Slot として登録する公開

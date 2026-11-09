@@ -6,19 +6,26 @@
 //!    原点も頻度も環境依存）。順序だけが意味を持つ。
 //! 2. **プロセス/スレッド**: raw PID・論理 process_id・thread_id は
 //!    「Trace 内で最初に現れた順」の序数に置き換える。
-//! 3. **オブジェクト（ハンドル）相関**: CallLeave の `return` フィールド
-//!    （Ty::U64、取得成功、0 でも INVALID_HANDLE_VALUE でもない）を
-//!    「オブジェクトの生成」とみなす。生成された生値は
+//! 3. **オブジェクト（ハンドル）相関**: Schema が
+//!    `ValueKind::CreatedObject` と宣言したフィールド（取得成功、
+//!    0 でも INVALID_HANDLE_VALUE でもない）を「オブジェクトの
+//!    生成」とみなす。生成された生値は
 //!    `(生成 API 名, その API による生成の序数)` という ObjectKey に
 //!    置き換わり、後続イベントで同じ生値が現れたら同じキーに解決する。
 //!    これにより Trace 全体のハンドル再番号付けは差分にならない。
 //!    生値が再利用された場合（Close 後の再生成）は、参照位置より前に
 //!    起きた最新の生成へ解決する。
-//! 4. **ポインタ**: 生成に対応しない U64 / Ptr32 / Ptr64 の値は中身を
-//!    消す（`Pointer`）。ただし 0 は `Null`、U64 の全ビット 1 は
-//!    `Invalid` として区別を残す。根拠: 公開 Schema の規約では U64 は
-//!    ハンドル/ポインタ級の値であり、個数は U32 等の明示的な型で
-//!    記録される（shirusu-hook の API 表の注記）。
+//!    意味種別の無い旧来の Schema (Unspecified) では、従来規約
+//!    「CallLeave の `return` フィールド (Ty::U64) が生成」へ
+//!    フォールバックする（互換のための経過措置。推定である以上、
+//!    U64 スカラーを返す API では誤判定しうる。レビュー #4 の #7）。
+//! 4. **意味種別による値の扱い**: `Scalar` は値をそのまま比較する
+//!    （U64 のカウンタや時刻も消さない）。`Pointer` と、生成に
+//!    対応しない `Handle` の値は中身を消す（`Pointer`）。ただし
+//!    0 は `Null`、U64 の全ビット 1 は `Invalid` として区別を残す。
+//!    Ptr32 / Ptr64 は型そのものがポインタ宣言であるため従来どおり
+//!    ポインタとして扱う（Scalar 宣言がある場合だけ値を比較する）。
+//!    Unspecified の U64 は従来規約（ハンドル/ポインタ級）で扱う。
 //! 5. **取得状態**: `ValueCapture != Captured` の値は本体がダミーの
 //!    ため、値ではなく取得状態そのものを比較対象にする。
 //! 6. **Payload**: Blob 参照は内容で比較する（Blob ID は内容ハッシュ
@@ -29,7 +36,7 @@
 
 use shirusu_analysis::{Phase, TraceView};
 use shirusu_trace::reader::ReadTrace;
-use shirusu_trace::schema::{Ty, TypedValue, ValueCapture};
+use shirusu_trace::schema::{Ty, TypedValue, ValueCapture, ValueKind};
 use std::collections::HashMap;
 
 /// 正準化したオブジェクト同一性。生ハンドル値は含まない。
@@ -215,7 +222,16 @@ impl NormTrace {
             }
             let Some(api) = &ev.api_name else { continue };
             for f in &ev.fields {
-                if f.name != "return" || f.ty != Ty::U64 || f.capture != ValueCapture::Captured {
+                // 生成の判定は Schema の意味種別が正。CreatedObject の
+                // 宣言があるフィールドだけが生成であり、Scalar 等の
+                // U64 戻り値は生成ではない (レビュー #4 の #7)。
+                // 種別が無い旧来の Schema では従来規約へフォールバック。
+                let is_creation = match f.kind {
+                    ValueKind::CreatedObject => true,
+                    ValueKind::Unspecified => f.name == "return" && f.ty == Ty::U64,
+                    _ => false,
+                };
+                if !is_creation || f.capture != ValueCapture::Captured {
                     continue;
                 }
                 let TypedValue::U64(raw) = f.value else {
@@ -405,6 +421,44 @@ impl NormTrace {
     }
 }
 
+/// U64 値の正規化。意味種別が判断の正であり、型だけでは決めない
+/// (レビュー #4 の #7)。
+/// - Scalar: 個数・カウンタ・時刻などの数値。そのまま比較する。
+/// - Pointer: アドレス。中身は消す（0 は Null として区別）。
+/// - Handle / CreatedObject: 生成との相関で Object へ解決し、
+///   相関できなければポインタ級として消す。0 は Null、全ビット 1
+///   は Invalid (INVALID_HANDLE_VALUE) として区別を残す。
+/// - Unspecified: 旧来の Schema 向けに Handle と同じ従来規約を適用
+///   する（U64 はハンドル/ポインタ級という公開 Schema の前提）。
+fn norm_u64(
+    kind: ValueKind,
+    raw: u64,
+    at_event: usize,
+    resolve: &dyn Fn(u64, usize) -> Option<ObjectKey>,
+) -> NormValue {
+    match kind {
+        ValueKind::Scalar => NormValue::Int(raw as i128),
+        ValueKind::Pointer => {
+            if raw == 0 {
+                NormValue::Null
+            } else {
+                NormValue::Pointer
+            }
+        }
+        ValueKind::Handle | ValueKind::CreatedObject | ValueKind::Unspecified => {
+            if raw == 0 {
+                NormValue::Null
+            } else if raw == u64::MAX {
+                NormValue::Invalid
+            } else if let Some(key) = resolve(raw, at_event) {
+                NormValue::Object(key)
+            } else {
+                NormValue::Pointer
+            }
+        }
+    }
+}
+
 fn norm_value(
     trace: &ReadTrace,
     f: &shirusu_analysis::FieldView,
@@ -415,19 +469,27 @@ fn norm_value(
         return NormValue::NotCaptured(shirusu_analysis::value_capture_name(f.capture));
     }
     match &f.value {
-        TypedValue::U64(raw) => {
-            if *raw == 0 {
+        TypedValue::U64(raw) => norm_u64(f.kind, *raw, at_event, resolve),
+        // Ptr32 / Ptr64 は型自体がポインタ宣言。Scalar と明示された
+        // 場合だけ値を比較し、それ以外は従来どおり中身を消す。
+        TypedValue::Ptr32(v) => {
+            if f.kind == ValueKind::Scalar {
+                NormValue::Int(*v as i128)
+            } else if *v == 0 {
                 NormValue::Null
-            } else if *raw == u64::MAX {
-                NormValue::Invalid
-            } else if let Some(key) = resolve(*raw, at_event) {
-                NormValue::Object(key)
             } else {
                 NormValue::Pointer
             }
         }
-        TypedValue::Ptr32(0) | TypedValue::Ptr64(0) => NormValue::Null,
-        TypedValue::Ptr32(_) | TypedValue::Ptr64(_) => NormValue::Pointer,
+        TypedValue::Ptr64(v) => {
+            if f.kind == ValueKind::Scalar {
+                NormValue::Int(*v as i128)
+            } else if *v == 0 {
+                NormValue::Null
+            } else {
+                NormValue::Pointer
+            }
+        }
         TypedValue::I32(v) => NormValue::Int(*v as i128),
         TypedValue::I64(v) => NormValue::Int(*v as i128),
         TypedValue::U32(v) => NormValue::Int(*v as i128),

@@ -9,8 +9,12 @@
 //! - Slot 不足時は記録せず、プロセス共通カウンタ（fetch_add のみ）を更新して Capture Coverage 欠落とする。
 //! - 予備 Queue は実装しない（spec v0.4 の判断）。
 //! - 拡張 (A70): 管理スレッドだけが [`SlotPool::add_slot`] で Slot を追加できる。
-//!   追加 Slot は generation 0・FREE から始まり、既存 Slot の generation/owner
-//!   には影響しない。追加は総メモリ上限 (`can_add_slot`) の範囲内でのみ行う。
+//!   追加 Slot は generation 0・PREPARING (取得不能) から始まり、既存 Slot の
+//!   generation/owner には影響しない。追加は総メモリ上限 (`can_add_slot`)
+//!   の範囲内でのみ行う。Mapping の登録と Control の初期化が済んだ後に
+//!   [`SlotPool::publish_slot`] で FREE を公開する (公開順序はレビュー #4
+//!   の #10: FREE で追加すると、登録前の Slot を別スレッドが取得して
+//!   Mapping の無いローカル領域で記録を始める競合があった)。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
@@ -28,6 +32,9 @@ pub const SLOT_DRAINING: u8 = 3;
 pub const SLOT_RECLAIMABLE: u8 = 4;
 /// 回収中 (Host が Generation/所有者を更新している間)。claim はできない。
 pub const SLOT_RECLAIMING: u8 = 5;
+/// 追加直後 (Mapping 登録と Control 初期化が未完)。claim はできない。
+/// 準備が済んだら publish_slot で FREE を公開する。
+pub const SLOT_PREPARING: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
@@ -37,6 +44,7 @@ pub enum SlotState {
     Draining,
     Reclaimable,
     Reclaiming,
+    Preparing,
 }
 impl SlotState {
     pub fn from_u8(v: u8) -> Option<Self> {
@@ -47,6 +55,7 @@ impl SlotState {
             SLOT_DRAINING => Self::Draining,
             SLOT_RECLAIMABLE => Self::Reclaimable,
             SLOT_RECLAIMING => Self::Reclaiming,
+            SLOT_PREPARING => Self::Preparing,
             _ => return None,
         })
     }
@@ -58,6 +67,7 @@ impl SlotState {
             Self::Draining => SLOT_DRAINING,
             Self::Reclaimable => SLOT_RECLAIMABLE,
             Self::Reclaiming => SLOT_RECLAIMING,
+            Self::Preparing => SLOT_PREPARING,
         }
     }
 }
@@ -76,6 +86,15 @@ impl Slot {
     fn with_generation(generation: u64) -> Self {
         Self {
             state: AtomicU8::new(SLOT_FREE),
+            generation: AtomicU64::new(generation),
+            owner_thread_id: AtomicU64::new(0),
+        }
+    }
+    /// 追加 Slot 用: 取得不能 (PREPARING) で作る。Mapping 登録などの
+    /// 準備が完了するまで claim できてはならない (レビュー #4 の #10)。
+    fn preparing(generation: u64) -> Self {
+        Self {
+            state: AtomicU8::new(SLOT_PREPARING),
             generation: AtomicU64::new(generation),
             owner_thread_id: AtomicU64::new(0),
         }
@@ -152,16 +171,41 @@ impl SlotPool {
         }
     }
     /// 拡張で Slot を 1 本追加する (A70)。管理スレッドだけが呼ぶ。
-    /// 追加 Slot は generation 0・FREE から始まり、既存 Slot の
-    /// generation/owner には影響しない。追加された Slot の index を返す。
+    /// 追加 Slot は generation 0・PREPARING (取得不能) から始まり、既存
+    /// Slot の generation/owner には影響しない。追加された Slot の
+    /// index を返す。呼び出し側は Mapping の登録と Control の初期化を
+    /// 済ませてから [`publish_slot`](Self::publish_slot) で FREE を
+    /// 公開すること (公開前の Slot を別スレッドが取得すると、Mapping
+    /// の無い Slot で記録が始まってしまう。レビュー #4 の #10)。
     /// 総メモリ上限を超える場合は追加せず None を返す (既存 Slot は不変)。
     pub fn add_slot(&self) -> Option<usize> {
         let mut slots = self.slots.write().unwrap();
         if !self.can_add_slot_with_len(slots.len()) {
             return None;
         }
-        slots.push(Arc::new(Slot::with_generation(EXPANDED_SLOT_GENERATION)));
+        slots.push(Arc::new(Slot::preparing(EXPANDED_SLOT_GENERATION)));
         Some(slots.len() - 1)
+    }
+    /// 追加 Slot の準備完了を公開する (PREPARING→FREE)。
+    ///
+    /// 順序が要 (R3 の回収公開と同じ原則): Mapping 登録などの準備が
+    /// 全て終わってから FREE を Release で公開する。claim 側の Acquire
+    /// CAS と対になるため、FREE を見て claim した側は登録済みの
+    /// Mapping を必ず観測する。対象が PREPARING でない (初期 Slot や
+    /// 二重公開) 場合は何もせず false を返す。
+    pub fn publish_slot(&self, index: usize) -> bool {
+        let slots = self.slots.read().unwrap();
+        let Some(s) = slots.get(index) else {
+            return false;
+        };
+        s.state
+            .compare_exchange(
+                SLOT_PREPARING,
+                SLOT_FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
     pub fn capacity(&self) -> usize {
         self.slots.read().unwrap().len()
@@ -349,27 +393,47 @@ mod tests {
         assert_eq!(pool.missing_calls(), 1);
     }
     #[test]
-    fn add_slot_starts_free_with_generation_zero() {
-        // A70: 追加 Slot は generation 0・FREE から始まり、既存 Slot には影響しない。
+    fn add_slot_starts_preparing_with_generation_zero() {
+        // A70 + レビュー #4 の #10: 追加 Slot は generation 0・PREPARING
+        // (取得不能) から始まり、既存 Slot には影響しない。公開するまで
+        // claim はこの Slot を飛ばす。
         let pool = SlotPool::new(2);
         let h = pool.claim(111).unwrap();
         assert_eq!(pool.capacity(), 2);
         let idx = pool.add_slot().unwrap();
         assert_eq!(idx, 2);
         assert_eq!(pool.capacity(), 3);
-        assert_eq!(pool.slot(idx).state(), SlotState::Free);
+        assert_eq!(pool.slot(idx).state(), SlotState::Preparing);
         assert_eq!(pool.slot(idx).generation(), 0);
         assert_eq!(pool.slot(idx).owner_thread_id(), 0);
         // 既存 Slot の generation/owner は不変。
         assert_eq!(pool.slot(h.index).generation(), h.generation);
         assert_eq!(pool.slot(h.index).owner_thread_id(), 111);
         assert_eq!(pool.slot(h.index).state(), SlotState::Active);
-        // 追加 Slot は通常どおり claim できる。
+        // 未公開の間は claim できない (空き数にも数えない)。
         let h2 = pool.claim(222).unwrap();
         assert_eq!(h2.index, 1, "free initial slot is claimed first");
+        assert!(pool.claim(333).is_none(), "preparing slot is not claimable");
+        assert_eq!(pool.free_count(), 0);
+        // 公開後は通常どおり claim できる。
+        assert!(pool.publish_slot(idx));
+        assert_eq!(pool.slot(idx).state(), SlotState::Free);
         let h3 = pool.claim(333).unwrap();
         assert_eq!(h3.index, idx);
         assert_eq!(h3.generation, 0);
+    }
+    #[test]
+    fn publish_slot_only_from_preparing() {
+        let pool = SlotPool::new(1);
+        // 初期 Slot は FREE であって PREPARING ではないので公開できない。
+        assert!(!pool.publish_slot(0));
+        assert_eq!(pool.slot(0).state(), SlotState::Free);
+        let idx = pool.add_slot().unwrap();
+        assert!(pool.publish_slot(idx));
+        // 二重公開はできない。
+        assert!(!pool.publish_slot(idx));
+        // 範囲外 index は静かに false。
+        assert!(!pool.publish_slot(999));
     }
     #[test]
     fn add_slot_respects_memory_limit() {
@@ -392,6 +456,7 @@ mod tests {
         // 再利用では generation が 0→1 に進む。
         let pool = SlotPool::new(1);
         let idx = pool.add_slot().unwrap();
+        assert!(pool.publish_slot(idx));
         let h = pool.claim(7).unwrap();
         assert_eq!(h.index, 0, "initial slot is claimed first");
         let h2 = pool.claim(8).unwrap();
@@ -412,6 +477,9 @@ mod tests {
         assert!(pool.claim(1).is_some());
         assert!(pool.claim(2).is_none());
         assert_eq!(pool.add_slot(), Some(1));
+        // 未公開の間は不足のまま。公開して初めて claim が通る。
+        assert!(pool.claim(2).is_none());
+        assert!(pool.publish_slot(1));
         let h = pool.claim(2).unwrap();
         assert_eq!(h.index, 1);
         assert_eq!(h.generation, 0);

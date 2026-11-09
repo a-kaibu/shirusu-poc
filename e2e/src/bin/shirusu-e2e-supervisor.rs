@@ -266,13 +266,31 @@ fn production_path() -> ScenarioReport {
     };
     let base = mapping.as_ptr();
 
-    // 回収ヘルパ: data_ready を待ってから Worker を作り (Control の初期化は
-    // producer の最初の公開と対になる)、2ms 再確認付きで目標件数まで回収する。
+    // 回収ヘルパ: 期待 Generation への遷移を Control 自身で確認してから
+    // Worker を作り、2ms 再確認付きで目標件数まで回収する。
+    //
+    // data_ready の通知だけを根拠に Worker を作ってはいけない
+    // (レビュー #4 の仮説): auto-reset イベントに前フェーズの通知が
+    // 残っていると、producer が次世代の Control を初期化する前に
+    // Host が未来 Generation の Worker で回収を始めてしまい、検証が
+    // GenerationMismatch で Ring を恒久停止させる (第 2 フェーズが
+    // 0/700 でタイムアウトした事象)。遷移の確認が先、通知は補助。
     let drain_phase = |generation: u64,
                        from: u64,
                        count: u64,
                        notify: &ProcessNotify|
      -> Result<(Vec<u64>, usize, bool), String> {
+        // SAFETY: base は mapping の生存期間中は有効で、cfg 分の領域を指す。
+        match unsafe {
+            shirusu_host::wait_for_ring_generation(base, generation, Duration::from_secs(30))
+        } {
+            Ok(()) => {}
+            Err(observed) => {
+                return Err(format!(
+                    "ring generation never reached {generation} (observed {observed})"
+                ));
+            }
+        }
         if !notify.data_ready.wait_timeout(Duration::from_secs(30)) {
             return Err("data_ready was never signaled".to_string());
         }
@@ -298,9 +316,19 @@ fn production_path() -> ScenarioReport {
             Duration::from_secs(60),
         );
         if !reached {
+            // タイムアウトの切り分け材料: 検証で Ring が止まっていたのか
+            // (停止理由)、単にイベントが来なかったのかを区別できるよう、
+            // Worker の停止状態と共有 Control の現在世代を残す。
+            // SAFETY: base は mapping の生存期間中は有効。
+            let shared_generation = unsafe { shirusu_host::ring_generation(base) };
             return Err(format!(
-                "drain timed out at generation {generation}: got {}/{count}",
-                got.len()
+                "drain timed out at generation {generation}: got {}/{count} \
+                 integrity_lost={} stopped={} shared_generation={shared_generation} \
+                 last_loss={:?}",
+                got.len(),
+                worker.integrity_lost,
+                worker.is_stopped(),
+                worker.loss_events.last(),
             ));
         }
         let want: Vec<u64> = (from..from + count).collect();

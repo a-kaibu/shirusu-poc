@@ -154,6 +154,47 @@ pub struct TemporaryPayloadKey {
     pub payload_position: u64,
 }
 
+/// 共有 Control の現在の Generation を読む（診断用）。
+///
+/// # Safety
+/// `base` は RingConfig 分の共有領域を指し、読み取りの間も有効であること。
+pub unsafe fn ring_generation(base: *const u8) -> u64 {
+    layout::load(base, layout::OFF_GENERATION, Ordering::Acquire)
+}
+
+/// 共有 Control が初期化され (Magic が現れ)、Generation が期待値へ
+/// 遷移するまで待つ。遷移しなければ最後に観測した Generation を
+/// Err で返す。
+///
+/// Host が未来の Generation 用の [`DrainWorker`] を先に作って回収を
+/// 始めると、検証側が GenerationMismatch を検出して Ring を恒久
+/// 停止させ、その世代のイベントを以後一切受け取れなくなる
+/// (レビュー #4 の production_path_interprocess 仮説)。通知
+/// (data_ready) の残留は「その世代が始まった」証拠にはならないため、
+/// Reader を作る前に Control 自身で遷移を確認するのが正しい順序。
+///
+/// # Safety
+/// `base` は RingConfig 分の共有領域を指し、待機の間も有効であること。
+pub unsafe fn wait_for_ring_generation(
+    base: *const u8,
+    expected_generation: u64,
+    timeout: std::time::Duration,
+) -> Result<(), u64> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let magic = layout::load(base, layout::OFF_MAGIC, Ordering::Acquire);
+        // SAFETY: 呼び出し側の契約に従う (ring_generation と同じ前提)。
+        let generation = unsafe { ring_generation(base) };
+        if magic == layout::MAGIC && generation == expected_generation {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(generation);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// Ring 1 本分の Drain Worker。単一読み手を前提とし、複数 Worker で同じ Ring を扱わない。
 ///
 /// 回収は必ず検証付き経路を通る (R2): 共有領域を Host 側バッファへコピーし
@@ -1197,5 +1238,94 @@ mod tests {
                 },
             ]
         );
+    }
+    #[test]
+    fn future_generation_worker_stops_ring_on_mismatch() {
+        // レビュー #4 の production_path 仮説の機構そのもの: まだ
+        // Generation 1 の Ring に対して Generation 2 用の Worker で
+        // 回収を始めると、検証が GenerationMismatch で Ring を恒久
+        // 停止させ、その世代のイベントは以後一切回収できない。
+        // Supervisor は Reader を作る前に遷移を確認しなければならない。
+        let cfg = RingConfig::new(16, 512);
+        let region = SharedRegion::new(cfg, 1, 1);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        w.write(ev(EventKind::CallEnter, 1, b"gen1"));
+        let mut host = unsafe { DrainWorker::new(region.base(), cfg, 2) };
+        let batch = host.drain_all();
+        assert!(batch.events.is_empty());
+        assert!(host.integrity_lost);
+        assert!(host.is_stopped());
+        assert!(
+            host.loss_events.iter().any(|l| matches!(
+                l,
+                LossEvent::IntegrityLost { reason } if reason.contains("GenerationMismatch")
+            )),
+            "stop reason must name the generation mismatch: {:?}",
+            host.loss_events
+        );
+        // 停止は恒久的: 後から正しい世代のイベントが来ても回収しない。
+        let batch = host.drain_all();
+        assert!(batch.events.is_empty());
+    }
+    #[test]
+    fn wait_for_ring_generation_gates_worker_creation() {
+        // 修正後の順序 (Supervisor の drain_phase と同じ): 遷移を待って
+        // から Worker を作れば、新世代のイベントを正常に回収できる。
+        let cfg = RingConfig::new(16, 512);
+        let region = SharedRegion::new(cfg, 1, 1);
+        let base = region.base();
+        // 未遷移の間は待機がタイムアウトし、観測した世代を返す。
+        let observed =
+            unsafe { wait_for_ring_generation(base, 2, std::time::Duration::from_millis(50)) };
+        assert_eq!(observed, Err(1));
+        // Producer 側の再初期化 (Slot 再利用時の init_control) を模す。
+        let base_addr = base as usize;
+        let reinit = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            layout::init_control(base_addr as *mut u8, cfg, 2, 1);
+        });
+        let waited =
+            unsafe { wait_for_ring_generation(base, 2, std::time::Duration::from_secs(5)) };
+        reinit.join().unwrap();
+        assert_eq!(waited, Ok(()));
+        // 遷移後に作った Worker は新世代のイベントを回収できる。
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        w.write(ev(EventKind::CallEnter, 9, b"gen2"));
+        let mut host = unsafe { DrainWorker::new(region.base(), cfg, 2) };
+        let batch = host.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert!(!host.integrity_lost);
+    }
+    #[test]
+    fn wait_for_ring_generation_requires_initialization() {
+        // Magic が無い (未初期化) 領域は、Generation 欄が 0 でも
+        // 「世代 0 に遷移した」とはみなさない。
+        let cfg = RingConfig::new(16, 512);
+        let len = cfg.required_len();
+        let layout_alloc = std::alloc::Layout::from_size_align(len, 64).expect("region layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout_alloc) };
+        assert!(!ptr.is_null());
+        let observed =
+            unsafe { wait_for_ring_generation(ptr, 0, std::time::Duration::from_millis(50)) };
+        assert_eq!(observed, Err(0));
+        unsafe { std::alloc::dealloc(ptr, layout_alloc) };
     }
 }

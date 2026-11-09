@@ -7,7 +7,13 @@
 //! 3. Agent DLL を LoadLibrary で注入し、Bootstrap を対象メモリへ
 //!    書いて `shirusu_agent_init` をリモートスレッドで呼ぶ。
 //! 4. DLL が init_done を立てるまで待ち、確認できたらメインスレッドを
-//!    再開する（アタッチ時は再開は無い）。
+//!    再開する（アタッチ時は再開は無い）。初期化の成否とは別に、
+//!    DLL が Bootstrap へ書き戻したフック設置/欠落件数を読み戻し、
+//!    Capture Coverage へ反映する（レビュー #4 の #8）。
+//! 5. 対象を生かしたまま終える場合は `shirusu_agent_shutdown` を
+//!    リモートスレッドで呼び、Agent 側の終了手順（記録無効化 →
+//!    進行中 Detour の完了待ち → IAT 復元）を済ませてから最終回収・
+//!    確定を行う（レビュー #4 の #9）。
 //!
 //! 制約（Phase 3 の範囲として正直に残す）:
 //! - 注入は同一ビットネス間のみ（x64 Host → x64 対象、x86 → x86）。
@@ -46,6 +52,10 @@ impl LaunchConfig {
 
 /// 初期化エントリの候補名（x64 は素の名前、x86 は stdcall デコレーション）。
 const INIT_EXPORT_CANDIDATES: [&str; 2] = ["shirusu_agent_init", "_shirusu_agent_init@4"];
+/// 終了エントリの候補名。引数なしのため x86 のデコレーションは `@0`。
+/// 旧 DLL には無い場合があり、その場合は解決できなくても失敗にしない。
+const SHUTDOWN_EXPORT_CANDIDATES: [&str; 2] =
+    ["shirusu_agent_shutdown", "_shirusu_agent_shutdown@0"];
 /// Trace 内の Process ID は対象 1 プロセス前提の固定値（Phase 3 の範囲）。
 const TARGET_PROCESS_ID: u64 = 1;
 
@@ -53,6 +63,10 @@ pub struct LaunchedCapture {
     session: Option<CaptureSession>,
     process: win::HandleValue,
     pid: u32,
+    /// 対象プロセス内での `shirusu_agent_shutdown` のアドレス。
+    /// 解決できなかった（旧 DLL 等）場合は None で、finish は
+    /// Agent 側の終了手順を呼ばずに従来どおり閉じる。
+    shutdown_addr: Option<usize>,
 }
 
 impl LaunchedCapture {
@@ -65,7 +79,7 @@ impl LaunchedCapture {
         let spawned = win::spawn_suspended(cmdline)?;
         let prepared = inject_and_prepare(trace_path, &cfg, spawned.process, spawned.pid);
         match prepared {
-            Ok(session) => {
+            Ok((session, shutdown_addr)) => {
                 if let Err(e) = win::resume_main_thread(spawned.thread) {
                     // 再開できない対象は止めたまま放置しない
                     let _ = win::terminate_process(spawned.process, 1);
@@ -78,6 +92,7 @@ impl LaunchedCapture {
                     session: Some(session),
                     process: spawned.process,
                     pid: spawned.pid,
+                    shutdown_addr,
                 })
             }
             Err(e) => {
@@ -97,10 +112,11 @@ impl LaunchedCapture {
     ) -> Result<Self, SessionError> {
         let process = win::open_process_for_injection(pid)?;
         match inject_and_prepare(trace_path, &cfg, process, pid) {
-            Ok(session) => Ok(Self {
+            Ok((session, shutdown_addr)) => Ok(Self {
                 session: Some(session),
                 process,
                 pid,
+                shutdown_addr,
             }),
             Err(e) => {
                 win::close_handle_value(process);
@@ -144,6 +160,19 @@ impl LaunchedCapture {
 
     /// 対象を生かしたままセッションだけを閉じる。
     pub fn finish(mut self) -> Result<SessionSummary, SessionError> {
+        // 対象が生きているなら、先に Agent 側の終了手順（記録無効化
+        // → 進行中 Detour の完了待ち → IAT 復元）を呼んでから最終
+        // 回収・確定を行う（レビュー #4 の #9）。これをしないと、
+        // アタッチした対象はセッション終了後もフックされたまま
+        // 誰も回収しない Ring へ書き続けてしまう。対象が既に終了
+        // していれば書き手はおらず、呼び出し自体が不要。
+        if !self.target_exited() {
+            if let Some(addr) = self.shutdown_addr {
+                // ベストエフォート: 失敗してもセッションの確定は
+                // 続ける（対象が終了処理中などで応答しない場合がある）。
+                let _ = win::remote_call(self.process, addr, 0);
+            }
+        }
         let session = self.session.take().expect("session present");
         let summary = session.stop()?;
         win::close_handle_value(self.process);
@@ -160,14 +189,38 @@ impl Drop for LaunchedCapture {
     }
 }
 
+/// Bootstrap の初期化結果（設置数, 欠落数）を対象メモリから読み戻す。
+/// 読めない場合は None（Coverage は「不明」のままにする。値を
+/// 捏造しない）。DLL は init_done を立てる前に書き戻すため、
+/// リモートスレッドの完了後には確定している。
+fn read_hook_outcome(process: win::HandleValue, remote: usize) -> Option<(usize, usize)> {
+    let mut buf = AgentBootstrap::default();
+    // SAFETY: AgentBootstrap は repr(C) の値型。バイト列として読み込む。
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            &mut buf as *mut AgentBootstrap as *mut u8,
+            std::mem::size_of::<AgentBootstrap>(),
+        )
+    };
+    win::read_process_memory(process, remote, bytes.as_mut_ptr(), bytes.len()).ok()?;
+    let (hooked, missing) = buf.hook_outcome();
+    // 対象 API の総数を超える報告は信用しない（書かれていない
+    // 領域の読み違い等を Coverage として採用しない）。
+    if hooked + missing > 64 {
+        return None;
+    }
+    Some((hooked as usize, missing as usize))
+}
+
 /// Mapping とイベントを用意し、DLL を注入して初期化を確認する。
-/// 起動（suspended）とアタッチで共通の手順。
+/// 起動（suspended）とアタッチで共通の手順。戻り値にはセッションと
+/// Agent 終了エントリのアドレス（解決できた場合）を含む。
 fn inject_and_prepare(
     trace_path: impl AsRef<Path>,
     cfg: &LaunchConfig,
     process: win::HandleValue,
     pid: u32,
-) -> Result<CaptureSession, SessionError> {
+) -> Result<(CaptureSession, Option<usize>), SessionError> {
     let ring_len = cfg.session.ring_config.required_len();
     let mut session = CaptureSession::create_file(trace_path, cfg.session.clone())?;
 
@@ -223,6 +276,12 @@ fn inject_and_prepare(
         .iter()
         .find_map(|name| pe::find_export(&image, name))
         .ok_or_else(|| SessionError::Injection("shirusu_agent_init export not found".into()))?;
+    // 終了エントリは任意（旧 DLL には無い）。解決できなければ
+    // finish は Agent 終了手順を呼ばずに従来どおり閉じる。
+    let shutdown_addr = SHUTDOWN_EXPORT_CANDIDATES
+        .iter()
+        .find_map(|name| pe::find_export(&image, name))
+        .map(|r| base + r as usize);
 
     let remote = win::remote_alloc(process, std::mem::size_of::<AgentBootstrap>())?;
     let write_result = (|| -> Result<(), SessionError> {
@@ -241,6 +300,13 @@ fn inject_and_prepare(
         return Err(e);
     }
     let status = win::remote_call(process, base + rva as usize, remote);
+    // 初期化結果（設置/欠落件数）の読み戻しは、Bootstrap 領域の
+    // 解放より前に行う（レビュー #4 の #8）。
+    let outcome = if status.is_ok() {
+        read_hook_outcome(process, remote)
+    } else {
+        None
+    };
     win::remote_free(process, remote);
     let status = status?;
     if status != 0 {
@@ -253,5 +319,8 @@ fn inject_and_prepare(
             "agent did not signal init_done before timeout".into(),
         ));
     }
-    Ok(session)
+    if let Some((hooked, missing)) = outcome {
+        session.set_hook_coverage(hooked, missing);
+    }
+    Ok((session, shutdown_addr))
 }

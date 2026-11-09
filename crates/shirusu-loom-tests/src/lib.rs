@@ -556,6 +556,99 @@ mod tests {
         });
     }
 
+    // ---- レビュー #4 #10: 動的 Slot 追加の公開順序 (slot.rs / agent の転写モデル) ----
+    // 管理スレッドが「Slot 追加 → Mapping 登録 → FREE 公開」を進める間、
+    // 記録スレッドが claim を試みる。claim に成功した側は、対応する
+    // Mapping が登録済みであることを必ず観測しなければならない
+    // (未登録のまま取得すると、Mapping の無いローカル領域で記録が
+    // 始まり Host から見えなくなる)。Mapping の登録は AtomicBool、
+    // 状態遷移は slot.rs と同じ Ordering で転写する。
+    const MINI_PREPARING: u64 = 6;
+
+    struct MiniAddedSlot {
+        state: AtomicU64,
+        mapping_registered: AtomicBool,
+    }
+    impl MiniAddedSlot {
+        /// 修正後の追加順序: PREPARING で追加する。
+        fn new_adding() -> Self {
+            Self {
+                state: AtomicU64::new(MINI_PREPARING),
+                mapping_registered: AtomicBool::new(false),
+            }
+        }
+        /// 修正前の旧順序: 追加時点で FREE、Mapping は後から登録する。
+        fn new_adding_old_order() -> Self {
+            Self {
+                state: AtomicU64::new(MINI_FREE),
+                mapping_registered: AtomicBool::new(false),
+            }
+        }
+        /// 管理側 (修正後): Mapping を登録してから FREE を Release で公開。
+        fn register_and_publish(&self) {
+            self.mapping_registered.store(true, Ordering::Release);
+            self.state.store(MINI_FREE, Ordering::Release);
+        }
+        /// 管理側 (旧順序): Slot は最初から FREE で、Mapping だけ後で登録。
+        fn register_only(&self) {
+            self.mapping_registered.store(true, Ordering::Release);
+        }
+        /// 記録側 claim (slot.rs の転写): FREE→CLAIMED の CAS。成功したら
+        /// Mapping の登録状態を読む (実コードでは expanded_regions の有無)。
+        fn claim_and_check_mapping(&self) -> Option<bool> {
+            if self
+                .state
+                .compare_exchange(MINI_FREE, MINI_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                Some(self.mapping_registered.load(Ordering::Acquire))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn loom_added_slot_claim_observes_registered_mapping() {
+        // #10 の性質: PREPARING で追加し、登録後に公開する順序では、
+        // どのスケジュールで claim が成功しても Mapping は登録済み。
+        loom::model(|| {
+            let slot = Arc::new(MiniAddedSlot::new_adding());
+            let s2 = slot.clone();
+            let manager = loom::thread::spawn(move || s2.register_and_publish());
+            let claimed = slot.claim_and_check_mapping();
+            manager.join().unwrap();
+            if let Some(registered) = claimed {
+                assert!(
+                    registered,
+                    "claimer must observe the registered mapping, never claim an unpublished slot"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "claimer must observe the registered mapping")]
+    fn loom_added_slot_old_order_is_detected() {
+        // 旧順序 (追加時点で FREE) では、登録前に claim が割り込んで
+        // Mapping 未登録のまま取得するスケジュールが存在する。その
+        // スケジュールで上の性質表明が落ちることを回帰として固定する
+        // (loom_slot_reclaim_old_order_is_detected と同じ流儀)。
+        loom::model(|| {
+            let slot = Arc::new(MiniAddedSlot::new_adding_old_order());
+            let s2 = slot.clone();
+            let manager = loom::thread::spawn(move || s2.register_only());
+            let claimed = slot.claim_and_check_mapping();
+            manager.join().unwrap();
+            if let Some(registered) = claimed {
+                assert!(
+                    registered,
+                    "claimer must observe the registered mapping, never claim an unpublished slot"
+                );
+            }
+        });
+    }
+
     #[test]
     #[should_panic(expected = "claimer must observe the advanced generation")]
     fn loom_slot_reclaim_old_order_is_detected() {

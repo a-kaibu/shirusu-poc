@@ -161,7 +161,10 @@ message SchemaDef {
 message FieldDef {
   string name = 1;
   uint32 ty = 2;                    // 型タグ（Compact Binary の型表）
-  uint32 flags = 3;                 // bit0: 入出力が両方向（inout)、bit1: 省略可能
+  uint32 flags = 3;                 // bit0: 入出力が両方向（inout)、bit1: 省略可能、
+                                    // bit2..=4: 値の意味種別 ValueKind (0=未指定 1=scalar
+                                    // 2=pointer 3=handle 4=生成オブジェクト)。種別は正規化・
+                                    // 比較の入力であり、型だけからの推定はしない (レビュー #4 #7)
 }
 message BatchHeader {
   uint64 session_id = 1;

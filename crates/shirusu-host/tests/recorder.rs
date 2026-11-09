@@ -352,3 +352,49 @@ proptest! {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[test]
+fn zero_hook_target_is_coverage_loss_not_session_failure() {
+    // レビュー #4 の #8: 対象 API を 1 つもインポートしていない
+    // アプリは「0 件設置・全件欠落」であり、セッションの失敗では
+    // ない。Coverage の劣化として閉じられる。
+    let path = temp_trace("zero-hook");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.set_hook_coverage(0, 4);
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.hook_coverage, Some((0, 4)));
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Degraded);
+    assert!(
+        summary
+            .integrity
+            .notes
+            .iter()
+            .any(|n| n.contains("ran unrecorded")),
+        "notes: {:?}",
+        summary.integrity.notes
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn partial_and_full_hook_coverage_levels() {
+    // 一部欠落も劣化。全件設置なら Coverage は落ちない。
+    let path = temp_trace("partial-hook");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.set_hook_coverage(3, 1);
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.hook_coverage, Some((3, 1)));
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Degraded);
+    let _ = std::fs::remove_file(&path);
+
+    let path = temp_trace("full-hook");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.set_hook_coverage(4, 0);
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.hook_coverage, Some((4, 0)));
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Complete);
+    let _ = std::fs::remove_file(&path);
+}

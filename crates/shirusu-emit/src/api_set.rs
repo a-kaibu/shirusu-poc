@@ -15,13 +15,16 @@
 //!   0 / 全ビット 1 は「生成しなかった」として区別される。
 //! - Leave の最後のフィールドは `last_error`（Ty::U32）とする
 //!   （shirusu-hook の表と同じ規約）。
-//! - 個数やサイズは Ty::U32 等の明示的な型で記録する。Ty::U64 は
-//!   ハンドル／ポインタ級の値のために予約される（compare の正規化
-//!   がこの前提に依存する）。
+//! - 各フィールドは意味種別 (ValueKind) を持つ。個数・カウンタは
+//!   Ty が U64 でも Scalar と宣言し、ハンドルは Handle、生成 API の
+//!   戻り値は CreatedObject と宣言する（compare の正規化は型では
+//!   なく意味種別で判断する。レビュー #4 の #7）。種別が無い旧来の
+//!   Schema に対しては、compare が「Ty::U64 はハンドル／ポインタ級」
+//!   という従来規約へフォールバックする。
 
 use crate::EmitError;
 use shirusu_trace::proto::SchemaDef;
-use shirusu_trace::schema::{make_schema, Ty};
+use shirusu_trace::schema::{make_schema, Ty, ValueKind};
 
 /// 1 API の Schema 仕様。enter / leave それぞれのフィールド列が
 /// Compact Binary の値列の順序そのものを定める。
@@ -29,23 +32,27 @@ use shirusu_trace::schema::{make_schema, Ty};
 pub struct ApiSpec {
     /// API 名。`モジュール!関数` 形式（例 `kernel32!CreateFileW`）。
     pub name: String,
-    pub enter_fields: Vec<(String, Ty)>,
-    pub leave_fields: Vec<(String, Ty)>,
+    pub enter_fields: Vec<(String, Ty, ValueKind)>,
+    pub leave_fields: Vec<(String, Ty, ValueKind)>,
     /// SchemaDef.annotation へ写される注記（観測レベル等）。
     pub annotation: String,
 }
 
 impl ApiSpec {
-    pub fn new(name: &str, enter_fields: &[(&str, Ty)], leave_fields: &[(&str, Ty)]) -> Self {
+    pub fn new(
+        name: &str,
+        enter_fields: &[(&str, Ty, ValueKind)],
+        leave_fields: &[(&str, Ty, ValueKind)],
+    ) -> Self {
         ApiSpec {
             name: name.to_string(),
             enter_fields: enter_fields
                 .iter()
-                .map(|(n, t)| (n.to_string(), *t))
+                .map(|(n, t, k)| (n.to_string(), *t, *k))
                 .collect(),
             leave_fields: leave_fields
                 .iter()
-                .map(|(n, t)| (n.to_string(), *t))
+                .map(|(n, t, k)| (n.to_string(), *t, *k))
                 .collect(),
             annotation: String::new(),
         }
@@ -127,7 +134,7 @@ impl ApiSet {
                 &format!("{}/enter", spec.name),
                 spec.enter_fields
                     .iter()
-                    .map(|(n, t)| (n.clone(), *t, 0))
+                    .map(|(n, t, k)| (n.clone(), *t, k.flags()))
                     .collect(),
             );
             enter.annotation = spec.annotation.clone();
@@ -136,7 +143,7 @@ impl ApiSet {
                 &format!("{}/leave", spec.name),
                 spec.leave_fields
                     .iter()
-                    .map(|(n, t)| (n.clone(), *t, 0))
+                    .map(|(n, t, k)| (n.clone(), *t, k.flags()))
                     .collect(),
             );
             leave.annotation = spec.annotation.clone();
@@ -161,50 +168,56 @@ pub fn file_io_api_set() -> ApiSet {
         ApiSpec::new(
             "kernel32!CreateFileW",
             &[
-                ("lpFileName", Ty::Str16),
-                ("dwDesiredAccess", DWORD),
-                ("dwShareMode", DWORD),
-                ("lpSecurityAttributes", HANDLE),
-                ("dwCreationDisposition", DWORD),
-                ("dwFlagsAndAttributes", DWORD),
-                ("hTemplateFile", HANDLE),
+                ("lpFileName", Ty::Str16, ValueKind::Scalar),
+                ("dwDesiredAccess", DWORD, ValueKind::Scalar),
+                ("dwShareMode", DWORD, ValueKind::Scalar),
+                ("lpSecurityAttributes", HANDLE, ValueKind::Pointer),
+                ("dwCreationDisposition", DWORD, ValueKind::Scalar),
+                ("dwFlagsAndAttributes", DWORD, ValueKind::Scalar),
+                ("hTemplateFile", HANDLE, ValueKind::Handle),
             ],
-            &[("return", HANDLE), ("last_error", DWORD)],
+            &[
+                ("return", HANDLE, ValueKind::CreatedObject),
+                ("last_error", DWORD, ValueKind::Scalar),
+            ],
         )
         .with_annotation("L2 (file_io_api_set: shirusu-hook API_TABLE と同一定義)"),
         ApiSpec::new(
             "kernel32!ReadFile",
             &[
-                ("hFile", HANDLE),
-                ("lpBuffer", HANDLE),
-                ("nNumberOfBytesToRead", DWORD),
+                ("hFile", HANDLE, ValueKind::Handle),
+                ("lpBuffer", HANDLE, ValueKind::Pointer),
+                ("nNumberOfBytesToRead", DWORD, ValueKind::Scalar),
             ],
             &[
-                ("return", BOOL),
-                ("lpNumberOfBytesRead", DWORD),
-                ("data", Ty::Bytes),
-                ("last_error", DWORD),
+                ("return", BOOL, ValueKind::Scalar),
+                ("lpNumberOfBytesRead", DWORD, ValueKind::Scalar),
+                ("data", Ty::Bytes, ValueKind::Scalar),
+                ("last_error", DWORD, ValueKind::Scalar),
             ],
         )
         .with_annotation("L2 (file_io_api_set: shirusu-hook API_TABLE と同一定義)"),
         ApiSpec::new(
             "kernel32!WriteFile",
             &[
-                ("hFile", HANDLE),
-                ("data", Ty::Bytes),
-                ("nNumberOfBytesToWrite", DWORD),
+                ("hFile", HANDLE, ValueKind::Handle),
+                ("data", Ty::Bytes, ValueKind::Scalar),
+                ("nNumberOfBytesToWrite", DWORD, ValueKind::Scalar),
             ],
             &[
-                ("return", BOOL),
-                ("lpNumberOfBytesWritten", DWORD),
-                ("last_error", DWORD),
+                ("return", BOOL, ValueKind::Scalar),
+                ("lpNumberOfBytesWritten", DWORD, ValueKind::Scalar),
+                ("last_error", DWORD, ValueKind::Scalar),
             ],
         )
         .with_annotation("L2 (file_io_api_set: shirusu-hook API_TABLE と同一定義)"),
         ApiSpec::new(
             "kernel32!CloseHandle",
-            &[("hObject", HANDLE)],
-            &[("return", BOOL), ("last_error", DWORD)],
+            &[("hObject", HANDLE, ValueKind::Handle)],
+            &[
+                ("return", BOOL, ValueKind::Scalar),
+                ("last_error", DWORD, ValueKind::Scalar),
+            ],
         )
         .with_annotation("L1 (file_io_api_set: shirusu-hook API_TABLE と同一定義)"),
     ];
@@ -236,7 +249,7 @@ mod tests {
     #[test]
     fn duplicate_and_empty_names_rejected() {
         let mut set = ApiSet::new();
-        let spec = ApiSpec::new("a!B", &[], &[("return", Ty::I32)]);
+        let spec = ApiSpec::new("a!B", &[], &[("return", Ty::I32, ValueKind::Scalar)]);
         assert!(matches!(set.add(spec.clone()), Ok(1)));
         assert!(matches!(
             set.add(spec),

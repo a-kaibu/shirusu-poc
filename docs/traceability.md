@@ -9,7 +9,7 @@
 進捗率 = 検証済み項目数 ÷ 全項目数。項目を追加したら分母が増えたことをここに記録する。
 現時点の自己申告: 全体で約 3%（仕様読解・接続・CI 配置・push 疎通・骨格着手まで。検証済みはまだほぼ無い）。
 
-最終更新: 2026-11-09（転送層の残項目 A74・A75・D53〜D56・D77 を実施し、未着手は D41 のみになった。測定ハーネス・検討記録・証跡/回帰化・モデルの独立性実証・本番経路 E2E と、D54/D55 の CI 配線。詳細は集計の残項目ワークストリーム記録を参照。前回: Phase 3（フック＋レコーダ）を実装し G01〜G14 を追加。IAT フック基盤 shirusu-hook、Agent DLL、Capture Session（recorder）と Windows 起動ドライバ、引数付き変換、Windows E2E シナリオと CI 配線。ローカルテスト総数 1673 件。Windows 実動部は CI 待ち。前回: Phase 2（Trace 永続化）を実装し F01〜F16 を追加。公開 Trace 形式 v1 の確定（docs/trace-format.md）、shirusu-trace の新設、Host 変換（A72）、fuzz 2 件、Windows 両ターゲット check 通過。ローカルテスト総数 1637 件。詳細は集計の F 追加記録を参照。さらに前回: A73 を実装: 調整値の掃引測定（shirusu-tuning-bench）で全既定値を維持と決定。4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8。Linux VM で 3 回測定し同じ傾向を確認。A72 の修正実装は 10:10 の記録を参照）
+最終更新: 2026-11-09 18:29 の定時実行で D78 を追加し、分母は 255 になった（expansion_e2e のタイミング依存 2 件の決定的修正。ローカルテスト総数 1773 件は不変）。前回: 2026-11-09（コードレビュー第4回の対応として J01〜J11 を追加し、分母は 254 になった。CI 終了コード伝播＋カナリア、x86 ビルド、E2E 型、production_path 世代ゲート、Slot 公開順序、Blob ハッシュ検証、サイズ契約、ValueKind 正規化、フック 0 件の継続、終了時フック解除。ローカルテスト総数 1773 件、Windows 実動部は CI 待ち。前回: 転送層の残項目 A74・A75・D53〜D56・D77 を実施し、未着手は D41 のみになった。測定ハーネス・検討記録・証跡/回帰化・モデルの独立性実証・本番経路 E2E と、D54/D55 の CI 配線。詳細は集計の残項目ワークストリーム記録を参照。前回: Phase 3（フック＋レコーダ）を実装し G01〜G14 を追加。IAT フック基盤 shirusu-hook、Agent DLL、Capture Session（recorder）と Windows 起動ドライバ、引数付き変換、Windows E2E シナリオと CI 配線。ローカルテスト総数 1673 件。Windows 実動部は CI 待ち。前回: Phase 2（Trace 永続化）を実装し F01〜F16 を追加。公開 Trace 形式 v1 の確定（docs/trace-format.md）、shirusu-trace の新設、Host 変換（A72）、fuzz 2 件、Windows 両ターゲット check 通過。ローカルテスト総数 1637 件。詳細は集計の F 追加記録を参照。さらに前回: A73 を実装: 調整値の掃引測定（shirusu-tuning-bench）で全既定値を維持と決定。4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8。Linux VM で 3 回測定し同じ傾向を確認。A72 の修正実装は 10:10 の記録を参照）
 
 ## A. spec.md（Agent–Host 転送仕様 v0.4）条項
 
@@ -210,6 +210,7 @@
 | D75 | レビュー第2回・項目6: TLA+ モデルの Slot 再利用を段階分割。Reclaim を ReclaimBegin (RECLAIMING の間に Generation 加算と終了フラグのクリア) と PublishFree (FREE 公開) に分け、Claim が観測した Generation を slotClaimGen に記録。不変条件 ClaimedGenerationIsCurrent を追加。TLC 結果 (2026-11-09、tla2tools v1.8.0): 主モデルは全 7 不変条件が成立 (990,889 状態生成 / 310,249 相異 / 深さ 28)。旧順序 (FREE 公開 → Generation 更新) の変種モデル ShirusuTransportBuggy では TLC が ClaimedGenerationIsCurrent の違反を 924 状態で検出し、モデルが競合を表現できることを実証。scripts/ci/tla.sh は両方向を主張する | tla/ShirusuTransport.tla・ShirusuTransport.cfg、tla/ShirusuTransportBuggy.tla・ShirusuTransportBuggy.cfg、scripts/ci/tla.sh、docs/verification.md「Slot 再利用の段階分割と旧順序の変種」 | 実装済み未検証 |
 | D76 | レビュー第2回・項目5 (後半): RingReader::drain の多層防御。本番経路は検証付きに統一済みで RingReader はテスト専用に格下げ済みだったが、drain 自体は payload_len / payload_position を検証せずコピーしていた。コピー前に ValidatingReader と同等の最小検証 (種別・予約領域・格納長と容量・Payload 位置の範囲と連続性・Sequence 後退) を行い、失敗時はコピーせず Cursor も進めず、DrainBatch::integrity_error で破損として報告し Reader は停止する。格下げ表記は維持 | crates/shirusu-transport/src/ring.rs (check_descriptor)、crates/shirusu-transport/tests/regression_reader_hardening.rs (破損 len/position/連続性の回帰 4 件、赤→緑)、crates/shirusu-host/src/lib.rs (DrainBatch 構築の追随) | 実装済み未検証 |
 | D77 | レビュー第2回・項目7 の残り: Windows 実プロセス間で、本番経路そのもの (実 Agent::record → 共有メモリ → data_ready Event での待機 → 検証付き Host の回収・Slot 再利用) を end-to-end で確認する E2E | 実装済み: capture-e2e との突き合わせでは、capture-e2e は Hook + Recorder + Trace の経路で本項目の組み合わせを含まず、cross_arch は生 RingWriter + 生 RingReader + ポーリングだった。新規シナリオ production_path_interprocess を追加: producer は実 Agent を DLL と同じ手順で構築して record ごとに data_ready を通知し、supervisor は wait_with_recheck (2ms 再確認) で待ちながら検証付き DrainWorker (A72 identity 付き) で回収する。DETACH と回収完了の確認後にだけ Slot 再利用を許可し (reclaim-ok はテスト用同期ポイント)、次 Generation での再記録までを通す。両フェーズで内容の連番一致・payload_keys 数・integrity_lost 無しを検証。CI: windows-x64 の --all (x64 同士) と windows-x86.ps1 の --production-path (x64 Host × i686 Producer) で実行。Windows 実走は CI 待ち | e2e (supervisor シナリオ追加)・CI | 実装済み未検証 |
+| D78 | expansion_e2e のタイミング依存 2 件の決定的修正（レビュー第4回ワークストリームが「観測記録に留める」とした負荷時 1 回の失敗を、定時実行で再現・原因特定・修正）。(1) host_stop_during_expansion: 管理スレッドを claim の前に起動すると、claim 2 で立った要求フラグを claim 3 の前に消費され、claim 3 がフラグを再び立てる（slot.rs の再ラッチは仕様どおり）。破棄後に 2 件目の要求が送られ requested が 2 になる。起動を claim の後にして要求をちょうど 1 件に決めた（再現: claim 間に 10ms を挟むと requested=2/discarded=2 で赤になることを確認）。(2) agent_to_host_round_trip: 待機が容量 (Slot 数) を見ていたが、J06 の PREPARING 導入後は add（容量に数える）と publish（FREE）の間に窓があり、その間に待機が抜けると thread_begin が None を返す。取得可能性 (free_count > 0) を待つように変更。修正後は expansion_e2e を 30 回連続で全通過。残る 100ms の待ちはポーリング 5ms の 20 回分の余裕で、従来のタイミングテストと同程度の仮定 | crates/shirusu-host/tests/expansion_e2e.rs | 実装済み未検証 |
 
 ## E. ドキュメント
 
@@ -270,7 +271,7 @@
 | H03 | `shirusu inspect`: セッションメタデータ（CaptureEnvironment）、三つの完全性指標＋裏付け内訳（Loss Record 種別、落ちた Payload、劣化イベント、欠落 Blob、回復 issue、Index 照合）、Finalization 欠落時は「確定できない」と明示。API 別 Enter/Leave 集計。人間可読＋JSON | cli/main.rs | 実装済み未検証 |
 | H04 | `shirusu dump` / `export`: フィルタは CLI オプションの組（--api / --kind / --seq / --thread / --text / --limit。独自クエリ言語は作らない＝ overview の方針）。dump は人間可読＋JSON、export は JSONL。出力はゴールデンテストで固定 | cli/main.rs、cli/tests | 実装済み未検証 |
 | H05 | compare 正規化ルール（normalize.rs のモジュール文書が正）: (1) タイムスタンプ絶対値は不比較 (2) PID/プロセス/スレッドは出現順の序数化 (3) ハンドルは生成相関で ObjectKey 化 (4) 非相関ポインタは中身を消去（0 と全ビット1 は区別を残す） (5) 未取得値は取得状態で比較 (6) Payload は内容で比較し Inline/Blob の表現差を吸収 (7) 戻り値・last_error・意味値は正規化しない | compare/normalize.rs | 実装済み未検証 |
-| H06 | オブジェクト同一性: 生成は「CallLeave の return（U64・取得成功・0/INVALID 以外）」と定義し、同一性は (生成 API 名, 生成序数)。生値の再利用（Close 後の再生成）は参照位置より前の最新生成へ解決。生成帰属はイベント位置で正確に引く（既存ハンドルを返す API を生成と誤認しない） | compare/normalize.rs | 実装済み未検証 |
+| H06 | オブジェクト同一性: 生成は「CallLeave の return（U64・取得成功・0/INVALID 以外）」と定義し、同一性は (生成 API 名, 生成序数)。生値の再利用（Close 後の再生成）は参照位置より前の最新生成へ解決。生成帰属はイベント位置で正確に引く（既存ハンドルを返す API を生成と誤認しない）。（2026-11-09 の J09 で精緻化: Schema に ValueKind がある場合は生成判定を意味種別で決め、本項の定義は種別の無い旧 Schema へのフォールバックとして残る） | compare/normalize.rs | 実装済み未検証 |
 | H07 | 状態遷移の比較: オブジェクトごとに対応づけ、「そのオブジェクトへの操作列」を整列して欠落/追加を検出。両側に同じ多重集合が残る場合は欠落+追加ではなく順序相違の候補 1 件にまとめる | compare/diff.rs | 実装済み未検証 |
 | H08 | オブジェクト非関与の呼び出しはスレッド（出現順対応）ごとに整列比較。Enter/Leave の揃い方の相違は CallShapeDifference、取得状態の相違は CaptureDifference として別種別で出す | compare/diff.rs | 実装済み未検証 |
 | H09 | 完全性メタデータの別枠比較: 三指標・Loss Record 内訳・落ちた Payload 数・欠落 Blob 数が片側だけ違う場合を IntegrityDifference とする（「比較以前に観測できていない」可能性の提示） | compare/diff.rs | 実装済み未検証 |
@@ -301,9 +302,27 @@
 | I14 | 契約ドキュメント docs/ippai-integration.md: 境界（ippai/sake のコードは本 repo に無いこと、統合は ippai 側の作業であること）を冒頭に明記し、エミッタ契約 C1〜C10（チェッカの検査 ID と対応）、共有 API セットの同一性（content_hash）と追加規則（末尾追加のみ）、バンドル形式、Probe 生成の仕組みと限界、ippai 側に残る作業 4 件を定義 | docs/ippai-integration.md | 実装済み未検証 |
 | I15 | 解析系への追加と CI 配線: 新規 3 クレート（emit / conformance / probe）はいずれも OS 非依存で、windows-check-targets（x86_64 / i686）に matrix.json の最小変更で追加。既存クレートの公開 API は不変更 | Cargo.toml、scripts/ci/matrix.json | 実装済み未検証 |
 
+## J. コードレビュー第4回（2026-11-09、対象は remote main f9600b0）の指摘対応
+
+レビュー全文と照合メモは goals 側の hidden_files/2026-11-09-review4-findings.md。いずれの指摘も現行コードで実在を確認し、回帰テスト先行（赤→緑）で修正した。すべてローカル通過済みだが CI 未実施のため「実装済み未検証」。MSRV の決定（#2）は kota 判断のため本セクションに含めない。
+
+| ID | 項目 | 実装 | 状態 |
+|---|---|---|---|
+| J01 | #3 (P0) Windows CI スクリプトの終了コード伝播: 全ネイティブコマンドを Invoke-Native ヘルパー経由にし、失敗がジョブを落とす。あわせて意図的に失敗するコマンドを踏むカナリア (canary-exit-code.ps1) を両スクリプトの先頭で実行し、伝播の仕組み自体を毎回検証する | scripts/ci/native-step.ps1, canary-exit-code.ps1, windows.ps1, windows-x86.ps1 | 実装済み未検証 |
+| J02 | #3(a) golden テストの改行不安定性: .gitattributes で golden に eol=lf を固定し、比較側も改行正規化してから照合する（内容差は検出する単体テスト付き） | .gitattributes, shirusu-cli/tests/cli.rs | 実装済み未検証 |
+| J03 | #1 (P0) x86 ビルド: `(len >> 32) as u32` の overflow を u64 経由の split_mapping_size に修正。i686 / x86_64 両ターゲットの build（check でなく）で確認 | transport-win/lib.rs | 実装済み未検証 |
+| J04 | #4 capture-e2e の期待値型: lpNumberOfBytesRead は Schema 上 DWORD (U32)。期待値を TypedValue::U32(24) に修正 | e2e/shirusu-capture-e2e.rs | 実装済み未検証 |
+| J05 | production_path 第 2 フェーズ 0/700 の切り分け: 残留 data_ready 通知で Host が世代初期化前に DrainWorker を作ると GenerationMismatch で Ring が恒久停止する機構を Host 単体テスト 3 件で再現・固定。Supervisor は期待世代への遷移を確認してから Worker を作り、タイムアウト時に停止理由（完全性喪失・停止状態・共有世代・最後の Loss）を診断出力する。Windows 実走での第 2 フェーズ通過は CI 待ち | host/lib.rs (wait_for_ring_generation), e2e/shirusu-e2e-supervisor.rs | 実装済み未検証 |
+| J06 | #10 動的 Slot の公開順序: 追加 Slot は取得不能な PREPARING 状態で作り、Mapping 登録後に publish_slot で FREE を公開する。claim は PREPARING を掴めないこと、公開順序の loom モデル（新順序 + 旧順序 should_panic）を追加（loom 14 → 16） | transport/slot.rs, agent, shirusu-loom-tests | 実装済み未検証 |
+| J07 | #5 Blob ハッシュ検証: Trace Reader が取り込み時に BlobId::of_content(body) == id を検証し、不一致は BlobHashMismatch として隔離する。適合性検査に blob-ids-match-content を追加（9 → 10 件）。CRC を再計算して整合させた改竄 Blob の回帰テスト付き | shirusu-trace/reader.rs, shirusu-conformance/check.rs | 実装済み未検証 |
+| J08 | #6 Writer/Reader サイズ契約: Writer も raw（展開後）256MiB 上限を守り、超える単一 Payload は明示的エラーで拒否する。上限ちょうどの往復テスト含む | shirusu-trace/container.rs, writer.rs | 実装済み未検証 |
+| J09 | #7 正規化の意味種別: FieldDef.flags の bit2..=4 に ValueKind (Scalar / Pointer / Handle / CreatedObject) を定義し、compare の生成判定と U64 正規化を種別駆動にした。hook API 表と emit 共有 API セットへ同時に導入し content_hash ピンを維持。スカラー戻り値 100→200 の検出等、回帰テスト 4 件。種別の無い旧 Schema は従来規約へフォールバック（限界を明記） | shirusu-trace/schema.rs, hook/api.rs, emit/api_set.rs, compare/normalize.rs | 実装済み未検証 |
+| J10 | #8 フック対象 0 件の継続: NoTargets は計画を保持して返し、初期化失敗と分離。Agent DLL は 0 件設置で成功として継続し、Bootstrap v2 の書き戻し欄で設置/欠落件数を Host へ返す。Host は Capture Coverage の劣化として記録する（対象プロセスは終了させない） | hook/engine.rs, hook/bootstrap.rs, agent-dll, host/recorder.rs, recorder_launch.rs | 実装済み未検証 |
+| J11 | #9 終了時のフック解除経路: HookRuntime に記録ゲート (DetourFlight) を追加し、DLL の shutdown が「記録無効化 → 進行中 Detour の完了待ち → IAT 復元」の順序を実行する。Host の finish() は対象が生きている場合のみ最終回収前に shutdown をリモートスレッドで呼ぶ（ベストエフォート、旧 DLL では省略）。ゲートは Linux 単体テストで検証、recorder_launch の順序は CI 待ち | hook/runtime.rs, hook/engine.rs, agent-dll, host/recorder_launch.rs | 実装済み未検証 |
+
 ## 集計
 
-- 全項目数: A 75 + B 9 + C 19 + D 77 + E 5 + F 16 + G 14 + H 13 + I 15 = **243 項目**（固定。追加したらここを更新する）
+- 全項目数: A 75 + B 9 + C 19 + D 78 + E 5 + F 16 + G 14 + H 13 + I 15 + J 11 = **255 項目**（固定。追加したらここを更新する）
   - 2026-11-09 01:39 に A61〜A65 を追加し、分母が 135→140 に増えた。理由: 仕様再読でチェックリストの漏れ（空き待ちフェンス、セクション ACL、総メモリ上限、Finalization 不在の扱い、待機方式のベンチマーク選定）を発見したため。
   - 2026-11-09 02:52 に A66〜A68 を追加し、分母が 140→143 に増えた。理由: A61 の配線がライブラリ単位に留まっていたこと（A66）、ベンチ選定の結果を書き手が使う手段が無かったこと（A67）、Agent への space_available 受け渡しが未設計だったこと（A68）。
   - 2026-11-09 に D43〜D52 を追加し、分母が 143→153 に増えた。理由: ユーザーから「テストが全然足らない」との指摘を受け、カバレッジ・境界・PBT・loom・Kani・Miri・ミューテーション・Fuzz・E2E・Stress の各手法の増強を個別項目として追跡するため。いずれもローカルでは実施・通過済みだが、CI 未実施のため状態は「実装済み未検証」とする。
@@ -324,6 +343,8 @@
   - 2026-11-09 に Phase 4（解析 CLI＋差分エンジン＋shirusu-test 基礎）の H01〜H13 を追加し、分母が 215→228 に増えた。理由: スコープ拡大（Phase 4）とレビュー第3回で採用した設計指針（shirusu-compare は正規化つき差分エンジンとし、出すのは契約違反の「候補」まで）を項目として追跡するため。新規 4 クレート（analysis / cli / compare / test）は全てローカル通過済み（テスト総数 1673→1713 件、Windows ターゲット check は x86_64 / i686 とも通過）だが CI 未実施のため「実装済み未検証」。
   - 2026-11-09 に Phase 5（ippai 連携の shirusu 側基盤）の I01〜I15 を追加し、分母が 228→243 に増えた。理由: レビュー第3回で新設した Phase 5（sake 側 Trace エミッタ、差分の最小 Probe 化、ippai 回帰テストへの取り込み支援）のうち、shirusu 側で用意できる基盤（エミッタキット、適合性チェッカ、バンドル生成）と契約ドキュメントを項目として追跡するため。ippai / sake のコードは本 repo に無く、統合は ippai 側の残作業として契約文書に切り分けた。新規 3 クレート（emit / conformance / probe）はローカル通過済み（テスト総数は最終ゲートで確定し README に記録、Windows ターゲット check は x86_64 / i686 とも通過）だが CI 未実施のため「実装済み未検証」。
   - 2026-11-09 に転送層の残項目ワークストリームとして A74・A75・D53〜D56・D77 を実施し、未着手が 8→1 項目（残りは D41 のみ）になった。分母は 243 のまま変わらない。A74: 測定ハーネス shirusu-atomic-bench と CI 配線（i686 実測は CI 待ち、x86_64 参考値は全項目比率 0.90〜1.00）。A75: 検討記録を作成し条件付き保留と結論。D53: 証跡形式＋決定的再実行器＋DST の TestRunner 化と失敗時保存、縮小回帰ケース 2 件、loom 旧順序の should_panic 回帰化（loom 14 件）。D54: windows.ps1 に AppVerifier 併用を配線。D55: windows-2022 ジョブを追加。D56: 参照モデルの監査と usage_percent 依存の切り離し、mutation 実証スクリプト（nightly 配線、ローカルで両 mutation 検出を確認）。D77: production_path_interprocess シナリオを追加（x64 同士は --all、x64×i686 は windows-x86.ps1）。いずれも CI 未実施のため「実装済み未検証」。ローカルテスト総数は最終ゲートで確定し README に記録。
+  - 2026-11-09 にコードレビュー第4回（対象は remote main f9600b0、P0 2 件 + P1 8 件 + E2E 仮説 1 件）の対応として J01〜J11 を追加し、分母が 243→254 に増えた。#7/#8/#9 は着手前に実在をコードで確認し、いずれも実在した。回帰テスト先行で修正し、ローカルテスト総数は 1749→1773 件。PowerShell スクリプトの実挙動・production_path の Windows 実走・recorder_launch の終了順序は CI 未実施のため、いずれも「実装済み未検証」。MSRV（レビュー #2）は kota の決定待ちで本ワークストリームでは扱っていない。
+  - 2026-11-09 18:29 の定時実行で D78 を追加し、分母が 254→255 に増えた。理由: レビュー第4回ワークストリームが「観測記録に留める」とした expansion_e2e の負荷時 1 回の失敗を、定時ループが再現・原因特定して決定的に修正したため。(1) host_stop テストは管理スレッドの起動順序（claim 2 のフラグ消費と claim 3 の再ラッチのインタリーブ）が原因で、100ms の待ち時間の仮定ではなかった。(2) 往復テストは J06 の PREPARING 導入後、容量と取得可能性が分離したため待機条件が誤っていた。いずれもテスト側の修正で、仕組みの変更はない。修正後の expansion_e2e は 30 回連続で全通過し、全テスト 1773 件も維持。CI 未実施のため「実装済み未検証」。
 - 検証済み: 0 項目（2026-11-09 時点。ローカル通過のみの項目は検証済みに数えない）
-- 実装済み未検証: 242 項目 / 未着手: 1 項目（D41 CI フィードバックループ）
-- 進捗率: 検証済み 0 / 243 = 0%。作業量ベースの自己申告は約 3%（仕様読解等の前段を含む）。
+- 実装済み未検証: 254 項目 / 未着手: 1 項目（D41 CI フィードバックループ）
+- 進捗率: 検証済み 0 / 255 = 0%。作業量ベースの自己申告は約 3%（仕様読解等の前段を含む）。

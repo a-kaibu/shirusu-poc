@@ -1,0 +1,4 @@
+# golden ファイルは LF 固定。Windows チェックアウトで CRLF 化すると
+# CLI 出力との比較が改行コードだけで落ちる (レビュー #4 の隠れ失敗 (a))。
+# テスト側でも改行を正規化して比較するが、チェックアウト側も固定する。
+crates/shirusu-cli/tests/golden/*.txt text eol=lf

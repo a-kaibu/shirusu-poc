@@ -40,8 +40,12 @@ pub fn runtime() -> Option<Arc<HookRuntime>> {
 pub enum EngineError {
     /// モジュールイメージが PE として読めない
     NotPe,
-    /// 対象 API のインポートが 1 件も無い（計画が空）
-    NoTargets,
+    /// 対象 API のインポートが 1 件も無い（計画が空）。計画（全 API
+    /// が missing）を一緒に返す。これは**初期化の失敗ではない**:
+    /// 対象 API を使わない正常なアプリが存在するため、呼び出し側は
+    /// 「0 件設置・全件欠落」として記録を継続してよい
+    /// (レビュー #4 の #8)。
+    NoTargets(HookPlan),
     /// IAT スロットの保護属性変更に失敗した
     ProtectFailed { iat_rva: u32 },
 }
@@ -166,7 +170,7 @@ pub unsafe fn install_hooks(
     let sites = pe::parse_imports(image);
     let plan = build_plan(&sites);
     if plan.entries.is_empty() {
-        return Err(EngineError::NoTargets);
+        return Err(EngineError::NoTargets(plan));
     }
     let mut slots = Vec::new();
     for entry in &plan.entries {
@@ -221,16 +225,49 @@ fn detour_for(api_id: u32) -> usize {
 /// Detour 共通の前処理： ランタイム取得と元関数の解決。
 /// 元関数が無い（設置されていない）場合は None を返し、呼び出し側は
 /// API ごとの失敗値を返す（プロセスを落とさないことを優先する）。
-fn prepare(api_id: u32) -> Option<(Arc<HookRuntime>, usize, u64, &'static ApiDef)> {
-    let rt = runtime()?;
+/// Detour の入口判定 (レビュー #4 の #9)。
+enum Prepare {
+    /// 記録する通常経路。`flight` を Detour 全体で保持することで、
+    /// 終了手順が進行中 Detour の完了を待てる。
+    Record {
+        rt: Arc<HookRuntime>,
+        original: usize,
+        tid: u64,
+        api: &'static ApiDef,
+        flight: crate::runtime::DetourFlight,
+    },
+    /// 終了手順の進行中: 記録せず元関数を素通しで呼ぶ。IAT 復元と
+    /// 競合させないための経路。
+    Passthrough { original: usize },
+    /// ランタイム未登録 / 元関数なし: 呼び出し側は失敗値を返す。
+    Unavailable,
+}
+
+fn prepare(api_id: u32) -> Prepare {
+    let Some(rt) = runtime() else {
+        return Prepare::Unavailable;
+    };
     let original = rt.original(api_id);
     if original == 0 {
-        return None;
+        return Prepare::Unavailable;
     }
-    let api = api_by_id(api_id)?;
-    let tid = unsafe { GetCurrentThreadId() } as u64;
-    rt.ensure_thread(tid);
-    Some((rt, original, tid, api))
+    let Some(api) = api_by_id(api_id) else {
+        return Prepare::Unavailable;
+    };
+    match crate::runtime::DetourFlight::begin(&rt) {
+        Some(flight) => {
+            let tid = unsafe { GetCurrentThreadId() } as u64;
+            rt.ensure_thread(tid);
+            Prepare::Record {
+                rt,
+                original,
+                tid,
+                api,
+                flight,
+            }
+        }
+        None => Prepare::Passthrough { original },
+    }
 }
 
 const INVALID_HANDLE: usize = usize::MAX;
@@ -244,8 +281,30 @@ unsafe extern "system" fn detour_create_file_w(
     flags_and_attributes: u32,
     template_file: Handle,
 ) -> Handle {
-    let Some((rt, original, tid, api)) = prepare(API_CREATE_FILE_W) else {
-        return INVALID_HANDLE as Handle;
+    let (rt, original, tid, api, _flight) = match prepare(API_CREATE_FILE_W) {
+        Prepare::Record {
+            rt,
+            original,
+            tid,
+            api,
+            flight,
+        } => (rt, original, tid, api, flight),
+        Prepare::Passthrough { original } => {
+            // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
+            let orig: CreateFileWFn = unsafe { std::mem::transmute(original) };
+            return unsafe {
+                orig(
+                    file_name,
+                    desired_access,
+                    share_mode,
+                    security_attributes,
+                    creation_disposition,
+                    flags_and_attributes,
+                    template_file,
+                )
+            };
+        }
+        Prepare::Unavailable => return INVALID_HANDLE as Handle,
     };
     // SAFETY: original は設置時に保存した本物の CreateFileW。
     let orig: CreateFileWFn = unsafe { std::mem::transmute(original) };
@@ -295,8 +354,20 @@ unsafe extern "system" fn detour_read_file(
     bytes_read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let Some((rt, original, tid, api)) = prepare(API_READ_FILE) else {
-        return 0;
+    let (rt, original, tid, api, _flight) = match prepare(API_READ_FILE) {
+        Prepare::Record {
+            rt,
+            original,
+            tid,
+            api,
+            flight,
+        } => (rt, original, tid, api, flight),
+        Prepare::Passthrough { original } => {
+            // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
+            let orig: ReadFileFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(file, buffer, bytes_to_read, bytes_read, overlapped) };
+        }
+        Prepare::Unavailable => return 0,
     };
     // SAFETY: 設置時に保存した本物の ReadFile。
     let orig: ReadFileFn = unsafe { std::mem::transmute(original) };
@@ -333,8 +404,20 @@ unsafe extern "system" fn detour_write_file(
     bytes_written: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let Some((rt, original, tid, api)) = prepare(API_WRITE_FILE) else {
-        return 0;
+    let (rt, original, tid, api, _flight) = match prepare(API_WRITE_FILE) {
+        Prepare::Record {
+            rt,
+            original,
+            tid,
+            api,
+            flight,
+        } => (rt, original, tid, api, flight),
+        Prepare::Passthrough { original } => {
+            // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
+            let orig: WriteFileFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(file, buffer, bytes_to_write, bytes_written, overlapped) };
+        }
+        Prepare::Unavailable => return 0,
     };
     // SAFETY: 設置時に保存した本物の WriteFile。
     let orig: WriteFileFn = unsafe { std::mem::transmute(original) };
@@ -366,8 +449,20 @@ unsafe extern "system" fn detour_write_file(
 }
 
 unsafe extern "system" fn detour_close_handle(object: Handle) -> i32 {
-    let Some((rt, original, tid, api)) = prepare(API_CLOSE_HANDLE) else {
-        return 0;
+    let (rt, original, tid, api, _flight) = match prepare(API_CLOSE_HANDLE) {
+        Prepare::Record {
+            rt,
+            original,
+            tid,
+            api,
+            flight,
+        } => (rt, original, tid, api, flight),
+        Prepare::Passthrough { original } => {
+            // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
+            let orig: CloseHandleFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(object) };
+        }
+        Prepare::Unavailable => return 0,
     };
     // SAFETY: 設置時に保存した本物の CloseHandle。
     let orig: CloseHandleFn = unsafe { std::mem::transmute(original) };

@@ -169,8 +169,10 @@ mod win {
         if let Some(e) = find(&events, rf.leave_schema_id()) {
             let n = arg(&trace, e, 1);
             let data = arg(&trace, e, 2);
+            // lpNumberOfBytesRead は Schema 上 DWORD = U32 (レビュー
+            // #4 の #4: 以前は U64 を期待しており型不一致で必ず失敗した)。
             c.check(
-                n == TypedValue::U64(24)
+                n == TypedValue::U32(24)
                     && data == TypedValue::Bytes(b"shirusu-hook-e2e-content".to_vec()),
                 "readfile data captured",
             );

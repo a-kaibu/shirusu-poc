@@ -18,7 +18,7 @@
 //!   相関できる）。
 
 use shirusu_trace::proto::SchemaDef;
-use shirusu_trace::schema::{make_schema, Ty};
+use shirusu_trace::schema::{make_schema, Ty, ValueKind};
 
 pub const API_CREATE_FILE_W: u32 = 1;
 pub const API_READ_FILE: u32 = 2;
@@ -26,7 +26,10 @@ pub const API_WRITE_FILE: u32 = 3;
 pub const API_CLOSE_HANDLE: u32 = 4;
 
 /// 1 API の定義。`enter_fields` / `leave_fields` は Compact Binary の
-/// 値列の順序そのものである（Schema が型と順序を定める）。
+/// 値列の順序そのものである（Schema が型と順序を定める）。各
+/// フィールドは型に加えて意味種別 (ValueKind) を持ち、Schema の
+/// flags へ格納される（比較エンジンは型ではなく意味で正規化する。
+/// レビュー #4 の #7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiDef {
     pub api_id: u32,
@@ -38,8 +41,8 @@ pub struct ApiDef {
     pub level: u8,
     /// 到達範囲と未達部分の正直な注記。SchemaDef.annotation へ写す。
     pub level_note: &'static str,
-    pub enter_fields: &'static [(&'static str, Ty)],
-    pub leave_fields: &'static [(&'static str, Ty)],
+    pub enter_fields: &'static [(&'static str, Ty, ValueKind)],
+    pub leave_fields: &'static [(&'static str, Ty, ValueKind)],
 }
 
 impl ApiDef {
@@ -60,7 +63,7 @@ impl ApiDef {
             &format!("{}/enter", self.schema_base_name()),
             self.enter_fields
                 .iter()
-                .map(|(n, t)| (n.to_string(), *t, 0))
+                .map(|(n, t, k)| (n.to_string(), *t, k.flags()))
                 .collect(),
         );
         def.annotation = format!("L{} (enter): {}", self.level, self.level_note);
@@ -72,7 +75,7 @@ impl ApiDef {
             &format!("{}/leave", self.schema_base_name()),
             self.leave_fields
                 .iter()
-                .map(|(n, t)| (n.to_string(), *t, 0))
+                .map(|(n, t, k)| (n.to_string(), *t, k.flags()))
                 .collect(),
         );
         def.annotation = format!("L{} (leave): {}", self.level, self.level_note);
@@ -94,15 +97,18 @@ pub const API_TABLE: &[ApiDef] = &[
                      hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で \
                      後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)",
         enter_fields: &[
-            ("lpFileName", Ty::Str16),
-            ("dwDesiredAccess", DWORD),
-            ("dwShareMode", DWORD),
-            ("lpSecurityAttributes", HANDLE),
-            ("dwCreationDisposition", DWORD),
-            ("dwFlagsAndAttributes", DWORD),
-            ("hTemplateFile", HANDLE),
+            ("lpFileName", Ty::Str16, ValueKind::Scalar),
+            ("dwDesiredAccess", DWORD, ValueKind::Scalar),
+            ("dwShareMode", DWORD, ValueKind::Scalar),
+            ("lpSecurityAttributes", HANDLE, ValueKind::Pointer),
+            ("dwCreationDisposition", DWORD, ValueKind::Scalar),
+            ("dwFlagsAndAttributes", DWORD, ValueKind::Scalar),
+            ("hTemplateFile", HANDLE, ValueKind::Handle),
         ],
-        leave_fields: &[("return", HANDLE), ("last_error", DWORD)],
+        leave_fields: &[
+            ("return", HANDLE, ValueKind::CreatedObject),
+            ("last_error", DWORD, ValueKind::Scalar),
+        ],
     },
     ApiDef {
         api_id: API_READ_FILE,
@@ -113,15 +119,15 @@ pub const API_TABLE: &[ApiDef] = &[
                      (上限超過は Truncated)。OVERLAPPED 指定時は完了が非同期の \
                      ためバッファ内容と読取バイト数は Unsupported として記録する",
         enter_fields: &[
-            ("hFile", HANDLE),
-            ("lpBuffer", HANDLE),
-            ("nNumberOfBytesToRead", DWORD),
+            ("hFile", HANDLE, ValueKind::Handle),
+            ("lpBuffer", HANDLE, ValueKind::Pointer),
+            ("nNumberOfBytesToRead", DWORD, ValueKind::Scalar),
         ],
         leave_fields: &[
-            ("return", BOOL),
-            ("lpNumberOfBytesRead", DWORD),
-            ("data", Ty::Bytes),
-            ("last_error", DWORD),
+            ("return", BOOL, ValueKind::Scalar),
+            ("lpNumberOfBytesRead", DWORD, ValueKind::Scalar),
+            ("data", Ty::Bytes, ValueKind::Scalar),
+            ("last_error", DWORD, ValueKind::Scalar),
         ],
     },
     ApiDef {
@@ -132,14 +138,14 @@ pub const API_TABLE: &[ApiDef] = &[
         level_note: "入力バッファ内容を呼び出し前に上限付きで復元する \
                      (上限超過は Truncated)",
         enter_fields: &[
-            ("hFile", HANDLE),
-            ("data", Ty::Bytes),
-            ("nNumberOfBytesToWrite", DWORD),
+            ("hFile", HANDLE, ValueKind::Handle),
+            ("data", Ty::Bytes, ValueKind::Scalar),
+            ("nNumberOfBytesToWrite", DWORD, ValueKind::Scalar),
         ],
         leave_fields: &[
-            ("return", BOOL),
-            ("lpNumberOfBytesWritten", DWORD),
-            ("last_error", DWORD),
+            ("return", BOOL, ValueKind::Scalar),
+            ("lpNumberOfBytesWritten", DWORD, ValueKind::Scalar),
+            ("last_error", DWORD, ValueKind::Scalar),
         ],
     },
     ApiDef {
@@ -149,8 +155,11 @@ pub const API_TABLE: &[ApiDef] = &[
         level: 1,
         level_note: "型付き引数・戻り値のみ。対象 HANDLE の生値で生成側 \
                      イベントと相関可能 (Object ID は未割当)",
-        enter_fields: &[("hObject", HANDLE)],
-        leave_fields: &[("return", BOOL), ("last_error", DWORD)],
+        enter_fields: &[("hObject", HANDLE, ValueKind::Handle)],
+        leave_fields: &[
+            ("return", BOOL, ValueKind::Scalar),
+            ("last_error", DWORD, ValueKind::Scalar),
+        ],
     },
 ];
 
@@ -258,6 +267,46 @@ mod tests {
             );
             assert_eq!(last.1, Ty::U32);
         }
+    }
+
+    #[test]
+    fn schemas_carry_value_kinds() {
+        // レビュー #4 の #7: 意味種別が Schema の flags へ格納される。
+        // CreateFileW の戻りは生成、ReadFile のバイト数はスカラー。
+        let create = api_by_id(API_CREATE_FILE_W).unwrap();
+        let leave = create.leave_schema();
+        assert_eq!(leave.fields[0].name, "return");
+        assert_eq!(
+            ValueKind::from_flags(leave.fields[0].flags),
+            ValueKind::CreatedObject
+        );
+        let read = api_by_id(API_READ_FILE).unwrap();
+        let enter = read.enter_schema();
+        assert_eq!(
+            ValueKind::from_flags(enter.fields[0].flags),
+            ValueKind::Handle,
+            "hFile"
+        );
+        assert_eq!(
+            ValueKind::from_flags(enter.fields[1].flags),
+            ValueKind::Pointer,
+            "lpBuffer"
+        );
+        let kinds: Vec<ValueKind> = read
+            .leave_schema()
+            .fields
+            .iter()
+            .map(|f| ValueKind::from_flags(f.flags))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ValueKind::Scalar,
+                ValueKind::Scalar, // lpNumberOfBytesRead は個数 (スカラー)
+                ValueKind::Scalar,
+                ValueKind::Scalar,
+            ]
+        );
     }
 
     #[test]

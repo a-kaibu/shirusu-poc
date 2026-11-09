@@ -23,10 +23,15 @@ exclude = ["fuzz"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-# MSRV: descriptor.rs のレイアウト静的検査で core::mem::offset_of! (安定化
-# 1.77) を使うため 1.77 が下限 (R5: 以前は 1.74 と宣言しながら使っており
-# 不一致だった)。各クレートは rust-version.workspace = true で継承する。
-rust-version = "1.77"
+# MSRV: 当初の下限は descriptor.rs のレイアウト静的検査で使う
+# core::mem::offset_of! (安定化 1.77) だった (R5)。2026-11-09 に kota の
+# 決定で 1.87 へ引き上げた: 依存グラフが 1.77 では成立しないため
+# (ruzstd 0.8.3 が rust-version 1.87 を宣言、blake3 経由の cpufeatures 0.3 は
+# edition2024 で Cargo 1.85 以降が必要、ruzstd のソース自体も #[expect] 等
+# 1.81 以降の機能を使う)。唯一のピンは Cargo.lock 側の generator ≤ 0.8.11
+# (0.8.12 が rust-version 1.95 を宣言するため)。各クレートは
+# rust-version.workspace = true で継承する。
+rust-version = "1.87"
 
 [workspace.lints.clippy]
 all = "warn"

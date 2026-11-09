@@ -194,6 +194,10 @@ pub struct SessionSummary {
     pub rings_stopped: usize,
     pub args_attached: usize,
     pub args_fallback_blob: usize,
+    /// Agent DLL が報告したフック設置結果 (設置数, 欠落数)。
+    /// プロセス間記録で DLL から読み戻せた場合のみ Some
+    /// (レビュー #4 の #8)。
+    pub hook_coverage: Option<(usize, usize)>,
     pub integrity: IntegrityReport,
 }
 
@@ -235,6 +239,9 @@ pub struct CaptureSession {
     /// プロセス間では Agent 内カウンタに留まり Host からは見えない
     /// （Phase 3 の制約として summary の注記にも残す）。
     coverage_missing_calls: u64,
+    /// Agent DLL が Bootstrap 経由で報告したフック設置結果
+    /// (設置数, 欠落数)。プロセス間記録でのみ設定される。
+    hook_coverage: Option<(usize, usize)>,
 }
 
 impl CaptureSession {
@@ -262,6 +269,7 @@ impl CaptureSession {
             trace_path: path.as_ref().to_path_buf(),
             args_stats: ArgsConversionStats::default(),
             coverage_missing_calls: 0,
+            hook_coverage: None,
         })
     }
 
@@ -278,6 +286,14 @@ impl CaptureSession {
     /// （Capture Coverage の劣化として Finalization に写す）。
     pub fn set_coverage_missing_calls(&mut self, n: u64) {
         self.coverage_missing_calls = n;
+    }
+
+    /// Agent DLL が報告したフック設置結果を知らせる (レビュー #4 の
+    /// #8)。欠落がある場合は Capture Coverage の劣化として
+    /// Finalization に写す。対象 API を 1 つもインポートしていない
+    /// 正常なアプリは「0 件設置・全件欠落」としてここへ届く。
+    pub fn set_hook_coverage(&mut self, hooked: usize, missing: usize) {
+        self.hook_coverage = Some((hooked, missing));
     }
 
     fn ensure_state(&self, want: SessionState, op: &'static str) -> Result<(), SessionError> {
@@ -487,6 +503,23 @@ impl CaptureSession {
                     .into(),
             );
         }
+        if let Some((hooked, missing)) = self.hook_coverage {
+            if missing > 0 {
+                report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
+                let total = hooked + missing;
+                if hooked == 0 {
+                    report.notes.push(format!(
+                        "hook coverage: 0/{total} target APIs hooked in the main module; \
+                         the target imports none of them, so it ran unrecorded"
+                    ));
+                } else {
+                    report.notes.push(format!(
+                        "hook coverage: {hooked}/{total} target APIs hooked in the main \
+                         module; {missing} not imported"
+                    ));
+                }
+            }
+        }
         let total_events: u64 = self.rings.iter().map(|r| r.events).sum();
         let trace_path = self.trace_path.clone();
         let mut file = self.recorder.finish(&report)?;
@@ -502,6 +535,7 @@ impl CaptureSession {
             rings_stopped,
             args_attached: self.args_stats.args_attached,
             args_fallback_blob: self.args_stats.args_fallback_blob,
+            hook_coverage: self.hook_coverage,
             integrity: report,
         })
     }

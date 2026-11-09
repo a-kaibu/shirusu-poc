@@ -26,12 +26,17 @@ fn make_agent(pool: Arc<SlotPool>, cfg: RingConfig) -> Arc<Agent> {
     )
 }
 
-fn wait_capacity(pool: &SlotPool, want: usize, label: &str) {
+/// 取得可能な空き Slot が現れるまで待つ。容量 (Slot 数) では待たない:
+/// J06 (レビュー #4 #10) 以降、追加 Slot は add_slot 時点で容量に
+/// 数えられるが PREPARING で取得不能で、publish_slot で初めて FREE に
+/// なる。容量だけ見ると add と publish の間の窓で thread_begin が
+/// None を返し、負荷時の繰り返しで落ちる（30 回ループの 5 回目で再現）。
+fn wait_claimable_slot(pool: &SlotPool, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while pool.capacity() < want {
+    while pool.free_count() == 0 {
         assert!(
             Instant::now() < deadline,
-            "{label}: capacity stayed {} (want {want})",
+            "{label}: no claimable slot appeared (capacity {})",
             pool.capacity()
         );
         std::thread::sleep(Duration::from_millis(5));
@@ -54,7 +59,8 @@ fn agent_to_host_round_trip_expands_slot_and_new_thread_records() {
     assert!(agent.thread_begin(1).is_some());
     assert!(agent.thread_begin(2).is_some());
     assert!(agent.thread_begin(3).is_some());
-    wait_capacity(&pool, 4, "expansion round trip");
+    wait_claimable_slot(&pool, "expansion round trip");
+    assert!(pool.capacity() >= 4, "slot was added");
     // 新規スレッドは追加 Slot (generation 0) を取り、Host の Mapping の Ring で記録する。
     let h4 = agent.thread_begin(4).unwrap();
     assert_eq!(h4.index, 3);
@@ -124,11 +130,18 @@ fn host_stop_during_expansion_existing_rings_continue() {
     let agent = make_agent(Arc::clone(&pool), cfg);
     let (req_tx, req_rx) = mpsc::channel();
     let (del_tx, del_rx) = mpsc::channel();
-    let manager = Agent::spawn_expansion_manager(Arc::clone(&agent), req_tx, del_rx);
     // サービスは起動しない (Host 役はいない)。要求が届いたら配送口を落とす。
     assert!(agent.thread_begin(1).is_some());
     assert!(agent.thread_begin(2).is_some());
     assert!(agent.thread_begin(3).is_some());
+    // 管理スレッドは 3 本の claim の後で起動する。先に起動すると、
+    // claim 2 で立った要求フラグを管理スレッドが claim 3 の前に消費し、
+    // claim 3 がフラグを再び立てる (slot.rs の再ラッチは仕様どおり)。
+    // その場合、破棄後に 2 件目の要求が送られて requested が 2 になり、
+    // 下の `requested == 1` が負荷時の割り込み次第で落ちる。起動を
+    // claim の後にすることで要求はちょうど 1 件に決まる（負荷時に 1 度
+    // だけ落ちた実例の原因。100ms の待ち時間の仮定ではなかった）。
+    let manager = Agent::spawn_expansion_manager(Arc::clone(&agent), req_tx, del_rx);
     let req = req_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("manager must send a request");

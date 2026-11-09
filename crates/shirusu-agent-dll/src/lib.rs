@@ -44,8 +44,11 @@ pub extern "system" fn shirusu_agent_init(bootstrap: *const AgentBootstrap) -> u
     }
 }
 
-/// フックの巻き戻し（IAT を元へ戻す）。プロセス終了前の後始末用であり、
-/// 通常の記録停止は Host 側のセッション終了で行う。
+/// 終了手順（レビュー #4 の #9）: 記録の無効化 → 進行中 Detour の
+/// 完了待ち → IAT の巻き戻し、の順に行う。Host は対象プロセスを
+/// 生かしたまま記録だけを終える場合（LaunchedCapture::finish）に
+/// これをリモートスレッドで呼んでから最終回収・確定を行う。
+/// 対象が既に終了している場合は呼ばれない（呼ぶ必要もない）。
 #[no_mangle]
 pub extern "system" fn shirusu_agent_shutdown() -> u32 {
     #[cfg(windows)]
@@ -82,7 +85,7 @@ mod win {
     use super::*;
     use shirusu_agent::Agent;
     use shirusu_hook::bootstrap::BOOTSTRAP_VERSION;
-    use shirusu_hook::engine::{self, InstalledHooks};
+    use shirusu_hook::engine::{self, EngineError, InstalledHooks};
     use shirusu_hook::runtime::HookRuntime;
     use shirusu_transport::context::HostMonitor;
     use shirusu_transport::expansion::ExpansionDelivery;
@@ -189,8 +192,30 @@ mod win {
         // メインモジュールに限ることで抑える（Phase 3 の範囲）。
         let installed = match unsafe { engine::install_hooks(main_base as *mut u8, &rt) } {
             Ok(i) => i,
+            // フック対象が 0 件（レビュー #4 の #8）: 対象 API を 1 つも
+            // インポートしていない正常なアプリである。初期化失敗には
+            // せず、空の設置状態で成功として継続する。欠落は下の
+            // Bootstrap 書き戻し経由で Host の Capture Coverage へ
+            // 記録される。
+            Err(EngineError::NoTargets(plan)) => InstalledHooks {
+                module_base: main_base as usize,
+                slots: Vec::new(),
+                plan,
+            },
             Err(_) => return STATUS_HOOK_FAILED,
         };
+        // Host が読み戻せるよう、init_done を立てる前に Bootstrap へ
+        // 設置/欠落件数を書き戻す。
+        // SAFETY: bootstrap は Host が書き込み可能に確保した領域で、
+        // 初期化が戻るまで有効（呼び出し側の契約）。書き戻し欄は
+        // バージョン 2 で追加された結果専用の欄である。
+        unsafe {
+            AgentBootstrap::write_hook_outcome(
+                bootstrap as *mut AgentBootstrap,
+                installed.slots.len() as u32,
+                installed.plan.missing.len() as u32,
+            );
+        }
         *STATE.lock().unwrap() = Some(DllState { installed });
         if b.init_done_handle != 0 {
             // SAFETY: Host が複製して渡したイベント。立てた後は所有を
@@ -203,6 +228,18 @@ mod win {
     }
 
     pub fn shutdown() -> u32 {
+        // 順序（レビュー #4 の #9）: (1) 新規記録を無効化し、以後の
+        // Detour は元関数を素通しで呼ぶ。(2) 進行中の Detour が完了
+        // するまで待つ。(3) IAT を復元する。Host はこの後に Ring の
+        // 最終回収と Trace の確定を行う。
+        if let Some(rt) = engine::runtime() {
+            rt.shutdown_recording();
+            // 待ち上限を超えても復元は試みる（対象プロセスの終了を
+            // 妨げるより、復元を優先する）。その場合に書き込み途中
+            // だった Detour のイベントは不完全なまま Ring に残り、
+            // Host 側の完全性評価で扱われる。
+            let _ = rt.wait_in_flight_drained(std::time::Duration::from_secs(5));
+        }
         let state = STATE.lock().unwrap().take();
         if let Some(s) = state {
             // SAFETY: 設置時に保存したスロット情報。対象モジュールは

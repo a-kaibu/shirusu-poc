@@ -158,6 +158,16 @@ mod imp {
         })
     }
 
+    /// File Mapping のサイズを CreateFileMappingW の (high, low) DWORD
+    /// 対へ分ける。`usize` のまま `>> 32` すると、32bit ターゲットでは
+    /// シフト量が型の幅以上になり算術オーバーフローとしてコンパイル
+    /// エラーになる (レビュー #4 の #1: i686 ビルド失敗の原因)。
+    /// u64 へ広げてから分ける。
+    fn split_mapping_size(len: usize) -> (u32, u32) {
+        let size = len as u64;
+        ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32)
+    }
+
     pub struct SharedMapping {
         handle: HANDLE,
         view: *mut u8,
@@ -170,13 +180,14 @@ mod imp {
             if len == 0 {
                 return Err(WinError::InvalidArgument("len"));
             }
+            let (size_high, size_low) = split_mapping_size(len);
             let handle = unsafe {
                 CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
                     std::ptr::null(),
                     PAGE_READWRITE,
-                    (len >> 32) as u32,
-                    (len & 0xFFFF_FFFF) as u32,
+                    size_high,
+                    size_low,
                     std::ptr::null(), // 名前付きにしない
                 )
             };
@@ -205,13 +216,14 @@ mod imp {
                 return Err(WinError::InvalidArgument("len"));
             }
             let restricted = restricted_security_attributes()?;
+            let (size_high, size_low) = split_mapping_size(len);
             let handle = unsafe {
                 CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
                     &restricted.sa,
                     PAGE_READWRITE,
-                    (len >> 32) as u32,
-                    (len & 0xFFFF_FFFF) as u32,
+                    size_high,
+                    size_low,
                     std::ptr::null(), // 名前付きにしない
                 )
             };
@@ -582,6 +594,30 @@ mod imp {
         Ok(())
     }
 
+    /// 対象プロセスのメモリを読む (Bootstrap の初期化結果の読み戻し等)。
+    pub fn read_process_memory(
+        process: HandleValue,
+        src: usize,
+        dest: *mut u8,
+        len: usize,
+    ) -> Result<()> {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        let mut read: usize = 0;
+        let ok = unsafe {
+            ReadProcessMemory(
+                h(process),
+                src as *const c_void,
+                dest as *mut c_void,
+                len,
+                &mut read,
+            )
+        };
+        if ok == 0 || read != len {
+            return Err(last_err("ReadProcessMemory"));
+        }
+        Ok(())
+    }
+
     /// 対象プロセスで `start(param)` をリモートスレッドで実行し、戻り値
     /// （スレッド終了コード）を返す。30 秒で打ち切る。
     pub fn remote_call(process: HandleValue, start: usize, param: usize) -> Result<u32> {
@@ -892,6 +928,14 @@ mod imp {
     ) -> Result<()> {
         Err(WinError::Unsupported)
     }
+    pub fn read_process_memory(
+        _process: HandleValue,
+        _src: usize,
+        _dest: *mut u8,
+        _len: usize,
+    ) -> Result<()> {
+        Err(WinError::Unsupported)
+    }
     pub fn remote_call(_process: HandleValue, _start: usize, _param: usize) -> Result<u32> {
         Err(WinError::Unsupported)
     }
@@ -912,9 +956,9 @@ mod imp {
 
 pub use imp::{
     close_handle_value, duplicate_handle_to_process, module_base, open_process_for_injection,
-    process_exited, remote_alloc, remote_call, remote_free, remote_load_library,
-    resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process, wait_process,
-    write_process_memory, EventObject, SharedMapping,
+    process_exited, read_process_memory, remote_alloc, remote_call, remote_free,
+    remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process,
+    wait_process, write_process_memory, EventObject, SharedMapping,
 };
 
 /// プロセス単位の通知イベント群。data_ready は auto-reset。

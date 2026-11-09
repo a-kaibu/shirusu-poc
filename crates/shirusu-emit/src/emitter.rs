@@ -283,7 +283,7 @@ impl<W: Write> Emitter<W> {
             .api_id(api)
             .ok_or_else(|| EmitError::UnknownApi(api.to_string()))?;
         let spec = self.set.spec(api_id).expect("api_id from set");
-        let types: Vec<Ty> = spec.enter_fields.iter().map(|(_, t)| *t).collect();
+        let types: Vec<Ty> = spec.enter_fields.iter().map(|(_, t, _)| *t).collect();
         let args = encode_args(&types, values)?;
         let payload = self.resolve_payload(meta.payload)?;
         let state = self.threads.entry(thread_id).or_default();
@@ -328,7 +328,7 @@ impl<W: Write> Emitter<W> {
             .set
             .spec(token.api_id)
             .ok_or_else(|| EmitError::UnknownApi(format!("api_id {}", token.api_id)))?;
-        let types: Vec<Ty> = spec.leave_fields.iter().map(|(_, t)| *t).collect();
+        let types: Vec<Ty> = spec.leave_fields.iter().map(|(_, t, _)| *t).collect();
         let args = encode_args(&types, values)?;
         let payload = self.resolve_payload(meta.payload)?;
         let state = self

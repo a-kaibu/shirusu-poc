@@ -317,6 +317,46 @@ fn blobs_are_written_before_referencing_chunk() {
 }
 
 #[test]
+fn writer_rejects_single_payload_above_raw_limit() {
+    // レビュー #4 の #6: 1 Blob のエントリ (ID 32 + 長さ 4 + 本体) が
+    // Reader の上限 MAX_RAW_LEN を超える Payload は、Writer が明示的
+    // に拒否する。黙って書くと Reader が読めない Trace ができる。
+    let limit = shirusu_trace::container::MAX_RAW_LEN as usize;
+    let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    let too_big = vec![0u8; limit - 36 + 1];
+    let err = w.add_payload(&too_big).unwrap_err();
+    assert!(
+        format!("{err}").contains("raw limit"),
+        "error must name the raw limit: {err}"
+    );
+}
+
+#[test]
+fn writer_reader_roundtrip_at_raw_limit_boundary() {
+    // 境界値: エントリ全体がちょうど MAX_RAW_LEN に収まる Blob は
+    // 書けて、同じバージョンの Reader が読み戻せる (Writer/Reader 契約)。
+    let limit = shirusu_trace::container::MAX_RAW_LEN as usize;
+    let data = vec![0u8; limit - 36];
+    let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    let id = w.add_payload(&data).unwrap();
+    w.write_batch(&batch(3, vec![event(1, PayloadRef::Blob(id))]))
+        .unwrap();
+    let bytes = w.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace_via(&bytes).unwrap();
+    assert_eq!(trace.blobs.get(&id).map(|b| b.len()), Some(limit - 36));
+    assert!(
+        trace.issues.is_empty(),
+        "boundary trace must read cleanly: {:?}",
+        trace.issues
+    );
+    let ev = &trace.batches[0].events[0];
+    assert!(matches!(
+        trace.resolve_payload(ev),
+        PayloadResolution::Blob(b) if b.len() == limit - 36
+    ));
+}
+
+#[test]
 fn repetitive_chunk_is_stored_compressed() {
     let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
     let events: Vec<TraceEvent> = (1..=500u64)

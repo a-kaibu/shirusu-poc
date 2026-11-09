@@ -8,7 +8,7 @@ use crate::json::JsonValue;
 use shirusu_trace::compact::decode_values;
 use shirusu_trace::model::{PayloadLossReason, PayloadRef};
 use shirusu_trace::reader::{ReadTrace, RecoveryIssue};
-use shirusu_trace::schema::{EventCapture, Ty, TypedValue, ValueCapture};
+use shirusu_trace::schema::{EventCapture, Ty, TypedValue, ValueCapture, ValueKind};
 use shirusu_trace::BlobId;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -60,6 +60,9 @@ pub fn api_name_of_schema(schema_name: &str) -> &str {
 pub struct FieldView {
     pub name: String,
     pub ty: Ty,
+    /// Schema が宣言した意味種別。Schema が引けない場合は
+    /// Unspecified (利用側は型からの推定にフォールバックする)。
+    pub kind: ValueKind,
     pub capture: ValueCapture,
     pub value: TypedValue,
 }
@@ -495,6 +498,9 @@ impl IntegritySummary {
                 }
                 RecoveryIssue::Resync { from, to } => format!("resync({from}..{to})"),
                 RecoveryIssue::DuplicateBlob { id } => format!("duplicate_blob({id})"),
+                RecoveryIssue::BlobHashMismatch { id, computed } => {
+                    format!("blob_hash_mismatch(id={id}, computed={computed})")
+                }
                 RecoveryIssue::MissingBlob { id } => format!("missing_blob({id})"),
                 RecoveryIssue::IndexMismatch => "index_mismatch".to_string(),
                 RecoveryIssue::LimitExceeded { what } => format!("limit_exceeded({what})"),
@@ -645,6 +651,11 @@ fn decode_fields(
                         .map(|f| f.name.clone())
                         .unwrap_or_else(|| format!("field{i}")),
                     ty: cv.value.ty(),
+                    kind: def
+                        .fields
+                        .get(i)
+                        .map(|f| ValueKind::from_flags(f.flags))
+                        .unwrap_or(ValueKind::Unspecified),
                     capture: cv.capture,
                     value: cv.value,
                 })

@@ -63,7 +63,7 @@
       "java": false,
       "name": "windows-check-targets",
       "os": "ubuntu-latest",
-      "run": "cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-hook -p shirusu-agent-dll -p shirusu-analysis -p shirusu-cli -p shirusu-compare -p shirusu-test -p shirusu-emit -p shirusu-conformance -p shirusu-probe --target x86_64-pc-windows-msvc && cargo check -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-hook -p shirusu-agent-dll -p shirusu-analysis -p shirusu-cli -p shirusu-compare -p shirusu-test -p shirusu-emit -p shirusu-conformance -p shirusu-probe --target i686-pc-windows-msvc",
+      "run": "cargo check --all-targets -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-hook -p shirusu-agent-dll -p shirusu-analysis -p shirusu-cli -p shirusu-compare -p shirusu-test -p shirusu-emit -p shirusu-conformance -p shirusu-probe --target x86_64-pc-windows-msvc && cargo check --all-targets -p shirusu-transport-win -p shirusu-agent -p shirusu-host -p shirusu-hook -p shirusu-agent-dll -p shirusu-analysis -p shirusu-cli -p shirusu-compare -p shirusu-test -p shirusu-emit -p shirusu-conformance -p shirusu-probe --target i686-pc-windows-msvc && cargo build -p shirusu-transport-win --target x86_64-pc-windows-msvc && cargo build -p shirusu-transport-win --target i686-pc-windows-msvc",
       "suites": [
         "ci"
       ],
@@ -97,7 +97,7 @@
       ],
       "targets": "",
       "timeout": 30,
-      "toolchain": "1.77"
+      "toolchain": "1.87"
     },
     {
       "allow_failure": true,

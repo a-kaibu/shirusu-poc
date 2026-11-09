@@ -48,6 +48,11 @@ pub enum RecoveryIssue {
     Resync { from: u64, to: u64 },
     /// 同じ Blob ID がファイル内に複数回現れた（内容の同一性によらない）。
     DuplicateBlob { id: BlobId },
+    /// Blob の内容が、その ID (内容の BLAKE3 ハッシュ) と一致しなかった。
+    /// Block の CRC32C が整合していても受理しない: CRC は Block の
+    /// 破損検出用であり、Blob ID と内容の同一性は保証しない。その
+    /// Blob は取り込まれず、参照側には MissingBlob として現れる。
+    BlobHashMismatch { id: BlobId, computed: BlobId },
     /// イベントが参照する Blob がファイル内に無い。
     MissingBlob { id: BlobId },
     /// 保存されていた Index が走査結果と一致せず、無視した。
@@ -563,6 +568,17 @@ impl<'a> Scan<'a> {
                     .push(RecoveryIssue::LimitExceeded { what: "blobs" });
                 self.stopped_by_limit = true;
                 return;
+            }
+            // Blob ID は内容の BLAKE3 ハッシュそのものである。取り込み
+            // 時点で必ず照合する (レビュー #4 の #5)。Block の CRC32C が
+            // 整合していても、内容と ID が食い違う Blob は受理しない
+            // (受理すると後段の比較エンジン等が誤ったバイト列を正規の
+            // Blob 内容として扱ってしまう)。
+            let computed = BlobId::of_content(&body);
+            if computed != id {
+                self.issues
+                    .push(RecoveryIssue::BlobHashMismatch { id, computed });
+                continue;
             }
             self.blobs.insert(id, body);
         }
