@@ -22,7 +22,10 @@
 //! 4. **意味種別による値の扱い**: `Scalar` は値をそのまま比較する
 //!    （U64 のカウンタや時刻も消さない）。`Pointer` と、生成に
 //!    対応しない `Handle` の値は中身を消す（`Pointer`）。ただし
-//!    0 は `Null`、U64 の全ビット 1 は `Invalid` として区別を残す。
+//!    0 は `Null`、INVALID_HANDLE_VALUE の番兵値は `Invalid` として
+//!    区別を残す。番兵値はポインタ幅依存である（64bit: 全ビット 1、
+//!    32bit: 下位 32 ビットのみ 1。`CaptureEnvironment.pointer_width`
+//!    で判断する。レビュー第5回 #5）。
 //!    Ptr32 / Ptr64 は型そのものがポインタ宣言であるため従来どおり
 //!    ポインタとして扱う（Scalar 宣言がある場合だけ値を比較する）。
 //!    Unspecified の U64 は従来規約（ハンドル/ポインタ級）で扱う。
@@ -206,8 +209,26 @@ pub struct NormTrace {
     pub total_events: usize,
 }
 
+/// INVALID_HANDLE_VALUE の番兵値 (レビュー第5回 #5)。ポインタ幅で
+/// 決まる: 64bit 環境では全ビット 1、32bit 環境では下位 32 ビット
+/// だけが 1 (HANDLE は 32bit で、記録時に u64 へゼロ拡張される)。
+/// 幅が 32 以外・不明 (環境情報なし、0) の場合は 64bit とみなす。
+fn invalid_handle_sentinel(pointer_width: u32) -> u64 {
+    if pointer_width == 32 {
+        0x0000_0000_FFFF_FFFF
+    } else {
+        u64::MAX
+    }
+}
+
+/// Trace の記録環境から番兵値を決める。
+fn trace_invalid_handle(trace: &ReadTrace) -> u64 {
+    invalid_handle_sentinel(trace.environment.as_ref().map_or(0, |e| e.pointer_width))
+}
+
 impl NormTrace {
     pub fn build(trace: &ReadTrace) -> NormTrace {
+        let invalid_handle = trace_invalid_handle(trace);
         let view = TraceView::build(trace);
         // --- パス A: オブジェクト生成の収集 ---
         // raw value -> [(生成イベント index, ObjectKey)]（時刻順）
@@ -237,7 +258,7 @@ impl NormTrace {
                 let TypedValue::U64(raw) = f.value else {
                     continue;
                 };
-                if raw == 0 || raw == u64::MAX {
+                if raw == 0 || raw == invalid_handle {
                     continue;
                 }
                 let ordinal = {
@@ -426,13 +447,15 @@ impl NormTrace {
 /// - Scalar: 個数・カウンタ・時刻などの数値。そのまま比較する。
 /// - Pointer: アドレス。中身は消す（0 は Null として区別）。
 /// - Handle / CreatedObject: 生成との相関で Object へ解決し、
-///   相関できなければポインタ級として消す。0 は Null、全ビット 1
-///   は Invalid (INVALID_HANDLE_VALUE) として区別を残す。
+///   相関できなければポインタ級として消す。0 は Null、番兵値
+///   (`invalid_handle`、ポインタ幅依存) は Invalid
+///   (INVALID_HANDLE_VALUE) として区別を残す。
 /// - Unspecified: 旧来の Schema 向けに Handle と同じ従来規約を適用
 ///   する（U64 はハンドル/ポインタ級という公開 Schema の前提）。
 fn norm_u64(
     kind: ValueKind,
     raw: u64,
+    invalid_handle: u64,
     at_event: usize,
     resolve: &dyn Fn(u64, usize) -> Option<ObjectKey>,
 ) -> NormValue {
@@ -448,7 +471,7 @@ fn norm_u64(
         ValueKind::Handle | ValueKind::CreatedObject | ValueKind::Unspecified => {
             if raw == 0 {
                 NormValue::Null
-            } else if raw == u64::MAX {
+            } else if raw == invalid_handle {
                 NormValue::Invalid
             } else if let Some(key) = resolve(raw, at_event) {
                 NormValue::Object(key)
@@ -469,7 +492,9 @@ fn norm_value(
         return NormValue::NotCaptured(shirusu_analysis::value_capture_name(f.capture));
     }
     match &f.value {
-        TypedValue::U64(raw) => norm_u64(f.kind, *raw, at_event, resolve),
+        TypedValue::U64(raw) => {
+            norm_u64(f.kind, *raw, trace_invalid_handle(trace), at_event, resolve)
+        }
         // Ptr32 / Ptr64 は型自体がポインタ宣言。Scalar と明示された
         // 場合だけ値を比較し、それ以外は従来どおり中身を消す。
         TypedValue::Ptr32(v) => {

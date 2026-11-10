@@ -8,7 +8,8 @@ use shirusu_agent::{Agent, RecordResult};
 use shirusu_hook::api::{api_by_id, API_CLOSE_HANDLE, API_CREATE_FILE_W, API_WRITE_FILE};
 use shirusu_hook::capture::{self, MapMemory};
 use shirusu_host::recorder::{
-    CaptureSession, CaptureSessionConfig, RingSpec, SessionError, SessionState,
+    shutdown_integrity_impact, CaptureSession, CaptureSessionConfig, RingSpec, SessionError,
+    SessionState, ShutdownOutcome,
 };
 use shirusu_host::IntegrityLevel;
 use shirusu_trace::compact::decode_values;
@@ -374,6 +375,68 @@ fn zero_hook_target_is_coverage_loss_not_session_failure() {
         "notes: {:?}",
         summary.integrity.notes
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn shutdown_outcome_maps_to_event_integrity() {
+    // レビュー第5回 #6: 完全停止を確認できなかったセッションは
+    // 正常終了として確定しない。純粋関数の全分岐を固定する。
+    assert_eq!(
+        shutdown_integrity_impact(&ShutdownOutcome::NotRequired),
+        None
+    );
+    assert_eq!(shutdown_integrity_impact(&ShutdownOutcome::Confirmed), None);
+    assert_eq!(
+        shutdown_integrity_impact(&ShutdownOutcome::CallFailed("boom".into())).map(|(l, _)| l),
+        Some(IntegrityLevel::Degraded)
+    );
+    assert_eq!(
+        shutdown_integrity_impact(&ShutdownOutcome::AgentIncomplete).map(|(l, _)| l),
+        Some(IntegrityLevel::Degraded)
+    );
+    assert_eq!(
+        shutdown_integrity_impact(&ShutdownOutcome::ExportUnavailable).map(|(l, _)| l),
+        Some(IntegrityLevel::Unknown)
+    );
+    assert_eq!(
+        shutdown_integrity_impact(&ShutdownOutcome::AgentNotInitialized).map(|(l, _)| l),
+        Some(IntegrityLevel::Unknown)
+    );
+    assert_eq!(
+        shutdown_integrity_impact(&ShutdownOutcome::UnexpectedStatus(77)).map(|(l, _)| l),
+        Some(IntegrityLevel::Unknown)
+    );
+}
+
+#[test]
+fn unconfirmed_shutdown_degrades_finalized_integrity() {
+    // セッション経由: 終了結果が Finalization の Event Integrity と
+    // 注記へ写ること。
+    let path = temp_trace("shutdown-degraded");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.set_shutdown_outcome(ShutdownOutcome::AgentIncomplete);
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Degraded);
+    assert!(
+        summary
+            .integrity
+            .notes
+            .iter()
+            .any(|n| n.contains("agent shutdown")),
+        "notes: {:?}",
+        summary.integrity.notes
+    );
+    let _ = std::fs::remove_file(&path);
+
+    // 完全停止が確認できれば劣化しない。
+    let path = temp_trace("shutdown-confirmed");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.set_shutdown_outcome(ShutdownOutcome::Confirmed);
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
     let _ = std::fs::remove_file(&path);
 }
 

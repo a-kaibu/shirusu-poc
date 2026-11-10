@@ -12,9 +12,24 @@
 
 use shirusu_transport::RingConfig;
 
+/// `shirusu_agent_shutdown` の戻り値（Host と DLL の共有定義。
+/// レビュー第5回 #6）。Host はこの値で「完全に止まったか」を
+/// 区別し、Trace の Event Integrity へ写す。
+/// 完全停止: 記録無効化 → 進行中 Detour の完了 → IAT 復元まで済んだ。
+pub const SHUTDOWN_OK: u32 = 0;
+/// 終了手順は実行されたが、進行中 Detour が完了待ち上限内に
+/// 終わらなかった（IAT は復元済み。書き込み途中のイベントが
+/// 不完全なまま残りうる）。
+pub const SHUTDOWN_INCOMPLETE: u32 = 1;
+/// アクティブなセッションが無かった（未初期化、または終了済み）。
+pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
+
 /// v2: 初期化結果の書き戻し欄 (result_hooked_count /
 /// result_missing_count) を追加した。
-pub const BOOTSTRAP_VERSION: u32 = 2;
+/// v3: 末尾に result_unrestored_count を追加した (既存フィールドの
+/// オフセットは不変)。設置失敗時にロールバックも失敗して対象へ
+/// 残存した IAT スロットの数 (レビュー第5回 #8)。
+pub const BOOTSTRAP_VERSION: u32 = 3;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -45,6 +60,11 @@ pub struct AgentBootstrap {
     /// 初期化結果: メインモジュールがインポートしておらず、フック
     /// できなかった対象 API の数 (Capture Coverage の欠落)。
     pub result_missing_count: u32,
+    /// 初期化結果 (v3): フック設置が途中で失敗し、ロールバックでも
+    /// 復元できなかった IAT スロットの数。通常は 0。0 でない場合、
+    /// 対象プロセスには Detour が残存しており、Host は初期化失敗の
+    /// 詳細として扱わなければならない (レビュー第5回 #8)。
+    pub result_unrestored_count: u32,
 }
 
 impl Default for AgentBootstrap {
@@ -62,6 +82,7 @@ impl Default for AgentBootstrap {
             space_handles: [0; MAX_BOOTSTRAP_RINGS],
             result_hooked_count: 0,
             result_missing_count: 0,
+            result_unrestored_count: 0,
         }
     }
 }
@@ -138,6 +159,20 @@ impl AgentBootstrap {
     pub fn hook_outcome(&self) -> (u32, u32) {
         (self.result_hooked_count, self.result_missing_count)
     }
+    /// DLL 側が設置失敗の詳細を書き戻すためのポインタ経由の記録。
+    ///
+    /// # Safety
+    /// [`AgentBootstrap::write_hook_outcome`] と同じ前提。
+    pub unsafe fn write_install_failure(bootstrap: *mut AgentBootstrap, unrestored: u32) {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe {
+            (*bootstrap).result_unrestored_count = unrestored;
+        }
+    }
+    /// Host 側: 読み戻した復元失敗スロット数。
+    pub fn unrestored_count(&self) -> u32 {
+        self.result_unrestored_count
+    }
 }
 
 #[cfg(test)]
@@ -180,8 +215,18 @@ mod tests {
         // repr(C) の固定レイアウトであること（プロセス間受け渡しの前提）
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4
+            // フィールド合計 580 + 末尾パディング 4 (8 バイト整列)
+            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4 + 4 + 4
         );
+    }
+
+    #[test]
+    fn install_failure_writeback_roundtrip() {
+        // DLL 側の書き戻しと Host 側の読み戻し (レビュー第5回 #8)。
+        let mut b = AgentBootstrap::default();
+        assert_eq!(b.unrestored_count(), 0);
+        unsafe { AgentBootstrap::write_install_failure(&mut b, 2) };
+        assert_eq!(b.unrestored_count(), 2);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::pe;
 use crate::plan::{build_plan, HookPlan};
 use crate::runtime::{pop_call, push_call, HookRuntime};
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::System::Memory::{
     VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
@@ -26,14 +26,22 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
-static RUNTIME: OnceLock<Arc<HookRuntime>> = OnceLock::new();
-
 /// Agent DLL の初期化がランタイムを登録する。以後の Detour はこれを使う。
+///
+/// 登録はセッション単位（[`crate::runtime::RuntimeSlot`]）。アクティブな
+/// セッションがある間は失敗するが、終了手順が IAT 復元後に
+/// [`clear_runtime`] で解除すれば、同じプロセスへ再初期化できる
+/// （レビュー第5回 #7。旧実装は OnceLock で再アタッチ不能だった）。
 pub fn set_runtime(rt: Arc<HookRuntime>) -> Result<(), Arc<HookRuntime>> {
-    RUNTIME.set(rt)
+    crate::runtime::runtime_slot().register(rt)
 }
 pub fn runtime() -> Option<Arc<HookRuntime>> {
-    RUNTIME.get().cloned()
+    crate::runtime::runtime_slot().current()
+}
+/// 終了手順の最後（IAT 復元後）に、自分のセッションの登録を解除する。
+/// 解除できたら true。Detour が入口で掴んだ Arc には影響しない。
+pub fn clear_runtime(rt: &Arc<HookRuntime>) -> bool {
+    crate::runtime::runtime_slot().unregister(rt)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +56,16 @@ pub enum EngineError {
     NoTargets(HookPlan),
     /// IAT スロットの保護属性変更に失敗した
     ProtectFailed { iat_rva: u32 },
+    /// 設置途中の失敗（レビュー第5回 #8）。既にパッチしたスロットは
+    /// 逆順に復元を試みた後で返る。`unrestored` が空でなければ、
+    /// 対象プロセスに Detour が残存する重大な状態であり、呼び出し
+    /// 側は Host へその件数を伝えなければならない。
+    InstallFailed {
+        /// パッチに失敗したスロットの IAT RVA。
+        failed_iat_rva: u32,
+        /// 復元も失敗したスロットの IAT RVA。
+        unrestored: Vec<u32>,
+    },
 }
 
 /// プロセス内メモリの読み取り。VirtualQuery で「コミット済みかつ
@@ -172,17 +190,37 @@ pub unsafe fn install_hooks(
     if plan.entries.is_empty() {
         return Err(EngineError::NoTargets(plan));
     }
-    let mut slots = Vec::new();
-    for entry in &plan.entries {
-        // SAFETY: iat_rva はこのモジュールの IAT 内（plan の入力は同イメージの解析結果）。
-        let slot = unsafe { module_base.add(entry.iat_rva as usize) } as *mut usize;
-        // SAFETY: 同上。
-        let original = unsafe { slot.read_unaligned() };
-        rt.set_original(entry.api.api_id, original);
-        // SAFETY: 同上。
-        unsafe { write_slot(slot, detour_for(entry.api.api_id))? };
-        slots.push((entry.iat_rva, original));
-    }
+    // 設置はトランザクションとして実行する (レビュー第5回 #8):
+    // 途中の write_slot が失敗したら、既にパッチしたスロットを
+    // 逆順に復元してからエラーを返す。アタッチ先のプロセスは
+    // 生きたままなので、一部だけ Detour 化した状態を残さない。
+    let entries = &plan.entries;
+    let originals = crate::plan::patch_transactionally(
+        entries.len(),
+        |i| {
+            let entry = &entries[i];
+            // SAFETY: iat_rva はこのモジュールの IAT 内（plan の入力は同イメージの解析結果）。
+            let slot = unsafe { module_base.add(entry.iat_rva as usize) } as *mut usize;
+            // SAFETY: 同上。
+            let original = unsafe { slot.read_unaligned() };
+            rt.set_original(entry.api.api_id, original);
+            // SAFETY: 同上。
+            unsafe { write_slot(slot, detour_for(entry.api.api_id)) }?;
+            Ok(original)
+        },
+        |i, original| {
+            let entry = &entries[i];
+            // SAFETY: 設置時にパッチしたのと同じスロット。
+            let slot = unsafe { module_base.add(entry.iat_rva as usize) } as *mut usize;
+            // SAFETY: 同上。
+            unsafe { write_slot(slot, original) }
+        },
+    )
+    .map_err(|rb| EngineError::InstallFailed {
+        failed_iat_rva: entries[rb.failed_index].iat_rva,
+        unrestored: rb.unrestored.iter().map(|&i| entries[i].iat_rva).collect(),
+    })?;
+    let slots: Vec<(u32, usize)> = entries.iter().map(|e| e.iat_rva).zip(originals).collect();
     Ok(InstalledHooks {
         module_base: module_base as usize,
         slots,

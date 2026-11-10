@@ -276,8 +276,14 @@ impl FileHeader {
         out[16..24].copy_from_slice(&self.session_id.to_le_bytes());
         out
     }
+    /// File Header payload を検証付きで読む。長さ 24・Magic・
+    /// header_flags（予約、0）のいずれかが違う場合は None。
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 24 || bytes[0..10] != FILE_MAGIC {
+            return None;
+        }
+        // header_flags（予約）は 0 でなければならない（F24）。
+        if u16::from_le_bytes(bytes[14..16].try_into().ok()?) != 0 {
             return None;
         }
         Some(Self {

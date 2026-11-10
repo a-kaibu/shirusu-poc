@@ -123,11 +123,30 @@ pub fn fetch_add(base: *mut u8, offset: usize, v: u64) -> u64 {
 }
 
 /// Control 領域を初期化する（生成者のみが呼ぶ）。前提は load/store と共通。
+///
+/// 公開順序（レビュー第5回 #4）: Magic は**最後**に `Release` で書く。
+/// それ以外の全フィールド（ゼロクリア・版数・容量・Generation・
+/// Owner）を先に書き終えてから Magic を公開することで、Magic を
+/// `Acquire` で読んだ Host は「現れた Magic の向こうには初期化済みの
+/// 全フィールドがある」ことを保証される。旧実装は Magic を最初に
+/// Relaxed で書いていたため、Host が半初期化の Control（容量 0 や
+/// Generation 0）を検証して Ring を止める競合があった。読み手の
+/// 述語は `layout::load(base, OFF_MAGIC, Ordering::Acquire) == MAGIC`
+/// に統一する（通常のバイト読みは使わない）。
 pub fn init_control(base: *mut u8, cfg: RingConfig, generation: u64, owner_thread_id: u64) {
+    init_control_fields(base, cfg, generation, owner_thread_id);
+    // 単一公開点: この Release store より前の書き込みは、Acquire で
+    // Magic を観測した読み手から全て見える。
+    store(base, OFF_MAGIC, MAGIC, Ordering::Release);
+}
+
+/// [`init_control`] のうち Magic 以外の全て（ゼロクリアと Meta
+/// フィールド）を書く。まだ公開はされない。段階的な公開順序の
+/// テスト（書き手の途中段階で読み手述語を回す）ために分離してある。
+fn init_control_fields(base: *mut u8, cfg: RingConfig, generation: u64, owner_thread_id: u64) {
     for off in (0..CONTROL_SIZE).step_by(8) {
         store(base, off, 0, Ordering::Relaxed);
     }
-    store(base, OFF_MAGIC, MAGIC, Ordering::Relaxed);
     store(base, OFF_LAYOUT_VERSION, LAYOUT_VERSION, Ordering::Relaxed);
     store(
         base,
@@ -212,6 +231,53 @@ mod tests {
         assert_eq!(c.descriptor_capacity * 64, 256 * 1024);
         assert_eq!(c.required_len(), 256 + 256 * 1024 + 1024 * 1024);
     }
+    /// 読み手述語 (Host と同一の形): Magic を Acquire で読む。
+    fn reader_sees_initialized(base: *const u8) -> bool {
+        load(base, OFF_MAGIC, Ordering::Acquire) == MAGIC
+    }
+
+    #[test]
+    fn init_control_publishes_magic_last_staged() {
+        // レビュー第5回 #4 の段階テスト: 書き手の途中段階ごとに読み手
+        // 述語を回し、最終の Magic 公開より前は「初期化済み」に
+        // ならないことを確認する。旧順序 (Magic を最初に書く) では
+        // fields 書き込みの前に述語が真になり、このテストが落ちる
+        // (旧順序そのものは loom の検出モデルでも固定してある)。
+        use crate::validate::{validate_control, IntegrityError, KnownConfig};
+        let cfg = RingConfig::new(8, 256);
+        let mut words = [0xDEAD_BEEF_DEAD_BEEFu64; CONTROL_SIZE / 8];
+        let base = words.as_mut_ptr() as *mut u8;
+        // 段階 0: 未初期化 (ゴミ)。述語は偽。
+        assert!(!reader_sees_initialized(base));
+        // 段階 1: ゼロクリア + 全フィールド書き込み (公開前)。
+        // フィールドは直接読めば揃っているが、述語はまだ偽であり、
+        // 検証側も BadMagic で弾く (Host が Ring を作らない)。
+        init_control_fields(base, cfg, 7, 42);
+        assert_eq!(load(base, OFF_LAYOUT_VERSION, Ordering::Relaxed), 1);
+        assert_eq!(load(base, OFF_DESCRIPTOR_CAPACITY, Ordering::Relaxed), 8);
+        assert_eq!(load(base, OFF_GENERATION, Ordering::Relaxed), 7);
+        assert_eq!(load(base, OFF_OWNER_THREAD_ID, Ordering::Relaxed), 42);
+        assert!(!reader_sees_initialized(base));
+        let copy: [u8; CONTROL_SIZE] = unsafe { *(base as *const [u8; CONTROL_SIZE]) };
+        let known = KnownConfig::new(cfg, cfg.required_len());
+        assert_eq!(
+            validate_control(&copy, &known, None),
+            Err(IntegrityError::BadMagic)
+        );
+        // 段階 2: Magic を Release で公開 (init_control の最終段と同一)。
+        store(base, OFF_MAGIC, MAGIC, Ordering::Release);
+        assert!(reader_sees_initialized(base));
+        let copy: [u8; CONTROL_SIZE] = unsafe { *(base as *const [u8; CONTROL_SIZE]) };
+        let snap = validate_control(&copy, &known, None).expect("initialized control validates");
+        assert_eq!(snap.generation, 7);
+        // 一括の init_control でも同じ到達状態になる。
+        let mut words2 = [0u64; CONTROL_SIZE / 8];
+        let base2 = words2.as_mut_ptr() as *mut u8;
+        init_control(base2, cfg, 7, 42);
+        assert!(reader_sees_initialized(base2));
+        assert_eq!(words2, words);
+    }
+
     #[test]
     fn loss_counters_are_monotonic_diff() {
         let a = LossCounters {

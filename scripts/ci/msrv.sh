@@ -11,8 +11,17 @@
 # `cargo update` の際は generator が 0.8.12 以降へ上がらないよう注意する
 # こと (上がるとこのジョブが rust-version 不一致で落ちて気づける)。
 #
+# ピン契約 (レビュー第5回 #2 でテストコードまで拡張):
+# - generator ≤ 0.8.11 (0.8.12 は rust-version 1.95 を宣言)
+# - proptest ≤ 1.11.x (1.12.0 は rust-version 1.88 を要求する。
+#   proptest は dev-dependency のため、lib だけの check では検出できない。
+#   テストコードも MSRV でコンパイルできることを保証するため、この
+#   ジョブは --all-targets でテストターゲットまで検査する)
+# どちらも `cargo update` で上げる場合は、このジョブが rust-version
+# 不一致で落ちることで気づける。
+#
 # Cargo.lock は v4 だが Cargo 1.87 はそのまま読めるため、旧 1.77 時代の
 # ロックファイル差し替えは不要。--locked でピン済みグラフをそのまま使う。
 set -euo pipefail
 rustc --version
-cargo check --workspace --locked
+cargo check --workspace --all-targets --locked

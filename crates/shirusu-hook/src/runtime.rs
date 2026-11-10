@@ -20,7 +20,7 @@ use shirusu_transport_win::{ProcessNotify, RingNotify};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 thread_local! {
@@ -84,6 +84,85 @@ impl Drop for DetourFlight {
     }
 }
 
+/// セッション単位のランタイム登録スロット（レビュー第5回 #7）。
+///
+/// 旧実装は `OnceLock` で、shutdown 後も登録が残るため、同じ対象
+/// プロセスへの再アタッチ（init → shutdown → init）が
+/// ALREADY_INITIALIZED で失敗していた。このスロットは「アクティブな
+/// セッションが 1 つだけ」という不変条件を保ったまま、終了した
+/// セッションの登録を解除して次のセッションを受け入れられる。
+///
+/// 安全性の要点:
+/// - Detour は呼び出しの入口で [`RuntimeSlot::current`] から `Arc` を
+///   掴み、その呼び出しの間は掴んだランタイムだけを使う。登録が
+///   差し替わっても、進行中の Detour は旧ランタイムを安全に
+///   使い続けられる（`Arc` が寿命を保証し、元関数ポインタは掴んだ
+///   ランタイムの表から引く）。
+/// - 登録解除は **IAT 復元の後** にだけ行うこと。復元前に登録が
+///   無くなると、その間に到達した Detour が元関数を引けず、
+///   対象 API の失敗値を返してしまう。
+/// - 2 回目の設置では、復元済み IAT から元関数ポインタを読み直す
+///   （install_hooks が毎回スロット実値を読む）ため、旧セッションの
+///   ポインタが残ることはない。
+pub struct RuntimeSlot {
+    current: RwLock<Option<Arc<HookRuntime>>>,
+}
+
+impl RuntimeSlot {
+    pub const fn new() -> Self {
+        Self {
+            current: RwLock::new(None),
+        }
+    }
+
+    /// アクティブなセッションが無ければ登録する。ある場合は、
+    /// 渡したランタイムをそのまま `Err` で返す。
+    pub fn register(&self, rt: Arc<HookRuntime>) -> Result<(), Arc<HookRuntime>> {
+        let mut cur = self.current.write().unwrap();
+        if cur.is_some() {
+            return Err(rt);
+        }
+        *cur = Some(rt);
+        Ok(())
+    }
+
+    /// 現在のセッションのランタイム（Detour の入口が掴む）。
+    pub fn current(&self) -> Option<Arc<HookRuntime>> {
+        self.current.read().unwrap().clone()
+    }
+
+    /// 登録解除は「自分が登録したランタイム」に対してだけ行う
+    /// （後継セッションの登録を誤って消さない）。解除したら true。
+    pub fn unregister(&self, rt: &Arc<HookRuntime>) -> bool {
+        let mut cur = self.current.write().unwrap();
+        if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, rt)) {
+            *cur = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for RuntimeSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static RUNTIME_SLOT: RuntimeSlot = RuntimeSlot::new();
+
+/// プロセス全体のランタイム登録スロット（engine が使う）。
+pub fn runtime_slot() -> &'static RuntimeSlot {
+    &RUNTIME_SLOT
+}
+
+/// Call ID のセッション別シード。セッションごとに 2^32 の範囲を
+/// 割り当てることで、終了間際に残ったスレッドローカルの呼出
+/// スタックフレーム（旧セッションの Call ID）が、次セッションの
+/// ID と衝突して親子関係を誤らせることを防ぐ。
+static NEXT_CALL_ID_SEED: AtomicU64 = AtomicU64::new(1);
+
 pub struct HookRuntime {
     agent: Arc<Agent>,
     /// Slot index 順の space_available 通知。スレッドが Slot を取得した
@@ -113,7 +192,7 @@ impl HookRuntime {
             space_notifies,
             data_ready,
             originals: std::array::from_fn(|_| AtomicUsize::new(0)),
-            next_call_id: AtomicU64::new(1),
+            next_call_id: AtomicU64::new(NEXT_CALL_ID_SEED.fetch_add(1 << 32, Ordering::Relaxed)),
             seen_threads: Mutex::new(HashSet::new()),
             recording_enabled: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
@@ -354,6 +433,62 @@ mod tests {
         assert!(rt.wait_in_flight_drained(Duration::from_secs(5)));
         holder.join().unwrap();
         assert_eq!(rt.in_flight(), 0);
+    }
+
+    #[test]
+    fn runtime_slot_allows_reattach_after_unregister() {
+        // レビュー第5回 #7: init → shutdown → init の往復。
+        let slot = RuntimeSlot::new();
+        let (_a1, rt1) = runtime();
+        let rt1 = Arc::new(rt1);
+        let (_a2, rt2) = runtime();
+        let rt2 = Arc::new(rt2);
+        assert!(slot.current().is_none());
+        assert!(slot.register(Arc::clone(&rt1)).is_ok());
+        // アクティブな間は 2 つ目の登録は失敗する
+        assert!(slot.register(Arc::clone(&rt2)).is_err());
+        assert!(Arc::ptr_eq(&slot.current().unwrap(), &rt1));
+        // 他人のランタイムでは解除できない
+        assert!(!slot.unregister(&rt2));
+        assert!(slot.current().is_some());
+        // 自分のランタイムで解除すれば、次のセッションを受け入れる
+        assert!(slot.unregister(&rt1));
+        assert!(slot.current().is_none());
+        assert!(slot.register(Arc::clone(&rt2)).is_ok());
+        assert!(Arc::ptr_eq(&slot.current().unwrap(), &rt2));
+    }
+
+    #[test]
+    fn runtime_slot_in_flight_holder_keeps_its_own_runtime() {
+        // 進行中 Detour が掴んだ Arc は、登録が差し替わっても旧
+        // セッションのランタイムを指し続ける (寿命と元の表の分離)。
+        let slot = RuntimeSlot::new();
+        let (_a1, rt1) = runtime();
+        let rt1 = Arc::new(rt1);
+        rt1.set_original(API_CREATE_FILE_W, 0xAAAA);
+        let (_a2, rt2) = runtime();
+        let rt2 = Arc::new(rt2);
+        rt2.set_original(API_CREATE_FILE_W, 0xBBBB);
+        assert!(slot.register(Arc::clone(&rt1)).is_ok());
+        let held = slot.current().unwrap(); // Detour 入口で掴む Arc
+        assert!(slot.unregister(&rt1));
+        assert!(slot.register(Arc::clone(&rt2)).is_ok());
+        // 掴んだ側は旧ランタイムの元の表を見続ける
+        assert!(Arc::ptr_eq(&held, &rt1));
+        assert_eq!(held.original(API_CREATE_FILE_W), 0xAAAA);
+        // 新規の Detour は新ランタイムを見る
+        assert_eq!(slot.current().unwrap().original(API_CREATE_FILE_W), 0xBBBB);
+    }
+
+    #[test]
+    fn call_ids_do_not_collide_across_sessions() {
+        // セッションをまたいだ Call ID の衝突防止 (シード分離)。
+        let (_a1, rt1) = runtime();
+        let (_a2, rt2) = runtime();
+        let first1 = rt1.alloc_call_id();
+        let first2 = rt2.alloc_call_id();
+        assert_ne!(first1, first2);
+        assert!(first2 >= 1 << 32 || first1 >= 1 << 32);
     }
 
     #[test]

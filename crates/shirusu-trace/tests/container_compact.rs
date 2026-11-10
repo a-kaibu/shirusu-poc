@@ -96,6 +96,20 @@ fn file_header_roundtrip() {
 }
 
 #[test]
+fn file_header_rejects_nonzero_header_flags() {
+    // F24: header_flags（bytes[14..16]、予約）は 0 でなければならない。
+    let h = FileHeader::new(42);
+    let bytes = h.encode();
+    assert_eq!(bytes[14], 0);
+    assert_eq!(bytes[15], 0);
+    for flags in [1u16, 0x8000, 0xffff] {
+        let mut bad = bytes;
+        bad[14..16].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(FileHeader::decode(&bad), None, "flags={flags:#06x}");
+    }
+}
+
+#[test]
 fn zstd_roundtrip_repetitive_and_random() {
     let repetitive = vec![0xabu8; 100_000];
     let compressed = compress_chunk(&repetitive);

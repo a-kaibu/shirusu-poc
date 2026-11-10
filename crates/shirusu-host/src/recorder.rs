@@ -30,6 +30,7 @@ use shirusu_transport_win::SharedMapping;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub enum SessionError {
@@ -148,19 +149,16 @@ impl RingMapping {
             Self::Win(m) => m.len(),
         }
     }
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: どの裏付けでも base から len 分は有効な共有領域。
-        unsafe { std::slice::from_raw_parts(self.base(), self.len()) }
-    }
     /// Agent が Control 領域を初期化済みか（Magic の出現で判定する）。
+    ///
+    /// 判定は通常のバイト読みではなく Magic の `Acquire` 読みで行う
+    /// (レビュー第5回 #4)。書き手 (init_control) は全フィールドを
+    /// 書いてから Magic を `Release` で公開するため、この Acquire
+    /// 読みで Magic を観測した時点で、初期化済みの全フィールドが
+    /// 見えることが保証される。
     fn agent_initialized(&self) -> bool {
-        let s = self.as_slice();
-        s.len() >= layout::OFF_MAGIC + 8
-            && u64::from_le_bytes(
-                s[layout::OFF_MAGIC..layout::OFF_MAGIC + 8]
-                    .try_into()
-                    .unwrap(),
-            ) == layout::MAGIC
+        self.len() >= layout::OFF_MAGIC + 8
+            && layout::load(self.base(), layout::OFF_MAGIC, Ordering::Acquire) == layout::MAGIC
     }
 }
 
@@ -199,6 +197,72 @@ pub struct SessionSummary {
     /// (レビュー #4 の #8)。
     pub hook_coverage: Option<(usize, usize)>,
     pub integrity: IntegrityReport,
+}
+
+/// Agent 終了手順（`shirusu_agent_shutdown`）の結果
+/// （レビュー第5回 #6）。`LaunchedCapture::finish` が知らせ、
+/// [`CaptureSession::stop`] が Event Integrity へ写す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// 対象プロセスが既に終了していた（書き手はおらず呼び出し不要）。
+    NotRequired,
+    /// 終了エントリを解決できなかった（旧 DLL 等）。フック解除を
+    /// 確認する手段が無い。
+    ExportUnavailable,
+    /// Agent が完全停止を報告した。
+    Confirmed,
+    /// 終了エントリの呼び出し自体に失敗した（理由付き）。
+    CallFailed(String),
+    /// Agent は応答したが、進行中 Detour の完了待ちがタイムアウトし
+    /// 完全停止にならなかった。
+    AgentIncomplete,
+    /// Agent は「アクティブなセッションが無い」と報告した
+    /// （Host 側の見立てと食い違う異常系）。
+    AgentNotInitialized,
+    /// 未知の状態コードが返った。
+    UnexpectedStatus(u32),
+}
+
+/// 終了結果 → Event Integrity への影響（純粋関数）。
+/// 完全停止を確認できた場合は None（影響なし）。確認できなかった
+/// 場合は、理由に応じて Degraded（止め損ねが記録の欠落・不完全さに
+/// 直結する）または Unknown（確認する手段自体が無かった）を返す。
+pub fn shutdown_integrity_impact(outcome: &ShutdownOutcome) -> Option<(IntegrityLevel, String)> {
+    match outcome {
+        ShutdownOutcome::NotRequired | ShutdownOutcome::Confirmed => None,
+        ShutdownOutcome::CallFailed(reason) => Some((
+            IntegrityLevel::Degraded,
+            format!(
+                "agent shutdown: remote call failed ({reason}); hooks may remain \
+                 in the target and writes after the final drain are not in this trace"
+            ),
+        )),
+        ShutdownOutcome::AgentIncomplete => Some((
+            IntegrityLevel::Degraded,
+            "agent shutdown: in-flight detours did not drain within the timeout; \
+             the IAT was restored anyway and in-flight events may be incomplete"
+                .to_string(),
+        )),
+        ShutdownOutcome::ExportUnavailable => Some((
+            IntegrityLevel::Unknown,
+            "agent shutdown: shutdown entry point unavailable (older agent dll); \
+             hook removal could not be confirmed"
+                .to_string(),
+        )),
+        ShutdownOutcome::AgentNotInitialized => Some((
+            IntegrityLevel::Unknown,
+            "agent shutdown: agent reported no active session; \
+             hook removal could not be confirmed"
+                .to_string(),
+        )),
+        ShutdownOutcome::UnexpectedStatus(code) => Some((
+            IntegrityLevel::Unknown,
+            format!(
+                "agent shutdown: unexpected status {code}; \
+                 hook removal could not be confirmed"
+            ),
+        )),
+    }
 }
 
 fn level_severity(l: IntegrityLevel) -> u8 {
@@ -242,6 +306,9 @@ pub struct CaptureSession {
     /// Agent DLL が Bootstrap 経由で報告したフック設置結果
     /// (設置数, 欠落数)。プロセス間記録でのみ設定される。
     hook_coverage: Option<(usize, usize)>,
+    /// Agent 終了手順の結果（レビュー第5回 #6）。プロセス間記録で
+    /// 対象を生かしたまま閉じる場合のみ設定される。
+    shutdown_outcome: Option<ShutdownOutcome>,
 }
 
 impl CaptureSession {
@@ -270,6 +337,7 @@ impl CaptureSession {
             args_stats: ArgsConversionStats::default(),
             coverage_missing_calls: 0,
             hook_coverage: None,
+            shutdown_outcome: None,
         })
     }
 
@@ -294,6 +362,13 @@ impl CaptureSession {
     /// 正常なアプリは「0 件設置・全件欠落」としてここへ届く。
     pub fn set_hook_coverage(&mut self, hooked: usize, missing: usize) {
         self.hook_coverage = Some((hooked, missing));
+    }
+
+    /// Agent 終了手順の結果を知らせる (レビュー第5回 #6)。
+    /// 完全停止を確認できなかった場合、Finalization の Event
+    /// Integrity が劣化する（[`shutdown_integrity_impact`]）。
+    pub fn set_shutdown_outcome(&mut self, outcome: ShutdownOutcome) {
+        self.shutdown_outcome = Some(outcome);
     }
 
     fn ensure_state(&self, want: SessionState, op: &'static str) -> Result<(), SessionError> {
@@ -502,6 +577,12 @@ impl CaptureSession {
                  and is not visible to the host in this version"
                     .into(),
             );
+        }
+        if let Some(outcome) = &self.shutdown_outcome {
+            if let Some((level, note)) = shutdown_integrity_impact(outcome) {
+                report.event_integrity = worst(report.event_integrity, level);
+                report.notes.push(note);
+            }
         }
         if let Some((hooked, missing)) = self.hook_coverage {
             if missing > 0 {

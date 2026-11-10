@@ -22,9 +22,11 @@
 //!   stdcall 名デコレーション（`_shirusu_agent_init@4`）にも対応する。
 
 use crate::recorder::{
-    CaptureSession, CaptureSessionConfig, RingSpec, SessionError, SessionSummary,
+    CaptureSession, CaptureSessionConfig, RingSpec, SessionError, SessionSummary, ShutdownOutcome,
 };
-use shirusu_hook::bootstrap::AgentBootstrap;
+use shirusu_hook::bootstrap::{
+    AgentBootstrap, SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK,
+};
 use shirusu_hook::pe;
 use shirusu_transport::EXPANDED_SLOT_GENERATION;
 use shirusu_transport_win as win;
@@ -166,14 +168,21 @@ impl LaunchedCapture {
         // アタッチした対象はセッション終了後もフックされたまま
         // 誰も回収しない Ring へ書き続けてしまう。対象が既に終了
         // していれば書き手はおらず、呼び出し自体が不要。
-        if !self.target_exited() {
-            if let Some(addr) = self.shutdown_addr {
-                // ベストエフォート: 失敗してもセッションの確定は
-                // 続ける（対象が終了処理中などで応答しない場合がある）。
-                let _ = win::remote_call(self.process, addr, 0);
-            }
-        }
-        let session = self.session.take().expect("session present");
+        //
+        // 終了手順の結果は捨てない（レビュー第5回 #6）: セッションへ
+        // 知らせ、完全停止を確認できなかった場合は Finalization の
+        // Event Integrity が劣化する。呼び出しに失敗しても確定自体は
+        // 続ける（対象が終了処理中などで応答しない場合がある）が、
+        // 「正常終了として確定」はしない。
+        let outcome = if self.target_exited() {
+            ShutdownOutcome::NotRequired
+        } else if let Some(addr) = self.shutdown_addr {
+            shutdown_outcome_from_call(win::remote_call(self.process, addr, 0))
+        } else {
+            ShutdownOutcome::ExportUnavailable
+        };
+        let mut session = self.session.take().expect("session present");
+        session.set_shutdown_outcome(outcome);
         let summary = session.stop()?;
         win::close_handle_value(self.process);
         self.process = 0;
@@ -189,11 +198,75 @@ impl Drop for LaunchedCapture {
     }
 }
 
-/// Bootstrap の初期化結果（設置数, 欠落数）を対象メモリから読み戻す。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小の PE ヘッダー (nt_headers が読める形) を合成する。
+    fn synthetic_pe(magic: u16, opt_size: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 0x200];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        b[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+        let opt = coff + 20;
+        b[opt..opt + 2].copy_from_slice(&magic.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn dll_pointer_width_follows_pe_bitness() {
+        // レビュー第5回 #5 の記録側: pointer_width は DLL の PE が正。
+        assert_eq!(dll_pointer_width(&synthetic_pe(0x20B, 240)), Some(64));
+        assert_eq!(dll_pointer_width(&synthetic_pe(0x10B, 224)), Some(32));
+        assert_eq!(dll_pointer_width(b"not a pe"), None);
+        assert_eq!(dll_pointer_width(&[]), None);
+    }
+
+    #[test]
+    fn shutdown_call_classification_distinguishes_failure_kinds() {
+        // レビュー第5回 #6: 「呼べなかった」と「Agent が止め切れ
+        // なかった」を区別する。
+        use shirusu_transport_win::WinError;
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(SHUTDOWN_OK)),
+            ShutdownOutcome::Confirmed
+        );
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(SHUTDOWN_INCOMPLETE)),
+            ShutdownOutcome::AgentIncomplete
+        );
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(SHUTDOWN_NOT_INITIALIZED)),
+            ShutdownOutcome::AgentNotInitialized
+        );
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(99)),
+            ShutdownOutcome::UnexpectedStatus(99)
+        );
+        assert!(matches!(
+            shutdown_outcome_from_call(Err(WinError::Unsupported)),
+            ShutdownOutcome::CallFailed(_)
+        ));
+    }
+}
+
+/// Bootstrap の初期化結果（設置数・欠落数・復元失敗数）。
+struct BootstrapResult {
+    hooked: usize,
+    missing: usize,
+    /// 設置失敗時にロールバックでも復元できず、対象に残存した
+    /// IAT スロットの数 (レビュー第5回 #8)。通常は 0。
+    unrestored: usize,
+}
+
+/// Bootstrap の初期化結果を対象メモリから読み戻す。
 /// 読めない場合は None（Coverage は「不明」のままにする。値を
-/// 捏造しない）。DLL は init_done を立てる前に書き戻すため、
-/// リモートスレッドの完了後には確定している。
-fn read_hook_outcome(process: win::HandleValue, remote: usize) -> Option<(usize, usize)> {
+/// 捏造しない）。DLL は init_done を立てる前（成功時）か、失敗を
+/// 返す直前（設置失敗の詳細）に書き戻すため、リモートスレッドの
+/// 完了後には確定している。
+fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<BootstrapResult> {
     let mut buf = AgentBootstrap::default();
     // SAFETY: AgentBootstrap は repr(C) の値型。バイト列として読み込む。
     let bytes = unsafe {
@@ -204,25 +277,65 @@ fn read_hook_outcome(process: win::HandleValue, remote: usize) -> Option<(usize,
     };
     win::read_process_memory(process, remote, bytes.as_mut_ptr(), bytes.len()).ok()?;
     let (hooked, missing) = buf.hook_outcome();
+    let unrestored = buf.unrestored_count();
     // 対象 API の総数を超える報告は信用しない（書かれていない
     // 領域の読み違い等を Coverage として採用しない）。
-    if hooked + missing > 64 {
+    if hooked + missing > 64 || unrestored > 64 {
         return None;
     }
-    Some((hooked as usize, missing as usize))
+    Some(BootstrapResult {
+        hooked: hooked as usize,
+        missing: missing as usize,
+        unrestored: unrestored as usize,
+    })
 }
 
 /// Mapping とイベントを用意し、DLL を注入して初期化を確認する。
 /// 起動（suspended）とアタッチで共通の手順。戻り値にはセッションと
 /// Agent 終了エントリのアドレス（解決できた場合）を含む。
+/// `shirusu_agent_shutdown` の呼び出し結果を終了結果へ分類する
+/// （純粋関数。レビュー第5回 #6）。「呼べなかった」ことと「Agent が
+/// 完全停止できなかった」ことを区別する。
+fn shutdown_outcome_from_call(
+    result: Result<u32, shirusu_transport_win::WinError>,
+) -> ShutdownOutcome {
+    match result {
+        Ok(SHUTDOWN_OK) => ShutdownOutcome::Confirmed,
+        Ok(SHUTDOWN_INCOMPLETE) => ShutdownOutcome::AgentIncomplete,
+        Ok(SHUTDOWN_NOT_INITIALIZED) => ShutdownOutcome::AgentNotInitialized,
+        Ok(code) => ShutdownOutcome::UnexpectedStatus(code),
+        Err(e) => ShutdownOutcome::CallFailed(e.to_string()),
+    }
+}
+
+/// Agent DLL の PE から対象プロセスのポインタ幅を決める
+/// (レビュー第5回 #5)。DLL は対象プロセスの中で動くため、その
+/// ビットネスが対象のビットネスである。パースできない場合は None。
+fn dll_pointer_width(image: &[u8]) -> Option<u32> {
+    pe::is_pe64(image).map(|is64| if is64 { 64 } else { 32 })
+}
+
 fn inject_and_prepare(
     trace_path: impl AsRef<Path>,
     cfg: &LaunchConfig,
     process: win::HandleValue,
     pid: u32,
 ) -> Result<(CaptureSession, Option<usize>), SessionError> {
-    let ring_len = cfg.session.ring_config.required_len();
-    let mut session = CaptureSession::create_file(trace_path, cfg.session.clone())?;
+    // Agent DLL の PE は先に読んでおく (後段のエクスポート解決でも使う)。
+    let file_bytes = std::fs::read(&cfg.dll_path)?;
+    let image = pe::map_file_to_image(&file_bytes)
+        .ok_or_else(|| SessionError::Injection("agent dll is not a valid PE".into()))?;
+    // Trace の CaptureEnvironment.pointer_width は、呼び出し側の申告
+    // ではなく DLL の PE を正として上書きする (レビュー第5回 #5)。
+    // 比較側の INVALID_HANDLE_VALUE 判定がこの値に依存するため、
+    // 対象の実際のビットネスと食い違うと x86 の失敗ハンドルを
+    // オブジェクト生成と誤判定する。
+    let mut session_cfg = cfg.session.clone();
+    if let Some(width) = dll_pointer_width(&image) {
+        session_cfg.environment.pointer_width = width;
+    }
+    let ring_len = session_cfg.ring_config.required_len();
+    let mut session = CaptureSession::create_file(trace_path, session_cfg)?;
 
     let notify = win::ProcessNotify::new()?;
     let init_done = win::EventObject::new(false, false)?;
@@ -269,9 +382,6 @@ fn inject_and_prepare(
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| SessionError::Injection("dll path has no file name".into()))?;
     let base = win::module_base(pid, &dll_name)?;
-    let file_bytes = std::fs::read(&cfg.dll_path)?;
-    let image = pe::map_file_to_image(&file_bytes)
-        .ok_or_else(|| SessionError::Injection("agent dll is not a valid PE".into()))?;
     let rva = INIT_EXPORT_CANDIDATES
         .iter()
         .find_map(|name| pe::find_export(&image, name))
@@ -300,16 +410,25 @@ fn inject_and_prepare(
         return Err(e);
     }
     let status = win::remote_call(process, base + rva as usize, remote);
-    // 初期化結果（設置/欠落件数）の読み戻しは、Bootstrap 領域の
-    // 解放より前に行う（レビュー #4 の #8）。
+    // 初期化結果の読み戻しは、Bootstrap 領域の解放より前に行う
+    // （レビュー #4 の #8）。失敗時も読み戻す: 設置失敗の詳細
+    // （復元失敗スロット数）が書き戻されている場合がある
+    // （レビュー第5回 #8）。
     let outcome = if status.is_ok() {
-        read_hook_outcome(process, remote)
+        read_bootstrap_result(process, remote)
     } else {
         None
     };
     win::remote_free(process, remote);
     let status = status?;
     if status != 0 {
+        if let Some(result) = outcome.filter(|r| r.unrestored > 0) {
+            return Err(SessionError::Injection(format!(
+                "shirusu_agent_init returned status {status}; {} IAT slot(s) \
+                 could not be restored and remain detoured in the target process",
+                result.unrestored
+            )));
+        }
         return Err(SessionError::Injection(format!(
             "shirusu_agent_init returned status {status}"
         )));
@@ -319,8 +438,8 @@ fn inject_and_prepare(
             "agent did not signal init_done before timeout".into(),
         ));
     }
-    if let Some((hooked, missing)) = outcome {
-        session.set_hook_coverage(hooked, missing);
+    if let Some(result) = outcome {
+        session.set_hook_coverage(result.hooked, result.missing);
     }
     Ok((session, shutdown_addr))
 }

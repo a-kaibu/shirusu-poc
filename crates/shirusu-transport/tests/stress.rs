@@ -72,7 +72,8 @@ fn spsc_concurrent_writer_reader_100k() {
 }
 
 /// 1000 万 ops 級のソーク (release 前提)。debug では縮小版になる。
-/// 規模は環境変数 SHIRUSU_STRESS_OPS で上書きできる (CI の短時間ジョブ用)。
+/// 規模は環境変数 SHIRUSU_STRESS_OPS で上書きできる（短時間ジョブでは縮小し、
+/// 週次 CI では scripts/ci/stress-long.sh が 10 億 ops に拡大する）。
 /// バッチ単位で書いて回収するので欠落は起きず、全 Payload の内容と
 /// Sequence の連続性を全件検証する。Payload Ring は小さくして
 /// 位置の折り返しを大量に踏ませる。

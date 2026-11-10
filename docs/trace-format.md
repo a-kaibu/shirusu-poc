@@ -90,7 +90,7 @@ Finalization が無いファイルは「途中で終わった可能性がある�
 | 0 | 10 | magic `SHIRUSU\0TR` |
 | 10 | 2 | container_version = 1 |
 | 12 | 2 | schema_version = 1 |
-| 14 | 2 | header_flags（予約、0） |
+| 14 | 2 | header_flags（予約、0 でなければならない。Reader が検証する） |
 | 16 | 8 | session_id |
 
 Feature Flags は Environment / Finalization 側の Protobuf に持たせる

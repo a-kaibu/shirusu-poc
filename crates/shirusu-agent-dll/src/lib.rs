@@ -13,7 +13,13 @@
 //!
 //! エクスポート:
 //! - `shirusu_agent_init(*const AgentBootstrap) -> u32`（状態コード）
-//! - `shirusu_agent_shutdown() -> u32`（IAT の巻き戻し）
+//! - `shirusu_agent_shutdown() -> u32`（IAT の巻き戻し。戻り値は
+//!   `shirusu_hook::bootstrap` の SHUTDOWN_* 状態コード）
+//!
+//! セッションは init → shutdown の往復を繰り返せる（レビュー第5回
+//! #7）: shutdown が IAT 復元後にランタイム登録を解除するため、
+//! 同じプロセスへの再初期化が可能。`STATUS_ALREADY_INITIALIZED` は
+//! 「アクティブなセッションがある」場合にだけ返る。
 
 use shirusu_hook::bootstrap::AgentBootstrap;
 
@@ -23,6 +29,26 @@ pub const STATUS_MAPPING_FAILED: u32 = 2;
 pub const STATUS_HOOK_FAILED: u32 = 3;
 pub const STATUS_ALREADY_INITIALIZED: u32 = 4;
 pub const STATUS_UNSUPPORTED: u32 = 5;
+
+/// 終了手順の状態コード決定（純粋関数。レビュー第5回 #6）。
+/// - セッションが無い → `SHUTDOWN_NOT_INITIALIZED`
+/// - セッションがあり、進行中 Detour が完了した → `SHUTDOWN_OK`
+/// - 完了しなかった（完了待ちタイムアウト）→ `SHUTDOWN_INCOMPLETE`
+///
+/// 旧実装はタイムアウトを無視して常に成功を返していた。Host は
+/// この区別を Trace の Event Integrity へ写す。
+/// (非 Windows では win::shutdown 自体が無いためテストからのみ使われる)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shutdown_status(has_session: bool, drained: bool) -> u32 {
+    use shirusu_hook::bootstrap::{SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK};
+    if !has_session {
+        SHUTDOWN_NOT_INITIALIZED
+    } else if drained {
+        SHUTDOWN_OK
+    } else {
+        SHUTDOWN_INCOMPLETE
+    }
+}
 
 /// Agent DLL の初期化エントリ。Host が Bootstrap を対象プロセスの
 /// メモリへ書いてからリモートスレッドで呼ぶ想定であり、DllMain から
@@ -45,10 +71,15 @@ pub extern "system" fn shirusu_agent_init(bootstrap: *const AgentBootstrap) -> u
 }
 
 /// 終了手順（レビュー #4 の #9）: 記録の無効化 → 進行中 Detour の
-/// 完了待ち → IAT の巻き戻し、の順に行う。Host は対象プロセスを
-/// 生かしたまま記録だけを終える場合（LaunchedCapture::finish）に
-/// これをリモートスレッドで呼んでから最終回収・確定を行う。
-/// 対象が既に終了している場合は呼ばれない（呼ぶ必要もない）。
+/// 完了待ち → IAT の巻き戻し → ランタイム登録の解除、の順に行う。
+/// Host は対象プロセスを生かしたまま記録だけを終える場合
+/// （LaunchedCapture::finish）にこれをリモートスレッドで呼んでから
+/// 最終回収・確定を行う。対象が既に終了している場合は呼ばれない
+/// （呼ぶ必要もない）。
+///
+/// 戻り値は `shirusu_hook::bootstrap` の SHUTDOWN_* 状態コード
+/// （レビュー第5回 #6）: 完全停止か、完了待ちタイムアウトか、
+/// セッション無しかを区別して返す。
 #[no_mangle]
 pub extern "system" fn shirusu_agent_shutdown() -> u32 {
     #[cfg(windows)]
@@ -184,6 +215,8 @@ mod win {
         // SAFETY: GetModuleHandleW(NULL) はメインモジュールを返す。
         let main_base = unsafe { GetModuleHandleW(std::ptr::null()) };
         if main_base.is_null() {
+            // 登録したまま失敗すると再初期化が永久に塞がれる
+            engine::clear_runtime(&rt);
             return STATUS_HOOK_FAILED;
         }
         // SAFETY: main_base はロード済みメインモジュール。対象のメイン
@@ -202,7 +235,27 @@ mod win {
                 slots: Vec::new(),
                 plan,
             },
-            Err(_) => return STATUS_HOOK_FAILED,
+            // 設置途中の失敗 (レビュー第5回 #8): ロールバック済みなら
+            // 対象は元の状態に戻っているが、復元も失敗したスロットが
+            // ある場合はその件数を Bootstrap へ書き戻し、Host が
+            // 「対象に Detour が残存する初期化失敗」として扱えるように
+            // する (書き戻し欄の前提は write_hook_outcome と同じ)。
+            Err(EngineError::InstallFailed { unrestored, .. }) => {
+                // SAFETY: bootstrap は Host が書き込み可能に確保した
+                // 領域で、初期化が戻るまで有効 (呼び出し側の契約)。
+                unsafe {
+                    AgentBootstrap::write_install_failure(
+                        bootstrap as *mut AgentBootstrap,
+                        unrestored.len() as u32,
+                    );
+                }
+                engine::clear_runtime(&rt);
+                return STATUS_HOOK_FAILED;
+            }
+            Err(_) => {
+                engine::clear_runtime(&rt);
+                return STATUS_HOOK_FAILED;
+            }
         };
         // Host が読み戻せるよう、init_done を立てる前に Bootstrap へ
         // 設置/欠落件数を書き戻す。
@@ -228,24 +281,57 @@ mod win {
     }
 
     pub fn shutdown() -> u32 {
-        // 順序（レビュー #4 の #9）: (1) 新規記録を無効化し、以後の
-        // Detour は元関数を素通しで呼ぶ。(2) 進行中の Detour が完了
-        // するまで待つ。(3) IAT を復元する。Host はこの後に Ring の
-        // 最終回収と Trace の確定を行う。
-        if let Some(rt) = engine::runtime() {
-            rt.shutdown_recording();
-            // 待ち上限を超えても復元は試みる（対象プロセスの終了を
-            // 妨げるより、復元を優先する）。その場合に書き込み途中
-            // だった Detour のイベントは不完全なまま Ring に残り、
-            // Host 側の完全性評価で扱われる。
-            let _ = rt.wait_in_flight_drained(std::time::Duration::from_secs(5));
-        }
+        // 順序（レビュー #4 の #9 + 第5回 #6/#7）: (1) 新規記録を
+        // 無効化し、以後の Detour は元関数を素通しで呼ぶ。(2) 進行中
+        // の Detour が完了するまで待つ。(3) IAT を復元する。
+        // (4) ランタイム登録を解除し、再初期化を受け入れる。
+        // Host はこの後に Ring の最終回収と Trace の確定を行う。
+        //
+        // 戻り値は状態を区別する（レビュー第5回 #6）: 完了待ちが
+        // タイムアウトした場合は SHUTDOWN_INCOMPLETE を返し、Host が
+        // Event Integrity を劣化させられるようにする。セッションが
+        // 無ければ SHUTDOWN_NOT_INITIALIZED。
         let state = STATE.lock().unwrap().take();
-        if let Some(s) = state {
-            // SAFETY: 設置時に保存したスロット情報。対象モジュールは
-            // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
-            unsafe { engine::uninstall_hooks(&s.installed) };
+        let Some(state) = state else {
+            return shutdown_status(false, false);
+        };
+        let mut drained = true;
+        match engine::runtime() {
+            Some(rt) => {
+                rt.shutdown_recording();
+                // 待ち上限を超えても復元は試みる（対象プロセスの終了を
+                // 妨げるより、復元を優先する）。その場合に書き込み途中
+                // だった Detour のイベントは不完全なまま Ring に残り、
+                // Host 側の完全性評価で扱われる。
+                drained = rt.wait_in_flight_drained(std::time::Duration::from_secs(5));
+                // SAFETY: 設置時に保存したスロット情報。対象モジュールは
+                // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
+                unsafe { engine::uninstall_hooks(&state.installed) };
+                // 登録解除は IAT 復元の後（RuntimeSlot の安全性契約）。
+                engine::clear_runtime(&rt);
+            }
+            None => {
+                // 設置状態はあるのにランタイム登録が無い異常系。
+                // 復元だけは行い、完了確認はできないため未完了とする。
+                // SAFETY: 同上。
+                unsafe { engine::uninstall_hooks(&state.installed) };
+                drained = false;
+            }
         }
-        STATUS_OK
+        shutdown_status(true, drained)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shirusu_hook::bootstrap::{SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK};
+
+    #[test]
+    fn shutdown_status_distinguishes_outcomes() {
+        assert_eq!(shutdown_status(false, true), SHUTDOWN_NOT_INITIALIZED);
+        assert_eq!(shutdown_status(false, false), SHUTDOWN_NOT_INITIALIZED);
+        assert_eq!(shutdown_status(true, true), SHUTDOWN_OK);
+        assert_eq!(shutdown_status(true, false), SHUTDOWN_INCOMPLETE);
     }
 }

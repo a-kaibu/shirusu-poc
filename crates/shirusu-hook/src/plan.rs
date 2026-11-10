@@ -55,10 +55,60 @@ pub fn build_plan(sites: &[ImportSite]) -> HookPlan {
     HookPlan { entries, missing }
 }
 
+/// 設置失敗時の巻き戻し結果（レビュー第5回 #8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchRollback<E> {
+    /// 失敗したパッチのインデックス。
+    pub failed_index: usize,
+    /// パッチ失敗そのもののエラー。
+    pub source: E,
+    /// 復元も失敗したパッチ済みインデックス。空でなければ、対象
+    /// プロセスにパッチが残存する（呼び出し側は重大な状態として
+    /// 伝播させること）。
+    pub unrestored: Vec<usize>,
+}
+
+/// パッチの列をトランザクションとして実行する順序制御
+/// （プラットフォーム非依存。実際の IAT 書き換えは engine が担う）。
+///
+/// `patch(i)` は対象 i を書き換え、復元に必要な元値を返す。
+/// いずれかの `patch` が失敗したら、パッチ済みの範囲を**逆順**に
+/// `restore(i, 元値)` で戻す。復元に失敗したものは
+/// [`PatchRollback::unrestored`] に残し、残りの復元は続ける。
+/// 全部成功した場合だけ、元値の列を対象順で返す。
+pub fn patch_transactionally<E>(
+    count: usize,
+    mut patch: impl FnMut(usize) -> Result<usize, E>,
+    mut restore: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<Vec<usize>, PatchRollback<E>> {
+    let mut originals: Vec<usize> = Vec::with_capacity(count);
+    for i in 0..count {
+        match patch(i) {
+            Ok(original) => originals.push(original),
+            Err(source) => {
+                let mut unrestored = Vec::new();
+                for j in (0..i).rev() {
+                    if restore(j, originals[j]).is_err() {
+                        unrestored.push(j);
+                    }
+                }
+                return Err(PatchRollback {
+                    failed_index: i,
+                    source,
+                    unrestored,
+                });
+            }
+        }
+    }
+    Ok(originals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn site(dll: &str, func: Option<&str>, iat: u32) -> ImportSite {
         ImportSite {
@@ -85,6 +135,89 @@ mod tests {
         // CloseHandle はこのモジュール経由でフックできない = Coverage 欠落
         assert_eq!(plan.missing.len(), 1);
         assert_eq!(plan.missing[0].api_id, API_CLOSE_HANDLE);
+    }
+
+    #[test]
+    fn transactional_patch_all_succeeds_without_restore() {
+        let restored: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let r2 = Rc::clone(&restored);
+        let out: Result<Vec<usize>, PatchRollback<&str>> = patch_transactionally(
+            3,
+            |i| Ok(1000 + i),
+            move |i, _orig| {
+                r2.borrow_mut().push(i);
+                Ok(())
+            },
+        );
+        assert_eq!(out, Ok(vec![1000, 1001, 1002]));
+        assert!(restored.borrow().is_empty(), "no restore on success");
+    }
+
+    #[test]
+    fn transactional_patch_failure_rolls_back_in_reverse() {
+        // レビュー第5回 #8: N 番目で失敗したら、それまでのパッチを
+        // 逆順に復元してからエラーを返す。
+        let restored: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let r2 = Rc::clone(&restored);
+        let out: Result<Vec<usize>, PatchRollback<&str>> = patch_transactionally(
+            4,
+            |i| {
+                if i == 2 {
+                    Err("write failed")
+                } else {
+                    Ok(1000 + i)
+                }
+            },
+            move |i, orig| {
+                assert_eq!(orig, 1000 + i, "restore gets the saved original");
+                r2.borrow_mut().push(i);
+                Ok(())
+            },
+        );
+        let rb = out.unwrap_err();
+        assert_eq!(rb.failed_index, 2);
+        assert_eq!(rb.source, "write failed");
+        assert!(rb.unrestored.is_empty());
+        assert_eq!(*restored.borrow(), vec![1, 0], "reverse order");
+    }
+
+    #[test]
+    fn transactional_patch_failure_at_first_needs_no_rollback() {
+        let out: Result<Vec<usize>, PatchRollback<&str>> =
+            patch_transactionally(2, |_| Err("boom"), |_, _| Ok(()));
+        let rb = out.unwrap_err();
+        assert_eq!(rb.failed_index, 0);
+        assert!(rb.unrestored.is_empty());
+    }
+
+    #[test]
+    fn transactional_patch_rollback_failure_is_reported() {
+        // 復元自体が失敗したスロットは unrestored に残り、
+        // 残りの復元は続けられる。
+        let restored: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let r2 = Rc::clone(&restored);
+        let out: Result<Vec<usize>, PatchRollback<&str>> = patch_transactionally(
+            4,
+            |i| {
+                if i == 3 {
+                    Err("write failed")
+                } else {
+                    Ok(1000 + i)
+                }
+            },
+            move |i, _orig| {
+                r2.borrow_mut().push(i);
+                if i == 1 {
+                    Err("restore failed")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let rb = out.unwrap_err();
+        assert_eq!(rb.failed_index, 3);
+        assert_eq!(rb.unrestored, vec![1]);
+        assert_eq!(*restored.borrow(), vec![2, 1, 0], "all attempted, reverse");
     }
 
     #[test]

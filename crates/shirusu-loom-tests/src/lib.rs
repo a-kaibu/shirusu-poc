@@ -649,6 +649,102 @@ mod tests {
         });
     }
 
+    /// Control 領域の最小モデル (レビュー第5回 #4)。実 `init_control`
+    /// (shirusu-transport::layout) と同じフィールド構成で、初期化の
+    /// 公開順序を検査する。読み手の述語は Host と同じ「Magic を
+    /// Acquire で読み、現れたら他フィールドを読む」。
+    struct MiniControl {
+        magic: AtomicU64,
+        version: AtomicU64,
+        desc_cap: AtomicU64,
+        payload_cap: AtomicU64,
+        generation: AtomicU64,
+        owner: AtomicU64,
+    }
+    const MINI_MAGIC: u64 = 0x5348_4952_5553_5531; // 実 MAGIC と同じ値
+    impl MiniControl {
+        fn new() -> Self {
+            Self {
+                magic: AtomicU64::new(0),
+                version: AtomicU64::new(0),
+                desc_cap: AtomicU64::new(0),
+                payload_cap: AtomicU64::new(0),
+                generation: AtomicU64::new(0),
+                owner: AtomicU64::new(0),
+            }
+        }
+        /// 新順序: 全フィールドを書いてから Magic を最後に Release。
+        fn init_new_order(&self) {
+            self.version.store(1, Ordering::Relaxed);
+            self.desc_cap.store(8, Ordering::Relaxed);
+            self.payload_cap.store(256, Ordering::Relaxed);
+            self.generation.store(7, Ordering::Relaxed);
+            self.owner.store(42, Ordering::Relaxed);
+            self.magic.store(MINI_MAGIC, Ordering::Release);
+        }
+        /// 旧順序 (レビュー第5回 #4 の指摘): Magic を最初に Relaxed。
+        fn init_old_order(&self) {
+            self.magic.store(MINI_MAGIC, Ordering::Relaxed);
+            self.version.store(1, Ordering::Relaxed);
+            self.desc_cap.store(8, Ordering::Relaxed);
+            self.payload_cap.store(256, Ordering::Relaxed);
+            self.generation.store(7, Ordering::Relaxed);
+            self.owner.store(42, Ordering::Relaxed);
+        }
+        /// 読み手: Magic が現れたら、全フィールドが初期化済みの値を
+        /// 持っていなければならない。
+        fn check_if_initialized(&self) {
+            if self.magic.load(Ordering::Acquire) == MINI_MAGIC {
+                let fields = (
+                    self.version.load(Ordering::Relaxed),
+                    self.desc_cap.load(Ordering::Relaxed),
+                    self.payload_cap.load(Ordering::Relaxed),
+                    self.generation.load(Ordering::Relaxed),
+                    self.owner.load(Ordering::Relaxed),
+                );
+                assert_eq!(
+                    fields,
+                    (1, 8, 256, 7, 42),
+                    "reader must never observe a half-initialized control"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loom_control_init_magic_published_last() {
+        loom::model(|| {
+            let control = Arc::new(MiniControl::new());
+            let c2 = control.clone();
+            let writer = loom::thread::spawn(move || c2.init_new_order());
+            // 書き手と並行に読み手述語を回す (有限回)。
+            for _ in 0..3 {
+                control.check_if_initialized();
+                loom::thread::yield_now();
+            }
+            writer.join().unwrap();
+            control.check_if_initialized();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "reader must never observe a half-initialized control")]
+    fn loom_control_init_magic_first_is_detected() {
+        // 旧順序では「Magic だけが見えて他が 0」のスケジュールが存在し、
+        // 同じ表明が落ちることを失敗そのものの回帰として固定する。
+        loom::model(|| {
+            let control = Arc::new(MiniControl::new());
+            let c2 = control.clone();
+            let writer = loom::thread::spawn(move || c2.init_old_order());
+            for _ in 0..3 {
+                control.check_if_initialized();
+                loom::thread::yield_now();
+            }
+            writer.join().unwrap();
+            control.check_if_initialized();
+        });
+    }
+
     #[test]
     #[should_panic(expected = "claimer must observe the advanced generation")]
     fn loom_slot_reclaim_old_order_is_detected() {

@@ -335,9 +335,7 @@ mod tests {
     #[test]
     fn utf16_string_truncates_at_cap() {
         let mut m = MapMemory::new();
-        let units: Vec<u16> = std::iter::repeat(0x41u16)
-            .take(MAX_STRING_UNITS + 500)
-            .collect();
+        let units: Vec<u16> = std::iter::repeat_n(0x41u16, MAX_STRING_UNITS + 500).collect();
         m.write_u16s(0x2000, &units);
         let v = read_utf16_string(&m, 0x2000);
         assert_eq!(v.capture, ValueCapture::Truncated);

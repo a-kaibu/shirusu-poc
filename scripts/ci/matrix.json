@@ -169,6 +169,20 @@
       "targets": "",
       "timeout": 90,
       "toolchain": "nightly"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "long-stress",
+      "os": "ubuntu-latest",
+      "run": "bash scripts/ci/stress-long.sh",
+      "suites": [
+        "weekly"
+      ],
+      "targets": "",
+      "timeout": 60,
+      "toolchain": "stable"
     }
   ]
 }

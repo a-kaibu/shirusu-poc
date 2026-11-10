@@ -53,6 +53,8 @@ impl PublishNotifyTracker {
 }
 
 /// Host 側の再確認ポリシー。通知を取りこぼしても無期限に待たない。
+/// ただし待機が終わった後にすぐ実行されるとは限らないため、2ms 以内の回収は
+/// 保証しない。2ms は再確認の周期であり、回収遅延の上限ではない。
 #[derive(Debug, Clone, Copy)]
 pub struct ReCheckPolicy {
     pub interval: Duration,

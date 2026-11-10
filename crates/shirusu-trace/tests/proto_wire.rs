@@ -218,7 +218,7 @@ fn group_wire_types_are_invalid() {
 fn varint_too_long_is_invalid() {
     // field 1 の varint が 11 バイト続く
     let mut buf = vec![0x08];
-    buf.extend(std::iter::repeat(0x80).take(10));
+    buf.extend(std::iter::repeat_n(0x80, 10));
     buf.push(0x01);
     assert_eq!(
         SessionMetadata::decode(&buf),
@@ -226,7 +226,7 @@ fn varint_too_long_is_invalid() {
     );
     // 10 バイト目が 2 以上（u64 に収まらない）
     let mut buf = vec![0x08];
-    buf.extend(std::iter::repeat(0xff).take(9));
+    buf.extend(std::iter::repeat_n(0xff, 9));
     buf.push(0x02);
     assert_eq!(
         SessionMetadata::decode(&buf),

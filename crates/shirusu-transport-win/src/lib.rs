@@ -1193,6 +1193,16 @@ mod tests {
         // auto-reset: 複製側の待機がシグナルを消費したので、元側ももう立っていない。
         assert!(!e.wait_timeout(Duration::from_millis(1)));
     }
+    #[test]
+    fn duplicate_ring_notify_space_to_self_process() {
+        // レビュー第5回 #1 の対側: RingNotify の space イベントも自プロセスへ
+        // 複製でき、非ゼロのハンドル値が返ること (スタブ版テストの Windows 側)。
+        let notify = RingNotify::new().unwrap();
+        let dup = notify
+            .duplicate_space_to_process(std::process::id())
+            .unwrap();
+        assert_ne!(dup, 0);
+    }
 }
 
 #[cfg(test)]
@@ -1288,10 +1298,13 @@ mod portable_tests {
         assert!(start.elapsed() < Duration::from_millis(50));
         assert_eq!(clock.sleep_calls(), 2);
     }
+    #[cfg(not(windows))]
     #[test]
     fn duplicate_space_to_process_is_unsupported_on_stub() {
         // Linux スタブにプロセス間の実体は無い。Windows 実機では
-        // `duplicate_event_to_self_process_signals_across_handle` が通ること。
+        // `duplicate_event_to_self_process_signals_across_handle` と
+        // `duplicate_ring_notify_space_to_self_process` が通ること。
+        // (レビュー第5回 #1: cfg が無いと Windows 実機で Ok が返り失敗する)
         let notify = RingNotify::new().unwrap();
         assert_eq!(
             notify.duplicate_space_to_process(std::process::id()),

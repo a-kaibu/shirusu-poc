@@ -113,8 +113,8 @@ Test SupervisorがAPIを大量に呼ぶ専用プログラムを起動し、Host�
 | タイミング | 実行する検証 |
 | --- | --- |
 | PR | Unit、PBT（故障操作を含む）、短いloom、Kaniの主要Harness、短いFuzz、Windows x86・x64 E2E |
-| Nightly | 長時間Fuzz、多数SeedのPBT・DST、Host・Agentの障害注入 |
-| 週次 | 拡大したloom、TLA+の状態探索、長時間の負荷テスト |
+| Nightly | 多数SeedのPBT・DST、Host・Agentの障害注入 |
+| 週次 | 拡大したloom、TLA+の状態探索、長時間Fuzz、長時間の負荷テスト |
 | リリース前 | 全検証、Application Verifier、破損復旧、異なるWindows環境での確認 |
 
 PBTとDSTで見つけたSeed、Fuzzの最小入力、loomの失敗スケジュールは回帰テストに加える。テストが本当に不具合を検出できるかは、ReleaseをRelaxedにする、Generationの確認を外す、容量計算を壊すといった変更を加えて確かめる（Mutation Test）。

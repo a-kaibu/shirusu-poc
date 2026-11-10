@@ -3,7 +3,7 @@
 
 use shirusu_trace::blob::BlobId;
 use shirusu_trace::container::{
-    parse_raw_header, serialize_header, BlockHeader, BlockType, Compression,
+    parse_raw_header, serialize_header, BlockHeader, BlockType, Compression, FileHeader,
 };
 use shirusu_trace::error::TraceError;
 use shirusu_trace::model::{EventBatch, PayloadRef, TraceEvent};
@@ -124,6 +124,37 @@ fn not_a_trace_inputs() {
         read_trace(&bytes[env_start..]),
         Err(TraceError::NotATrace)
     ));
+}
+
+#[test]
+fn nonzero_header_flags_is_not_a_trace() {
+    // F24: Header payload の header_flags（予約、0）が 0 でないファイルは
+    // Trace ではない。CRC は serialize_header で付け直すため、失敗の原因
+    // は header_flags の検証だけになる。
+    let header = BlockHeader {
+        block_type: BlockType::Header,
+        compression: Compression::None,
+        sequence: 0,
+        stored_len: 24,
+        raw_len: 24,
+    };
+    // 対照: flags=0 の Header だけのファイルは読める。
+    let good_payload = FileHeader::new(42).encode();
+    let mut good = serialize_header(&header, &good_payload).to_vec();
+    good.extend_from_slice(&good_payload);
+    let read = read_trace(&good).expect("header-only trace reads");
+    assert_eq!(read.header.session_id, 42);
+
+    for flags in [1u16, 0x8000, 0xffff] {
+        let mut payload = FileHeader::new(42).encode();
+        payload[14..16].copy_from_slice(&flags.to_le_bytes());
+        let mut file = serialize_header(&header, &payload).to_vec();
+        file.extend_from_slice(&payload);
+        assert!(
+            matches!(read_trace(&file), Err(TraceError::NotATrace)),
+            "flags={flags:#06x} must be rejected"
+        );
+    }
 }
 
 #[test]
