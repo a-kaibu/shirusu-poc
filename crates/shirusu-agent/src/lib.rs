@@ -73,6 +73,13 @@ pub struct Agent {
     /// フィールドの破棄順に注意: `threads` より後に宣言し、書き手状態が
     /// 先に破棄されてから Mapping の保持を解く。
     expanded_regions: Arc<Mutex<HashMap<usize, ExpandedRegion>>>,
+    /// `--order=global` (L11) が有効かどうか。`with_order_global` で
+    /// 構築時に設定し、以後は不変。Host は Bootstrap / セッション設定から
+    /// 決める。無効な間は Descriptor の `global_order` は 0 のまま。
+    order_global: bool,
+    /// 全スレッド共通の観測順序カウンタ (L11)。`record` で書き込みが
+    /// 確定する直前に 1 つ採番する。1 始まり（0 は未割当）。
+    next_global_order: AtomicU64,
 }
 
 /// 追加 Slot (A70) へ紐付けた Mapping。Slot の index ごとに Agent が保持する。
@@ -162,7 +169,17 @@ impl Agent {
             host_monitor,
             threads: RwLock::new(HashMap::new()),
             expanded_regions: Arc::new(Mutex::new(HashMap::new())),
+            order_global: false,
+            next_global_order: AtomicU64::new(1),
         }
+    }
+    /// `--order=global` (L11) を有効にする。フックの観測点ごとに
+    /// 全スレッド共通の番号を振り、Descriptor の `global_order` に刻む。
+    /// 番号はアトミックカウンタの更新順であり、API 処理の完了順や
+    /// メモリ操作全体の順序を保証しない。
+    pub fn with_order_global(mut self, enabled: bool) -> Self {
+        self.order_global = enabled;
+        self
     }
     pub fn with_policy(mut self, policy: WriterPolicy) -> Self {
         self.policy = policy;
@@ -433,6 +450,13 @@ impl Agent {
                 return RecordResult::AfterDetach;
             }
             let _guard = PublishGuard::enter(); // 公開区間だけのガード
+                                                // L11: 書き込みが確定する直前に全体順序を採番する。
+                                                // 採番は観測点（この record 呼び出し）の順序を反映する。
+                                                // 欠落したイベントの分は欠番になる（Sequence の欠番と同じ扱い）。
+            let mut input = input;
+            if self.order_global {
+                input.global_order = self.next_global_order.fetch_add(1, Ordering::Relaxed);
+            }
             writer.write(input)
         };
         // 容量不足などの異常経路でのみ Host 生存確認する。通常経路では確認しない。
@@ -466,6 +490,7 @@ impl Agent {
                 parent_call_id: parent,
                 payload,
                 capture_state: CaptureState::Captured,
+                global_order: 0,
             },
         )
     }
@@ -489,6 +514,65 @@ impl Agent {
                 parent_call_id: parent,
                 payload,
                 capture_state: CaptureState::Captured,
+                global_order: 0,
+            },
+        )
+    }
+
+    /// 非同期 I/O の完了を記録する（F27）。OVERLAPPED 指定の呼び出し
+    /// の leave は未完了のため Unsupported だが、完了を観測した時点
+    /// （GetOverlappedResult / GetQueuedCompletionStatus）で、元の
+    /// 呼び出しの leave Schema の値列を改めて記録する。`schema_id`
+    /// には元の API の leave Schema の ID を入れる。
+    pub fn record_completion(
+        &self,
+        thread_id: u64,
+        api_id: u32,
+        leave_schema_id: u32,
+        call_id: u64,
+        parent: u64,
+        payload: &[u8],
+    ) -> RecordResult {
+        self.record(
+            thread_id,
+            CallOrigin::Application,
+            EventInput {
+                kind: EventKind::CallCompleted,
+                api_id,
+                schema_id: leave_schema_id,
+                call_id,
+                parent_call_id: parent,
+                payload,
+                capture_state: CaptureState::Captured,
+                global_order: 0,
+            },
+        )
+    }
+
+    /// 中断した呼び出しを記録する（L08）。元の API が例外で戻らなかった
+    /// 場合に、CallLeave の代わりに記録する。戻り値が無いため引数値列
+    /// は空で、`schema_id` には leave Schema の ID を入れる（どの API
+    /// の leave になるはずだったかが読めるようにする）。
+    pub fn record_aborted(
+        &self,
+        thread_id: u64,
+        api_id: u32,
+        leave_schema_id: u32,
+        call_id: u64,
+        parent: u64,
+    ) -> RecordResult {
+        self.record(
+            thread_id,
+            CallOrigin::Application,
+            EventInput {
+                kind: EventKind::CallAborted,
+                api_id,
+                schema_id: leave_schema_id,
+                call_id,
+                parent_call_id: parent,
+                payload: &[],
+                capture_state: CaptureState::Captured,
+                global_order: 0,
             },
         )
     }
@@ -554,9 +638,71 @@ mod tests {
                 parent_call_id: 0,
                 payload: b"",
                 capture_state: CaptureState::Captured,
+                global_order: 0,
             },
         );
         assert_eq!(internal, RecordResult::SkippedAgentInternal);
+    }
+    #[test]
+    fn record_completion_writes_call_completed_event() {
+        // F27: 非同期 I/O の完了は CallCompleted として、元の呼び出しの
+        // leave Schema の値列とともに記録される。
+        let a = agent(4);
+        assert!(matches!(
+            a.record_enter(1, 10, 20, 100, 0, b"args"),
+            RecordResult::Written(_)
+        ));
+        assert!(matches!(
+            a.record_leave(1, 10, 21, 100, 0, b"leave-args"),
+            RecordResult::Written(_)
+        ));
+        assert!(matches!(
+            a.record_completion(1, 10, 21, 100, 0, b"completed-args"),
+            RecordResult::Written(_)
+        ));
+        let base = unsafe { a.thread_region_base(1) }.expect("region");
+        let mut reader =
+            unsafe { shirusu_transport::ring::RingReader::new(base, RingConfig::new(16, 512)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 3);
+        assert_eq!(
+            batch.events[2].descriptor.kind_enum(),
+            Some(EventKind::CallCompleted)
+        );
+        assert_eq!(batch.events[2].descriptor.call_id, 100);
+        assert_eq!(batch.events[2].descriptor.api_id, 10);
+        assert_eq!(batch.events[2].descriptor.schema_id, 21);
+        assert_eq!(batch.events[2].payload, b"completed-args");
+    }
+    #[test]
+    fn record_aborted_writes_call_aborted_event() {
+        // L08: 中断した呼び出しは CallAborted として記録される。
+        let a = agent(4);
+        assert!(matches!(
+            a.record_enter(1, 10, 20, 100, 0, b"args"),
+            RecordResult::Written(_)
+        ));
+        assert!(matches!(
+            a.record_aborted(1, 10, 21, 100, 0),
+            RecordResult::Written(_)
+        ));
+        let base = unsafe { a.thread_region_base(1) }.expect("region");
+        let mut reader =
+            unsafe { shirusu_transport::ring::RingReader::new(base, RingConfig::new(16, 512)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(
+            batch.events[0].descriptor.kind_enum(),
+            Some(EventKind::CallEnter)
+        );
+        assert_eq!(
+            batch.events[1].descriptor.kind_enum(),
+            Some(EventKind::CallAborted)
+        );
+        assert_eq!(batch.events[1].descriptor.call_id, 100);
+        assert_eq!(batch.events[1].descriptor.api_id, 10);
+        assert_eq!(batch.events[1].descriptor.schema_id, 21);
+        assert_eq!(batch.events[1].payload.len(), 0, "aborted has no args");
     }
     #[test]
     fn no_slot_counts_coverage_loss() {

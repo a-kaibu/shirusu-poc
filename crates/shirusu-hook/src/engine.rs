@@ -6,17 +6,24 @@
 //!   Win32 API を呼んでも、呼び出し側から見た LastError は変わらない。
 //! - 取得は全て「元の呼び出しの外側」で行い、元の呼び出し自体の
 //!   引数・戻り値には一切触れない。
-//! - Reentrance： Agent の記録経路がフック対象 API を呼ぶことはない
-//!   （メモリ読み取りは VirtualQuery + 直接コピーのみ）。対象アプリ
-//!   自身の入れ子呼び出しは呼出スタックで親子として記録される。
+//! - 例外 (L08)：元の API が例外で中断したら、例外はそのまま伝え、
+//!   中断した呼び出しを `CallAborted` として記録する（`CallGuard` の
+//!   Drop。例外は捕捉しない）。
+//! - Reentrance (G15)： Detour の記録経路の実行中にフック対象 API が
+//!   呼ばれたら、Agent 自身の呼び出しとして記録せず素通しする
+//!   （TLS の `ReentrancyGuard`。`prepare` が入口で判定する）。
+//!   元の API 呼び出しの間だけガードを外すため、アプリ由来の入れ子
+//!   呼び出しは親子として記録される（A43）。旧実装は記録経路がフック
+//!   対象 API を呼ばないことに暗黙に依存していた。
 
 use crate::api::{
-    api_by_id, ApiDef, API_CLOSE_HANDLE, API_CREATE_FILE_W, API_READ_FILE, API_WRITE_FILE,
+    api_by_id, ApiDef, API_CLOSE_HANDLE, API_CREATE_FILE_W, API_GET_OVERLAPPED_RESULT,
+    API_GET_QUEUED_COMPLETION_STATUS, API_READ_FILE, API_WRITE_FILE,
 };
 use crate::capture::{self, MemoryReader};
 use crate::pe;
 use crate::plan::{build_plan, HookPlan};
-use crate::runtime::{pop_call, push_call, HookRuntime};
+use crate::runtime::{pop_call, push_call, HookRuntime, ReentrancyGuard};
 use std::ffi::c_void;
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
@@ -249,6 +256,9 @@ type CreateFileWFn =
 type ReadFileFn = unsafe extern "system" fn(Handle, *mut u8, u32, *mut u32, *mut c_void) -> i32;
 type WriteFileFn = unsafe extern "system" fn(Handle, *const u8, u32, *mut u32, *mut c_void) -> i32;
 type CloseHandleFn = unsafe extern "system" fn(Handle) -> i32;
+type GetOverlappedResultFn = unsafe extern "system" fn(Handle, *mut c_void, *mut u32, i32) -> i32;
+type GetQueuedCompletionStatusFn =
+    unsafe extern "system" fn(Handle, *mut u32, *mut u64, *mut *mut c_void, u32) -> i32;
 
 fn detour_for(api_id: u32) -> usize {
     match api_id {
@@ -256,7 +266,45 @@ fn detour_for(api_id: u32) -> usize {
         API_READ_FILE => (detour_read_file as ReadFileFn) as usize,
         API_WRITE_FILE => (detour_write_file as WriteFileFn) as usize,
         API_CLOSE_HANDLE => (detour_close_handle as CloseHandleFn) as usize,
+        API_GET_OVERLAPPED_RESULT => {
+            (detour_get_overlapped_result as GetOverlappedResultFn) as usize
+        }
+        API_GET_QUEUED_COMPLETION_STATUS => {
+            (detour_get_queued_completion_status as GetQueuedCompletionStatusFn) as usize
+        }
         _ => 0,
+    }
+}
+
+/// 完了した非同期 I/O 操作の CallCompleted を記録する（F27）。
+/// `transferred` は完了時点の転送バイト数、`success` は完了の成否、
+/// `last_error` は完了観測 API の直後に読んだ GetLastError。値列は
+/// 元の API の leave Schema で符号化する。
+fn record_overlapped_completion(
+    rt: &HookRuntime,
+    tid: u64,
+    pending: capture::PendingOverlapped,
+    transferred: u32,
+    success: bool,
+    last_error: u32,
+) {
+    let Some(api) = api_by_id(pending.api_id) else {
+        return;
+    };
+    let values = match pending.direction {
+        capture::OverlappedDirection::Read => capture::complete_read_file_leave(
+            &ProcessMemory,
+            pending.buffer,
+            transferred,
+            success,
+            last_error,
+        ),
+        capture::OverlappedDirection::Write => {
+            capture::complete_write_file_leave(transferred, success, last_error)
+        }
+    };
+    if let Ok(bytes) = capture::encode_leave(api, &values) {
+        rt.record_completion(tid, api, pending.call_id, &bytes);
     }
 }
 
@@ -266,22 +314,41 @@ fn detour_for(api_id: u32) -> usize {
 /// Detour の入口判定 (レビュー #4 の #9)。
 enum Prepare {
     /// 記録する通常経路。`flight` を Detour 全体で保持することで、
-    /// 終了手順が進行中 Detour の完了を待てる。
+    /// 終了手順が進行中 Detour の完了を待てる。`guard` は Detour の
+    /// 記録経路全体を覆う再入ガード (G15)。元の API 呼び出しの間だけ
+    /// Detour 側が suspend し、呼び出しが終われば resume する。
     Record {
         rt: Arc<HookRuntime>,
         original: usize,
         tid: u64,
         api: &'static ApiDef,
         flight: crate::runtime::DetourFlight,
+        guard: ReentrancyGuard,
     },
-    /// 終了手順の進行中: 記録せず元関数を素通しで呼ぶ。IAT 復元と
-    /// 競合させないための経路。
+    /// 終了手順の進行中、または再入中: 記録せず元関数を素通しで呼ぶ。
+    /// IAT 復元と競合させないための経路。再入の場合は Agent 自身の
+    /// 呼び出しであり、記録対象ではない (G15)。
     Passthrough { original: usize },
     /// ランタイム未登録 / 元関数なし: 呼び出し側は失敗値を返す。
     Unavailable,
 }
 
 fn prepare(api_id: u32) -> Prepare {
+    // G15: 記録経路の実行中にフック対象 API が呼ばれたら、Agent 自身の
+    // 呼び出しとして記録せず元関数を素通しで呼ぶ。ガードはここで立て、
+    // Record 経路の Detour が終わりまで保持する（元の API 呼び出しの間
+    // だけ Detour 側が suspend する）。再入の判定はこの入口に集約し、
+    // 各 Detour は Prepare の結果に従うだけにする。
+    let Some(guard) = ReentrancyGuard::try_enter() else {
+        let Some(rt) = runtime() else {
+            return Prepare::Unavailable;
+        };
+        let original = rt.original(api_id);
+        if original == 0 {
+            return Prepare::Unavailable;
+        }
+        return Prepare::Passthrough { original };
+    };
     let Some(rt) = runtime() else {
         return Prepare::Unavailable;
     };
@@ -302,6 +369,7 @@ fn prepare(api_id: u32) -> Prepare {
                 tid,
                 api,
                 flight,
+                guard,
             }
         }
         None => Prepare::Passthrough { original },
@@ -319,14 +387,15 @@ unsafe extern "system" fn detour_create_file_w(
     flags_and_attributes: u32,
     template_file: Handle,
 ) -> Handle {
-    let (rt, original, tid, api, _flight) = match prepare(API_CREATE_FILE_W) {
+    let (rt, original, tid, api, _flight, mut guard) = match prepare(API_CREATE_FILE_W) {
         Prepare::Record {
             rt,
             original,
             tid,
             api,
             flight,
-        } => (rt, original, tid, api, flight),
+            guard,
+        } => (rt, original, tid, api, flight, guard),
         Prepare::Passthrough { original } => {
             // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
             let orig: CreateFileWFn = unsafe { std::mem::transmute(original) };
@@ -361,6 +430,12 @@ unsafe extern "system" fn detour_create_file_w(
         rt.record_enter(tid, api, call_id, &bytes);
     }
     push_call(call_id);
+    // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
+    // CallAborted を記録する（例外は捕捉しない）。
+    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // G15: 元の API 呼び出しの間だけ再入ガードを外す。元の呼び出しの中で
+    // アプリ由来の入れ子呼び出しが起きた場合は記録される (A43)。
+    guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
     let ret = unsafe {
         orig(
@@ -373,6 +448,8 @@ unsafe extern "system" fn detour_create_file_w(
             template_file,
         )
     };
+    guard.resume();
+    call_guard.complete();
     // 透明性: 他の処理より先に LastError を確定させる（overview）。
     let last_error = unsafe { GetLastError() };
     pop_call(call_id);
@@ -392,14 +469,15 @@ unsafe extern "system" fn detour_read_file(
     bytes_read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let (rt, original, tid, api, _flight) = match prepare(API_READ_FILE) {
+    let (rt, original, tid, api, _flight, mut guard) = match prepare(API_READ_FILE) {
         Prepare::Record {
             rt,
             original,
             tid,
             api,
             flight,
-        } => (rt, original, tid, api, flight),
+            guard,
+        } => (rt, original, tid, api, flight, guard),
         Prepare::Passthrough { original } => {
             // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
             let orig: ReadFileFn = unsafe { std::mem::transmute(original) };
@@ -415,20 +493,69 @@ unsafe extern "system" fn detour_read_file(
         rt.record_enter(tid, api, call_id, &bytes);
     }
     push_call(call_id);
+    // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
+    // CallAborted を記録する（例外は捕捉しない）。
+    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
     let ret = unsafe { orig(file, buffer, bytes_to_read, bytes_read, overlapped) };
+    guard.resume();
+    call_guard.complete();
     let last_error = unsafe { GetLastError() };
     pop_call(call_id);
-    let values = capture::read_file_leave(
-        &ProcessMemory,
-        ret,
-        buffer as u64,
-        bytes_read as u64,
-        !overlapped.is_null(),
-        last_error,
-    );
+    let is_overlapped = !overlapped.is_null();
+    // F27: 同期完了した OVERLAPPED 操作は leave 時点で既に完了して
+    // いるため、転送バイト数とバッファ内容をここで取る。未完了
+    // (ERROR_IO_PENDING) なら完了の観測に備えて登録する。
+    let values = if is_overlapped && ret != 0 {
+        match capture::read_overlapped_transferred(
+            &ProcessMemory,
+            bytes_read as u64,
+            overlapped as u64,
+        ) {
+            Some(n) => capture::complete_read_file_leave(
+                &ProcessMemory,
+                buffer as u64,
+                n,
+                true,
+                last_error,
+            ),
+            None => capture::read_file_leave(
+                &ProcessMemory,
+                ret,
+                buffer as u64,
+                bytes_read as u64,
+                true,
+                last_error,
+            ),
+        }
+    } else {
+        capture::read_file_leave(
+            &ProcessMemory,
+            ret,
+            buffer as u64,
+            bytes_read as u64,
+            is_overlapped,
+            last_error,
+        )
+    };
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.record_leave(tid, api, call_id, &bytes);
+    }
+    if is_overlapped && ret == 0 && last_error == capture::ERROR_IO_PENDING {
+        rt.register_pending_overlapped(
+            overlapped as u64,
+            capture::PendingOverlapped {
+                api_id: API_READ_FILE,
+                call_id,
+                handle: file as u64,
+                buffer: buffer as u64,
+                requested_len: bytes_to_read,
+                direction: capture::OverlappedDirection::Read,
+                bytes_addr: bytes_read as u64,
+            },
+        );
     }
     // SAFETY: LastError を復元する。
     unsafe { SetLastError(last_error) };
@@ -442,14 +569,15 @@ unsafe extern "system" fn detour_write_file(
     bytes_written: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let (rt, original, tid, api, _flight) = match prepare(API_WRITE_FILE) {
+    let (rt, original, tid, api, _flight, mut guard) = match prepare(API_WRITE_FILE) {
         Prepare::Record {
             rt,
             original,
             tid,
             api,
             flight,
-        } => (rt, original, tid, api, flight),
+            guard,
+        } => (rt, original, tid, api, flight, guard),
         Prepare::Passthrough { original } => {
             // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
             let orig: WriteFileFn = unsafe { std::mem::transmute(original) };
@@ -467,19 +595,60 @@ unsafe extern "system" fn detour_write_file(
         rt.record_enter(tid, api, call_id, &bytes);
     }
     push_call(call_id);
+    // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
+    // CallAborted を記録する（例外は捕捉しない）。
+    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
     let ret = unsafe { orig(file, buffer, bytes_to_write, bytes_written, overlapped) };
+    guard.resume();
+    call_guard.complete();
     let last_error = unsafe { GetLastError() };
     pop_call(call_id);
-    let values = capture::write_file_leave(
-        &ProcessMemory,
-        ret,
-        bytes_written as u64,
-        !overlapped.is_null(),
-        last_error,
-    );
+    let is_overlapped = !overlapped.is_null();
+    // F27: ReadFile と同じく、同期完了は leave 時点で値を取り、未完了
+    // (ERROR_IO_PENDING) は完了の観測に備えて登録する。
+    let values = if is_overlapped && ret != 0 {
+        match capture::read_overlapped_transferred(
+            &ProcessMemory,
+            bytes_written as u64,
+            overlapped as u64,
+        ) {
+            Some(n) => capture::complete_write_file_leave(n, true, last_error),
+            None => capture::write_file_leave(
+                &ProcessMemory,
+                ret,
+                bytes_written as u64,
+                true,
+                last_error,
+            ),
+        }
+    } else {
+        capture::write_file_leave(
+            &ProcessMemory,
+            ret,
+            bytes_written as u64,
+            is_overlapped,
+            last_error,
+        )
+    };
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.record_leave(tid, api, call_id, &bytes);
+    }
+    if is_overlapped && ret == 0 && last_error == capture::ERROR_IO_PENDING {
+        rt.register_pending_overlapped(
+            overlapped as u64,
+            capture::PendingOverlapped {
+                api_id: API_WRITE_FILE,
+                call_id,
+                handle: file as u64,
+                buffer: buffer as u64,
+                requested_len: bytes_to_write,
+                direction: capture::OverlappedDirection::Write,
+                bytes_addr: bytes_written as u64,
+            },
+        );
     }
     // SAFETY: LastError を復元する。
     unsafe { SetLastError(last_error) };
@@ -487,14 +656,15 @@ unsafe extern "system" fn detour_write_file(
 }
 
 unsafe extern "system" fn detour_close_handle(object: Handle) -> i32 {
-    let (rt, original, tid, api, _flight) = match prepare(API_CLOSE_HANDLE) {
+    let (rt, original, tid, api, _flight, mut guard) = match prepare(API_CLOSE_HANDLE) {
         Prepare::Record {
             rt,
             original,
             tid,
             api,
             flight,
-        } => (rt, original, tid, api, flight),
+            guard,
+        } => (rt, original, tid, api, flight, guard),
         Prepare::Passthrough { original } => {
             // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
             let orig: CloseHandleFn = unsafe { std::mem::transmute(original) };
@@ -510,8 +680,15 @@ unsafe extern "system" fn detour_close_handle(object: Handle) -> i32 {
         rt.record_enter(tid, api, call_id, &bytes);
     }
     push_call(call_id);
+    // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
+    // CallAborted を記録する（例外は捕捉しない）。
+    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
     let ret = unsafe { orig(object) };
+    guard.resume();
+    call_guard.complete();
     let last_error = unsafe { GetLastError() };
     pop_call(call_id);
     let values = capture::close_handle_leave(ret, last_error);
@@ -521,4 +698,245 @@ unsafe extern "system" fn detour_close_handle(object: Handle) -> i32 {
     // SAFETY: LastError を復元する。
     unsafe { SetLastError(last_error) };
     ret
+}
+
+/// GetOverlappedResult の Detour（F27）。通常の API 呼び出しとして
+/// enter / leave を記録したうえで、成功時は待っていた OVERLAPPED
+/// 操作の完了を `CallCompleted` として記録する。FALSE でも
+/// ERROR_IO_INCOMPLETE 以外なら操作自体がエラーで終わった完了として
+/// 記録する。未完了 (996) の場合は何もしない（操作はまだ保留中）。
+unsafe extern "system" fn detour_get_overlapped_result(
+    file: Handle,
+    overlapped: *mut c_void,
+    bytes_transferred: *mut u32,
+    wait: i32,
+) -> i32 {
+    let (rt, original, tid, api, _flight, mut guard) = match prepare(API_GET_OVERLAPPED_RESULT) {
+        Prepare::Record {
+            rt,
+            original,
+            tid,
+            api,
+            flight,
+            guard,
+        } => (rt, original, tid, api, flight, guard),
+        Prepare::Passthrough { original } => {
+            // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
+            let orig: GetOverlappedResultFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(file, overlapped, bytes_transferred, wait) };
+        }
+        Prepare::Unavailable => return 0,
+    };
+    // SAFETY: 設置時に保存した本物の GetOverlappedResult。
+    let orig: GetOverlappedResultFn = unsafe { std::mem::transmute(original) };
+    let call_id = rt.alloc_call_id();
+    let values = capture::get_overlapped_result_enter(file as u64, overlapped as u64, wait);
+    if let Ok(bytes) = capture::encode_enter(api, &values) {
+        rt.record_enter(tid, api, call_id, &bytes);
+    }
+    push_call(call_id);
+    // L08: 元の呼び出しが例外で中断したら CallGuard が CallAborted を記録する。
+    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    guard.suspend();
+    // SAFETY: 元の呼び出しは引数をそのまま渡す。
+    let ret = unsafe { orig(file, overlapped, bytes_transferred, wait) };
+    guard.resume();
+    call_guard.complete();
+    let last_error = unsafe { GetLastError() };
+    pop_call(call_id);
+    // 完了の観測：元の呼び出しが返した後に転送バイト数を読み、
+    // 保留中の操作を解決する。読めなければ完了は記録できない。
+    let transferred = capture::read_overlapped_transferred(
+        &ProcessMemory,
+        bytes_transferred as u64,
+        overlapped as u64,
+    );
+    let values = capture::get_overlapped_result_leave(ret, transferred, last_error);
+    if let Ok(bytes) = capture::encode_leave(api, &values) {
+        rt.record_leave(tid, api, call_id, &bytes);
+    }
+    if ret != 0 {
+        if let Some(pending) = rt.take_pending_overlapped(overlapped as u64) {
+            if let Some(n) = transferred {
+                record_overlapped_completion(&rt, tid, pending, n, true, last_error);
+            }
+        }
+    } else if last_error != capture::ERROR_IO_INCOMPLETE {
+        if let Some(pending) = rt.take_pending_overlapped(overlapped as u64) {
+            record_overlapped_completion(&rt, tid, pending, 0, false, last_error);
+        }
+    }
+    // SAFETY: LastError を復元する。
+    unsafe { SetLastError(last_error) };
+    ret
+}
+
+/// GetQueuedCompletionStatus の Detour（F27）。完了ポートから取り出した
+/// OVERLAPPED 操作の完了を `CallCompleted` として記録する。戻り値が
+/// FALSE でも lpOverlapped が非 NULL なら完了した I/O の失敗として
+/// 記録する。タイムアウト等で lpOverlapped が NULL の場合は何もしない。
+unsafe extern "system" fn detour_get_queued_completion_status(
+    port: Handle,
+    bytes_transferred: *mut u32,
+    completion_key: *mut u64,
+    overlapped: *mut *mut c_void,
+    milliseconds: u32,
+) -> i32 {
+    let (rt, original, tid, api, _flight, mut guard) =
+        match prepare(API_GET_QUEUED_COMPLETION_STATUS) {
+            Prepare::Record {
+                rt,
+                original,
+                tid,
+                api,
+                flight,
+                guard,
+            } => (rt, original, tid, api, flight, guard),
+            Prepare::Passthrough { original } => {
+                // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
+                let orig: GetQueuedCompletionStatusFn = unsafe { std::mem::transmute(original) };
+                return unsafe {
+                    orig(
+                        port,
+                        bytes_transferred,
+                        completion_key,
+                        overlapped,
+                        milliseconds,
+                    )
+                };
+            }
+            Prepare::Unavailable => return 0,
+        };
+    // SAFETY: 設置時に保存した本物の GetQueuedCompletionStatus。
+    let orig: GetQueuedCompletionStatusFn = unsafe { std::mem::transmute(original) };
+    let call_id = rt.alloc_call_id();
+    let values = capture::get_queued_completion_status_enter(
+        port as u64,
+        bytes_transferred as u64,
+        completion_key as u64,
+        overlapped as u64,
+        milliseconds,
+    );
+    if let Ok(bytes) = capture::encode_enter(api, &values) {
+        rt.record_enter(tid, api, call_id, &bytes);
+    }
+    push_call(call_id);
+    // L08: 元の呼び出しが例外で中断したら CallGuard が CallAborted を記録する。
+    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    guard.suspend();
+    // SAFETY: 元の呼び出しは引数をそのまま渡す。
+    let ret = unsafe {
+        orig(
+            port,
+            bytes_transferred,
+            completion_key,
+            overlapped,
+            milliseconds,
+        )
+    };
+    guard.resume();
+    call_guard.complete();
+    let last_error = unsafe { GetLastError() };
+    pop_call(call_id);
+    // 取り出した OVERLAPPED ポインタは元の呼び出しが書いたもの。
+    // SAFETY: overlapped が指す領域は元の呼び出しが書き込んだ有効な領域。
+    let dequeued = if overlapped.is_null() {
+        0u64
+    } else {
+        (unsafe { *overlapped }) as u64
+    };
+    let transferred =
+        capture::read_overlapped_transferred(&ProcessMemory, bytes_transferred as u64, dequeued);
+    let values = capture::get_queued_completion_status_leave(ret, transferred, last_error);
+    if let Ok(bytes) = capture::encode_leave(api, &values) {
+        rt.record_leave(tid, api, call_id, &bytes);
+    }
+    if dequeued != 0 {
+        if let Some(pending) = rt.take_pending_overlapped(dequeued) {
+            if let Some(n) = transferred {
+                record_overlapped_completion(&rt, tid, pending, n, ret != 0, last_error);
+            }
+        }
+    }
+    // SAFETY: LastError を復元する。
+    unsafe { SetLastError(last_error) };
+    ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shirusu_agent::Agent;
+    use shirusu_transport::context::HostMonitor;
+    use shirusu_transport::slot::SlotPool;
+    use shirusu_transport::RingConfig;
+
+    #[test]
+    fn detour_for_covers_every_table_api() {
+        // F27: 完了観測の 2 API を含め、表の全 API に Detour が割当てられる。
+        for api in crate::api::API_TABLE {
+            assert_ne!(detour_for(api.api_id), 0, "{}", api.function);
+        }
+        assert_eq!(detour_for(999), 0);
+    }
+
+    #[test]
+    fn prepare_returns_passthrough_while_record_path_active() {
+        // G15: 記録経路の実行中に同じスレッドから prepare を呼ぶと、
+        // Agent 自身の呼び出しとして記録せず素通しになる。
+        // グローバルスロットはこのテストだけが使う（他のテストは触らない）。
+        assert!(runtime().is_none());
+        let pool = Arc::new(SlotPool::new(2));
+        let agent = Arc::new(Agent::new(
+            pool,
+            RingConfig::new(64, 4096),
+            Arc::new(HostMonitor::always_alive()),
+        ));
+        let rt = Arc::new(HookRuntime::new(agent, Vec::new(), None));
+        rt.set_original(API_CREATE_FILE_W, 0x1234_5678);
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+
+        // 1 回目: 記録経路に入る（ガードと flight を保持する）。
+        let first = prepare(API_CREATE_FILE_W);
+        let mut guard = match first {
+            Prepare::Record { guard, flight, .. } => {
+                let _flight = flight;
+                guard
+            }
+            Prepare::Passthrough { .. } => panic!("expected Record on first prepare"),
+            Prepare::Unavailable => panic!("expected Record, runtime/original missing"),
+        };
+        assert!(ReentrancyGuard::is_active());
+
+        // 記録経路の実行中は 2 回目の prepare が素通しになる
+        // （元関数ポインタは引けるが、記録はしない）。
+        match prepare(API_CREATE_FILE_W) {
+            Prepare::Passthrough { original } => assert_eq!(original, 0x1234_5678),
+            Prepare::Record { .. } => panic!("expected Passthrough while record path active"),
+            Prepare::Unavailable => panic!("expected Passthrough, runtime/original missing"),
+        };
+
+        // 元の API 実行中（suspend 中）は、アプリ由来の入れ子呼び出しとして
+        // 再び記録経路に入れる (A43)。
+        guard.suspend();
+        assert!(!ReentrancyGuard::is_active());
+        let nested = prepare(API_CREATE_FILE_W);
+        let nested_guard = match nested {
+            Prepare::Record { guard, .. } => guard,
+            Prepare::Passthrough { .. } => panic!("expected Record while outer guard suspended"),
+            Prepare::Unavailable => panic!("expected Record, runtime/original missing"),
+        };
+        assert!(ReentrancyGuard::is_active());
+        drop(nested_guard);
+        assert!(!ReentrancyGuard::is_active());
+        guard.resume();
+        assert!(ReentrancyGuard::is_active());
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+
+        assert!(clear_runtime(&rt));
+        assert!(runtime().is_none());
+    }
 }

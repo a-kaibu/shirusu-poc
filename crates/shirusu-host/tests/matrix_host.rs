@@ -137,6 +137,7 @@ fn ev(kind: EventKind, call: u64) -> EventInput<'static> {
         parent_call_id: 0,
         payload: b"x",
         capture_state: CaptureState::Captured,
+        global_order: 0,
     }
 }
 #[test]
@@ -244,6 +245,7 @@ fn degraded_counters_breakdown() {
         parent_call_id: 0,
         payload: b"12345678",
         capture_state: CaptureState::Captured,
+        global_order: 0,
     };
     w.write(big(1));
     w.write(big(2));

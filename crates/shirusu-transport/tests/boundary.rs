@@ -48,6 +48,7 @@ fn input(kind: EventKind, call: u64, payload: &[u8]) -> EventInput<'_> {
         parent_call_id: 0,
         payload,
         capture_state: CaptureState::Captured,
+        global_order: 0,
     }
 }
 fn ctrl(base: *const u8, off: usize) -> u64 {
@@ -416,17 +417,17 @@ fn descriptor_all_fields_at_extremes_roundtrip() {
     d.payload_position = u64::MAX;
     d.api_id = u32::MAX;
     d.schema_id = u32::MAX;
-    d.reserved = 0;
+    d.global_order = 0;
     let bytes = d.to_bytes();
     assert_eq!(EventDescriptor::from_bytes(&bytes), Some(d));
 }
 
 #[test]
 fn descriptor_kind_enum_boundaries() {
-    for v in 0u16..=6 {
+    for v in 0u16..=8 {
         assert!(EventKind::from_u16(v).is_some(), "kind {v} valid");
     }
-    for v in [7u16, 100, 1000, u16::MAX] {
+    for v in [9u16, 100, 1000, u16::MAX] {
         assert_eq!(EventKind::from_u16(v), None, "kind {v} unknown");
     }
     let mut d = EventDescriptor::new(EventKind::Unknown, 1);
@@ -1670,47 +1671,49 @@ fn decode_descriptor_boundaries() {
     let known = known_small(); // payload capacity 256
     let good = EventDescriptor::new(EventKind::CallEnter, 1);
     assert!(matches!(
-        decode_descriptor(&good.to_bytes()[..63], &known),
+        decode_descriptor(&good.to_bytes()[..63], &known, false),
         Err(IntegrityError::ImageTooSmall)
     ));
-    for kind in 1u16..=6 {
+    for kind in 1u16..=8 {
         let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
         d.kind = kind;
         assert!(
-            decode_descriptor(&d.to_bytes(), &known).is_ok(),
+            decode_descriptor(&d.to_bytes(), &known, false).is_ok(),
             "kind {kind}"
         );
     }
     let mut d = EventDescriptor::new(EventKind::Unknown, 1);
     assert!(matches!(
-        decode_descriptor(&d.to_bytes(), &known),
+        decode_descriptor(&d.to_bytes(), &known, false),
         Err(IntegrityError::UnknownKind(0))
     ));
-    d.kind = 7;
+    d.kind = 9;
     assert!(matches!(
-        decode_descriptor(&d.to_bytes(), &known),
-        Err(IntegrityError::UnknownKind(7))
+        decode_descriptor(&d.to_bytes(), &known, false),
+        Err(IntegrityError::UnknownKind(9))
     ));
     // payload_len は容量ちょうどまで可、+1 は不可
     let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
     d.payload_len = 256;
-    assert!(decode_descriptor(&d.to_bytes(), &known).is_ok());
+    assert!(decode_descriptor(&d.to_bytes(), &known, false).is_ok());
     d.payload_len = 257;
     assert!(matches!(
-        decode_descriptor(&d.to_bytes(), &known),
+        decode_descriptor(&d.to_bytes(), &known, false),
         Err(IntegrityError::PayloadTooLarge {
             len: 257,
             capacity: 256
         })
     ));
-    // reserved は 1 でも MAX でも不可
+    // L11: global_order は無効なセッションでは 1 でも MAX でも不可。
+    // 有効なセッションでは受理する。
     for r in [1u64, u64::MAX] {
         let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
-        d.reserved = r;
+        d.global_order = r;
         assert!(matches!(
-            decode_descriptor(&d.to_bytes(), &known),
-            Err(IntegrityError::ReservedNonZero)
+            decode_descriptor(&d.to_bytes(), &known, false),
+            Err(IntegrityError::GlobalOrderNotAllowed)
         ));
+        assert!(decode_descriptor(&d.to_bytes(), &known, true).is_ok());
     }
 }
 

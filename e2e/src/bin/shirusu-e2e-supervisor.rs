@@ -3,6 +3,7 @@
 //!   shirusu-e2e-supervisor --all          プロセス内シナリオ + 子プロセス起動スモーク
 //!   shirusu-e2e-supervisor --cross-arch   (Windows) i686 producer + x64 host のプロセス間実テスト
 //!   shirusu-e2e-supervisor --production-path (Windows, D77) 本番経路: 実 Agent → Event 待機 → 検証付き Host → Slot 再利用
+//!   shirusu-e2e-supervisor --memory-order-stress (Windows, A77) プロセス間メモリ順序ストレス: 実 Agent が別プロセスから 100 万件を順に書き、検証付き Host が順序・内容・欠落会計を検証する
 //!   shirusu-e2e-supervisor --list
 
 use shirusu_e2e::{run_all_in_process, ScenarioReport};
@@ -394,6 +395,198 @@ fn production_path() -> ScenarioReport {
     }
 }
 
+/// A77: Windows プロセス間でのメモリ順序ストレステスト。
+/// producer (別プロセス) が実 `shirusu_agent::Agent` で 100 万件の
+/// イベントを共有メモリへ順に書き、Host (本プロセス) は `data_ready`
+/// Event を 2ms 再確認付きで待ちながら、検証付き `DrainWorker` で回収
+/// する。検証は `verify_memory_order_stress` に集約する:
+/// 順序・内容 (payload が 0..N を順にちょうど 1 回ずつ)、payload_keys、
+/// 完全性、欠落会計 (gaps == dropped)、劣化会計 (total == N + degraded)。
+/// D77 との違い: D77 は 2,200 件・2 フェーズで Slot 再利用が主題、
+/// A77 は 100 万件の高負荷でプロセスを越えたメモリ順序と欠落会計、
+/// およびプロセス終了後の挙動 (終了コード・終了後の最終回収で新規
+/// イベントが無いこと・Handle の寿命) が主題。
+#[cfg(windows)]
+fn memory_order_stress() -> ScenarioReport {
+    use shirusu_e2e::{verify_memory_order_stress, StressObservation};
+    use shirusu_host::{DrainWorker, LossEvent, ProcessInstanceId, RingId, RingIdentity};
+    use shirusu_transport::notify::ReCheckPolicy;
+    use shirusu_transport::RingConfig;
+    use shirusu_transport_win::{
+        spawn_inheriting, wait_process, EventObject, ProcessNotify, SharedMapping,
+    };
+    use std::time::Duration;
+
+    let name = "memory_order_stress_interprocess";
+    const COUNT: u64 = 1_000_000;
+    let producer_path = std::env::var("SHIRUSU_E2E_PRODUCER").unwrap_or_else(|_| {
+        let exe = std::env::current_exe().unwrap();
+        exe.parent()
+            .unwrap()
+            .join("shirusu-e2e-producer.exe")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let cfg = RingConfig::new(4096, 1024 * 1024);
+    let len = cfg.required_len();
+    let fail = |detail: String| ScenarioReport {
+        name,
+        passed: false,
+        detail,
+    };
+    let mapping = match SharedMapping::create(len) {
+        Ok(m) => m,
+        Err(e) => return fail(format!("mapping: {e}")),
+    };
+    let notify = match ProcessNotify::new() {
+        Ok(n) => n,
+        Err(e) => return fail(format!("process notify: {e}")),
+    };
+    let phase_done = match EventObject::new(true, false) {
+        Ok(e) => e,
+        Err(e) => return fail(format!("phase-done event: {e}")),
+    };
+    let inheritable = mapping
+        .make_inheritable()
+        .and_then(|_| notify.data_ready.make_inheritable())
+        .and_then(|_| phase_done.make_inheritable());
+    if let Err(e) = inheritable {
+        return fail(format!("inheritable: {e}"));
+    }
+    let cmdline = format!(
+        "\"{}\" --agent-stress --mapping {} --len {} --count {} --data-ready {} --phase-done {}",
+        producer_path,
+        mapping.handle_value(),
+        len,
+        COUNT,
+        notify.data_ready.handle_value(),
+        phase_done.handle_value(),
+    );
+    let proc = match spawn_inheriting(&cmdline) {
+        Ok(p) => p,
+        Err(e) => return fail(format!("spawn: {e}")),
+    };
+    let base = mapping.as_ptr();
+
+    // 回収ヘルパ (D77 と同じ流儀): 期待 Generation への遷移を Control
+    // 自身で確認してから Worker を作る。data_ready の通知だけを根拠に
+    // Worker を作ってはいけない (レビュー #4 の仮説)。
+    match unsafe { shirusu_host::wait_for_ring_generation(base, 0, Duration::from_secs(30)) } {
+        Ok(()) => {}
+        Err(observed) => {
+            return fail(format!(
+                "ring generation never reached 0 (observed {observed})"
+            ));
+        }
+    }
+    if !notify.data_ready.wait_timeout(Duration::from_secs(30)) {
+        let _ = wait_process(proc, Duration::from_secs(5));
+        return fail("data_ready was never signaled".to_string());
+    }
+    // SAFETY: base は mapping の生存期間中は有効で、cfg 分の領域を指す。
+    let mut worker = unsafe { DrainWorker::new(base, cfg, 0) };
+    worker.set_identity(RingIdentity::new(ProcessInstanceId(1), RingId(0), 0));
+    let mut got: Vec<u64> = Vec::new();
+    let mut sequence_gaps = 0u64;
+    let reached = notify.wait_with_recheck(
+        ReCheckPolicy::default(),
+        || {
+            let batch = worker.drain_all();
+            sequence_gaps += batch.sequence_gaps;
+            for e in batch.events {
+                if !e.descriptor.payload_dropped() {
+                    got.push(u64::from_le_bytes(e.payload.try_into().unwrap()));
+                }
+            }
+            got.len() as u64 >= COUNT
+        },
+        Duration::from_secs(120),
+    );
+    if !reached {
+        let _ = wait_process(proc, Duration::from_secs(5));
+        // SAFETY: base は mapping の生存期間中は有効。
+        let shared_generation = unsafe { shirusu_host::ring_generation(base) };
+        return fail(format!(
+            "drain timed out: got {}/{} integrity_lost={} stopped={} shared_generation={} last_loss={:?}",
+            got.len(),
+            COUNT,
+            worker.integrity_lost,
+            worker.is_stopped(),
+            shared_generation,
+            worker.loss_events.last(),
+        ));
+    }
+    // producer の DETACH 完了と終了を確認してから、終了後の最終回収で
+    // 新規イベントが無いこと (プロセス終了後の挙動・Handle の寿命) を見る。
+    if !phase_done.wait_timeout(Duration::from_secs(30)) {
+        return fail("producer did not signal detach".to_string());
+    }
+    let exit_code = wait_process(proc, Duration::from_secs(30));
+    if exit_code != Some(0) {
+        return fail(format!("producer exit={exit_code:?}"));
+    }
+    let tail_new = worker.drain_all().events.len();
+    let (mut dropped_reported, mut degraded_reported) = (0u64, 0u64);
+    for loss in &worker.loss_events {
+        if let LossEvent::Counters {
+            dropped_events,
+            degraded_events,
+            ..
+        } = loss
+        {
+            dropped_reported += dropped_events;
+            degraded_reported += degraded_events;
+        }
+    }
+    let obs = StressObservation {
+        payloads: &got,
+        expected: COUNT,
+        payload_keys: worker.payload_keys.len(),
+        total_events: worker.total_events,
+        integrity_lost: worker.integrity_lost,
+        sequence_gaps,
+        dropped_reported,
+        degraded_reported,
+    };
+    let mut detail = match verify_memory_order_stress(&obs) {
+        Ok(summary) => summary,
+        Err(e) => {
+            return fail(format!(
+                "verify: {e} (got={} keys={} gaps={} dropped={} degraded={} total={})",
+                got.len(),
+                worker.payload_keys.len(),
+                sequence_gaps,
+                dropped_reported,
+                degraded_reported,
+                worker.total_events
+            ));
+        }
+    };
+    if worker.is_stopped() {
+        return fail(format!("worker stopped after drain: {detail}"));
+    }
+    if tail_new != 0 {
+        return fail(format!(
+            "events arrived after producer exit: {tail_new} ({detail})"
+        ));
+    }
+    detail.push_str(" exit=0 tail_after_exit=0");
+    ScenarioReport {
+        name,
+        passed: true,
+        detail,
+    }
+}
+
+#[cfg(not(windows))]
+fn memory_order_stress() -> ScenarioReport {
+    ScenarioReport {
+        name: "memory_order_stress_interprocess",
+        passed: false,
+        detail: "SKIP: Windows 専用。GHA windows-latest で実行する".into(),
+    }
+}
+
 #[cfg(not(windows))]
 fn cross_arch() -> ScenarioReport {
     ScenarioReport {
@@ -406,7 +599,7 @@ fn cross_arch() -> ScenarioReport {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list") {
-        println!("basic, host_pause_overflow, notification_loss_recheck, space_available_notify, agent_space_available_handoff, host_killed_passthrough, writer_stops_midway, slot_reuse_generation, corrupted_memory, host_restart_resume, producer_killed_mid_publish, producer_storm_32_threads, soak_1m_loss_accounting, corruption_injection_stops_ring, detach_publish_storm, subprocess_smoke, cross_arch_interprocess, production_path_interprocess");
+        println!("basic, host_pause_overflow, notification_loss_recheck, space_available_notify, agent_space_available_handoff, host_killed_passthrough, writer_stops_midway, slot_reuse_generation, corrupted_memory, host_restart_resume, producer_killed_mid_publish, producer_storm_32_threads, soak_1m_loss_accounting, corruption_injection_stops_ring, detach_publish_storm, subprocess_smoke, cross_arch_interprocess, production_path_interprocess, memory_order_stress_interprocess");
         return;
     }
     if args.iter().any(|a| a == "--cross-arch") {
@@ -422,12 +615,19 @@ fn main() {
         print_reports(&[r]);
         std::process::exit(if passed || !cfg!(windows) { 0 } else { 1 });
     }
+    if args.iter().any(|a| a == "--memory-order-stress") {
+        let r = memory_order_stress();
+        let passed = r.passed;
+        print_reports(&[r]);
+        std::process::exit(if passed || !cfg!(windows) { 0 } else { 1 });
+    }
     // --all (既定)
     let mut reports = run_all_in_process();
     reports.push(subprocess_smoke(1000));
     if cfg!(windows) {
         reports.push(cross_arch());
         reports.push(production_path());
+        reports.push(memory_order_stress());
     }
     let ok = print_reports(&reports);
     std::process::exit(if ok { 0 } else { 1 });

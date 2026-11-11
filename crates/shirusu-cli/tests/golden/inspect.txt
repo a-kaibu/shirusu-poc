@@ -6,9 +6,11 @@ environment:
   cpu_arch: x86_64 pointer_width: 64
   session_qpc_frequency: 10000000
 events: 4 in 1 batches, 1 threads
+global_order: absent
 blobs: 0 stored, 0 bytes
 schemas: 4 registered
 integrity:
+  status: complete
   capture_coverage: Complete (0)
   event_integrity: Complete (0)
   semantic_completeness: Complete (0)

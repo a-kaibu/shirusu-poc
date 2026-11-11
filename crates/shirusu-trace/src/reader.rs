@@ -7,14 +7,16 @@
 //!
 //! v1 はファイル全体をメモリに載せる前提（形式仕様の留保どおり）。
 
-use crate::blob::BlobId;
+use crate::blob::{apply_update_to, BlobId, BlobUpdate};
 use crate::compact;
 use crate::container::{
     self, BlockType, Compression, FileHeader, HEADER_LEN, MAX_RAW_LEN, MAX_STORED_LEN,
 };
 use crate::error::{Result, TraceError};
 use crate::model::{EventBatch, PayloadRef, TraceEvent};
-use crate::proto::{BlockIndex, CaptureEnvironment, Finalization, LossRecord, SchemaSet};
+use crate::proto::{
+    BlockIndex, CaptureEnvironment, Finalization, LossRecord, ProfileSummary, SchemaSet,
+};
 use crate::schema::SchemaRegistry;
 use std::collections::{HashMap, HashSet};
 
@@ -55,8 +57,42 @@ pub enum RecoveryIssue {
     BlobHashMismatch { id: BlobId, computed: BlobId },
     /// イベントが参照する Blob がファイル内に無い。
     MissingBlob { id: BlobId },
+    /// Blob Chunk が、それを参照する Event Chunk より後に現れた
+    /// （前方参照。F23）。trace-format.md のレイアウト規則は「Blob
+    /// は参照する Event Chunk より先に書く（前方参照を許さない）」
+    /// だが、Reader は回復意味論どおり内容を解決して保持したうえで、
+    /// 違反を issue として記録する（拒否はしない）。Blob ごとに 1 回。
+    ForwardBlobReference { id: BlobId },
     /// 保存されていた Index が走査結果と一致せず、無視した。
     IndexMismatch,
+    /// Header の session_id と、Environment / Event Chunk の
+    /// session_id が一致しなかった（F17。信頼できない入力への対応）。
+    /// 不一致の内容は読み捨てず、issue として記録するだけ。
+    SessionMismatch {
+        what: &'static str,
+        expected: u64,
+        found: u64,
+    },
+    /// Blob の部分的な更新（F18）: 基底 Blob がファイル内に無いため
+    /// 更新を適用できなかった。リソースごとに 1 回だけ記録する。
+    BlobUpdateMissingBase { resource_id: BlobId },
+    /// Blob の部分的な更新（F18）: `offset + size` が基底長を超えた
+    /// ため更新を適用しなかった。基底の内容はそのまま残し、後続の
+    /// 正常な更新の畳み込みは続く。更新ごとに記録する。
+    BlobUpdateOutOfRange {
+        resource_id: BlobId,
+        offset: u64,
+        size: u64,
+        base_len: u64,
+    },
+    /// Blob の部分的な更新（F18）: 畳み込み結果の BLAKE3 が、更新が
+    /// 宣言した新版 ID と食い違ったため更新を適用しなかった。更新
+    /// ごとに記録する。
+    BlobUpdateHashMismatch {
+        resource_id: BlobId,
+        expected: BlobId,
+        computed: BlobId,
+    },
     /// Reader の上限（blocks / events / blobs）に達して走査を止めた。
     LimitExceeded { what: &'static str },
 }
@@ -93,6 +129,12 @@ pub struct ReadTrace {
     pub registry: SchemaRegistry,
     pub batches: Vec<EventBatch>,
     pub blobs: HashMap<BlobId, Vec<u8>>,
+    /// ファイル順に受理した Blob の部分的な更新（F18）。復号できた
+    /// ものはすべて並ぶ（畳み込みに失敗したものも含む）。
+    pub blob_updates: Vec<BlobUpdate>,
+    /// リソース ID から、適用に成功した直近の更新が生んだ版の ID への
+    /// 写像（F18）。派生版の内容は `blobs` へ具体化されている。
+    pub resource_versions: HashMap<BlobId, BlobId>,
     pub loss_records: Vec<LossRecord>,
     /// ファイルに保存されていた Index（検証前）。最適化であり正ではない。
     pub stored_index: Option<BlockIndex>,
@@ -100,6 +142,10 @@ pub struct ReadTrace {
     pub index_matches_scan: bool,
     pub finalization: Option<Finalization>,
     pub finalized_cleanly: bool,
+    /// 記録モード `profile` の集計（L09）。ProfileSummary Block が
+    /// あれば最後の 1 件。無い Trace（`full` / `filtered`・旧版）では
+    /// None。
+    pub profile_summary: Option<ProfileSummary>,
     pub blocks: Vec<ScannedBlock>,
     pub issues: Vec<RecoveryIssue>,
 }
@@ -145,18 +191,28 @@ pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadT
         schemas: Vec::new(),
         registry: SchemaRegistry::new(),
         batches: Vec::new(),
+        batch_offsets: Vec::new(),
         blobs: HashMap::new(),
+        blob_offsets: HashMap::new(),
+        blob_updates: Vec::new(),
+        resource_versions: HashMap::new(),
         loss_records: Vec::new(),
         stored_index: None,
         index_block_offset: None,
         finalization: None,
         finalized_cleanly: false,
+        profile_summary: None,
         total_events: 0u64,
         stopped_by_limit: false,
         resync_end: 0,
     };
     let header = scan.read_file_header()?;
     scan.run();
+    // F18: Blob の部分的な更新の畳み込み。走査後に、ファイル順の更新を
+    // 基底内容へ順に適用する。失敗した更新は issue として記録し、適用
+    // しない（内容は推測で作らない）。派生版は blobs へ具体化するため、
+    // この後の欠落 Blob の判定は更新版への参照も解決済みとして扱う。
+    fold_blob_updates(&mut scan);
     // 参照先 Blob の欠落を、走査後にまとめて明示する（重複は1回だけ）。
     let mut missing: Vec<BlobId> = Vec::new();
     let mut seen_missing: HashSet<BlobId> = HashSet::new();
@@ -172,6 +228,50 @@ pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadT
     missing.sort();
     for id in missing {
         scan.issues.push(RecoveryIssue::MissingBlob { id });
+    }
+    // 前方参照の検証（F23）。Blob は参照する Event Chunk より先に
+    // 書くのがレイアウト規則だが、Reader は走査後の一括解決のため
+    // 順序を問わず解決してしまう。そこで走査で記録した各 Batch と
+    // 各 Blob の初出オフセットを比べ、Blob が参照元より後に現れた
+    // 場合に issue として記録する（内容は解決して保持。Blob ごとに
+    // 1 回だけ）。BlobHashMismatch で受理されなかった Blob は
+    // blob_offsets に無いため、MissingBlob としてだけ現れる。
+    let mut seen_forward: HashSet<BlobId> = HashSet::new();
+    for (batch, &batch_offset) in scan.batches.iter().zip(scan.batch_offsets.iter()) {
+        for e in &batch.events {
+            if let PayloadRef::Blob(id) = &e.payload {
+                if let Some(&blob_offset) = scan.blob_offsets.get(id) {
+                    if blob_offset > batch_offset && seen_forward.insert(*id) {
+                        scan.issues
+                            .push(RecoveryIssue::ForwardBlobReference { id: *id });
+                    }
+                }
+            }
+        }
+    }
+    // セッション一致の検証（F17）。Writer は Header・Environment・
+    // 各 Batch の session_id を単一源泉で一致させるが、信頼できない
+    // 入力では不一致があり得る。不一致は issue として記録し、内容は
+    // 読み捨てない（回復意味論どおり）。同じ session_id の不一致は
+    // 1 回だけ記録する。
+    if let Some(env) = &scan.environment {
+        if env.session.session_id != header.session_id {
+            scan.issues.push(RecoveryIssue::SessionMismatch {
+                what: "environment",
+                expected: header.session_id,
+                found: env.session.session_id,
+            });
+        }
+    }
+    let mut seen_batch_sessions: HashSet<u64> = HashSet::new();
+    for batch in &scan.batches {
+        if batch.session_id != header.session_id && seen_batch_sessions.insert(batch.session_id) {
+            scan.issues.push(RecoveryIssue::SessionMismatch {
+                what: "event chunk",
+                expected: header.session_id,
+                found: batch.session_id,
+            });
+        }
     }
     // 保存 Index の検証：Index Block より前に走査した Block 列と一致するか。
     let mut index_matches_scan = false;
@@ -200,14 +300,66 @@ pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadT
         registry: scan.registry,
         batches: scan.batches,
         blobs: scan.blobs,
+        blob_updates: scan.blob_updates,
+        resource_versions: scan.resource_versions,
         loss_records: scan.loss_records,
         stored_index: scan.stored_index,
         index_matches_scan,
         finalization: scan.finalization,
         finalized_cleanly: scan.finalized_cleanly,
+        profile_summary: scan.profile_summary,
         blocks: scan.blocks,
         issues: scan.issues,
     })
+}
+
+/// F18: 走査で集めた Blob の部分的な更新を、ファイル順に畳み込む。
+/// 基底は `blobs` から引き、適用に成功した版は `blobs` へ具体化する
+/// （イベントの Payload 解決と Finalization の総数照合がそのまま通る）。
+/// 失敗した更新は適用せず、issue として記録する。`resource_id` が
+/// 既に具体化された派生版を指す場合は、その版を起点に畳み込む。
+fn fold_blob_updates(scan: &mut Scan) {
+    let mut missing_base_reported: HashSet<BlobId> = HashSet::new();
+    // リソースごとの作業中内容（初回は基底のコピー）。
+    let mut current: HashMap<BlobId, Vec<u8>> = HashMap::new();
+    let mut versions: HashMap<BlobId, BlobId> = HashMap::new();
+    for update in &scan.blob_updates {
+        let Some(base) = scan.blobs.get(&update.resource_id) else {
+            if missing_base_reported.insert(update.resource_id) {
+                scan.issues.push(RecoveryIssue::BlobUpdateMissingBase {
+                    resource_id: update.resource_id,
+                });
+            }
+            continue;
+        };
+        let base_len = base.len() as u64;
+        let working = current
+            .entry(update.resource_id)
+            .or_insert_with(|| base.clone());
+        match apply_update_to(working, update.offset, &update.data) {
+            None => scan.issues.push(RecoveryIssue::BlobUpdateOutOfRange {
+                resource_id: update.resource_id,
+                offset: update.offset,
+                size: update.data.len() as u64,
+                base_len,
+            }),
+            Some(folded) => {
+                let computed = BlobId::of_content(&folded);
+                if computed != update.new_version_id {
+                    scan.issues.push(RecoveryIssue::BlobUpdateHashMismatch {
+                        resource_id: update.resource_id,
+                        expected: update.new_version_id,
+                        computed,
+                    });
+                } else {
+                    *working = folded.clone();
+                    versions.insert(update.resource_id, update.new_version_id);
+                    scan.blobs.entry(update.new_version_id).or_insert(folded);
+                }
+            }
+        }
+    }
+    scan.resource_versions = versions;
 }
 
 struct Scan<'a> {
@@ -219,12 +371,25 @@ struct Scan<'a> {
     schemas: Vec<crate::proto::SchemaDef>,
     registry: SchemaRegistry,
     batches: Vec<EventBatch>,
+    /// `batches` と並行する、各 Batch を受理した Block のファイル
+    /// オフセット（F23 の前方参照検証用）。
+    batch_offsets: Vec<u64>,
     blobs: HashMap<BlobId, Vec<u8>>,
+    /// 各 Blob ID の初出 Blob Chunk のファイルオフセット（F23 用。
+    /// DuplicateBlob の 2 回目以降は初出を残す）。
+    blob_offsets: HashMap<BlobId, u64>,
+    /// ファイル順に受理した Blob の部分的な更新（F18）。走査後に
+    /// 畳み込む。復号できたものはすべて並ぶ。
+    blob_updates: Vec<BlobUpdate>,
+    /// F18 の畳み込み結果：リソース ID から直近の版の ID への写像。
+    resource_versions: HashMap<BlobId, BlobId>,
     loss_records: Vec<LossRecord>,
     stored_index: Option<BlockIndex>,
     index_block_offset: Option<u64>,
     finalization: Option<Finalization>,
     finalized_cleanly: bool,
+    /// L09: ProfileSummary Block があれば最後の 1 件。
+    profile_summary: Option<ProfileSummary>,
     total_events: u64,
     stopped_by_limit: bool,
     /// 直近の再同期で受理した Block の末尾位置（走査再開位置）。
@@ -506,12 +671,23 @@ impl<'a> Scan<'a> {
                         return;
                     }
                     self.batches.push(batch);
+                    self.batch_offsets.push(offset);
                 }
                 Err(e) => corrupt(&mut self.issues, format!("event chunk: {e}")),
             },
             BlockType::BlobChunk => {
                 self.handle_blob_chunk(offset, &raw_payload);
             }
+            BlockType::BlobUpdate => match BlobUpdate::decode(&raw_payload) {
+                // 復号できた更新は走査後にまとめて畳み込む（F18）。
+                // 宣言サイズの不一致等は、その Block だけを破損として
+                // 隔離する（F05 の厳格さと同じ）。
+                Some(update) => self.blob_updates.push(update),
+                None => corrupt(
+                    &mut self.issues,
+                    "blob update payload malformed: declared size mismatch or truncated".into(),
+                ),
+            },
             BlockType::Index => match BlockIndex::decode(&raw_payload) {
                 Ok(index) => {
                     self.stored_index = Some(index);
@@ -529,6 +705,13 @@ impl<'a> Scan<'a> {
             BlockType::Loss => match crate::proto::decode_loss_block(&raw_payload) {
                 Ok(records) => self.loss_records.extend(records),
                 Err(e) => corrupt(&mut self.issues, format!("loss proto: {e}")),
+            },
+            // L09: 復号できた集計は最後の 1 件を保持する（正しくは
+            // `finish` が 1 回だけ書く）。復号できなければその Block
+            // だけを破損として隔離する（F05 の厳格さと同じ）。
+            BlockType::ProfileSummary => match ProfileSummary::decode(&raw_payload) {
+                Ok(summary) => self.profile_summary = Some(summary),
+                Err(e) => corrupt(&mut self.issues, format!("profile summary proto: {e}")),
             },
             BlockType::Unknown(_) => {
                 // 未知の Block は読み飛ばす（破損ではない）。
@@ -580,6 +763,7 @@ impl<'a> Scan<'a> {
                     .push(RecoveryIssue::BlobHashMismatch { id, computed });
                 continue;
             }
+            self.blob_offsets.insert(id, offset);
             self.blobs.insert(id, body);
         }
     }

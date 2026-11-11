@@ -113,6 +113,8 @@ pub fn write_snapshot(
             parent_call_id: 0,
             payload: &buf[..n],
             capture_state: CaptureState::Captured,
+            // Snapshot はフックの観測点ではないため全体順序は付かない (L11)。
+            global_order: 0,
         };
         match writer.write(input) {
             WriteOutcome::Published { .. } => {
@@ -134,6 +136,8 @@ pub fn write_snapshot(
         parent_call_id: 0,
         payload: &[],
         capture_state: CaptureState::Captured,
+        // Snapshot はフックの観測点ではないため全体順序は付かない (L11)。
+        global_order: 0,
     };
     match writer.write(complete) {
         WriteOutcome::Published { .. } => {

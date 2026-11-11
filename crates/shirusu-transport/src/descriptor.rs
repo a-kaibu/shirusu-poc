@@ -12,6 +12,15 @@ pub enum EventKind {
     SnapshotComplete = 4,
     Loss = 5,
     SlotExpandRequest = 6,
+    /// 元の API 呼び出しが例外で中断した（L08）。CallLeave の代わりに
+    /// 記録され、引数値列は無い。例外自体は Detour が捕捉しない。
+    CallAborted = 7,
+    /// 非同期 I/O が完了した（F27）。OVERLAPPED 指定の呼び出しの
+    /// leave は未完了のため Unsupported だが、完了を観測した時点
+    /// （GetOverlappedResult / GetQueuedCompletionStatus）で、元の
+    /// 呼び出しの leave Schema の値列を改めて記録する。`schema_id`
+    /// には元の API の leave Schema の ID を入れる。
+    CallCompleted = 8,
 }
 
 impl EventKind {
@@ -24,6 +33,8 @@ impl EventKind {
             4 => Self::SnapshotComplete,
             5 => Self::Loss,
             6 => Self::SlotExpandRequest,
+            7 => Self::CallAborted,
+            8 => Self::CallCompleted,
             _ => return None,
         })
     }
@@ -107,7 +118,12 @@ pub struct EventDescriptor {
     pub payload_position: u64,
     pub api_id: u32,
     pub schema_id: u32,
-    pub reserved: u64,
+    /// 全スレッド共通の観測順序番号（L11 `--order=global`）。
+    /// 0 は「未割当」（同オプション無効時）。有効時は Agent が観測点で
+    /// アトミックカウンタから採番した値（1 始まり）が入る。Payload の
+    /// 識別子ではない（A72 の「Payload ID を持たない」決定は不変）。
+    /// 64B レイアウトは維持し、旧 `reserved` 欄の再利用である。
+    pub global_order: u64,
 }
 
 impl EventDescriptor {
@@ -124,7 +140,7 @@ impl EventDescriptor {
             payload_position: 0,
             api_id: 0,
             schema_id: 0,
-            reserved: 0,
+            global_order: 0,
         }
     }
     pub fn kind_enum(&self) -> Option<EventKind> {
@@ -149,7 +165,7 @@ impl EventDescriptor {
         b[40..48].copy_from_slice(&self.payload_position.to_le_bytes());
         b[48..52].copy_from_slice(&self.api_id.to_le_bytes());
         b[52..56].copy_from_slice(&self.schema_id.to_le_bytes());
-        b[56..64].copy_from_slice(&self.reserved.to_le_bytes());
+        b[56..64].copy_from_slice(&self.global_order.to_le_bytes());
         b
     }
     /// バイト列からの復号（長さ 64 未満は None）。検証は validate 側の責務。
@@ -171,7 +187,7 @@ impl EventDescriptor {
             payload_position: g64(40),
             api_id: g32(48),
             schema_id: g32(52),
-            reserved: g64(56),
+            global_order: g64(56),
         })
     }
 }
@@ -190,7 +206,7 @@ const _: () = {
     assert!(core::mem::offset_of!(EventDescriptor, payload_position) == 40);
     assert!(core::mem::offset_of!(EventDescriptor, api_id) == 48);
     assert!(core::mem::offset_of!(EventDescriptor, schema_id) == 52);
-    assert!(core::mem::offset_of!(EventDescriptor, reserved) == 56);
+    assert!(core::mem::offset_of!(EventDescriptor, global_order) == 56);
 };
 
 #[cfg(test)]
@@ -210,6 +226,33 @@ mod tests {
         let b = d.to_bytes();
         assert_eq!(EventDescriptor::from_bytes(&b), Some(d));
         assert_eq!(EventDescriptor::from_bytes(&b[..63]), None);
+    }
+    #[test]
+    fn call_completed_kind_roundtrips() {
+        // F27: 非同期 I/O の完了を表す CallCompleted = 8。元の呼び出しの
+        // leave Schema の値列を、完了を観測した時点で記録する。
+        assert_eq!(EventKind::CallCompleted as u16, 8);
+        assert_eq!(EventKind::from_u16(8), Some(EventKind::CallCompleted));
+        assert_eq!(EventKind::from_u16(9), None);
+    }
+    #[test]
+    fn call_aborted_kind_roundtrips() {
+        // L08: 中断した呼び出しを表す CallAborted = 7。
+        assert_eq!(EventKind::CallAborted as u16, 7);
+        assert_eq!(EventKind::from_u16(7), Some(EventKind::CallAborted));
+        assert_eq!(EventKind::from_u16(8), Some(EventKind::CallCompleted));
+    }
+    #[test]
+    fn global_order_roundtrips_and_defaults_to_unassigned() {
+        // L11: 既定は未割当 (0)。有効時は観測点で採番した値が入る。
+        let d = EventDescriptor::new(EventKind::CallEnter, 1);
+        assert_eq!(d.global_order, 0);
+        let mut stamped = d;
+        stamped.global_order = 123;
+        assert_eq!(
+            EventDescriptor::from_bytes(&stamped.to_bytes()),
+            Some(stamped)
+        );
     }
     #[test]
     fn capture_state_flags_roundtrip_and_l1() {
@@ -246,7 +289,7 @@ mod proofs {
         d.payload_position = kani::any();
         d.api_id = kani::any();
         d.schema_id = kani::any();
-        d.reserved = kani::any();
+        d.global_order = kani::any();
         assert!(EventDescriptor::from_bytes(&d.to_bytes()) == Some(d));
     }
 

@@ -38,6 +38,7 @@ fn valid_trace_bytes() -> Vec<u8> {
         capture: EventCapture::Captured,
         payload: PayloadRef::None,
         args: None,
+        global_order: None,
     };
     w.write_batch(&EventBatch {
         session_id: 3,

@@ -22,7 +22,10 @@ Container と Schema は別々にバージョンを持つ（overview の決定�
 
 ファイルは Block の列である。先頭は必ず Header Block、以降は任意順で、
 Blob は参照する Event Chunk より先に書く（前方参照を許さない、overview
-の決定）。Index と Finalization は末尾に置き、両方とも省略可能である。
+の決定）。Writer は参照の直前に Blob をフラッシュしてこの順序を守る
+（F09）。Reader は走査後に Blob を一括解決するため順序を問わず内容は
+解決できるが、順序の違反は黙って通さず、前方参照を `ForwardBlobReference
+{ id }` として issue に記録する（F23。内容は保持し、拒否はしない）。Index と Finalization は末尾に置き、両方とも省略可能である。
 Finalization が無いファイルは「途中で終わった可能性がある」ものとして
 扱い、完全性を確定できない（Event Integrity = Unknown 相当）。
 
@@ -33,7 +36,7 @@ Finalization が無いファイルは「途中で終わった可能性がある�
 | 3 | Schema | 必要時 | Schema 定義の集合（Protobuf） |
 | 4 | Event Chunk（繰り返し） | － | Event Batch（Batch Header は Protobuf、イベント列は Compact Binary） |
 | 5 | Blob Chunk（繰り返し） | － | Blob 本体の集合（生バイト列の連結、後述） |
-| 6 | Schema Checkpoint（繰り返し） | － | 途中までに必要になった Schema 定義の複製（Protobuf、Schema と同形式） |
+| 6 | Schema Checkpoint（繰り返し） | － | 途中までに必要になった Schema 定義の複製（Protobuf、Schema と同形式）。Writer は Schema Block の直後にも書く（F22） |
 | 7 | Loss | － | Loss Record の列（Protobuf） |
 | 8 | Index | 省略可 | Block 索引（Protobuf）。ランダムアクセス用 |
 | 9 | Finalization | 省略可 | 正常終了の印と集計、完全性（Protobuf） |
@@ -82,6 +85,8 @@ Finalization が無いファイルは「途中で終わった可能性がある�
 | 7 | Index | Protobuf `BlockIndex` |
 | 8 | Finalization | Protobuf `Finalization` |
 | 9 | Loss | Protobuf `LossRecord` の repeated |
+| 10 | BlobUpdate | 部分更新 1 件（下記。F18） |
+| 11 | ProfileSummary | Protobuf `ProfileSummary`（L09。`profile` モードの集計） |
 
 ### Header payload（24 バイト固定）
 
@@ -103,6 +108,21 @@ Feature Flags は Environment / Finalization 側の Protobuf に持たせる
 しない。同じ Blob ID が1ファイルに複数回現れてはならない（Writer は
 セッション内で重複排除し、Reader は重複を破損として報告する）。
 
+### BlobUpdate Block の payload（F18）
+
+部分更新 1 件。レイアウトは次のとおり（すべて little-endian）。
+
+| オフセット | サイズ | フィールド |
+| --- | --- | --- |
+| 0 | 32 | `resource_id`（基底 Blob の ID） |
+| 32 | 32 | `new_version_id`（更新適用後の内容全体の BLAKE3） |
+| 64 | 8 | `offset`（置き換え開始位置。u64） |
+| 72 | 4 | `size`（更新内容の長さ。u32。残りバイト数と等しくなければならない） |
+| 76 | `size` | `data`（置き換えるバイト列） |
+
+`size` が残りバイト数と違う Block は破損として隔離する。Block レベル
+の圧縮（Zstd）は可逆圧縮のみであり、元データに非可逆圧縮は使わない。
+
 ## 圧縮（Zstd）
 
 - 圧縮単位は Block（= チャンク）ごと。Event Chunk / Blob Chunk に適用し、
@@ -116,9 +136,11 @@ Feature Flags は Environment / Finalization 側の Protobuf に持たせる
   （Raw ブロック）のみを使う。`ruzstd` の `Default` 等は現行版では
   `unimplemented!()` になるため使わない（決定。将来 ruzstd が実装したら
   再評価する）。
-- Event Chunk の非圧縮サイズの目安は 256 KiB（overview の 256KiB〜1MiB
-  の下限側。決定：Batch の蓄積閾値 `DEFAULT_CHUNK_RAW_TARGET`）。
-  Blob Chunk も同じ閾値で分割する。
+- Event Chunk の非圧縮サイズの目安は 512 KiB（overview の 256KiB〜1MiB
+  の範囲内。決定：`DEFAULT_CHUNK_RAW_TARGET`。F25 のベンチ測定で
+  256 KiB から変更。詳細は「チャンクサイズの決定（F25）」節）。
+  Blob Chunk も同じ閾値で分割する。`WriterOptions::chunk_raw_target`
+  で変更できる（0 は既定値と等価）。
 - Zstd の学習済み辞書は使わない（overview の「初版では使わない」）。
 
 ## Protobuf メタデータ
@@ -147,6 +169,20 @@ message CaptureEnvironment {
   string capture_config = 6;        // 記録設定の要約（自由形式）
   uint64 feature_flags = 7;
   string target_description = 8;    // 対象プロセスの説明（任意）
+  repeated ModuleClassification modules = 9;  // L07: モジュール分類。
+                                    // 空のときは書かないので旧ファイルと同じバイト列
+}
+message ModuleClassification {      // L07: 1 モジュールの分類結果
+  string module_name = 1;           // ロードされたままの名前・パス
+                                    // （API Set 契約名の場合もある）
+  uint32 class = 2;                 // 1=windows 2=runtime 3=application
+                                    // 4=unknown（未知の数値は unknown）
+  string reason = 3;                // 判定理由
+  bool uncertain = 4;               // 真のとき分類は不確実で、
+                                    // Application として観測する
+  string implementation_module = 5; // API Set 契約名の解決先
+                                    // （解決できた場合のみ）
+  bool overridden = 6;              // 真のとき CLI の上書きによる分類
 }
 message SchemaSet {
   repeated SchemaDef schemas = 1;
@@ -165,6 +201,13 @@ message FieldDef {
                                     // bit2..=4: 値の意味種別 ValueKind (0=未指定 1=scalar
                                     // 2=pointer 3=handle 4=生成オブジェクト)。種別は正規化・
                                     // 比較の入力であり、型だけからの推定はしない (レビュー #4 #7)
+                                    // bit5..=7: メモリの取得タイミング CaptureTiming
+                                    // (0=未指定 1=Before 2=After 3=Completion 4=Both)。
+                                    // タイミングも content_hash の入力に含まれる
+                                    // bit8..=10: GetLastError の意味条件 LastErrorMeaning
+                                    // (0=未指定 1=常に意味あり 2=戻り値 FALSE 時のみ
+                                    // 3=戻り値 INVALID_HANDLE_VALUE 時のみ)。last_error
+                                    // フィールドだけに付ける。条件も content_hash の入力
 }
 message BatchHeader {
   uint64 session_id = 1;
@@ -175,6 +218,7 @@ message BatchHeader {
   uint64 qpc_frequency = 6;
   uint64 first_sequence = 7;        // バッチ先頭イベントの Writer 内通番
   uint32 event_count = 8;
+  bool has_global_order = 9;        // L11: 真のとき各イベントに global_order あり（false のとき書かないので旧ファイルと同じバイト列）
 }
 message LossRecord {
   uint32 kind = 1;                  // 1=SequenceGap 2=Counters 3=UnknownTermination 4=IntegrityLost
@@ -204,9 +248,25 @@ message Finalization {
   bool finalized_cleanly = 7;       // この Block が書けたこと自体が正常終了の印。常時 true
   repeated string notes = 8;
 }
+message ProfileSummary {            // L09: `profile` モードの集計全体
+  uint64 qpc_frequency = 1;         // 所要時間（QPC ティック）の換算用
+  uint64 total_events_seen = 2;     // `record_batch` に渡された全イベント数
+  repeated ApiProfile apis = 3;     // api_id の昇順
+}
+message ApiProfile {                // L09: API ごとの集計 1 行
+  uint32 api_id = 1;
+  uint64 calls = 2;                 // enter / leave が揃った呼び出し数
+  uint64 enters = 3;                // 観測した enter 数（leave が無くても数える）
+  uint64 leaves = 4;                // 観測した leave 数（enter が無くても数える）
+  uint64 total_duration_qpc = 5;    // 揃った呼び出しの所要時間の合計
+  uint64 min_duration_qpc = 6;      // calls == 0 のとき 0（「呼び出し無し」）
+  uint64 max_duration_qpc = 7;      // calls == 0 のとき 0
+}
 ```
 
-`SessionMetadata` は Header payload の session_id と一致させる。
+`SessionMetadata` は Header payload の session_id と一致させる。Reader は
+不一致を `SessionMismatch` として issue に記録する（回復意味論の表を参照）。
+Writer は Header・Environment・各 Batch の session_id を単一源泉で一致させる。
 `content_hash` は、正規化した Schema 定義の BLAKE3 ハッシュ先頭
 8 バイト（LE）。正規化バイト列は「名前のバイト列＋区切り 0xFF＋
 フィールドごとに（名前のバイト列＋区切り 0x00＋ty の u32 LE＋
@@ -215,6 +275,54 @@ flags の u32 LE）」とする（曖昧さのない連結のため区切りを�
 完全な 32 バイトではなく 8 バイトに切り詰めるのは、衝突判定が
 「同一ファイル内の重複検出と、Trace 間の目安」用途だからであり、
 セキュリティ用途ではない（決定）。
+
+### 取得タイミング（CaptureTiming）
+
+メモリの取得タイミングは Schema で引数ごとに定める（overview
+「型付きの値」節の決定。F19）。FieldDef.flags の bit5..=7 に格納する。
+
+- `Before`（1）: 呼び出し前に取得する。入力バッファの内容はここで取る。
+  enter Schema のフィールドは原則すべて Before である。
+- `After`（2）: 元の API が書き込んだ後に取得する。出力バッファの内容は
+  ここで取る。leave Schema のフィールドは原則すべて After である。
+- `Completion`（3）: 非同期 I/O の完了時に取得する。leave 時点では完了
+  していないため、完了を捕捉する仕組みが値を供給するまで取得できない。
+  現行フックは OVERLAPPED 指定の leave 時点で当該フィールドを
+  Unsupported として記録する（完了時の取得機構は F27 の対象）。
+- `Both`（4）: 入出力が同じバッファで、前後両方のスナップショットを
+  保存する。フィールドは enter と leave の両 Schema に現れ、それぞれの
+  時点で別々の値として保存する。現行の 6 API には入出力共用バッファが
+  無いため Both の実例は無く、L03 の API 拡張時に初めて現れる。
+
+取得タイミングの違いは Schema の意味の違いであり、content_hash の
+入力に含まれる（タイミングだけが違う Schema は別物として判定される）。
+
+### GetLastError の区別（LastErrorMeaning）
+
+GetLastError の生値と、API 仕様上意味のあるエラー値を区別する（overview
+「型付きの値」節の決定。F20）。FieldDef.flags の bit8..=10 に格納する。
+
+- `Unspecified`（0）: 条件を宣言しない旧来の Schema 用。利用側は生値を
+  そのまま意味のある値として扱う（フォールバック）。
+- `Always`（1）: 常に意味を持つ（`GetLastError` 自体など、戻り値が
+  エラー値そのものである API 用）。
+- `WhenReturnIsFalse`（2）: 戻り値が FALSE / 0 の場合にだけ意味を持つ
+  （BOOL 戻り値の API。現行の ReadFile / WriteFile / CloseHandle）。
+- `WhenReturnIsInvalidHandle`（3）: 戻り値が INVALID_HANDLE_VALUE の
+  場合にだけ意味を持つ（HANDLE 戻り値の API。現行の CreateFileW）。
+  INVALID_HANDLE_VALUE はポインタ幅依存（64bit: 全ビット 1、32bit:
+  下位 32 ビットのみ 1。レビュー第5回 #5）。
+
+取得側は、条件を満たさない生値を `ValueCapture::Stale`（符号化 5）と
+して記録する。Stale の値本体は読み取った生値を保持する（再検証のため）
+が、表示では `<stale>` とし、比較では状態名だけで比較して残留値の違い
+を差分にしない。条件を満たす生値は `Captured` として記録し、意味の
+あるエラー値として比較する。条件の違いは Schema の意味の違いであり、
+content_hash の入力に含まれる。
+
+互換性：取得状態に `Stale`（5）を追加した。符号化 5 を含む値列は、
+それを知らない旧来の Reader では復号できない（`InvalidCapture`）。
+v1 形式の開発途上の追加であり、既存の符号化 0〜4 の意味は変わらない。
 
 ## Compact Binary
 
@@ -266,8 +374,9 @@ Schema が型と順序を定め、値ごとの型タグは持たない（overvie
 1 レコード（1 イベントの引数列など）は、Schema のフィールド数と同じ
 個数の値を順に並べたもの。各値は「取得状態 1 バイト＋値本体」。
 取得状態: 0 = Captured、1 = Unreadable、2 = Truncated、
-3 = Unsupported、4 = LimitExceeded。Unreadable / Unsupported の場合も
-本体は符号化する（ダミー 0 / 空）。復号側は余分なバイト列の残りを
+3 = Unsupported、4 = LimitExceeded、5 = Stale。Unreadable / Unsupported
+の場合も本体は符号化する（ダミー 0 / 空）。Stale だけは例外で、本体に
+読み取った生値を保持する（再検証のため）。復号側は余分なバイト列の残りを
 不正として拒否する。
 
 ### イベント列のレイアウト（Event Chunk 内）
@@ -280,7 +389,7 @@ Binary のイベント列が続く。Protobuf メッセージは後続バイト�
 event_count は Batch Header 側で宣言する。各イベント:
   seq_delta      LEB128   前イベントの sequence との差（先頭は first_sequence との差）
   ts_delta       zigzag LEB128  前イベントの timestamp_qpc との差（先頭は base_timestamp_qpc との差）
-  kind           LEB128   転送 Descriptor の kind と同じ番号（1 = CallEnter 等）
+  kind           LEB128   転送 Descriptor の kind と同じ番号（1 = CallEnter、2 = CallLeave、7 = CallAborted、8 = CallCompleted）
   call_id        LEB128
   parent_call_id LEB128
   api_id         LEB128
@@ -294,6 +403,10 @@ event_count は Batch Header 側で宣言する。各イベント:
   args_tag       1 バイト
     0 = なし
     1 = あり → LEB128 長＋ Compact Binary 値列（schema_id の Schema で解釈）
+  global_order   LEB128   Batch Header の has_global_order が真の場合のみ。
+                          先頭は絶対値、2 件目以降は前イベントからの差分。
+                          同一 Batch 内で厳密に増加するため差分は 1 以上。
+                          0・overflow は破損として拒否。
 ```
 
 イベント単位の取得状態（capture）は転送 `CaptureState` の意味を保ち、
@@ -323,6 +436,189 @@ sequence は Writer（スレッド）単位で単調増加が前提であり、s
   Chunk として書き出す（バッファし、Event Batch 書込直前と
   finalize 時にフラッシュする）。
 
+## Blob の部分的な更新（F18）
+
+overview「チャンク、圧縮、Blob」節は「部分的な更新は、Resource ID、
+オフセット、サイズ、更新内容で表す。元データは可逆圧縮だけで保存する」
+とする。v1 の決定は次のとおり。
+
+- **Resource ID は基底 Blob の ID**（内容の BLAKE3 ハッシュ）である。
+  リソースの同一性は「最初に確立した内容のハッシュ」で表し、新しい
+  ID 空間は作らない。更新は基底内容の `[offset..offset+size)` を
+  `data` で置き換える。長さは変わらない（範囲外の更新は無効）。
+- **更新は BlobUpdate Block（種別 10）で表す**。1 Block に更新 1 件。
+  payload のレイアウトは「BlobUpdate Block の payload」節のとおり。
+  `new_version_id` は更新適用後の内容全体の BLAKE3 であり、呼び出し側
+  （更新後の全体内容を観測した記録側）が求めて渡す。
+- **Writer は基底の全体内容を保持しない**。そのため新版 ID の正しさは
+  Writer では検証しない（Reader が畳み込み結果のハッシュと照合する）。
+  Writer が検証するのは「リソースがこのセッションで既知であること」と
+  「`offset + size` が基底長以内であること」のみで、反すれば書かない
+  （`WriterInvariant` エラー）。更新は基底の Blob Chunk より後に書く
+  （書出し前に未書出し Blob をフラッシュする）。新版 ID は既知として
+  登録するため、後続のイベントが新版を参照できる。更新版への Payload
+  参照を作るのに全体内容を改めて格納する必要はない（更新記録だけで足りる）。
+- **Reader は走査後にファイル順で畳み込む**。後の更新が前の更新に重なる
+  範囲は、後の更新が勝つ。`resource_id` が既に具体化された派生版を指す
+  場合は、その版を起点に畳み込む。適用に成功した版は、内容をその
+  BLAKE3（＝宣言された新版 ID）で `blobs` へ具体化する。そのため更新版
+  を参照するイベントの Payload 解決は通常の Blob 参照と同じ経路で動き、
+  `Finalization.total_blobs` の照合（格納した Blob＋派生版の合計）も
+  一致する。`resource_versions`（リソース→直近の版）は読み取り結果で
+  引ける。
+- **失敗した更新は適用せず、issue として記録する**（内容は推測で作らない）。
+  基底が無い場合は `BlobUpdateMissingBase`（リソースごとに 1 回）。
+  範囲外の場合は `BlobUpdateOutOfRange`（基底の内容はそのまま残し、後続
+  の正常な更新の畳み込みは続く）。畳み込み結果のハッシュが宣言と違う
+  場合は `BlobUpdateHashMismatch`（Blob ID は内容ハッシュそのもの、
+  という設計を更新経路でも守る）。3 件とも conformance の clean-scan
+  では damaging 扱い（内容を復元できないため）。宣言サイズと実データ長
+  が食い違う Block は、復号の時点で破損として隔離する。
+- **元データは可逆圧縮だけで保存する**。基底 Blob と更新内容は、Block
+  レベルの Zstd（可逆）または無圧縮でしか保存しない。更新内容そのものに
+  非可逆圧縮や差分の再符号化はしない。更新の表現自体が差分であるため、
+  全体内容の再格納は要らない。
+
+## Event Chunk の独立デコード可能性（F22）
+
+overview「チャンク、圧縮、Blob」節は「各 Event Chunk は、自分をデコード
+するのに必要な Schema の部分集合とローカル辞書を持つ」「独立デコード
+可能」（チャンク単独で型とイベントを解釈できる）とする。v1 の決定は
+**Checkpoint 方式で十分とする**ことであり、字面どおりのチャンク毎の
+部分集合埋め込みはしない。根拠は次のとおり。
+
+- チャンクの構造復号（イベント境界・sequence・timestamp・api_id・kind・
+  args の生バイト列）は Schema を要しない。BatchHeader は基底の
+  sequence / timestamp_qpc を持ち、イベントは schema_id を不透明な
+  参照として持つだけである。つまり「チャンク単独でイベント列を復号し、
+  API 呼び出しを列挙・検索できる」ことは、Schema が無くても成り立つ。
+- Schema が要るのは args の型付き解釈のみである。Reader はファイル
+  全体を走査して Schema / Schema Checkpoint の定義を 1 つのレジストリ
+  に集めるため、ファイル内のどこかに定義のコピーが 1 つ残っていれば、
+  全チャンクの型付き解釈ができる。
+- チャンク毎の部分集合埋め込みは、セッション全体で共有される Schema
+  集合を全チャンクに重複させるだけで、新しい情報を増やさない。
+  Checkpoint は Schema の変化回数に比例するコストで同じ回復性を得る。
+
+したがって v1 の保証は二層である。
+
+1. **構造復号と API 呼び出しの検索はチャンク単独で可能**（Schema 不要）。
+   Schema Block が壊れても、イベント列は復号でき、API 呼び出しは
+   `dump --api` 等で検索できる。args の生バイト列はイベントに残る。
+2. **型付き解釈は、ファイル内のいずれかの Schema / Checkpoint に
+   定義が残っている限り可能**。Writer は Schema Block を書くたびに、
+   直後にその時点までの全定義の複製を Schema Checkpoint Block として
+   書く（`TraceWriter::flush_schemas`）。これにより、単一 Block の
+   破損では型付き解釈は失われない。手動の `write_schema_checkpoint()`
+   は、長時間記録の途中で任意の時点に複製を追加で置くために残す。
+
+「リソース復元可能」との区別: 独立デコード可能とは、チャンク単独で型と
+イベントを解釈できることである。参照先の Blob やオブジェクト状態まで
+含めて復元できる「リソース復元可能」とは別である。Blob が壊れても上記
+1. は保たれる（API 呼び出し自体は検索できる）が、Blob 内容の復元は
+できない。Blob 喪失は `MissingBlob` として明示され、イベントは保持
+される（回復意味論の表の行どおり）。
+
+境界: v1 の冗長性は単一 Block 破損までである。Schema Block とその
+Checkpoint の両方が壊れると型付き解釈はできない（構造復号と API 検索は
+残る）。周期的な Checkpoint（Schema の変化が無い長い区間での複製）は
+将来の拡張とし、Host が `write_schema_checkpoint()` を任意の時点で
+呼ぶことで置ける。
+
+## チャンクサイズの決定（F25）
+
+overview「チャンク、圧縮、Blob」節は「チャンクの大きさは非圧縮で
+256KiB〜1MiBを目安に、ベンチマークで決める」とする。`e2e/src/bin/
+shirusu-trace-bench.rs` で 20,000 イベントの決定的な合成ワークロード
+（CreateFileW 20% / ReadFile 30% / WriteFile 30% / CloseHandle 20%、
+64 種のパス Blob＋256 種のデータ Blob（512 B〜4 KiB）を参照、10,000 件
+ずつの Batch）を 128 KiB / 256 KiB / 512 KiB / 1 MiB で掃引した。
+測定は 2026-11-11、共有 Linux VM、release ビルド、各目標値 5 回の中央値。
+
+| 目標値 | 総バイト数 | バイト/イベント | Event Chunk 数 | 書き込み | デコード |
+| --- | --- | --- | --- | --- | --- |
+| 128 KiB（対照・範囲外） | 555,459 | 27.8 | 8 | 33.0 ms | 12.6 ms |
+| 256 KiB | 550,193 | 27.5 | 4 | 36.1 ms | 12.6 ms |
+| 512 KiB | 542,515 | 27.1 | 2 | 36.0 ms | 12.5 ms |
+| 1 MiB | 542,515 | 27.1 | 2 | 36.3 ms | 12.5 ms |
+
+決定：**既定値は 512 KiB**（`DEFAULT_CHUNK_RAW_TARGET`）。
+決定規則は、仕様の目安範囲 256 KiB〜1 MiB の中で「1 MiB に対する
+総バイト数が +1% 以内で、デコード時間が最速の +5% 以内を満たす最小の
+目標値」とした。256 KiB は同ワークロードで総バイト数が 1.4% 多く
+（550,193 B 対 542,515 B）、512 KiB と 1 MiB は同値で最良だった。
+書き込み・デコード時間は全目標値で差が無かった（1% 未満）。
+大きいチャンクは同一内容の圧縮で不利にならない（窓が広がる分だけ
+良化するか同値）が、1 Block の破損で失われる量が増えるため、最小の
+合格値を既定とした。128 KiB は仕様範囲外の対照用で決定対象外。
+注意：1.4% の差は繰り返し現れる Payload のチャンク跨ぎ圧縮によるもの
+であり、Payload が全て異なるワークロードでは目標値による差はほぼ消える。
+その場合でも 512 KiB が 256 KiB より悪くなることはない（同値に収束する）。
+
+## 4 指標の分離測定（F26）
+
+overview「転送形式とディスク形式」節は「ベンチマークでは Agent の
+観測コスト、Host の処理量、ファイルサイズ、デコード速度を別々に測る」
+とする。同じ `shirusu-trace-bench` で、F25 で決めたチャンクサイズ
+（512 KiB）で 4 指標を分離して測った（2026-11-11、共有 Linux VM、
+release ビルド、5 回の中央値）。
+
+| 指標 | 測定方法 | 結果 |
+| --- | --- | --- |
+| M1 Agent の観測コスト | `Agent::record` を 50,000 件（8 B Payload、Ring 65,536 件 / 4 MiB、Host は回収しない） | **219.1 ns/イベント**（4,563,774 イベント/秒） |
+| M2 Host の処理量 | 同じ 50,000 件を `DrainWorker::drain_all`（検証付き回収）＋`TraceRecorder::record_batch` で変換 | **228,517 イベント/秒**、書き出した Trace は 75.8 B/イベント |
+| M3 ファイルサイズ | F25 の 20,000 イベントのワークロード（512 KiB） | **27.1 B/イベント**（542,515 B） |
+| M4 デコード速度 | 同じ Trace の `read_trace` | **1,595,958 イベント/秒**（Trace バイト換算 41.3 MiB/秒） |
+
+読み方の注意：
+
+- M1 は記録経路（Ring 書き込みまで）のコストであり、Windows の
+  Detour 自体のコストは含まない。Detour の実測は Windows 実機での
+  ABI 適合性テスト（L06）の範囲。
+- M2 の 75.8 B/イベントが M3 の 27.1 B/イベントより大きいのは、
+  M2 のワークロードが 50,000 件すべて異なる 8 B Payload（重複排除が
+  効かない）だからであり、M3 は現実的な重複のある Payload プールを使う。
+  両者は別ワークロードの数値であり、直接の優劣ではない。
+- M2 には `DrainWorker` の検証付き回収（共有領域の像全体のコピー。
+  D65 の注記どおり Ring が大きいほど回収コストが増える）が含まれる。
+  Ring 容量を変えると M2 は変わる。
+- 絶対値は共有 VM の測定であり、機械によって変わる。比較の基準は
+  測定方法（この節とベンチのヘッダ）とし、数値そのものを保証値としない。
+
+## 全体順序 (--order=global) (L11)
+
+overview「転送形式とディスク形式」節：`--order=global`を付けると、
+フックの観測点ごとに全スレッド共通の番号を振る。この番号はアトミック
+カウンタを更新した順序であり、API処理の完了順やメモリ操作全体の順序を
+保証しない。別のPCで取ったTraceどうしは時刻の原点が異なるので、時刻
+だけで対応づけない。
+
+- 採番は Agent 側の `AtomicU64`（1 始まり）。`Agent::record()` 内、
+  書き込み確定の直前に採番し、Descriptor の `global_order`（オフセット
+  56、64B レイアウト維持）に刻む。書き込みが確定しなかったイベントは
+  番号を消費しない。欠落したイベントの分は欠番になる（Sequence の欠番と
+  同じ扱い）。
+- Host は `CaptureSessionConfig.order_global` が真のセッションでのみ非 0
+  を受け入れる。無効なセッションで非 0 は `GlobalOrderNotAllowed` として
+  拒否する（条件付き検証。仕様は spec-transport.md「全体順序（L11）」）。
+- `TraceEvent.global_order: Option<u64>`。Descriptor の 0 は None に
+  変換する。`BatchHeader.has_global_order`（proto field 9）が真の Batch
+  でのみ Compact Binary に符号化する（false のとき書かないので旧ファイル
+  と同じバイト列）。符号化は args の後に ULEB128 を 1 個：先頭は絶対値、
+  2 件目以降は前イベントからの差分（同一 Batch 内で厳密に増加するため
+  差分は 1 以上。0・overflow は破損として拒否）。Writer は混在
+  （Some+None）・非増加を拒否する。
+- CLI：`dump --order=global` は全 Batch のイベントを global_order で
+  マージして表示する。全体順序を持たないイベントが 1 件でもあれば
+  「--order=global で記録されていない Trace」としてエラーにする。
+  `dump` の行表示は全体順序がある場合だけ `g=<n>` を出す。
+  `inspect` に有無を表示し、export の JSON にも全体順序がある場合だけ
+  含める。`--order=global` は `--key=value` 形式で渡す
+  （`parse_args` は `--key=value` を受け付ける）。
+- shirusu-compare の正規化は `global_order` を無視する（比較は
+  スレッド単位の呼び出し構造で行い、全体順序は実行ごとの観測順序で
+  あって比較対象の契約ではないため）。
+
 ## 回復意味論（recover_trace）
 
 Reader は、信頼できない入力として Trace を扱う（overview の決定）。
@@ -341,6 +637,13 @@ Reader は、信頼できない入力として Trace を扱う（overview の決
 | 参照先 Blob がファイル内に無い | イベントは保持し、解決時に「欠落 Blob」として明示（イベント自体は検索可能） |
 | Protobuf の破損 | その Block を破損として隔離（メタデータ欠落として報告） |
 | Index の指すオフセットが実 Block と不一致 | Index を無視して走査結果を使う（Index は最適化であり正ではない） |
+| Header と Environment / Event Chunk の session_id 不一致 | 内容は保持し、`SessionMismatch { what, expected, found }` を issue に記録（F17） |
+| Blob Chunk が参照する Event Chunk より後に現れる（前方参照） | 内容は解決して保持し、`ForwardBlobReference { id }` を issue に記録（F23。Blob ごとに 1 回） |
+| BlobUpdate の基底 Blob がファイル内に無い | 更新を適用せず、`BlobUpdateMissingBase { resource_id }` を issue に記録（F18。リソースごとに 1 回） |
+| BlobUpdate の `offset + size` が基底長を超える | その更新を適用せず、`BlobUpdateOutOfRange { resource_id, offset, size, base_len }` を issue に記録（F18。基底の内容は残し、後続の正常な更新の畳み込みは続く） |
+| BlobUpdate の畳み込み結果のハッシュが宣言された新版 ID と違う | その更新を適用せず、`BlobUpdateHashMismatch { resource_id, expected, computed }` を issue に記録（F18） |
+| BlobUpdate の宣言サイズと実データ長が食い違う | その Block だけを破損として隔離する（F18。F05 の厳格さと同じ） |
+| Schema Block の破損（CRC 不一致等） | その Block だけを破損として隔離。直後の Schema Checkpoint に複製があるため型付き解釈も維持される（F22）。複製も無い場合は、イベント列の構造復号（API 呼び出しの検索）までは可能だが、args の型付き解釈はできない（`schema N not registered` として残す） |
 | Finalization が無い | `finalization: None` として返し、完全性は確定できないことを呼び出し側が分かる形にする |
 
 再同期: 破損した Block の開始位置の次バイトから `SBLK` を探し、
@@ -354,6 +657,247 @@ CRC が一致」の全てを満たす場合にだけ Block として受理し直
 1,000,000、イベント総数は 100,000,000、Blob 総数は 10,000,000 を
 Reader の既定上限とし、超過したら破損として停止する（DoS 対策の
 目安値であり、設定で変更可能にする）。
+
+## repair（L12）
+
+`shirusu repair <trace> [--output <path>] [--json]` は、回復意味論
+（recover_trace）で読めたイベントだけを新しい Trace に書き出す
+CLI コマンドである。overview「完全性と復旧」節の「`shirusu repair`
+は正常なチャンクと参照関係を検証して、読めるイベントを回収する。
+失われたイベントを推測で作らない」に対応する。
+
+- 入力は `read_trace`（回復読み）で読む。先頭 Header が不成立の
+  入力は全体拒否となり、修復は行わない（出力ファイルは作らない）。
+- 出力は `--output` で指定する。省略時は `<trace>.repaired`。
+  入力そのものへの上書きは拒否する（修復元を壊さない）。
+- 出力に残すもの：読めたイベント（元の Batch 順・元の内容のまま）、
+  参照された Blob（内容の BLAKE3 から同じ ID を再計算する。重複排除
+  済み）、Schema 定義、Loss Record。
+- 回収できないもの：参照先 Blob がファイル内に無いイベント
+  （MissingBlob。Blob の内容を推測して補わない）、Header と
+  session_id が異なる Batch（SessionMismatch。session_id を書き換え
+  て取り込まない）、同一スレッドで sequence が退行する Batch
+  （Writer の不変条件に反するため、順序を並べ替えて取り込まない）、
+  空の Batch。いずれも数えて報告する（`lost_events`）。
+- Blob の部分的な更新（F18）は再発行しない。派生版の内容は Reader
+  が `blobs` へ具体化済みで、イベントが参照する版 ID の内容を運べば
+  十分なため。更新の履歴そのものは修復出力には残らない。
+- Schema は同一内容の再登録は受理される。内容の違う再定義や
+  content_hash の不一致は Writer が拒否するため、その定義だけ落と
+  して数える（修復全体は止めない）。
+- Finalization は元の Trace の三つの指標を引き継ぐ。ただし修復で
+  イベントを失った場合、Complete の宣言は維持できないため
+  event_integrity を Degraded（1）へ落とす。Finalization が無い入力
+  は三つとも Unknown（3）とする。修復の来歴は notes に残す。
+- 終了コード：0 = 修復済みファイルの書き出しに成功（イベントを
+  失った場合も含む。失った分は報告に明記する）。1 = 入力が読めない・
+  出力が書けない・入出力が同一。2 = 使い方の誤り。
+
+## モジュール分類（L07）
+
+overview「記録境界とモジュール分類」節に対応する。モジュールを
+Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
+を `CaptureEnvironment.modules`（`ModuleClassification` の列）に残す。
+`shirusu inspect`（人間可読・JSON）が表示する。分類と記録ポリシー
+（どの呼び出しを記録するか）は分けて扱う。
+
+分類の優先順位（上から先に当たったものを採用する）：
+
+1. パスが空・特定できない → Unknown（不確実）。
+2. API Set 契約名（`api-ms-win-*` / `ext-ms-win-*` の DLL）→ 実装
+   モジュールが解決できればその分類、解決できなければ Unknown。
+   論理名（契約名）と実装モジュールの両方を残す。
+3. 既知の実行基盤モジュール → Runtime。対象は `msvcp*` / `msvcr*` /
+   `vcruntime*` / `concrt*` と `clr.dll` / `coreclr.dll` /
+   `clrjit.dll` / `mscorlib.dll` / `mscorwks.dll` / `mscoree.dll` /
+   `ucrtbase.dll`。実行基盤であることはモジュール固有の性質のため、
+   配置＋署名の Windows 判定より先に見る（これらは通常 System32 に
+   あり Microsoft 署名付きだが、Runtime としての扱いが先。`fopen`
+   経由の `CreateFileW` が記録されるのはこのため）。
+4. System32 / SysWOW64 / WinSxS にあり Microsoft 署名を確認できる
+   → Windows。KnownDLLs は System32 への解決、SxS は WinSxS への
+   配置として同じ扱い。
+5. システム配置だが署名が未確認 → Unknown（不確実として残す）。
+   署名の確認そのものは Windows 側の仕事（WinVerifyTrust 等）で、
+   分類器は `microsoft_signed` という証拠を受け取るだけである。
+6. それ以外（EXE、同梱 DLL、サードパーティ製 DLL）→ Application。
+
+パス比較は大文字小文字を区別せず、`\` と `/` を同じ区切りとして扱う。
+
+- CLI からモジュール単位で分類を上書きできる：
+  `shirusu capture --module-class <module>=<class> ...`（繰り返し可。
+  class は windows / runtime / application / unknown）。上書きは
+  ファイル名部分で突き合わせ、一致した分類を置き換えて `overridden`
+  と理由に残す。一致しなかった上書きは、capture 開始時に未ロードの
+  モジュールへの上書きが黙って消えないよう、上書きエントリとして
+  Trace へ残す（理由は `CLI override (module not loaded at capture start)`）。
+- Runtime 独自の API を記録するかは設定で選ぶ：
+  `CaptureSessionConfig::record_runtime_apis`（既定は false＝記録しない）
+  と CLI の `--record-runtime-apis`。設定そのものがここにあり、
+  フック時の呼び出し元分類による強制は Windows 側の残作業（L23）。
+- ロード済みモジュールの列挙と署名検証も Windows 側の残作業（L23）。
+  現行の CLI は起動対象の exe だけを分類して `modules` に載せる
+  （attach では対象モジュールが分からないため空から始める）。
+
+## 記録モード（L09）
+
+overview「記録モードと性能目標」節に対応する。記録モードは
+`CaptureSessionConfig::record_mode`（`RecordMode`）で選び、CLI は
+`shirusu capture --mode <full|profile|filtered> [--api <name> ...]`
+で指定する（attach も同じ）。モードは `CaptureEnvironment.capture_config`
+に `mode=full` / `mode=profile` / `mode=filtered apis=...` として明記する
+（`full` でも明記し、後から Trace を見たときに間引き無しで記録された
+ことが分かるようにする）。`shirusu inspect`（人間可読・JSON）が
+`profile` の集計を表示する。
+
+- `full`（既定）：対象境界の呼び出しを意図的に間引かず全て保存する。
+  間引きはしないが、負荷による欠落を防ぐ保証までは無い。欠落が起きたら
+  Loss Record と Finalization の三指標（H03）に残り、Trace は
+  `incomplete` として扱う（`shirusu inspect` の終了ステータスも H14
+  どおり 1 になる）。「間引かない」と「欠落したら incomplete」はこの
+  連動で保つ。
+- `profile`：個別イベントは保存せず、API ごとに呼び出し回数・分布・
+  所要時間を集計して ProfileSummary Block（種別 11）として `finish`
+  が Index の前に 1 回だけ書く。enter / leave の対応付けは
+  (thread, call_id) で行い、Batch をまたいでも対になる（DrainWorker
+  の `track_call` と同じ鍵）。対応の無い enter / leave は `calls` に
+  数えず `enters` / `leaves` だけに数える。CallEnter / CallLeave 以外の
+  種別（Snapshot 等）は集計の対象外だが `total_events_seen` には数える。
+  所要時間は leave の QPC 時刻から enter の QPC 時刻を引いたもの
+  （時計の逆行には `saturating_sub` で 0 に丸める）。このモードでは
+  Event Chunk が書かれないため Finalization の `total_events` は 0 になり、
+  回収したイベント数は集計の `total_events_seen` で分かる。Loss Record
+  は API によらず残る。`shirusu capture` の終了時の要約にも集計を出す。
+- `filtered`：指定した API 群のイベントだけを保存する。指定は CLI の
+  `--api <name>`（繰り返し可。素の関数名 `CreateFileW` と
+  `module!関数` 形式 `kernel32!ReadFile` の両方を受け付け、関数名は
+  ケース敏感。未知の名前は使い方エラー）。Host 側で `record_batch` の
+  前に落とす（Blob 化の前に落とすため、不要な Blob は書かれない）。
+  落とした後空になった Batch は書かない。sequence の欠番は許容される
+  （Writer の不変条件は退行の拒否だけで、欠番は Loss としても扱われない。
+  欠落したイベントの Loss Record は別途残る）。Schema と Loss Record
+  は API によらず残る。`--api` は `--mode filtered` のときだけ意味があり、
+  それ以外での指定は使い方エラー。`filtered` に `--api` が無いのも
+  使い方エラー（空の集合は何も記録しない罠になるため）。
+- Agent 側での間引きはしない。`filtered` / `profile` でも Agent は
+  全イベントを Ring へ書き、Host 側で落とす・集計する。Agent 側の間引きは
+  Ring の圧迫を減らす将来の最適化であり、現行の対象外とする。
+
+## 例外の透過と CallAborted（L08）
+
+overview「Hookの透明性」節の要求：元の API が投げた例外はそのまま伝え、
+中断した呼び出しを `CallAborted` として記録する。
+
+- イベント種別：転送 `EventKind::CallAborted = 7`。CallLeave の代わりに
+  記録する。戻り値が無いため引数値列は無く、`args` は None。
+  `schema_id` には leave Schema の ID を入れる（どの API の leave に
+  なるはずだったかが読めるようにする）。
+- 機構：Detour は enter の記録と呼出スタックへの push の直後に
+  `CallGuard`（RAII）を立て、元の呼び出しが正常に戻ったら
+  `complete()` で武装解除する。元の呼び出しが例外（C++ 例外 / SEH /
+  Rust パニック）で戻らなかった場合、巻き戻しでガードの Drop が走り、
+  呼出スタックから外して `CallAborted` を記録する。例外自体は一切
+  捕捉しないため、呼び出し側へ伝わる例外は Detour が無い場合と同一である。
+- Windows では Rust のフレームも SEH アンワインド情報を持つため、外来の
+  例外が Detour フレームを巻き戻すときにこの Drop は走る。仮に走らな
+  かった場合の失敗モードは「中断の記録漏れ」だけで、例外の伝播や対象
+  プロセスの挙動は変わらない（その場合は Host が「終了不明」として
+  UnknownTermination で扱う）。
+- Drop 中の記録は `catch_unwind` で包み、結果を捨てる。巻き戻し中の
+  Drop でパニックするとプロセスが abort するため、記録の失敗が例外の
+  伝播を壊すことはない。
+- Host：`track_call` は CallAborted で開いた呼び出しを閉じ、
+  `finalize_thread` での UnknownTermination にしない。`profile` モード
+  の集計では対応付け待ちから外すだけにし、`calls` / `leaves` には数えない
+  （所要時間が無いため）。
+- 表示・検査：`Phase::Aborted`（表示名 `aborted`）。conformance の
+  enter-leave-pairing は Aborted も Leave と同じく対応づけとみなす。
+  compare は `NormCall.aborted` として保持し、中断と正常終了の違いは
+  CallShapeDifference になる。ただしオブジェクト生成 API では中断で
+  生成物が無いため整列で対にならず、MissingCall と ObjectStateDifference
+  として出る。
+
+## 非同期 I/O の完了時取得（F27）
+
+overview「型付きの値」節の要求：非同期 I/O は完了時（completion）に
+取得する。`CaptureTiming::Completion` は F19 で宣言だけが Schema に
+載り、完了を捕捉する仕組みが無かった。ここで機構を定める。
+
+- イベント種別：転送 `EventKind::CallCompleted = 8`。OVERLAPPED 指定
+  の呼び出しの leave は未完了のためバイト数とバッファ内容が
+  Unsupported のままだが、完了を観測した時点で、元の呼び出しの leave
+  Schema の値列を改めて記録する。`schema_id` には元の API の leave
+  Schema の ID を入れる（`args` は leave と同じ形で復号できる）。
+  `call_id` は元の呼び出しと同じ。
+- 完了の観測：フック対象に `GetOverlappedResult` /
+  `GetQueuedCompletionStatus` を追加した（API 表の 5・6 番目。enter /
+  leave Schema は通常の API と同じ規約）。この 2 API 自体も通常の
+  呼び出しとして enter / leave を記録する。
+- 保留中の操作：ReadFile / WriteFile の Detour は、OVERLAPPED 指定で
+  `ERROR_IO_PENDING` (997) を返したときに、OVERLAPPED 構造体の
+  アドレスを鍵として `PendingOverlapped`（API・call_id・バッファ・
+  要求長・方向）を登録表へ登録する。完了は別スレッドで観測される
+  ことがある（IOCP）ため、登録表はセッション全体で共有する。同じ
+  構造体で完了前に再登録された場合は古い方を上書きする（Win32 は
+  完了前の構造体再利用を禁じているため、古い操作の完了は以後対応付け
+  できない）。
+- 完了時の値：`GetOverlappedResult` が成功したら、転送バイト数を
+  lpNumberOfBytesTransferred から（NULL なら OVERLAPPED.InternalHigh
+  から）読み、バッファ内容を完了時点で取る。FALSE でも
+  `ERROR_IO_INCOMPLETE` (996) 以外なら操作自体がエラーで終わった
+  完了として記録する（バイト数は Unsupported、データは空）。未完了
+  (996) の場合は何もしない。`GetQueuedCompletionStatus` も同じで、
+  戻り値が FALSE でも取り出した OVERLAPPED が非 NULL なら完了した
+  I/O の失敗として記録し、NULL（タイムアウト等）なら何もしない。
+  転送バイト数がどこからも読めなければ完了は記録しない（保留エントリ
+  は取り出して破棄する）。
+- 同期完了：OVERLAPPED 指定でも元の呼び出しが同期完了した場合
+  （戻り値が非 0）は、leave 時点で既に完了しているため、転送バイト数
+  （lpNumberOfBytesRead / lpNumberOfBytesWritten、NULL なら
+  OVERLAPPED.InternalHigh）とバッファ内容を leave イベント自体に
+  取る。完了イベントは記録しない。読めなければ従来どおり Unsupported。
+- Host：`track_call` は CallCompleted で開いた呼び出しを閉じるのは
+  leave が欠落していた場合だけで、通常は数を数えるだけ（leave が既に
+  閉じている）。対応する Enter が無い完了は無視する。`profile` モード
+  の集計では何もしない（所要時間は leave 時点で計測済み）。
+- 表示・検査：`Phase::Completed`（表示名 `completed`）。conformance
+  の enter-leave-pairing は、同じスレッドでまだ開いている Enter が
+  あれば完了で閉じる。leave が既に閉じている通常の場合は何もしない。
+  compare は `NormCall.completed` として保持し、比較では completed
+  があればそれを実効 leave として使う。非同期の呼び出しと同期の
+  呼び出しは、完了の値が同じなら一致する。完了が観測されなかった
+  呼び出しは leave の Unsupported 値列のままなので同期側と差分になる。
+- 対象外：`WaitForSingleObject` で OVERLAPPED の hEvent を待つ経路、
+  `GetOverlappedResultEx`、アラート可能待機（APC 経由の完了ルーチン）
+  は完了の観測点として扱わない。これらの経路で完了した操作は
+  leave の Unsupported のまま残る（将来の拡張）。
+
+## 永続化と復旧保証（F21）
+
+overview「完全性と復旧」節の「Host や OS がクラッシュしたら、最後に
+永続化されたチャンクまで復旧する（flush と fsync の設定で保証範囲が
+決まる）」に対応する。Writer の永続化設定は `Durability`（既定は
+`Buffered`）で、`CaptureSessionConfig::durability` から指定する。
+`finish` せずに終わったファイルは、ここでの保証範囲まで書かれた
+内容を回復意味論どおりに読む（Finalization が無い Trace）。
+
+| 設定 | Writer の動作 | 復旧保証範囲 |
+| --- | --- | --- |
+| `Buffered`（既定） | `flush` のみ。`sync_all` は呼ばない | プロセスのクラッシュには強い（OS へ渡した分は残る）。Host や OS のクラッシュでは、OS のページキャッシュに残った分は失われ得る |
+| `SyncOnFinish` | `finish` の成功時に `sync_all` を 1 回 | 正常終了した Trace は OS クラッシュにも耐える。書き込み途中のクラッシュでは `Buffered` と同じ範囲 |
+| `SyncPerBlock` | 各 Block の書き込み後に `sync_all`。`finish` の最終 flush 分も 1 回 sync する | `write_batch` 等が返った時点で、その Block までが OS クラッシュにも耐える。`sync_all` の回数が増える分、書き込みは遅くなる |
+
+注意点:
+
+- `sync_all` は `File::sync_all`（fsync 相当）への委譲であり、書き先が
+  `Vec<u8>` 等のメモリ上の場合は何もしない（`DurableWrite` トレイト）。
+- 「最後に永続化されたチャンクまで」の「チャンク」は Block 単位で数える。
+  `SyncPerBlock` でも、書き込み途中で OS がクラッシュした場合に
+  最後の Block が半分だけ書かれていることはあり得る。その場合は回復
+  意味論の「末尾切断」として扱われ、そこまでの内容が返る。
+- `Buffered` が既定なのは、記録中の性能を優先する従来の挙動を保つため。
+  長時間の記録で OS クラッシュ時の損失を抑えたい場合は
+  `SyncPerBlock`、正常終了だけ確実に残したい場合は `SyncOnFinish` を選ぶ。
 
 ## Host 変換（A72 の適用）
 
@@ -380,6 +924,54 @@ Reader の既定上限とし、超過したら破損として停止する（DoS 
 | ruzstd の符号化レベル | `Fastest` / `Uncompressed` のみ | `Default` 以下の指定は現行版で `unimplemented!()` になることを実測。`Fastest` は実 LZ 圧縮として動作（反復 100KiB → 14 バイトで往復確認）。復号は標準フレーム全般を受ける |
 | Protobuf | 手書きワイヤ形式 | prost は protoc の事前導入（prost-build）か、protoc バイナリ同梱クレートへの依存が要り、CI の全ジョブ（特に ubuntu 上の Windows ターゲット check）で確実に通すには部品が多い。メタデータは本プロジェクトが所有する小さいスキーマであり、ワイヤ形式自体は標準なので、手書きでも他言語の Protobuf 実装から読める。生成コードとの相互運用が必要になったら .proto を正として再生成する |
 | CRC32C | `shirusu-transport` の既存実装を再利用 | 転送側で検証済みの実装があり、二重実装を避ける。Trace 形式の正は本書とテストベクターであり、実装の置き場所は問わない |
+
+## ABI 適合性テスト（L06）
+
+overview「Hookの透明性」節：浮動小数点引数、構造体の戻り値、
+コールバック、例外、`LastError` を扱う Probe を Hook ありとなしで
+実行して結果を比べる。実行は `shirusu-capture-e2e --abi`
+（windows-x64 CI ジョブで実行）。
+
+- Probe 対象（`shirusu-hook-target --abi-probe`、各 Probe は
+  `ABI_PROBE <name> <value>` を 1 行出す）：
+  - `float`：8 個の f64 引数（x64 では先頭 4 個が XMM0-3、残りは
+    スタック渡し）と f32 1 個を、フックされた呼び出しの前後で生かし、
+    合計・積のビット列を出す。呼び出し規約・浮動小数点レジスタ・
+    スタックの整合性が壊れれば、Hook ありとなしでビット列が変わる。
+  - `struct-return`：24 B の構造体（`tag: u64`、`ratio: f64`、
+    `lo: u32`、`hi: u32`）を値で返す関数の中でフックされた呼び出しを
+    行い、返った構造体の各欄のビット列を出す。24 B は x64/x86 とも
+    隠しポインタ経由で返る。
+  - `callback`：関数ポインタ経由のコールバック中と、`CreateThread`
+    のスレッドプロシージャ（Windows からアプリへ入るコールバック）中で
+    フックされた API を呼び、書いたバイト数とファイル内容の往復を出す。
+    スレッド版は別スレッドでの Detour と入れ子記録も見る。
+  - `exception`：フックされた呼び出しの後に Rust のパニックを起こし、
+    `catch_unwind` で受けたペイロードと、巻き戻し後にフックが壊れて
+    いないこと（後続のファイル操作が正常なこと）を出す。
+  - `lasterror-success`：`SetLastError(0x1234)` の後に成功する
+    `CreateFileW` を呼び、呼び出し後の `GetLastError()` が `0x1234`
+    のままであることを出す（G06 の端到達確認）。
+  - `lasterror-failure`：存在しないファイルを `OPEN_EXISTING` で開き、
+    失敗のエラーコードが `ERROR_FILE_NOT_FOUND`（2）であることを出す。
+- 比較（`shirusu_e2e::compare_abi_probe_outputs`）：`ABI_PROBE` 行だけ
+  を対象にし、名前・順序・値を位置ごとに比べる。Probe 行以外の stdout
+  は無視する。`ABI_PROBE_DONE ok` 行の有無も比べる：対象が最後まで
+  走り切っていない（異常終了・クラッシュ）場合に DONE 行が欠けるため、
+  `LaunchedCapture` が対象の終了コードを返さない代わりの成功シグナル
+  として使う。
+- Trace の確認：Hook あり実行の Trace に Probe のファイル I/O が記録
+  されること（25 呼び出し → 50 イベント、下限 20）、コールバックの
+  別スレッド分を含めて 2 スレッド以上が現れること、4 API
+  （CreateFileW / ReadFile / WriteFile / CloseHandle）の enter が
+  すべてあること。
+- 境界：SEH 例外が Detour の実行中に起きる経路（L08 の CallAborted の
+  実動）は、現行 4 API の呼び出しでは SEH を起こす引数が作れない
+  （不正なバッファはカーネルがエラーで返す）ため、ここでは扱わない。
+  例外 Probe は Rust のパニックの伝播と巻き戻し後の健全性を対象とする。
+  可変長引数 API は現行フック対象に無く、対象外。WoW64（i686）での
+  `--abi` 実行は未配線（Probe コード自体は i686 ターゲットでコンパイル
+  される。WoW64 での capture-e2e 実行は B07 / C17 / D35 の範囲）。
 
 ## テストベクター
 

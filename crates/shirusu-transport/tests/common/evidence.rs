@@ -276,6 +276,7 @@ pub fn replay_dst(ops: &[DstOp]) -> Result<Vec<u64>, String> {
                         parent_call_id: 0,
                         payload: &payload,
                         capture_state: CaptureState::Captured,
+                        global_order: 0,
                     });
                 }
             }

@@ -9,12 +9,41 @@ use shirusu_trace::compact::encode_values;
 use shirusu_trace::model::{EventBatch, TraceEvent};
 use shirusu_trace::proto::{CaptureEnvironment, LossRecord, SessionMetadata};
 use shirusu_trace::reader::ReadTrace;
-use shirusu_trace::schema::{make_schema, CapturedValue, EventCapture, Ty, TypedValue};
+use shirusu_trace::schema::{
+    make_schema, CapturedValue, EventCapture, Ty, TypedValue, ValueCapture,
+};
 use shirusu_trace::writer::FinalizationInfo;
 use shirusu_trace::{PayloadRef, TraceWriter};
 
 fn cv(v: TypedValue) -> CapturedValue {
     CapturedValue::captured(v)
+}
+
+/// F20: 成功時の GetLastError 生値は古い残留値のため Stale として記録
+/// する（値本体は生値を保持）。失敗時は意味のある値として Captured。
+fn last_error(ok: bool, err: u32) -> CapturedValue {
+    if ok {
+        CapturedValue {
+            capture: ValueCapture::Stale,
+            value: TypedValue::U32(err),
+        }
+    } else {
+        cv(TypedValue::U32(err))
+    }
+}
+
+fn unsupported_u32() -> CapturedValue {
+    CapturedValue {
+        capture: ValueCapture::Unsupported,
+        value: TypedValue::U32(0),
+    }
+}
+
+fn unsupported_bytes() -> CapturedValue {
+    CapturedValue {
+        capture: ValueCapture::Unsupported,
+        value: TypedValue::Bytes(Vec::new()),
+    }
 }
 
 fn str16(s: &str) -> TypedValue {
@@ -85,6 +114,7 @@ impl Builder {
             capture: EventCapture::Captured,
             payload,
             args: Some(encode_values(types, &values).unwrap()),
+            global_order: None,
         });
     }
 
@@ -109,7 +139,7 @@ impl Builder {
             1,
             2,
             &[Ty::U64, Ty::U32],
-            vec![cv(TypedValue::U64(h)), cv(TypedValue::U32(0))],
+            vec![cv(TypedValue::U64(h)), last_error(true, 0)],
             PayloadRef::None,
         );
     }
@@ -148,10 +178,70 @@ impl Builder {
                 cv(TypedValue::I32(ok as i32)),
                 cv(TypedValue::U32(got)),
                 cv(TypedValue::Bytes(data.to_vec())),
-                cv(TypedValue::U32(err)),
+                last_error(ok, err),
             ],
             PayloadRef::None,
         );
+    }
+
+    /// 非同期 ReadFile（F27）。enter の後、leave は未完了のため戻り値
+    /// FALSE・last_error=997 (ERROR_IO_PENDING) で、バイト数とデータが
+    /// Unsupported。その後、完了観測で CallCompleted (kind 8) が leave
+    /// Schema の値列で実値を運ぶ（成功時は last_error は Stale）。
+    pub fn read_file_async(&mut self, call: u64, obj: u32, want: u32, got: u32, data: &[u8]) {
+        let h = self.handle(obj);
+        self.push(
+            1,
+            call,
+            2,
+            3,
+            &[Ty::U64, Ty::U64, Ty::U32],
+            vec![
+                cv(TypedValue::U64(h)),
+                cv(TypedValue::U64(0x7ff0_0000)),
+                cv(TypedValue::U32(want)),
+            ],
+            PayloadRef::None,
+        );
+        self.push(
+            2,
+            call,
+            2,
+            4,
+            &[Ty::I32, Ty::U32, Ty::Bytes, Ty::U32],
+            vec![
+                cv(TypedValue::I32(0)),
+                unsupported_u32(),
+                unsupported_bytes(),
+                cv(TypedValue::U32(997)),
+            ],
+            PayloadRef::None,
+        );
+        self.seq += 1;
+        self.events.push(TraceEvent {
+            kind: 8,
+            sequence: self.seq,
+            timestamp_qpc: self.env.ts_base + self.seq * 10,
+            call_id: call,
+            parent_call_id: 0,
+            api_id: 2,
+            schema_id: 4,
+            capture: EventCapture::Captured,
+            payload: PayloadRef::None,
+            args: Some(
+                encode_values(
+                    &[Ty::I32, Ty::U32, Ty::Bytes, Ty::U32],
+                    &[
+                        cv(TypedValue::I32(1)),
+                        cv(TypedValue::U32(got)),
+                        cv(TypedValue::Bytes(data.to_vec())),
+                        last_error(true, 0),
+                    ],
+                )
+                .unwrap(),
+            ),
+            global_order: None,
+        });
     }
 
     pub fn write_file(&mut self, call: u64, obj: u32, data: &[u8]) {
@@ -178,10 +268,70 @@ impl Builder {
             vec![
                 cv(TypedValue::I32(1)),
                 cv(TypedValue::U32(data.len() as u32)),
-                cv(TypedValue::U32(0)),
+                last_error(true, 0),
             ],
             PayloadRef::None,
         );
+    }
+
+    /// CreateFileW の enter の後に CallAborted（L08）。引数値列は無く、
+    /// leave Schema の ID だけが残る。ハンドルは生成されない。
+    pub fn abort_create_file(&mut self, call: u64, _obj: u32, path: &str) {
+        self.push(
+            1,
+            call,
+            1,
+            1,
+            &[Ty::Str16, Ty::U32, Ty::U64],
+            vec![
+                cv(str16(path)),
+                cv(TypedValue::U32(0x8000_0000)),
+                cv(TypedValue::U64(0)),
+            ],
+            PayloadRef::None,
+        );
+        self.seq += 1;
+        self.events.push(TraceEvent {
+            kind: 7,
+            sequence: self.seq,
+            timestamp_qpc: self.env.ts_base + self.seq * 10,
+            call_id: call,
+            parent_call_id: 0,
+            api_id: 1,
+            schema_id: 2,
+            capture: EventCapture::Captured,
+            payload: PayloadRef::None,
+            args: None,
+            global_order: None,
+        });
+    }
+
+    /// Ping の enter の後に CallAborted（L08）。オブジェクトに関与
+    /// しない呼び出しの中断を表す。
+    pub fn abort_ping(&mut self, call: u64, x: u32) {
+        self.push(
+            1,
+            call,
+            9,
+            17,
+            &[Ty::U32],
+            vec![cv(TypedValue::U32(x))],
+            PayloadRef::None,
+        );
+        self.seq += 1;
+        self.events.push(TraceEvent {
+            kind: 7,
+            sequence: self.seq,
+            timestamp_qpc: self.env.ts_base + self.seq * 10,
+            call_id: call,
+            parent_call_id: 0,
+            api_id: 9,
+            schema_id: 18,
+            capture: EventCapture::Captured,
+            payload: PayloadRef::None,
+            args: None,
+            global_order: None,
+        });
     }
 
     pub fn close_handle(&mut self, call: u64, obj: u32) {
@@ -201,7 +351,7 @@ impl Builder {
             4,
             8,
             &[Ty::I32, Ty::U32],
-            vec![cv(TypedValue::I32(1)), cv(TypedValue::U32(0))],
+            vec![cv(TypedValue::I32(1)), last_error(true, 0)],
             PayloadRef::None,
         );
     }

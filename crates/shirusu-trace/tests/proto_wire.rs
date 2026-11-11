@@ -18,6 +18,7 @@ fn sample_env() -> CaptureEnvironment {
         capture_config: "level=L2".into(),
         feature_flags: 0b101,
         target_description: "game.exe".into(),
+        modules: Vec::new(),
     }
 }
 
@@ -26,6 +27,26 @@ fn environment_roundtrip() {
     let env = sample_env();
     let bytes = env.encode();
     assert_eq!(CaptureEnvironment::decode(&bytes).unwrap(), env);
+}
+
+/// L07: モジュール分類付きの Environment の往復と、旧バイト列
+/// （field 9 無し）が modules 空として読めること。
+#[test]
+fn environment_with_modules_roundtrip() {
+    use shirusu_trace::module::{classify_module, ModuleEvidence};
+    let mut env = sample_env();
+    env.modules.push(classify_module(
+        &ModuleEvidence::new(r"C:\Windows\System32\kernel32.dll").signed(true),
+    ));
+    env.modules
+        .push(classify_module(&ModuleEvidence::new(r"C:\tools\game.exe")));
+    let bytes = env.encode();
+    assert_eq!(CaptureEnvironment::decode(&bytes).unwrap(), env);
+    let old = sample_env();
+    assert!(CaptureEnvironment::decode(&old.encode())
+        .unwrap()
+        .modules
+        .is_empty());
 }
 
 #[test]
@@ -84,6 +105,7 @@ fn batch_header_roundtrip() {
         qpc_frequency: 3_579_545,
         first_sequence: 0,
         event_count: 77,
+        has_global_order: false,
     };
     let bytes = h.encode();
     assert_eq!(BatchHeader::decode(&bytes).unwrap(), h);
@@ -288,4 +310,38 @@ fn wrong_wire_type_for_known_field_is_skipped_not_fatal() {
     let decoded = SessionMetadata::decode(w.as_slice()).unwrap();
     assert_eq!(decoded.session_id, 0);
     assert_eq!(decoded.qpc_frequency, 55);
+}
+
+/// L09: ProfileSummary の往復（空と複数 API）。0 の min/max は
+/// 「呼び出し無し」を表し、proto3 の既定値省略と一致する。
+#[test]
+fn profile_summary_roundtrip() {
+    let summary = ProfileSummary {
+        qpc_frequency: 10_000_000,
+        total_events_seen: 6,
+        apis: vec![
+            ApiProfile {
+                api_id: 1,
+                calls: 2,
+                enters: 3,
+                leaves: 2,
+                total_duration_qpc: 500,
+                min_duration_qpc: 100,
+                max_duration_qpc: 400,
+            },
+            ApiProfile {
+                api_id: 2,
+                calls: 0,
+                enters: 1,
+                leaves: 0,
+                total_duration_qpc: 0,
+                min_duration_qpc: 0,
+                max_duration_qpc: 0,
+            },
+        ],
+    };
+    let bytes = summary.encode();
+    assert_eq!(ProfileSummary::decode(&bytes).unwrap(), summary);
+    let empty = ProfileSummary::default();
+    assert_eq!(ProfileSummary::decode(&empty.encode()).unwrap(), empty);
 }

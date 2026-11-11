@@ -31,7 +31,7 @@ fn dropped_descriptor_with_original_len_above_capacity_is_accepted() {
     let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
     d.flags = flags::PAYLOAD_DROPPED | flags::DROPPED_BY_BACKPRESSURE;
     d.payload_len = 2 * 1024 * 1024;
-    let got = decode_descriptor(&d.to_bytes(), &known(16, 1024 * 1024))
+    let got = decode_descriptor(&d.to_bytes(), &known(16, 1024 * 1024), false)
         .expect("legit degraded event must be accepted");
     assert_eq!(got.payload_len, 2 * 1024 * 1024);
     assert!(got.payload_dropped());
@@ -39,14 +39,14 @@ fn dropped_descriptor_with_original_len_above_capacity_is_accepted() {
     let mut d2 = EventDescriptor::new(EventKind::CallEnter, 1);
     d2.flags = flags::PAYLOAD_DROPPED;
     d2.payload_len = u32::MAX;
-    assert!(decode_descriptor(&d2.to_bytes(), &known(16, 256)).is_ok());
+    assert!(decode_descriptor(&d2.to_bytes(), &known(16, 256), false).is_ok());
     // checked でも同じく受理し、格納長 0 として位置を扱う。
     let exp = DescriptorExpectation {
         sequence_at_least: 1,
         payload_position: Some(0),
         payload_write_position: 0,
     };
-    assert!(decode_descriptor_checked(&d.to_bytes(), &known(16, 1024 * 1024), &exp).is_ok());
+    assert!(decode_descriptor_checked(&d.to_bytes(), &known(16, 1024 * 1024), &exp, false).is_ok());
 }
 
 #[test]
@@ -67,6 +67,7 @@ fn writer_degraded_event_above_capacity_passes_validating_reader() {
         parent_call_id: 0,
         payload: &big,
         capture_state: CaptureState::MemoryUnreadable,
+        global_order: 0,
     });
     w.write(EventInput {
         kind: EventKind::CallLeave,
@@ -76,6 +77,7 @@ fn writer_degraded_event_above_capacity_passes_validating_reader() {
         parent_call_id: 0,
         payload: b"ok",
         capture_state: CaptureState::Captured,
+        global_order: 0,
     });
     let mut vr = ValidatingReader::new(known(8, 256), 1);
     let evs = vr

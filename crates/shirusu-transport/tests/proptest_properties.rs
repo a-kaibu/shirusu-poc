@@ -45,6 +45,7 @@ fn input(kind: EventKind, payload: &[u8], call: u64) -> EventInput<'_> {
         parent_call_id: 0,
         payload,
         capture_state: CaptureState::Captured,
+        global_order: 0,
     }
 }
 

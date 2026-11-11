@@ -15,12 +15,23 @@ use shirusu_trace::compact::encode_values;
 use shirusu_trace::model::{EventBatch, TraceEvent};
 use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
 use shirusu_trace::reader::ReadTrace;
-use shirusu_trace::schema::{make_schema, CapturedValue, EventCapture, Ty, TypedValue, ValueKind};
+use shirusu_trace::schema::{
+    make_schema, CapturedValue, EventCapture, LastErrorMeaning, Ty, TypedValue, ValueCapture,
+    ValueKind,
+};
 use shirusu_trace::writer::FinalizationInfo;
 use shirusu_trace::{PayloadRef, TraceWriter};
 
 fn cv(v: TypedValue) -> CapturedValue {
     CapturedValue::captured(v)
+}
+
+/// 古い残留値としての last_error（F20）。値本体は生値を保持する。
+fn stale(v: u32) -> CapturedValue {
+    CapturedValue {
+        capture: ValueCapture::Stale,
+        value: TypedValue::U32(v),
+    }
 }
 
 fn schemas() -> Vec<shirusu_trace::proto::SchemaDef> {
@@ -56,7 +67,13 @@ fn schemas() -> Vec<shirusu_trace::proto::SchemaDef> {
             "test!UseThing/leave",
             vec![
                 ("return".into(), Ty::I32, ValueKind::Scalar.flags()),
-                ("last_error".into(), Ty::U32, ValueKind::Scalar.flags()),
+                // F20: BOOL 戻り値の API なので、last_error は FALSE の
+                // 場合にだけ意味を持つ。
+                (
+                    "last_error".into(),
+                    Ty::U32,
+                    ValueKind::Scalar.flags() | LastErrorMeaning::WhenReturnIsFalse.flags(),
+                ),
             ],
         ),
     ]
@@ -95,6 +112,7 @@ impl B {
             capture: EventCapture::Captured,
             payload: PayloadRef::None,
             args: Some(encode_values(types, &values).unwrap()),
+            global_order: None,
         });
     }
     fn get_counter(&mut self, call: u64, value: u64) {
@@ -135,6 +153,31 @@ impl B {
             106,
             &[Ty::I32, Ty::U32],
             vec![cv(TypedValue::I32(1)), cv(TypedValue::U32(0))],
+        );
+    }
+    fn use_thing_with_last_error(
+        &mut self,
+        call: u64,
+        handle: u64,
+        flags: u64,
+        ret: i32,
+        last: CapturedValue,
+    ) {
+        self.push(
+            1,
+            call,
+            52,
+            105,
+            &[Ty::U64, Ty::U64],
+            vec![cv(TypedValue::U64(handle)), cv(TypedValue::U64(flags))],
+        );
+        self.push(
+            2,
+            call,
+            52,
+            106,
+            &[Ty::I32, Ty::U32],
+            vec![cv(TypedValue::I32(ret)), last],
         );
     }
     fn finish(self) -> ReadTrace {
@@ -261,4 +304,42 @@ fn scalar_u64_argument_difference_is_detected() {
         "candidates: {:?}",
         report.candidates
     );
+}
+
+#[test]
+fn stale_last_error_difference_is_ignored_but_meaningful_is_detected() {
+    // F20: 呼び出しが成功したときの last_error 生値は古い残留値
+    // (Stale) であり、値が違っても差分にしない。一方、呼び出しが
+    // 失敗したときの意味のある last_error の違いは ReturnDifference
+    // として検出する。
+    // 成功時: 残留値 5 と 7 の違いは差分にならない。
+    let mut l = B::new();
+    l.use_thing_with_last_error(1, 0x1000, 7, 1, stale(5));
+    let left = l.finish();
+    let mut r = B::new();
+    r.use_thing_with_last_error(1, 0x1000, 7, 1, stale(7));
+    let report = compare_traces(&left, &r.finish());
+    assert!(
+        report.is_identical(),
+        "stale last_error must not diff: {:?}",
+        report.candidates
+    );
+    // 失敗時: 意味のある last_error 5 と 2 の違いは差分になる。
+    let mut l = B::new();
+    l.use_thing_with_last_error(1, 0x1000, 7, 0, cv(TypedValue::U32(5)));
+    let left = l.finish();
+    let mut r = B::new();
+    r.use_thing_with_last_error(1, 0x1000, 7, 0, cv(TypedValue::U32(2)));
+    let report = compare_traces(&left, &r.finish());
+    assert_eq!(
+        kinds(&report),
+        vec![CandidateKind::ReturnDifference],
+        "candidates: {:?}",
+        report.candidates
+    );
+    // 失敗時でも同じ値なら差分なし。
+    let mut r2 = B::new();
+    r2.use_thing_with_last_error(1, 0x1000, 7, 0, cv(TypedValue::U32(5)));
+    let report = compare_traces(&left, &r2.finish());
+    assert!(report.is_identical(), "candidates: {:?}", report.candidates);
 }

@@ -34,6 +34,7 @@ fn input(call: u64, payload: &[u8]) -> EventInput<'_> {
         parent_call_id: 0,
         payload,
         capture_state: CaptureState::Captured,
+        global_order: 0,
     }
 }
 
@@ -121,6 +122,7 @@ fn well_formed_stream_still_drains_without_error() {
     // 落とした Payload (格納長 0 として扱う) を含む正常系。
     let dropped = EventInput {
         capture_state: CaptureState::DroppedByBackpressure,
+        global_order: 0,
         ..input(2, b"zzzz")
     };
     w.write(dropped);

@@ -14,7 +14,7 @@ pub mod view;
 
 pub use json::JsonValue;
 pub use view::{
-    api_name_of_schema, capture_name, integrity_level_name, loss_kind_name, reason_name,
-    value_capture_name, EventFilter, EventView, FieldView, IntegritySummary, PayloadView, Phase,
-    TraceView, KIND_ENTER, KIND_LEAVE,
+    api_name_of_schema, capture_name, format_field, integrity_level_name, loss_kind_name,
+    reason_name, value_capture_name, EventFilter, EventView, FieldView, IntegritySummary,
+    PayloadView, Phase, TraceView, KIND_ABORTED, KIND_COMPLETED, KIND_ENTER, KIND_LEAVE,
 };

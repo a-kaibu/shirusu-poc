@@ -58,7 +58,8 @@ pub enum PayloadRef {
 /// 絶対値（符号化時は Batch 内差分になる）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceEvent {
-    /// 転送 Descriptor の kind と同じ番号（1 = CallEnter、2 = CallLeave 等）。
+    /// 転送 Descriptor の kind と同じ番号（1 = CallEnter、2 = CallLeave、
+    /// 7 = CallAborted、8 = CallCompleted）。
     pub kind: u16,
     pub sequence: u64,
     pub timestamp_qpc: u64,
@@ -72,6 +73,10 @@ pub struct TraceEvent {
     /// Compact Binary で符号化済みの引数値列（生バイト列のまま保持し、
     /// Schema で解釈するのは読み手）。None は引数なし。
     pub args: Option<Vec<u8>>,
+    /// 全スレッド共通の観測順序番号（L11 `--order=global`）。
+    /// None は「未割当」（同オプション無効時に記録されたイベント）。
+    /// Some の値は 1 始まりで、同一 Batch 内では厳密に増加する。
+    pub global_order: Option<u64>,
 }
 
 /// Event Batch：同一 Writer（スレッド）のイベント列と、その文脈。

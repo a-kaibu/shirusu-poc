@@ -411,18 +411,30 @@ fn compare_calls(
     object: Option<ObjectKey>,
     out: &mut Vec<Candidate>,
 ) {
-    // 形の相違（未終了など）。
-    if (l.enter.is_some() != r.enter.is_some()) || (l.leave.is_some() != r.leave.is_some()) {
+    // F27: 実効 leave は completed があればそれ、無ければ leave。
+    // 非同期の呼び出しは leave の値列が Unsupported のままだが、完了で
+    // 実値が届く。同期の呼び出しと比べるときは、完了の値を leave の値
+    // として比べる（完了の有無自体は形の相違にしない）。
+    let l_leave = l.completed.as_ref().or(l.leave.as_ref());
+    let r_leave = r.completed.as_ref().or(r.leave.as_ref());
+    // 形の相違（未終了・中断など）。Leave と Aborted は別の終了の形
+    // として区別する（L08：中断と正常終了の取り違えは差分候補）。
+    if (l.enter.is_some() != r.enter.is_some())
+        || (l_leave.is_some() != r_leave.is_some())
+        || (l.aborted.is_some() != r.aborted.is_some())
+    {
         let mut c = Candidate::new(
             CandidateKind::CallShapeDifference,
             Severity::Medium,
             format!(
-                "call to {} has different shape: left enter={} leave={}, right enter={} leave={}",
+                "call to {} has different shape: left enter={} leave={} aborted={}, right enter={} leave={} aborted={}",
                 l.api,
                 l.enter.is_some(),
-                l.leave.is_some(),
+                l_leave.is_some(),
+                l.aborted.is_some(),
                 r.enter.is_some(),
-                r.leave.is_some()
+                r_leave.is_some(),
+                r.aborted.is_some()
             ),
         );
         c.api = Some(l.api.clone());
@@ -432,9 +444,10 @@ fn compare_calls(
         out.push(c);
     }
     for (phase, le, re) in [
-        ("enter", &l.enter, &r.enter),
-        ("leave", &l.leave, &r.leave),
-        ("event", &l.solo, &r.solo),
+        ("enter", l.enter.as_ref(), r.enter.as_ref()),
+        ("leave", l_leave, r_leave),
+        ("aborted", l.aborted.as_ref(), r.aborted.as_ref()),
+        ("event", l.solo.as_ref(), r.solo.as_ref()),
     ] {
         let (Some(le), Some(re)) = (le, re) else {
             continue;

@@ -18,10 +18,11 @@
 //! `recorder_launch`（cfg(windows)）が担い、本モジュールは
 //! 「Mapping が用意された後」の回収と Trace 化に集中する。
 
-use crate::trace_convert::{ArgsConversionStats, TraceBatchContext, TraceRecorder};
+use crate::trace_convert::{ArgsConversionStats, RecordMode, TraceBatchContext, TraceRecorder};
 use crate::{DrainWorker, IntegrityLevel, IntegrityReport, RingIdentity};
 use shirusu_hook::api as hook_api;
-use shirusu_trace::proto::CaptureEnvironment;
+use shirusu_trace::proto::{CaptureEnvironment, ProfileSummary};
+use shirusu_trace::writer::{Durability, WriterOptions};
 use shirusu_transport::layout;
 use shirusu_transport::ring::SharedRegion;
 use shirusu_transport::RingConfig;
@@ -107,6 +108,22 @@ pub struct CaptureSessionConfig {
     pub ring_config: RingConfig,
     pub environment: CaptureEnvironment,
     pub qpc_frequency: u64,
+    /// Trace ファイルへの永続化の強さ（F21）。既定は
+    /// [`Durability::Buffered`]（`flush` のみ）。
+    pub durability: Durability,
+    /// `--order=global` (L11)。有効にすると Agent が観測点で全スレッド
+    /// 共通の番号を採番し、Descriptor の `global_order` に刻む。
+    /// Host はこの設定で Descriptor の検証（非 0 の受理可否）を決め、
+    /// Agent DLL へは Bootstrap 経由で伝える。既定は false。
+    pub order_global: bool,
+    /// Runtime 独自の API も記録するか（L07、overview「記録境界と
+    /// モジュール分類」節）。既定は false（記録しない）。設定そのものが
+    /// ここにあり、CLI の `--record-runtime-apis` から渡す。フック時の
+    /// 呼び出し元分類による強制は Windows 側の残作業（L23）。
+    pub record_runtime_apis: bool,
+    /// 記録モード（L09、overview「記録モードと性能目標」節）。既定は
+    /// `RecordMode::Full`。CLI の `--mode` / `--api` から渡す。
+    pub record_mode: RecordMode,
 }
 
 /// Ring 1 本の登録仕様。thread_id は Trace 内の Writer ID（Ring の
@@ -196,6 +213,15 @@ pub struct SessionSummary {
     /// プロセス間記録で DLL から読み戻せた場合のみ Some
     /// (レビュー #4 の #8)。
     pub hook_coverage: Option<(usize, usize)>,
+    /// 注入できなかった子プロセス (pid, 理由)。L05: 保護されたプロセス
+    /// や注入前に終了した子はここに残り、Capture Coverage の劣化として
+    /// Finalization の注記にも写る。
+    pub uninjectable_children: Vec<(u32, String)>,
+    /// `profile` モードの集計（L09）。`profile` 以外のモードでは None。
+    /// `total_events` は回収したイベント数（`profile` では個別イベント
+    /// を保存しないため、Finalization の `total_events` は 0 になる。
+    /// 集計の `total_events_seen` が回収数と一致する）。
+    pub profile_summary: Option<ProfileSummary>,
     pub integrity: IntegrityReport,
 }
 
@@ -309,6 +335,10 @@ pub struct CaptureSession {
     /// Agent 終了手順の結果（レビュー第5回 #6）。プロセス間記録で
     /// 対象を生かしたまま閉じる場合のみ設定される。
     shutdown_outcome: Option<ShutdownOutcome>,
+    /// 注入できなかった子プロセス (pid, 理由)。L05。TreeCapture が
+    /// 注入の失敗時に知らせる。`stop` で Capture Coverage の劣化と
+    /// 注記に写す。
+    uninjectable_children: Vec<(u32, String)>,
 }
 
 impl CaptureSession {
@@ -324,7 +354,16 @@ impl CaptureSession {
             )));
         }
         let file = File::create(path.as_ref())?;
-        let mut recorder = TraceRecorder::from_environment(file, config.environment.clone())?;
+        let mut recorder = TraceRecorder::from_environment_with_options(
+            file,
+            config.environment.clone(),
+            WriterOptions {
+                durability: config.durability,
+                ..Default::default()
+            },
+        )?;
+        // L09: 記録モードを TraceRecorder へ渡す。
+        recorder.set_record_mode(config.record_mode.clone());
         for def in hook_api::all_schemas() {
             recorder.register_schema(def)?;
         }
@@ -338,6 +377,7 @@ impl CaptureSession {
             coverage_missing_calls: 0,
             hook_coverage: None,
             shutdown_outcome: None,
+            uninjectable_children: Vec::new(),
         })
     }
 
@@ -369,6 +409,15 @@ impl CaptureSession {
     /// Integrity が劣化する（[`shutdown_integrity_impact`]）。
     pub fn set_shutdown_outcome(&mut self, outcome: ShutdownOutcome) {
         self.shutdown_outcome = Some(outcome);
+    }
+
+    /// 注入できなかった子プロセスを知らせる (L05)。保護されたプロセスや
+    /// 注入前に終了した子など、記録できなかった子はここに残す。
+    /// 同じ pid は最初の理由のまま 1 件にまとめる。
+    pub fn note_uninjectable_child(&mut self, pid: u32, reason: &str) {
+        if !self.uninjectable_children.iter().any(|(p, _)| *p == pid) {
+            self.uninjectable_children.push((pid, reason.to_string()));
+        }
     }
 
     fn ensure_state(&self, want: SessionState, op: &'static str) -> Result<(), SessionError> {
@@ -471,6 +520,8 @@ impl CaptureSession {
                         ring.spec.expected_generation,
                     )
                 };
+                // L11: セッション設定で Descriptor の global_order 検証を決める。
+                worker.set_global_order(self.config.order_global);
                 worker.set_identity(RingIdentity::new(
                     crate::ProcessInstanceId(ring.spec.process_id),
                     crate::RingId(ring.spec.thread_id),
@@ -601,8 +652,22 @@ impl CaptureSession {
                 }
             }
         }
+        // L05: 注入できなかった子は記録の欠落として Capture Coverage を
+        // 劣化させ、pid と理由を注記に残す（値は捏造しない）。
+        if !self.uninjectable_children.is_empty() {
+            report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
+            for (pid, reason) in &self.uninjectable_children {
+                report.notes.push(format!(
+                    "child process {pid} could not be injected ({reason}); \
+                     its calls are not in this trace"
+                ));
+            }
+        }
         let total_events: u64 = self.rings.iter().map(|r| r.events).sum();
         let trace_path = self.trace_path.clone();
+        // L09: `profile` の集計は `finish` で Trace へ書く前に読む
+        //（`finish` は recorder を消費する）。
+        let profile_summary = self.recorder.profile_summary();
         let mut file = self.recorder.finish(&report)?;
         file.flush()?;
         self.state = SessionState::Finished;
@@ -617,6 +682,8 @@ impl CaptureSession {
             args_attached: self.args_stats.args_attached,
             args_fallback_blob: self.args_stats.args_fallback_blob,
             hook_coverage: self.hook_coverage,
+            uninjectable_children: std::mem::take(&mut self.uninjectable_children),
+            profile_summary,
             integrity: report,
         })
     }

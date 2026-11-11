@@ -50,6 +50,7 @@ fn input(kind: EventKind, call: u64, payload: &[u8]) -> EventInput<'_> {
         parent_call_id: 0,
         payload,
         capture_state: CaptureState::Captured,
+        global_order: 0,
     }
 }
 fn kind_of(o: &WriteOutcome) -> &'static str {
@@ -581,4 +582,28 @@ fn positions_accumulate_over_stored_lengths_only() {
         .map(|e| e.descriptor.payload_position)
         .collect();
     assert_eq!(positions, vec![0, 3, 3, 8]);
+}
+
+// ---------- Ring 使用量の観測 (L10: バッファ使用率) ----------
+#[test]
+fn reader_reports_descriptor_and_payload_usage() {
+    let (_rg, mut w, r, _clk) = setup(8, 256, no_wait());
+    assert_eq!(r.descriptor_used(), 0);
+    assert_eq!(r.payload_used(), 0);
+    w.write(input(EventKind::CallEnter, 1, &[0u8; 3]));
+    w.write(input(EventKind::CallEnter, 2, &[0u8; 5]));
+    assert_eq!(r.descriptor_used(), 2);
+    assert_eq!(r.payload_used(), 8);
+}
+
+#[test]
+fn reader_usage_drops_after_drain() {
+    let (_rg, mut w, mut r, _clk) = setup(8, 256, no_wait());
+    w.write(input(EventKind::CallEnter, 1, &[0u8; 3]));
+    w.write(input(EventKind::CallEnter, 2, &[0u8; 5]));
+    assert_eq!(r.descriptor_used(), 2);
+    let b = r.drain_all();
+    assert_eq!(b.events.len(), 2);
+    assert_eq!(r.descriptor_used(), 0);
+    assert_eq!(r.payload_used(), 0);
 }

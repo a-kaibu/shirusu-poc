@@ -710,6 +710,34 @@ mod imp {
         result
     }
 
+    /// 実行中の全プロセスの (pid, 親 pid) 一覧を返す
+    /// （L05 の子プロセス発見用。Toolhelp のプロセススナップショット）。
+    pub fn enumerate_processes() -> Result<Vec<(u32, u32)>> {
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return Err(last_err("CreateToolhelp32Snapshot"));
+        }
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = Vec::new();
+        unsafe {
+            if Process32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    out.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                    if Process32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        Ok(out)
+    }
+
     /// 対象プロセスのモジュール一覧から、名前でモジュールのベースを引く。
     pub fn module_base(pid: u32, module_name: &str) -> Result<usize> {
         use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -945,6 +973,10 @@ mod imp {
     pub fn module_base(_pid: u32, _module_name: &str) -> Result<usize> {
         Err(WinError::Unsupported)
     }
+    /// スタブ: プロセス一覧は Windows の概念のため Unsupported。
+    pub fn enumerate_processes() -> Result<Vec<(u32, u32)>> {
+        Err(WinError::Unsupported)
+    }
     pub fn remote_alloc(_process: HandleValue, _len: usize) -> Result<usize> {
         Err(WinError::Unsupported)
     }
@@ -955,10 +987,10 @@ mod imp {
 }
 
 pub use imp::{
-    close_handle_value, duplicate_handle_to_process, module_base, open_process_for_injection,
-    process_exited, read_process_memory, remote_alloc, remote_call, remote_free,
-    remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process,
-    wait_process, write_process_memory, EventObject, SharedMapping,
+    close_handle_value, duplicate_handle_to_process, enumerate_processes, module_base,
+    open_process_for_injection, process_exited, read_process_memory, remote_alloc, remote_call,
+    remote_free, remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended,
+    terminate_process, wait_process, write_process_memory, EventObject, SharedMapping,
 };
 
 /// プロセス単位の通知イベント群。data_ready は auto-reset。
@@ -1267,6 +1299,27 @@ mod portable_tests {
     fn stub_mapping_has_requested_len() {
         let m = SharedMapping::create(128).unwrap();
         assert_eq!(m.len(), 128);
+    }
+
+    /// L05: プロセス一覧の列挙。Windows では自プロセスが含まれ、
+    /// Windows 以外では Unsupported を返す（スタブ）。
+    #[test]
+    fn enumerate_processes_lists_self_on_windows() {
+        let list = enumerate_processes();
+        #[cfg(windows)]
+        {
+            let list = list.expect("enumerate_processes on windows");
+            let me = std::process::id();
+            assert!(
+                list.iter().any(|(pid, _)| *pid == me),
+                "own pid {me} must be in the process list"
+            );
+            assert!(!list.is_empty());
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(matches!(list, Err(WinError::Unsupported)));
+        }
     }
     #[test]
     fn notify_space_only_when_writer_waiting() {

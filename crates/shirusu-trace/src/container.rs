@@ -18,8 +18,17 @@ pub const SCHEMA_VERSION: u16 = 1;
 pub const MAX_STORED_LEN: u32 = 512 * 1024 * 1024;
 /// raw_len の上限（256 MiB）。展開後サイズの割り当てを縛る。
 pub const MAX_RAW_LEN: u32 = 256 * 1024 * 1024;
-/// Event / Blob Chunk の非圧縮サイズの目安（256 KiB）。
-pub const DEFAULT_CHUNK_RAW_TARGET: usize = 256 * 1024;
+/// Event / Blob Chunk の非圧縮サイズの目安（512 KiB）。
+/// F25 の測定（`shirusu-trace-bench`、20,000 イベントの合成ワークロード、
+/// 中央値 5 回）で決定：256 KiB は同ワークロードで総バイト数が 1.4%
+/// 多く（550,193 B 対 542,515 B）、512 KiB と 1 MiB は同値で最良。
+/// デコード時間・書き込み時間は 128 KiB〜1 MiB で差が無かった（1% 未満）。
+/// 512 KiB は仕様の目安範囲 256 KiB〜1 MiB の中で、決定規則（1 MiB に対し
+/// 総バイト数 +1% 以内・デコード時間は最速の +5% 以内）を満たす最小値。
+/// 大きいチャンクは圧縮で不利にならない（同一内容では単調に良化するか同値）
+/// が、1 Block の破損で失われる量が増えるため、最小の合格値を既定とする。
+/// 測定値は `docs/trace-format.md`「チャンクサイズの決定」節参照。
+pub const DEFAULT_CHUNK_RAW_TARGET: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockType {
@@ -32,6 +41,11 @@ pub enum BlockType {
     Index,
     Finalization,
     Loss,
+    /// Blob の部分的な更新（F18）。payload は `BlobUpdate::encode`。
+    BlobUpdate,
+    /// 記録モード `profile` の集計（L09）。payload は
+    /// `ProfileSummary::encode`。`finish` が Index の前に 1 回書く。
+    ProfileSummary,
     Unknown(u8),
 }
 
@@ -47,6 +61,8 @@ impl BlockType {
             Self::Index => 7,
             Self::Finalization => 8,
             Self::Loss => 9,
+            Self::BlobUpdate => 10,
+            Self::ProfileSummary => 11,
             Self::Unknown(c) => c,
         }
     }
@@ -61,6 +77,8 @@ impl BlockType {
             7 => Self::Index,
             8 => Self::Finalization,
             9 => Self::Loss,
+            10 => Self::BlobUpdate,
+            11 => Self::ProfileSummary,
             c => Self::Unknown(c),
         }
     }

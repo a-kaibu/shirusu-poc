@@ -13,15 +13,20 @@ use shirusu_trace::BlobId;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// 転送 Descriptor の kind と同じ番号（1 = CallEnter、2 = CallLeave）。
+/// 転送 Descriptor の kind と同じ番号（1 = CallEnter、2 = CallLeave、
+/// 7 = CallAborted、8 = CallCompleted）。
 pub const KIND_ENTER: u16 = 1;
 pub const KIND_LEAVE: u16 = 2;
+pub const KIND_ABORTED: u16 = 7;
+pub const KIND_COMPLETED: u16 = 8;
 
-/// イベントの相（Enter / Leave / その他）。
+/// イベントの相（Enter / Leave / Aborted / Completed / その他）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Enter,
     Leave,
+    Aborted,
+    Completed,
     Other(u16),
 }
 
@@ -30,6 +35,8 @@ impl Phase {
         match kind {
             KIND_ENTER => Phase::Enter,
             KIND_LEAVE => Phase::Leave,
+            KIND_ABORTED => Phase::Aborted,
+            KIND_COMPLETED => Phase::Completed,
             other => Phase::Other(other),
         }
     }
@@ -38,6 +45,8 @@ impl Phase {
         match self {
             Phase::Enter => "enter",
             Phase::Leave => "leave",
+            Phase::Aborted => "aborted",
+            Phase::Completed => "completed",
             Phase::Other(_) => "event",
         }
     }
@@ -141,6 +150,9 @@ pub fn value_capture_name(capture: ValueCapture) -> &'static str {
         ValueCapture::Truncated => "truncated",
         ValueCapture::Unsupported => "unsupported",
         ValueCapture::LimitExceeded => "limit_exceeded",
+        // F20: 値は読めたが生値が古い（この呼び出しのエラーではない）。
+        // format_field は Captured 以外を `<stale>` と表示する。
+        ValueCapture::Stale => "stale",
     }
 }
 
@@ -157,6 +169,8 @@ pub struct EventView {
     pub qpc_frequency: u64,
     pub kind: u16,
     pub sequence: u64,
+    /// 全スレッド共通の観測順序番号（L11）。None は未割当。
+    pub global_order: Option<u64>,
     pub timestamp_qpc: u64,
     pub call_id: u64,
     pub parent_call_id: u64,
@@ -191,6 +205,10 @@ impl EventView {
             "#{} seq={} thread={} ",
             self.index, self.sequence, self.thread_id
         );
+        // L11: 全体順序がある場合だけ表示する（無い Trace の表示は変わらない）。
+        if let Some(g) = self.global_order {
+            let _ = write!(s, "g={g} ");
+        }
         match &self.api_name {
             Some(api) => {
                 let _ = write!(s, "{} {}", api, self.phase().name());
@@ -253,38 +271,45 @@ impl EventView {
                 ("reason", JsonValue::Str(reason_name(*reason).into())),
             ]),
         };
-        JsonValue::obj(vec![
-            ("index", JsonValue::U64(self.index as u64)),
-            ("session_id", JsonValue::U64(self.session_id)),
-            ("process_id", JsonValue::U64(self.process_id)),
-            ("raw_pid", JsonValue::U64(self.raw_pid as u64)),
-            ("thread_id", JsonValue::U64(self.thread_id)),
-            ("sequence", JsonValue::U64(self.sequence)),
-            ("timestamp_qpc", JsonValue::U64(self.timestamp_qpc)),
-            ("kind", JsonValue::U64(self.kind as u64)),
-            ("phase", JsonValue::Str(self.phase().name().into())),
-            (
-                "api",
-                self.api_name
-                    .clone()
-                    .map(JsonValue::Str)
-                    .unwrap_or(JsonValue::Null),
-            ),
-            ("api_id", JsonValue::U64(self.api_id as u64)),
-            ("schema_id", JsonValue::U64(self.schema_id as u64)),
-            ("call_id", JsonValue::U64(self.call_id)),
-            ("parent_call_id", JsonValue::U64(self.parent_call_id)),
-            ("capture", JsonValue::Str(capture_name(self.capture))),
-            ("fields", JsonValue::Object(fields)),
-            (
-                "args_error",
-                self.args_error
-                    .clone()
-                    .map(JsonValue::Str)
-                    .unwrap_or(JsonValue::Null),
-            ),
-            ("payload", payload),
-        ])
+        JsonValue::obj({
+            let mut entries = vec![
+                ("index", JsonValue::U64(self.index as u64)),
+                ("session_id", JsonValue::U64(self.session_id)),
+                ("process_id", JsonValue::U64(self.process_id)),
+                ("raw_pid", JsonValue::U64(self.raw_pid as u64)),
+                ("thread_id", JsonValue::U64(self.thread_id)),
+                ("sequence", JsonValue::U64(self.sequence)),
+                ("timestamp_qpc", JsonValue::U64(self.timestamp_qpc)),
+                ("kind", JsonValue::U64(self.kind as u64)),
+                ("phase", JsonValue::Str(self.phase().name().into())),
+                (
+                    "api",
+                    self.api_name
+                        .clone()
+                        .map(JsonValue::Str)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                ("api_id", JsonValue::U64(self.api_id as u64)),
+                ("schema_id", JsonValue::U64(self.schema_id as u64)),
+                ("call_id", JsonValue::U64(self.call_id)),
+                ("parent_call_id", JsonValue::U64(self.parent_call_id)),
+                ("capture", JsonValue::Str(capture_name(self.capture))),
+                ("fields", JsonValue::Object(fields)),
+                (
+                    "args_error",
+                    self.args_error
+                        .clone()
+                        .map(JsonValue::Str)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                ("payload", payload),
+            ];
+            // L11: 全体順序がある場合だけ出す（無い Trace の JSON は変わらない）。
+            if let Some(g) = self.global_order {
+                entries.push(("global_order", JsonValue::U64(g)));
+            }
+            entries
+        })
     }
 }
 
@@ -502,8 +527,40 @@ impl IntegritySummary {
                     format!("blob_hash_mismatch(id={id}, computed={computed})")
                 }
                 RecoveryIssue::MissingBlob { id } => format!("missing_blob({id})"),
+                RecoveryIssue::ForwardBlobReference { id } => {
+                    format!("forward_blob_reference({id})")
+                }
                 RecoveryIssue::IndexMismatch => "index_mismatch".to_string(),
                 RecoveryIssue::LimitExceeded { what } => format!("limit_exceeded({what})"),
+                RecoveryIssue::SessionMismatch {
+                    what,
+                    expected,
+                    found,
+                } => {
+                    format!("session_mismatch(what={what}, expected={expected}, found={found})")
+                }
+                RecoveryIssue::BlobUpdateMissingBase { resource_id } => {
+                    format!("blob_update_missing_base(resource={resource_id})")
+                }
+                RecoveryIssue::BlobUpdateOutOfRange {
+                    resource_id,
+                    offset,
+                    size,
+                    base_len,
+                } => {
+                    format!(
+                        "blob_update_out_of_range(resource={resource_id}, offset={offset}, size={size}, base_len={base_len})"
+                    )
+                }
+                RecoveryIssue::BlobUpdateHashMismatch {
+                    resource_id,
+                    expected,
+                    computed,
+                } => {
+                    format!(
+                        "blob_update_hash_mismatch(resource={resource_id}, expected={expected}, computed={computed})"
+                    )
+                }
             })
             .collect();
         IntegritySummary {
@@ -566,6 +623,7 @@ impl<'a> TraceView<'a> {
                     qpc_frequency: batch.qpc_frequency,
                     kind: e.kind,
                     sequence: e.sequence,
+                    global_order: e.global_order,
                     timestamp_qpc: e.timestamp_qpc,
                     call_id: e.call_id,
                     parent_call_id: e.parent_call_id,
@@ -600,6 +658,11 @@ impl<'a> TraceView<'a> {
             match ev.phase() {
                 Phase::Enter => entry.0 += 1,
                 Phase::Leave => entry.1 += 1,
+                // 中断した呼び出しは Enter には数え、Leave には数えない。
+                Phase::Aborted => {}
+                // 完了した非同期 I/O は Leave には数えない（leave は既に
+                // 数えてある。完了はその値列の遅れての到着である）。
+                Phase::Completed => {}
                 Phase::Other(_) => {}
             }
         }
@@ -663,5 +726,29 @@ fn decode_fields(
             (fields, None)
         }
         Err(e) => (Vec::new(), Some(format!("decode failed: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aborted_phase_has_its_own_name() {
+        // L08: CallAborted (kind 7) は enter/leave とは別の相。
+        assert_eq!(KIND_ABORTED, 7);
+        assert_eq!(Phase::of_kind(KIND_ABORTED), Phase::Aborted);
+        assert_eq!(Phase::Aborted.name(), "aborted");
+        assert_eq!(Phase::of_kind(KIND_ENTER), Phase::Enter);
+        assert_eq!(Phase::of_kind(KIND_LEAVE), Phase::Leave);
+        assert_eq!(Phase::of_kind(99), Phase::Other(99));
+    }
+
+    #[test]
+    fn completed_phase_has_its_own_name() {
+        // F27: CallCompleted (kind 8) は leave とは別の相。
+        assert_eq!(KIND_COMPLETED, 8);
+        assert_eq!(Phase::of_kind(KIND_COMPLETED), Phase::Completed);
+        assert_eq!(Phase::Completed.name(), "completed");
     }
 }

@@ -30,7 +30,7 @@ fn arb_value() -> impl Strategy<Value = (Ty, TypedValue)> {
 }
 
 fn arb_capture() -> impl Strategy<Value = ValueCapture> {
-    (0u8..5).prop_map(|c| ValueCapture::from_code(c).unwrap())
+    (0u8..6).prop_map(|c| ValueCapture::from_code(c).unwrap())
 }
 
 proptest! {
@@ -130,6 +130,7 @@ fn run_writer_reader_case(
             capture: EventCapture::Captured,
             payload: payload_ref,
             args,
+            global_order: None,
         });
     }
     let batch = EventBatch {
@@ -198,7 +199,7 @@ proptest! {
             events: vec![TraceEvent {
                 kind: 1, sequence: 1, timestamp_qpc: 5, call_id: 1, parent_call_id: 0,
                 api_id: 1, schema_id: 0, capture: EventCapture::Captured,
-                payload: PayloadRef::Blob(id), args: None,
+                payload: PayloadRef::Blob(id), args: None, global_order: None,
             }],
         };
         w.write_batch(&batch).unwrap();

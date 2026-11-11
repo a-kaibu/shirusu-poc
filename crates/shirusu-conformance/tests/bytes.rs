@@ -42,6 +42,7 @@ fn build_trace(unregistered_schema_event: bool) -> Vec<u8> {
         capture: EventCapture::Captured,
         payload: PayloadRef::None,
         args: None,
+        global_order: None,
     };
     let mut events = vec![ev(1, 1, 1, 1), ev(2, 2, 1, 2)];
     if unregistered_schema_event {
@@ -92,4 +93,140 @@ fn truncated_trace_fails_finalization() {
         report.finding("finalization").unwrap().status,
         CheckStatus::Fail
     );
+}
+
+// ---- F18: Blob の部分的な更新 ----
+
+/// finish せずに中身を取り出すための共有バッファ Writer。
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl shirusu_trace::writer::DurableWrite for SharedBuf {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl SharedBuf {
+    fn bytes(&self) -> Vec<u8> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// 基底 Blob＋更新 1 件＋更新版を参照するイベントの Trace。
+/// 正常に finish したもの（適合するはず）。
+fn build_trace_with_blob_update() -> Vec<u8> {
+    use shirusu_trace::blob::BlobId;
+    let mut w = TraceWriter::new(Vec::new(), env()).unwrap();
+    let base_id = w.add_payload(b"0123456789abcdef").unwrap();
+    let folded = b"01234XXXXXabcdef".to_vec();
+    let new_version = BlobId::of_content(&folded);
+    w.write_blob_update(base_id, new_version, 5, b"XXXXX")
+        .unwrap();
+    let ev = |kind, sequence| TraceEvent {
+        kind,
+        sequence,
+        timestamp_qpc: sequence * 10,
+        call_id: 1,
+        parent_call_id: 0,
+        api_id: 1,
+        schema_id: 0,
+        capture: EventCapture::Captured,
+        payload: PayloadRef::Blob(new_version),
+        args: None,
+        global_order: None,
+    };
+    w.write_batch(&EventBatch {
+        session_id: 3,
+        process_id: 1,
+        raw_pid: 10,
+        thread_id: 1,
+        qpc_frequency: 10_000_000,
+        events: vec![ev(1, 1), ev(2, 2)],
+    })
+    .unwrap();
+    w.finish(FinalizationInfo::default()).unwrap()
+}
+
+#[test]
+fn writer_built_trace_with_blob_update_conforms() {
+    // F18: 正常な更新を含む Trace は適合する。特に finalization-counts
+    // は、派生版を Reader が blobs へ具体化するため一致する。
+    let bytes = build_trace_with_blob_update();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.issues.is_empty(), "issues: {:?}", trace.issues);
+    let report = check_trace(&trace);
+    assert!(report.conformant(), "{}", report.render_human("t"));
+}
+
+#[test]
+fn failed_blob_update_fails_clean_scan() {
+    // F18: 畳み込み結果のハッシュが宣言と食い違う更新は、clean-scan
+    // で damaging として落ちる（内容を復元できないため）。
+    use shirusu_trace::blob::{BlobId, BlobUpdate};
+    use shirusu_trace::container::{serialize_header, BlockHeader, BlockType, Compression};
+    use shirusu_trace::reader::RecoveryIssue;
+    let buf = SharedBuf::default();
+    let mut w = TraceWriter::new(buf.clone(), env()).unwrap();
+    let base_id = w.add_payload(b"0123456789abcdef").unwrap();
+    w.write_batch(&EventBatch {
+        session_id: 3,
+        process_id: 1,
+        raw_pid: 10,
+        thread_id: 1,
+        qpc_frequency: 10_000_000,
+        events: vec![TraceEvent {
+            kind: 1,
+            sequence: 1,
+            timestamp_qpc: 10,
+            call_id: 1,
+            parent_call_id: 0,
+            api_id: 1,
+            schema_id: 0,
+            capture: EventCapture::Captured,
+            payload: PayloadRef::Blob(base_id),
+            args: None,
+            global_order: None,
+        }],
+    })
+    .unwrap();
+    let mut bytes = buf.bytes();
+    // 手組みの誤った更新（新版 ID が畳み込み結果と一致しない）
+    let update = BlobUpdate {
+        resource_id: base_id,
+        new_version_id: BlobId::of_content(b"not the folded content"),
+        offset: 5,
+        data: b"XXXXX".to_vec(),
+    };
+    let payload = update.encode();
+    let header = BlockHeader {
+        block_type: BlockType::BlobUpdate,
+        compression: Compression::None,
+        sequence: 999,
+        stored_len: payload.len() as u32,
+        raw_len: payload.len() as u32,
+    };
+    bytes.extend_from_slice(&serialize_header(&header, &payload));
+    bytes.extend_from_slice(&payload);
+    drop(w);
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(
+        trace
+            .issues
+            .iter()
+            .any(|i| matches!(i, RecoveryIssue::BlobUpdateHashMismatch { .. })),
+        "issues: {:?}",
+        trace.issues
+    );
+    let report = check_trace(&trace);
+    let f = report.finding("clean-scan").unwrap();
+    assert_eq!(f.status, CheckStatus::Fail);
+    assert!(f.detail.contains("blob update"), "detail: {}", f.detail);
 }

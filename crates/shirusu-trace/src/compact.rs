@@ -232,7 +232,16 @@ pub fn decode_compact(
 
 /// 1 イベント分のフィールド列を書く（seq / ts は呼び出し側が差分を渡す）。
 /// `encode_event_chunk` と、Writer のチャンク分割サイズ見積もりで共有する。
-pub fn encode_event_fields(out: &mut Vec<u8>, e: &TraceEvent, seq_delta: u64, ts_delta: i64) {
+/// `global_delta` は Batch の `has_global_order` が真の場合にだけ Some
+/// （先頭イベントは絶対値、2 件目以降は前件からの差分。同一 Batch 内では
+/// global_order が厳密に増加するため差分は 1 以上）。
+pub fn encode_event_fields(
+    out: &mut Vec<u8>,
+    e: &TraceEvent,
+    seq_delta: u64,
+    ts_delta: i64,
+    global_delta: Option<u64>,
+) {
     write_uleb(out, seq_delta);
     write_sleb(out, ts_delta);
     write_uleb(out, e.kind as u64);
@@ -269,6 +278,11 @@ pub fn encode_event_fields(out: &mut Vec<u8>, e: &TraceEvent, seq_delta: u64, ts
             out.extend_from_slice(bytes);
         }
     }
+    // L11: 全体順序は args の後に ULEB128 で 1 個だけ書く。BatchHeader の
+    // has_global_order が真の場合にのみ存在する（旧ファイルには無い）。
+    if let Some(delta) = global_delta {
+        write_uleb(out, delta);
+    }
 }
 
 /// Event Chunk の payload を作る：BatchHeader 長（LEB128）＋
@@ -276,7 +290,10 @@ pub fn encode_event_fields(out: &mut Vec<u8>, e: &TraceEvent, seq_delta: u64, ts
 /// sequence は Batch 内で単調非減少である前提（減少する入力では
 /// 差分が巨大な値になり、復号側が overflow として拒否する。
 /// 呼び出し側は Writer 経由で使うこと。Writer が事前に検証する）。
+/// global_order は Batch 内で全件 Some なら Header に旗を立てて差分で
+/// 書く（先頭は絶対値）。混在は Writer が拒否するためここでは来ない。
 pub fn encode_event_chunk(batch: &EventBatch) -> Vec<u8> {
+    let has_global_order = batch.events.iter().any(|e| e.global_order.is_some());
     let header = BatchHeader {
         session_id: batch.session_id,
         process_id: batch.process_id,
@@ -286,6 +303,7 @@ pub fn encode_event_chunk(batch: &EventBatch) -> Vec<u8> {
         qpc_frequency: batch.qpc_frequency,
         first_sequence: batch.first_sequence(),
         event_count: batch.events.len() as u32,
+        has_global_order,
     };
     let header_bytes = header.encode();
     let mut out = Vec::new();
@@ -293,12 +311,24 @@ pub fn encode_event_chunk(batch: &EventBatch) -> Vec<u8> {
     out.extend_from_slice(&header_bytes);
     let mut prev_seq = batch.first_sequence();
     let mut prev_ts = batch.base_timestamp_qpc();
+    let mut prev_global: Option<u64> = None;
     for e in &batch.events {
         let seq_delta = e.sequence.wrapping_sub(prev_seq);
         prev_seq = e.sequence;
         let ts_delta = e.timestamp_qpc.wrapping_sub(prev_ts) as i64;
         prev_ts = e.timestamp_qpc;
-        encode_event_fields(&mut out, e, seq_delta, ts_delta);
+        let global_delta = if has_global_order {
+            let g = e.global_order.unwrap_or(0);
+            let d = match prev_global {
+                None => g,
+                Some(p) => g.wrapping_sub(p),
+            };
+            prev_global = Some(g);
+            Some(d)
+        } else {
+            None
+        };
+        encode_event_fields(&mut out, e, seq_delta, ts_delta, global_delta);
     }
     out
 }
@@ -323,6 +353,7 @@ pub fn decode_event_chunk(payload: &[u8]) -> Result<EventBatch, crate::error::Tr
     let mut events = Vec::with_capacity((header.event_count as usize).min(1 << 20));
     let mut prev_seq = header.first_sequence;
     let mut prev_ts = header.base_timestamp_qpc;
+    let mut prev_global: Option<u64> = None;
     for _ in 0..header.event_count {
         let seq_delta = cur.read_uleb().map_err(|_| corrupt("event truncated"))?;
         let sequence = prev_seq
@@ -377,6 +408,32 @@ pub fn decode_event_chunk(payload: &[u8]) -> Result<EventBatch, crate::error::Tr
             ),
             t => return Err(corrupt(&format!("unknown args tag {t}"))),
         };
+        // L11: has_global_order の場合のみ、args の後に全体順序の差分が
+        // 1 個ある。先頭は絶対値（0 は未割当のはずなので破損）、2 件目
+        // 以降は前件からの差分（同一 Batch 内で厳密に増加するため 1 以上。
+        // 0 は破損）。旗が無ければ None（旧ファイルとの互換）。
+        let global_order = if header.has_global_order {
+            let delta = cur.read_uleb().map_err(|_| corrupt("event truncated"))?;
+            let g = match prev_global {
+                None => {
+                    if delta == 0 {
+                        return Err(corrupt("global order 0 in first event"));
+                    }
+                    delta
+                }
+                Some(p) => {
+                    if delta == 0 {
+                        return Err(corrupt("global order not increasing"));
+                    }
+                    p.checked_add(delta)
+                        .ok_or_else(|| corrupt("global order overflow"))?
+                }
+            };
+            prev_global = Some(g);
+            Some(g)
+        } else {
+            None
+        };
         events.push(TraceEvent {
             kind,
             sequence,
@@ -388,6 +445,7 @@ pub fn decode_event_chunk(payload: &[u8]) -> Result<EventBatch, crate::error::Tr
             capture,
             payload,
             args,
+            global_order,
         });
     }
     if !cur.is_done() {

@@ -120,7 +120,7 @@ fn emitted_trace_roundtrips_and_honors_contract() {
     let bytes = record_session(0x100, b"DATA");
     let trace = shirusu_trace::read_trace(&bytes).unwrap();
     assert!(trace.issues.is_empty(), "issues: {:?}", trace.issues);
-    assert_eq!(trace.registry.len(), 8, "file_io set registers 8 schemas");
+    assert_eq!(trace.registry.len(), 12, "file_io set registers 12 schemas");
     assert_eq!(trace.total_events(), 8);
     let fin = trace.finalization.as_ref().expect("finalization present");
     assert_eq!(fin.total_events, 8);

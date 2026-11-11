@@ -1,0 +1,7 @@
+repaired: sample.trace -> repaired.trace
+events: 4 recovered, 0 lost (scanned 4)
+batches: 1 written, 0 skipped
+blobs: 0 carried over
+schemas: 4 registered
+loss_records: 0 preserved
+recovery_issues: 0

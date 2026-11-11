@@ -89,6 +89,7 @@ impl B {
             capture: EventCapture::Captured,
             payload: PayloadRef::None,
             args: Some(encode_values(types, &values).unwrap()),
+            global_order: None,
         });
     }
     /// CreateFileW の呼び出し。err は last_error (失敗時 5 など)。

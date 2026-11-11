@@ -98,19 +98,19 @@ pair_case!(
     })
 );
 
-// ---------- decode_descriptor: Kind x 長さ x reserved と検査順序 ----------
+// ---------- decode_descriptor: Kind x 長さ x global_order と検査順序 ----------
 #[test]
 fn dd_len_at_capacity_accepted() {
-    assert!(decode_descriptor(&desc(1, 0, 256).to_bytes(), &known()).is_ok());
+    assert!(decode_descriptor(&desc(1, 0, 256).to_bytes(), &known(), false).is_ok());
 }
 #[test]
 fn dd_len_below_capacity_accepted() {
-    assert!(decode_descriptor(&desc(1, 0, 255).to_bytes(), &known()).is_ok());
+    assert!(decode_descriptor(&desc(1, 0, 255).to_bytes(), &known(), false).is_ok());
 }
 #[test]
 fn dd_len_above_capacity_by_one() {
     assert_eq!(
-        decode_descriptor(&desc(1, 0, 257).to_bytes(), &known()),
+        decode_descriptor(&desc(1, 0, 257).to_bytes(), &known(), false),
         Err(IntegrityError::PayloadTooLarge {
             len: 257,
             capacity: 256
@@ -120,7 +120,7 @@ fn dd_len_above_capacity_by_one() {
 #[test]
 fn dd_len_u32_max() {
     assert_eq!(
-        decode_descriptor(&desc(1, 0, u32::MAX).to_bytes(), &known()),
+        decode_descriptor(&desc(1, 0, u32::MAX).to_bytes(), &known(), false),
         Err(IntegrityError::PayloadTooLarge {
             len: u32::MAX as u64,
             capacity: 256
@@ -134,31 +134,45 @@ fn dd_dropped_len_above_capacity_accepted() {
     // (修正前は dd_len_above_capacity_by_one と同じく誤拒否していた)。
     let mut d = desc(1, 0, 257);
     d.flags = flags::PAYLOAD_DROPPED;
-    assert!(decode_descriptor(&d.to_bytes(), &known()).is_ok());
+    assert!(decode_descriptor(&d.to_bytes(), &known(), false).is_ok());
 }
 #[test]
 fn dd_dropped_len_u32_max_accepted() {
     // 元の長さの受理上限は u32 の表現最大値 (MAX_DROPPED_ORIGINAL_LEN)。
     let mut d = desc(1, 0, u32::MAX);
     d.flags = flags::PAYLOAD_DROPPED | flags::DROPPED_BY_BACKPRESSURE;
-    assert!(decode_descriptor(&d.to_bytes(), &known()).is_ok());
+    assert!(decode_descriptor(&d.to_bytes(), &known(), false).is_ok());
 }
 #[test]
 fn dd_kind_unknown_zero_rejected_even_with_zero_len() {
     let mut d = desc(1, 0, 0);
     d.kind = 0;
     assert_eq!(
-        decode_descriptor(&d.to_bytes(), &known()),
+        decode_descriptor(&d.to_bytes(), &known(), false),
         Err(IntegrityError::UnknownKind(0))
     );
 }
 #[test]
-fn dd_kind_7_rejected() {
+fn dd_kind_7_aborted_accepted() {
+    // L08: kind 7 は CallAborted として有効。
     let mut d = desc(1, 0, 0);
     d.kind = 7;
+    assert!(decode_descriptor(&d.to_bytes(), &known(), false).is_ok());
+}
+#[test]
+fn dd_kind_8_completed_accepted() {
+    // F27: kind 8 は CallCompleted として有効。
+    let mut d = desc(1, 0, 0);
+    d.kind = 8;
+    assert!(decode_descriptor(&d.to_bytes(), &known(), false).is_ok());
+}
+#[test]
+fn dd_kind_9_rejected() {
+    let mut d = desc(1, 0, 0);
+    d.kind = 9;
     assert_eq!(
-        decode_descriptor(&d.to_bytes(), &known()),
-        Err(IntegrityError::UnknownKind(7))
+        decode_descriptor(&d.to_bytes(), &known(), false),
+        Err(IntegrityError::UnknownKind(9))
     );
 }
 #[test]
@@ -167,43 +181,55 @@ fn dd_kind_checked_before_length() {
     let mut d = desc(1, 0, u32::MAX);
     d.kind = 999;
     assert_eq!(
-        decode_descriptor(&d.to_bytes(), &known()),
+        decode_descriptor(&d.to_bytes(), &known(), false),
         Err(IntegrityError::UnknownKind(999))
     );
 }
 #[test]
-fn dd_reserved_one_rejected() {
-    let mut d = desc(1, 0, 0);
-    d.reserved = 1;
-    assert_eq!(
-        decode_descriptor(&d.to_bytes(), &known()),
-        Err(IntegrityError::ReservedNonZero)
-    );
+fn dd_global_order_rejected_when_disabled() {
+    // L11: --order=global 無効なセッションでは global_order 非 0 は弾く
+    // (旧 reserved 0 検証の維持)。
+    for g in [1u64, u64::MAX] {
+        let mut d = desc(1, 0, 0);
+        d.global_order = g;
+        assert_eq!(
+            decode_descriptor(&d.to_bytes(), &known(), false),
+            Err(IntegrityError::GlobalOrderNotAllowed)
+        );
+    }
 }
 #[test]
-fn dd_reserved_max_rejected() {
-    let mut d = desc(1, 0, 0);
-    d.reserved = u64::MAX;
-    assert_eq!(
-        decode_descriptor(&d.to_bytes(), &known()),
-        Err(IntegrityError::ReservedNonZero)
-    );
+fn dd_global_order_accepted_when_enabled() {
+    // L11: --order=global 有効なセッションでは任意の global_order を受理する。
+    for g in [1u64, u64::MAX] {
+        let mut d = desc(1, 0, 0);
+        d.global_order = g;
+        assert!(decode_descriptor(&d.to_bytes(), &known(), true).is_ok());
+    }
 }
 #[test]
-fn dd_reserved_checked_before_length() {
-    // reserved 非ゼロで長さも過大なら reserved が先
+fn dd_global_order_checked_before_length() {
+    // global_order 非 0 で長さも過大なら、無効なセッションでは global_order が先
     let mut d = desc(1, 0, u32::MAX);
-    d.reserved = 5;
+    d.global_order = 5;
     assert_eq!(
-        decode_descriptor(&d.to_bytes(), &known()),
-        Err(IntegrityError::ReservedNonZero)
+        decode_descriptor(&d.to_bytes(), &known(), false),
+        Err(IntegrityError::GlobalOrderNotAllowed)
+    );
+    // 有効なセッションでは長さの検査まで進む
+    assert_eq!(
+        decode_descriptor(&d.to_bytes(), &known(), true),
+        Err(IntegrityError::PayloadTooLarge {
+            len: u32::MAX as u64,
+            capacity: 256
+        })
     );
 }
 #[test]
 fn dd_short_bytes_rejected() {
     let d = desc(1, 0, 0);
     assert_eq!(
-        decode_descriptor(&d.to_bytes()[..63], &known()),
+        decode_descriptor(&d.to_bytes()[..63], &known(), false),
         Err(IntegrityError::ImageTooSmall)
     );
 }
@@ -211,7 +237,7 @@ fn dd_short_bytes_rejected() {
 fn dd_trailing_garbage_ignored() {
     let mut bytes = desc(3, 9, 4).to_bytes().to_vec();
     bytes.extend_from_slice(&[0xEE; 36]);
-    let got = decode_descriptor(&bytes, &known()).unwrap();
+    let got = decode_descriptor(&bytes, &known(), false).unwrap();
     assert_eq!(got.sequence, 3);
     assert_eq!(got.payload_position, 9);
 }
@@ -221,7 +247,7 @@ fn dd_all_valid_kinds_accepted() {
         let mut d = desc(1, 0, 0);
         d.kind = k;
         assert!(
-            decode_descriptor(&d.to_bytes(), &known()).is_ok(),
+            decode_descriptor(&d.to_bytes(), &known(), false).is_ok(),
             "kind {k}"
         );
     }
@@ -565,7 +591,7 @@ macro_rules! checked_case {
         #[test]
         fn $name() {
             assert_eq!(
-                decode_descriptor_checked(&$d.to_bytes(), &known(), &$e),
+                decode_descriptor_checked(&$d.to_bytes(), &known(), &$e, false),
                 $expect
             );
         }
@@ -704,12 +730,12 @@ fn chk_dropped_payload_uses_zero_stored_len() {
     let mut d = desc(5, 10, 9);
     d.flags = flags::PAYLOAD_DROPPED;
     assert_eq!(
-        decode_descriptor_checked(&d.to_bytes(), &known(), &exp(5, Some(10), 10)),
+        decode_descriptor_checked(&d.to_bytes(), &known(), &exp(5, Some(10), 10), false),
         Ok(d)
     );
     // アンカーがずれていれば格納長 0 でも連続性で弾く
     assert_eq!(
-        decode_descriptor_checked(&d.to_bytes(), &known(), &exp(5, Some(11), 11)),
+        decode_descriptor_checked(&d.to_bytes(), &known(), &exp(5, Some(11), 11), false),
         Err(IntegrityError::PayloadPositionNotContiguous {
             expected: 11,
             found: 10
@@ -722,7 +748,7 @@ fn chk_base_decode_error_surfaces_first() {
     let mut d = desc(5, 10, 4);
     d.kind = 42;
     assert_eq!(
-        decode_descriptor_checked(&d.to_bytes(), &known(), &exp(5, Some(10), 14)),
+        decode_descriptor_checked(&d.to_bytes(), &known(), &exp(5, Some(10), 14), false),
         Err(IntegrityError::UnknownKind(42))
     );
 }

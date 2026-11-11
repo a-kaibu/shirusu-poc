@@ -26,7 +26,9 @@ kind_case!(kind_3_fragment, 3, Some(EventKind::SnapshotFragment));
 kind_case!(kind_4_complete, 4, Some(EventKind::SnapshotComplete));
 kind_case!(kind_5_loss, 5, Some(EventKind::Loss));
 kind_case!(kind_6_expand, 6, Some(EventKind::SlotExpandRequest));
-kind_case!(kind_7_rejected, 7, None);
+kind_case!(kind_7_aborted, 7, Some(EventKind::CallAborted));
+kind_case!(kind_8_completed, 8, Some(EventKind::CallCompleted));
+kind_case!(kind_9_rejected, 9, None);
 kind_case!(kind_100_rejected, 100, None);
 kind_case!(kind_1000_rejected, 1000, None);
 kind_case!(kind_u16max_rejected, u16::MAX, None);
@@ -115,8 +117,8 @@ field_case!(
 );
 field_case!(
     field_reserved_max,
-    |d: &mut EventDescriptor| d.reserved = u64::MAX,
-    |d: &EventDescriptor| assert_eq!(d.reserved, u64::MAX)
+    |d: &mut EventDescriptor| d.global_order = u64::MAX,
+    |d: &EventDescriptor| assert_eq!(d.global_order, u64::MAX)
 );
 // 全フィールド同時最大でも往復する
 field_case!(
@@ -132,7 +134,7 @@ field_case!(
         d.payload_position = u64::MAX;
         d.api_id = u32::MAX;
         d.schema_id = u32::MAX;
-        d.reserved = u64::MAX;
+        d.global_order = u64::MAX;
     },
     |d: &EventDescriptor| assert_eq!(d.payload_position, u64::MAX)
 );
@@ -151,7 +153,7 @@ fn byte_layout_matches_spec_offsets() {
     d.payload_position = 0x302F2E2D2C2B2A29;
     d.api_id = 0x34333231;
     d.schema_id = 0x38373635;
-    d.reserved = 0x403F3E3D3C3B3A39;
+    d.global_order = 0x403F3E3D3C3B3A39;
     let b = d.to_bytes();
     let g16 = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap());
     let g32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
@@ -166,7 +168,7 @@ fn byte_layout_matches_spec_offsets() {
     assert_eq!(g64(40), d.payload_position);
     assert_eq!(g32(48), d.api_id);
     assert_eq!(g32(52), d.schema_id);
-    assert_eq!(g64(56), d.reserved);
+    assert_eq!(g64(56), d.global_order);
     assert_eq!(b.len(), EventDescriptor::SIZE);
 }
 

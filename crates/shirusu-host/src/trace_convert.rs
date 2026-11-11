@@ -18,15 +18,18 @@
 //! TraceEvent.args へ写す。
 
 use crate::{IntegrityLevel, IntegrityReport, LossEvent};
+use shirusu_hook::api as hook_api;
 use shirusu_trace::compact::decode_values;
 use shirusu_trace::error::Result as TraceResult;
 use shirusu_trace::model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};
-use shirusu_trace::proto::{loss_kind, CaptureEnvironment, LossRecord, SchemaDef};
+use shirusu_trace::proto::{
+    loss_kind, ApiProfile, CaptureEnvironment, LossRecord, ProfileSummary, SchemaDef,
+};
 use shirusu_trace::schema::EventCapture;
-use shirusu_trace::writer::{FinalizationInfo, TraceWriter};
-use shirusu_transport::descriptor::CaptureState;
+use shirusu_trace::writer::{DurableWrite, FinalizationInfo, TraceWriter, WriterOptions};
+use shirusu_transport::descriptor::{CaptureState, EventKind};
 use shirusu_transport::ring::ReceivedEvent;
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Batch 変換の文脈。転送 Descriptor が持たない Session / Process /
 /// Thread の情報は Host がここで補う。
@@ -128,22 +131,183 @@ pub struct ArgsConversionStats {
     pub args_fallback_blob: usize,
 }
 
+/// 記録モード（L09、overview「記録モードと性能目標」節）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RecordMode {
+    /// 標準。対象境界の呼び出しを意図的に間引かず全て保存する。
+    /// 欠落が起きたら Trace は `incomplete` として扱う（H03 の
+    /// Finalization の三指標と連動。間引きはしないが、負荷による
+    /// 欠落を防ぐ保証までは無い）。
+    #[default]
+    Full,
+    /// 個別イベントは保存せず、API ごとに呼び出し回数・分布・所要
+    /// 時間を集計して ProfileSummary Block として書く。
+    Profile,
+    /// 指定した API 群のイベントだけを保存する。Loss Record と
+    /// Schema は API によらず残る。Agent 側での間引きはしない
+    ///（Host 側で落とす。Agent 側の間引きは将来の最適化）。
+    Filtered { apis: BTreeSet<u32> },
+}
+
+impl RecordMode {
+    /// `CaptureEnvironment.capture_config` に載せる表示（L22 の来歴
+    /// 記録と同じ欄）。`api_names` は CLI で指定された通りの名前列
+    ///（`filtered` のときだけ使う）。
+    pub fn config_text(&self, api_names: &[String]) -> String {
+        match self {
+            RecordMode::Full => "mode=full".to_string(),
+            RecordMode::Profile => "mode=profile".to_string(),
+            RecordMode::Filtered { .. } => {
+                format!("mode=filtered apis={}", api_names.join(","))
+            }
+        }
+    }
+}
+
+/// CLI の `--api` で指定された API 名を api_id の集合へ解決する
+/// （L09）。素の関数名（`CreateFileW`）と `module!関数` 形式の両方を
+/// 受け付ける。未知の名前が 1 つでもあれば、その名前を入れてエラーに
+/// する（呼び出し側が使い方エラーとして表示する）。
+pub fn resolve_api_names(names: &[String]) -> Result<BTreeSet<u32>, String> {
+    let mut ids = BTreeSet::new();
+    for name in names {
+        match hook_api::api_by_name(name) {
+            Some(api) => {
+                ids.insert(api.api_id);
+            }
+            None => return Err(format!("unknown API: {name}")),
+        }
+    }
+    Ok(ids)
+}
+
+/// `profile` モードの集計器（L09）。enter / leave の対応付けは
+/// (thread, call_id) で行う（DrainWorker の `track_call` と同じ鍵）。
+/// 対応の無い enter / leave は calls に数えず enters / leaves だけに
+/// 数える。CallEnter / CallLeave 以外の種別は集計の対象外だが
+/// `total_events_seen` には数える。
+#[derive(Debug, Clone, Default)]
+struct ProfileAggregator {
+    total_seen: u64,
+    pending: HashMap<(u64, u64), (u32, u64)>,
+    apis: BTreeMap<u32, ApiProfile>,
+}
+
+impl ProfileAggregator {
+    fn observe(&mut self, thread_id: u64, event: &ReceivedEvent) {
+        self.total_seen += 1;
+        let d = &event.descriptor;
+        match d.kind_enum() {
+            Some(EventKind::CallEnter) => {
+                let row = self.apis.entry(d.api_id).or_default();
+                row.api_id = d.api_id;
+                row.enters += 1;
+                self.pending
+                    .insert((thread_id, d.call_id), (d.api_id, d.timestamp_qpc));
+            }
+            Some(EventKind::CallLeave) => {
+                let row = self.apis.entry(d.api_id).or_default();
+                row.api_id = d.api_id;
+                row.leaves += 1;
+                if let Some((enter_api, enter_ts)) = self.pending.remove(&(thread_id, d.call_id)) {
+                    let duration = d.timestamp_qpc.saturating_sub(enter_ts);
+                    let row = self.apis.entry(enter_api).or_default();
+                    row.api_id = enter_api;
+                    row.calls += 1;
+                    row.total_duration_qpc += duration;
+                    if row.calls == 1 {
+                        row.min_duration_qpc = duration;
+                        row.max_duration_qpc = duration;
+                    } else {
+                        row.min_duration_qpc = row.min_duration_qpc.min(duration);
+                        row.max_duration_qpc = row.max_duration_qpc.max(duration);
+                    }
+                }
+            }
+            // L08: 中断した呼び出しは所要時間なしで終わる。対応付け待ち
+            // から外すだけにし、calls には数えない（leaves にも数えない）。
+            Some(EventKind::CallAborted) => {
+                self.pending.remove(&(thread_id, d.call_id));
+            }
+            // F27: 完了した非同期 I/O。leave が既に対応付けを済ませて
+            // いるため、集計には何もしない（所要時間は leave 時点で
+            // 計測済み。完了イベントの値列は集計対象外）。
+            Some(EventKind::CallCompleted) => {}
+            _ => {}
+        }
+    }
+
+    fn finish(self, qpc_frequency: u64) -> ProfileSummary {
+        ProfileSummary {
+            qpc_frequency,
+            total_events_seen: self.total_seen,
+            apis: self.apis.into_values().collect(),
+        }
+    }
+}
+
 /// TraceWriter を所有し、回収イベントをそのまま記録できる形にした
 /// レコーダ。Payload の Blob 化と重複排除は Writer が担い、ここでは
 /// 「落とした Payload は Blob 化しない」ことだけを守る。
-pub struct TraceRecorder<W: Write> {
+pub struct TraceRecorder<W: DurableWrite> {
     writer: TraceWriter<W>,
+    /// 記録モード（L09）。既定は `Full`。
+    mode: RecordMode,
+    /// `Profile` モードの集計状態。
+    profile: ProfileAggregator,
+    /// 集計の所要時間換算に使う QPC 周波数（Environment 由来）。
+    qpc_frequency: u64,
 }
 
-impl<W: Write> TraceRecorder<W> {
+impl<W: DurableWrite> TraceRecorder<W> {
     pub fn new(writer: TraceWriter<W>) -> Self {
-        Self { writer }
+        Self {
+            qpc_frequency: writer.qpc_frequency(),
+            writer,
+            mode: RecordMode::Full,
+            profile: ProfileAggregator::default(),
+        }
     }
 
     pub fn from_environment(inner: W, environment: CaptureEnvironment) -> TraceResult<Self> {
         Ok(Self {
+            qpc_frequency: environment.session.qpc_frequency,
             writer: TraceWriter::new(inner, environment)?,
+            mode: RecordMode::Full,
+            profile: ProfileAggregator::default(),
         })
+    }
+
+    /// 永続化設定を指定して作る（F21）。`CaptureSession::create_file`
+    /// 経由で `CaptureSessionConfig::durability` がここへ渡る。
+    pub fn from_environment_with_options(
+        inner: W,
+        environment: CaptureEnvironment,
+        options: WriterOptions,
+    ) -> TraceResult<Self> {
+        Ok(Self {
+            qpc_frequency: environment.session.qpc_frequency,
+            writer: TraceWriter::with_options(inner, environment, options)?,
+            mode: RecordMode::Full,
+            profile: ProfileAggregator::default(),
+        })
+    }
+
+    /// 記録モードを指定する（L09）。`CaptureSession::create_file` が
+    /// `CaptureSessionConfig::record_mode` から渡す。既定は `Full`。
+    pub fn set_record_mode(&mut self, mode: RecordMode) {
+        self.mode = mode;
+    }
+
+    /// `Profile` モードの現時点までの集計（`finish` 前でも読める）。
+    /// `Profile` 以外のモードでは None。`CaptureSession::stop` が
+    /// 要約へ載せるために使う。
+    pub fn profile_summary(&self) -> Option<ProfileSummary> {
+        if matches!(self.mode, RecordMode::Profile) {
+            Some(self.profile.clone().finish(self.qpc_frequency))
+        } else {
+            None
+        }
     }
 
     pub fn register_schema(&mut self, def: SchemaDef) -> TraceResult<()> {
@@ -187,8 +351,30 @@ impl<W: Write> TraceRecorder<W> {
         if events.is_empty() {
             return Ok(stats);
         }
-        let mut converted = Vec::with_capacity(events.len());
-        for event in events {
+        // L09: 記録モードで振り分ける。
+        // - `Profile`: 個別イベントは保存せず、集計だけを進める。
+        // - `Filtered`: 指定 API 以外のイベントをここで落とす（Blob 化
+        //   の前に落とすため、不要な Blob は書かれない）。落とした後
+        //   空になれば書かない（`write_batch` は空を拒否する）。
+        // - `Full`: 全て保存する。
+        let kept: Vec<&ReceivedEvent> = match &self.mode {
+            RecordMode::Profile => {
+                for event in events {
+                    self.profile.observe(ctx.thread_id, event);
+                }
+                return Ok(stats);
+            }
+            RecordMode::Filtered { apis } => events
+                .iter()
+                .filter(|e| apis.contains(&e.descriptor.api_id))
+                .collect(),
+            RecordMode::Full => events.iter().collect(),
+        };
+        if kept.is_empty() {
+            return Ok(stats);
+        }
+        let mut converted = Vec::with_capacity(kept.len());
+        for event in kept {
             let d = &event.descriptor;
             let mut args = None;
             let payload = if d.payload_dropped() {
@@ -229,6 +415,12 @@ impl<W: Write> TraceRecorder<W> {
                 capture: convert_capture(event.capture_state()),
                 payload,
                 args,
+                // L11: 0 は未割当として None にする（--order=global 無効時）。
+                global_order: if d.global_order == 0 {
+                    None
+                } else {
+                    Some(d.global_order)
+                },
             });
         }
         let batch = EventBatch {
@@ -258,7 +450,69 @@ impl<W: Write> TraceRecorder<W> {
     }
 
     /// IntegrityReport を Finalization へ写して Trace を閉じる。
-    pub fn finish(self, report: &IntegrityReport) -> TraceResult<W> {
+    /// `Profile` モードでは、先に集計を ProfileSummary Block として
+    /// 書く（L09。Index の前に置くため、集計も Index に載る）。
+    pub fn finish(mut self, report: &IntegrityReport) -> TraceResult<W> {
+        if matches!(self.mode, RecordMode::Profile) {
+            let summary = self.profile.finish(self.qpc_frequency);
+            self.writer.write_profile_summary(&summary)?;
+        }
         self.writer.finish(finalization_info(report))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shirusu_transport::descriptor::EventDescriptor;
+
+    fn received(kind: EventKind, call_id: u64, timestamp_qpc: u64) -> ReceivedEvent {
+        let mut d = EventDescriptor::new(kind, call_id);
+        d.call_id = call_id;
+        d.api_id = 3;
+        d.timestamp_qpc = timestamp_qpc;
+        ReceivedEvent {
+            descriptor: d,
+            payload: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn profile_aggregator_completed_does_not_change_counts() {
+        // F27: CallCompleted は leave が対応付け済みのため集計を変えない。
+        // total_events_seen にだけ数える。
+        let mut agg = ProfileAggregator::default();
+        agg.observe(5, &received(EventKind::CallEnter, 1, 100));
+        agg.observe(5, &received(EventKind::CallLeave, 1, 160));
+        agg.observe(5, &received(EventKind::CallCompleted, 1, 200));
+        let summary = agg.finish(10_000_000);
+        assert_eq!(summary.total_events_seen, 3);
+        assert_eq!(summary.apis.len(), 1);
+        let row = &summary.apis[0];
+        assert_eq!(row.enters, 1);
+        assert_eq!(row.leaves, 1);
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.total_duration_qpc, 60);
+    }
+
+    #[test]
+    fn profile_aggregator_aborted_clears_pending_without_a_call() {
+        // L08: 中断した呼び出しは所要時間なしで終わる。対応付け待ちから
+        // 外れ、calls には数えない（enter は enters に数えたまま）。
+        let mut agg = ProfileAggregator::default();
+        agg.observe(5, &received(EventKind::CallEnter, 1, 100));
+        agg.observe(5, &received(EventKind::CallAborted, 1, 150));
+        assert!(agg.pending.is_empty(), "aborted clears the pending enter");
+        // 同じ call_id の再利用が古い enter と対応付かないこと。
+        agg.observe(5, &received(EventKind::CallEnter, 1, 200));
+        agg.observe(5, &received(EventKind::CallLeave, 1, 260));
+        let summary = agg.finish(10_000_000);
+        assert_eq!(summary.total_events_seen, 4);
+        assert_eq!(summary.apis.len(), 1);
+        let row = &summary.apis[0];
+        assert_eq!(row.enters, 2);
+        assert_eq!(row.leaves, 1);
+        assert_eq!(row.calls, 1, "only the completed call counts");
+        assert_eq!(row.total_duration_qpc, 60);
     }
 }

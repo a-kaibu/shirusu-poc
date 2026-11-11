@@ -167,7 +167,9 @@ mod win {
         let pool = Arc::new(SlotPool::new(0));
         let agent = Arc::new(
             Agent::new(pool, config, host_monitor)
-                .with_timestamp_source(Arc::new(QpcTimestampSource::new())),
+                .with_timestamp_source(Arc::new(QpcTimestampSource::new()))
+                // L11: Host が Bootstrap v4 で指定した --order=global を Agent へ渡す。
+                .with_order_global(b.order_global != 0),
         );
         for i in 0..b.ring_count as usize {
             let delivery = ExpansionDelivery {

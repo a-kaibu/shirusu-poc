@@ -6,6 +6,7 @@
 //! 未知フィールドは読み飛ばすため、他言語の Protobuf 実装でも読める。
 
 use crate::error::ProtoError;
+use crate::module::ModuleClassification;
 
 // ---------------------------------------------------------------------------
 // ワイヤ形式の基礎
@@ -211,6 +212,9 @@ pub struct CaptureEnvironment {
     pub capture_config: String,
     pub feature_flags: u64,
     pub target_description: String,
+    /// モジュール分類（L07）。空のときは field 9 を書かないので旧ファイル
+    /// と同じバイト列になる。
+    pub modules: Vec<ModuleClassification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -245,6 +249,9 @@ pub struct BatchHeader {
     pub qpc_frequency: u64,
     pub first_sequence: u64,
     pub event_count: u32,
+    /// この Batch の全イベントが `global_order` を持つ (L11)。
+    /// 旧ファイルでは欄が無く false として読む（後方互換）。
+    pub has_global_order: bool,
 }
 
 /// LossRecord.kind の値。
@@ -350,6 +357,9 @@ impl CaptureEnvironment {
         w.string_field(6, &self.capture_config);
         w.u64_field(7, self.feature_flags);
         w.string_field(8, &self.target_description);
+        for m in &self.modules {
+            w.message_field(9, &m.encode());
+        }
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -365,6 +375,9 @@ impl CaptureEnvironment {
                 (6, WIRE_LEN) => m.capture_config = r.value_string()?,
                 (7, WIRE_VARINT) => m.feature_flags = r.value_u64()?,
                 (8, WIRE_LEN) => m.target_description = r.value_string()?,
+                (9, WIRE_LEN) => m
+                    .modules
+                    .push(ModuleClassification::decode(r.value_bytes()?)?),
                 _ => r.skip(wire)?,
             }
         }
@@ -456,6 +469,10 @@ impl BatchHeader {
         w.u64_field(6, self.qpc_frequency);
         w.u64_field(7, self.first_sequence);
         w.u32_field(8, self.event_count);
+        // L11: false は既定値のため書かない（旧ファイルと同じバイト列になる）。
+        if self.has_global_order {
+            w.u64_field(9, 1);
+        }
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -471,6 +488,7 @@ impl BatchHeader {
                 (6, WIRE_VARINT) => m.qpc_frequency = r.value_u64()?,
                 (7, WIRE_VARINT) => m.first_sequence = r.value_u64()?,
                 (8, WIRE_VARINT) => m.event_count = r.value_u64()? as u32,
+                (9, WIRE_VARINT) => m.has_global_order = r.value_u64()? != 0,
                 _ => r.skip(wire)?,
             }
         }
@@ -606,5 +624,92 @@ impl Finalization {
             }
         }
         Ok((m, cleanly))
+    }
+}
+
+/// L09: 記録モード `profile` で API ごとに集計した 1 行。所要時間は
+/// QPC ティック（`ProfileSummary.qpc_frequency` で秒へ換算する）。
+/// `min_duration_qpc` / `max_duration_qpc` は `calls == 0` のとき 0
+///（proto3 の既定値省略と一致し、「呼び出し無し」を表す）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApiProfile {
+    pub api_id: u32,
+    /// 対応する enter / leave が揃った呼び出しの数。
+    pub calls: u64,
+    /// 観測した enter の数（対応する leave が無くても数える）。
+    pub enters: u64,
+    /// 観測した leave の数（対応する enter が無くても数える）。
+    pub leaves: u64,
+    /// 揃った呼び出しの所要時間の合計（QPC ティック）。
+    pub total_duration_qpc: u64,
+    pub min_duration_qpc: u64,
+    pub max_duration_qpc: u64,
+}
+
+impl ApiProfile {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.u32_field(1, self.api_id);
+        w.u64_field(2, self.calls);
+        w.u64_field(3, self.enters);
+        w.u64_field(4, self.leaves);
+        w.u64_field(5, self.total_duration_qpc);
+        w.u64_field(6, self.min_duration_qpc);
+        w.u64_field(7, self.max_duration_qpc);
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        let mut m = Self::default();
+        let mut r = ProtoReader::new(buf);
+        while let Some((f, wire)) = r.next_field()? {
+            match (f, wire) {
+                (1, WIRE_VARINT) => m.api_id = r.value_u64()? as u32,
+                (2, WIRE_VARINT) => m.calls = r.value_u64()?,
+                (3, WIRE_VARINT) => m.enters = r.value_u64()?,
+                (4, WIRE_VARINT) => m.leaves = r.value_u64()?,
+                (5, WIRE_VARINT) => m.total_duration_qpc = r.value_u64()?,
+                (6, WIRE_VARINT) => m.min_duration_qpc = r.value_u64()?,
+                (7, WIRE_VARINT) => m.max_duration_qpc = r.value_u64()?,
+                _ => r.skip(wire)?,
+            }
+        }
+        Ok(m)
+    }
+}
+
+/// L09: 記録モード `profile` の集計全体。`TraceRecorder::finish` が
+/// ProfileSummary Block（種別 11）として Index の前に 1 回だけ書く。
+/// `apis` は api_id の昇順。個別イベントは保存されないため、この
+/// Block が `profile` モードの記録そのものである。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProfileSummary {
+    pub qpc_frequency: u64,
+    /// `record_batch` に渡された全イベント数（種別を問わない）。
+    pub total_events_seen: u64,
+    pub apis: Vec<ApiProfile>,
+}
+
+impl ProfileSummary {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.u64_field(1, self.qpc_frequency);
+        w.u64_field(2, self.total_events_seen);
+        for api in &self.apis {
+            w.message_field(3, &api.encode());
+        }
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
+        let mut m = Self::default();
+        let mut r = ProtoReader::new(buf);
+        while let Some((f, wire)) = r.next_field()? {
+            match (f, wire) {
+                (1, WIRE_VARINT) => m.qpc_frequency = r.value_u64()?,
+                (2, WIRE_VARINT) => m.total_events_seen = r.value_u64()?,
+                (3, WIRE_LEN) => m.apis.push(ApiProfile::decode(r.read_len_bytes()?)?),
+                _ => r.skip(wire)?,
+            }
+        }
+        Ok(m)
     }
 }

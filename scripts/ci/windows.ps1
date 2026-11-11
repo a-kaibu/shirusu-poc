@@ -42,6 +42,17 @@ if ($appverif) {
     Write-Host "D54: appverif.exe not found; running capture-e2e without Application Verifier"
     Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e"
 }
+# L05: 子プロセス追跡の E2E（対象が子プロセスを起動し、子の Trace が
+# 別ファイルに記録されることを検証する）。
+Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --child-tree } "capture-e2e --child-tree"
+# L06: ABI 適合性テスト（浮動小数点引数・構造体の戻り値・コールバック・
+# 例外・LastError の Probe を Hook ありとなしで実行して結果を比べる）。
+Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --abi } "capture-e2e --abi"
 # A74: 64bit アトミック操作のコスト測定 (x64 側の対照値。判断は i686 側の実測で行う)
 Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (x64)"
 Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe } "atomic bench (x64)"
+# L10: 性能目標の測定 (GUI ワークロード 3 倍・高負荷 5 倍・API 追加遅延・
+# スループット・バッファ使用率)。測定器でありゲートではないため終了コードは
+# 常に 0。判定の読み取りはログで行う。CI 時間を抑えるため --rounds 1。
+Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (x64)"
+Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-perf-bench.exe --rounds 1 } "perf bench (x64)"

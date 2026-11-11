@@ -47,6 +47,7 @@ impl B {
             capture: EventCapture::Captured,
             payload,
             args: Some(encode_values(types, &values).unwrap()),
+            global_order: None,
         });
     }
     fn create(&mut self, handle: u64, path: &str) {

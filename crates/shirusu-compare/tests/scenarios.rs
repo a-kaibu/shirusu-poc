@@ -224,3 +224,128 @@ fn integrity_difference_is_reported() {
         report.candidates
     );
 }
+
+#[test]
+fn aborted_on_both_sides_is_identical() {
+    // L08: 両側とも中断した呼び出しは、同じ形として一致する。
+    let mut l = Builder::new(Env::default());
+    l.abort_create_file(1, 0, "C:\\game\\save.dat");
+    let left = l.finish(FinalizationInfo::default(), &[]);
+    let mut r = Builder::new(Env::default());
+    r.abort_create_file(1, 0, "C:\\game\\save.dat");
+    let right = r.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert!(report.is_identical(), "candidates: {:?}", report.candidates);
+}
+
+#[test]
+fn aborted_vs_normal_return_is_shape_difference() {
+    // L08: 片側だけ中断した呼び出しは、正常終了との形の相違になる。
+    // （オブジェクトに関与しない Ping なら、整列で対応づいて比較される）
+    let mut l = Builder::new(Env::default());
+    l.abort_ping(1, 7);
+    let left = l.finish(FinalizationInfo::default(), &[]);
+    let mut r = Builder::new(Env::default());
+    r.ping(1, 7, 7);
+    let right = r.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert_eq!(report.candidates.len(), 1, "{:?}", report.candidates);
+    assert_eq!(
+        report.candidates[0].kind,
+        CandidateKind::CallShapeDifference
+    );
+}
+
+#[test]
+fn async_completed_read_equals_sync_read() {
+    // F27: 非同期 ReadFile が完了で実値を運べば、同期 ReadFile と同じ
+    // 振る舞いとして一致する（leave の Unsupported 値列ではなく、完了
+    // イベントの値列を実効 leave として比べる）。
+    let mut l = Builder::new(Env::default());
+    l.create_file(1, 0, "C:\\\\game\\\\save.dat");
+    l.read_file_async(2, 0, 4, 4, &[0xde, 0xad, 0xbe, 0xef]);
+    l.close_handle(3, 0);
+    let left = l.finish(FinalizationInfo::default(), &[]);
+    let mut r = Builder::new(Env::default());
+    r.create_file(1, 0, "C:\\\\game\\\\save.dat");
+    r.read_file(2, 0, 4, 4, &[0xde, 0xad, 0xbe, 0xef], true, 0);
+    r.close_handle(3, 0);
+    let right = r.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert!(report.is_identical(), "candidates: {:?}", report.candidates);
+}
+
+#[test]
+fn async_completed_read_data_difference_is_detected() {
+    // F27: 完了で運ばれたデータが違えば、同期側との差分になる。
+    let mut l = Builder::new(Env::default());
+    l.create_file(1, 0, "C:\\\\game\\\\save.dat");
+    l.read_file_async(2, 0, 4, 4, &[0xde, 0xad, 0xbe, 0xef]);
+    l.close_handle(3, 0);
+    let left = l.finish(FinalizationInfo::default(), &[]);
+    let mut r = Builder::new(Env::default());
+    r.create_file(1, 0, "C:\\\\game\\\\save.dat");
+    r.read_file(2, 0, 4, 4, &[0x11, 0x22, 0x33, 0x44], true, 0);
+    r.close_handle(3, 0);
+    let right = r.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|c| c.field.as_deref() == Some("data")),
+        "candidates: {:?}",
+        report.candidates
+    );
+}
+
+#[test]
+fn async_read_without_completion_differs_from_sync() {
+    // F27: 完了が観測されなかった非同期 ReadFile は、leave の
+    // Unsupported 値列のままなので同期 ReadFile と差分になる。
+    let mut l = Builder::new(Env::default());
+    l.create_file(1, 0, "C:\\\\game\\\\save.dat");
+    l.read_file_async(2, 0, 4, 4, &[0xde, 0xad, 0xbe, 0xef]);
+    l.events.pop(); // 完了イベントを取り除く
+    l.close_handle(3, 0);
+    let left = l.finish(FinalizationInfo::default(), &[]);
+    let mut r = Builder::new(Env::default());
+    r.create_file(1, 0, "C:\\\\game\\\\save.dat");
+    r.read_file(2, 0, 4, 4, &[0xde, 0xad, 0xbe, 0xef], true, 0);
+    r.close_handle(3, 0);
+    let right = r.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert!(
+        !report.is_identical(),
+        "must differ: {:?}",
+        report.candidates
+    );
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|c| c.field.as_deref() == Some("data")),
+        "candidates: {:?}",
+        report.candidates
+    );
+}
+
+#[test]
+fn aborted_creator_call_reports_missing_object() {
+    // L08: オブジェクトを生成するはずの呼び出しが中断すると、生成物が
+    // 無いことが差分になる（生成する側と対にできず、呼び出しの欠落と
+    // オブジェクトの状態差分の 2 候補が出る）。
+    let mut l = Builder::new(Env::default());
+    l.abort_create_file(1, 0, "C:\\game\\save.dat");
+    let left = l.finish(FinalizationInfo::default(), &[]);
+    let mut r = Builder::new(Env::default());
+    r.create_file(1, 0, "C:\\game\\save.dat");
+    let right = r.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert_eq!(report.candidates.len(), 2, "{:?}", report.candidates);
+    assert_eq!(report.candidates[0].kind, CandidateKind::MissingCall);
+    assert_eq!(
+        report.candidates[1].kind,
+        CandidateKind::ObjectStateDifference
+    );
+}

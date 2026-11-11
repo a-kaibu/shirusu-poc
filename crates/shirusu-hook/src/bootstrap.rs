@@ -29,7 +29,10 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v3: 末尾に result_unrestored_count を追加した (既存フィールドの
 /// オフセットは不変)。設置失敗時にロールバックも失敗して対象へ
 /// 残存した IAT スロットの数 (レビュー第5回 #8)。
-pub const BOOTSTRAP_VERSION: u32 = 3;
+/// v4: 末尾に order_global を追加した (L11 `--order=global`)。
+/// 0 = 無効、0 以外 = 有効。Agent は有効な場合のみ観測点で
+/// 全スレッド共通の番号を採番する。
+pub const BOOTSTRAP_VERSION: u32 = 4;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -65,6 +68,9 @@ pub struct AgentBootstrap {
     /// 対象プロセスには Detour が残存しており、Host は初期化失敗の
     /// 詳細として扱わなければならない (レビュー第5回 #8)。
     pub result_unrestored_count: u32,
+    /// `--order=global` (v4, L11): 0 = 無効、0 以外 = 有効。
+    /// Host が `CaptureSessionConfig::order_global` から設定する。
+    pub order_global: u32,
 }
 
 impl Default for AgentBootstrap {
@@ -83,6 +89,7 @@ impl Default for AgentBootstrap {
             result_hooked_count: 0,
             result_missing_count: 0,
             result_unrestored_count: 0,
+            order_global: 0,
         }
     }
 }
@@ -215,9 +222,24 @@ mod tests {
         // repr(C) の固定レイアウトであること（プロセス間受け渡しの前提）
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            // フィールド合計 580 + 末尾パディング 4 (8 バイト整列)
+            // フィールド合計 584 (8 バイト整列のため末尾パディング 0)。
+            // v4 で末尾に order_global (u32) を追加し、v3 の末尾パディング
+            // 4 バイトを埋めたため総サイズは v3 と同じ 584 のまま。
             4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4 + 4 + 4
         );
+    }
+
+    #[test]
+    fn order_global_defaults_to_disabled() {
+        // L11: v4 の order_global は既定 0（無効）で、validate は通る。
+        let cfg = RingConfig::new(64, 4096);
+        let b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        assert_eq!(b.version, BOOTSTRAP_VERSION);
+        assert_eq!(b.order_global, 0);
+        assert!(b.validate().is_ok());
+        let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        b.order_global = 1;
+        assert!(b.validate().is_ok());
     }
 
     #[test]

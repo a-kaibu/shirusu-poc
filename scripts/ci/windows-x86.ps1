@@ -22,7 +22,16 @@ Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe
 # Host 回収 → Slot 再利用) を x64 Host × i686 Producer で実行する。
 # x64 同士の組み合わせは windows-x64 ジョブの --all に含まれる。
 Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --production-path } "e2e supervisor --production-path"
+# A77: プロセス間メモリ順序ストレス (実 Agent が別プロセスから 100 万件を
+# 順に書き、検証付き Host が順序・内容・欠落会計を検証) を x64 Host ×
+# i686 Producer で実行する。x64 同士の組み合わせは windows-x64 ジョブの
+# --all に含まれる。
+Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --memory-order-stress } "e2e supervisor --memory-order-stress"
 # A74: i686 (WoW64) での 64bit アトミック操作のコスト測定。32bit
 # 折り返しカウンタへの切替判断はこの実測で行う (bench 内に基準を明記)。
 Invoke-Native { cargo build -p shirusu-e2e --target i686-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (i686)"
 Invoke-Native { .\target\i686-pc-windows-msvc\release\shirusu-atomic-bench.exe } "atomic bench (i686)"
+# L10: 性能目標の測定 (x64 と同じ内容を WoW64 でも測る。測定器であり
+# ゲートではないため終了コードは常に 0。CI 時間を抑えるため --rounds 1)。
+Invoke-Native { cargo build -p shirusu-e2e --target i686-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (i686)"
+Invoke-Native { .\target\i686-pc-windows-msvc\release\shirusu-perf-bench.exe --rounds 1 } "perf bench (i686)"

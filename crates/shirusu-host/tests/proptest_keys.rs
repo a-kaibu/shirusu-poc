@@ -77,6 +77,7 @@ impl Rig {
             parent_call_id: 0,
             payload,
             capture_state,
+            global_order: 0,
         });
     }
     /// 全回収し、新しく生成されたキーを参照モデルへ取り込む。

@@ -6,6 +6,9 @@
 //! - 記録の入口：スレッド初回時の Slot 取得と、その Ring の
 //!   `space_available` 通知の結線（管理パス。以後の記録は通常経路）
 //! - 書き込み通知（NotifySignal）に応じた data_ready の SetEvent
+//! - Detour の再入制御 (G15): 記録経路の実行中にフック対象 API が呼ばれたら
+//!   TLS ガードで素通しにする（`ReentrancyGuard`）。元の API 呼び出しの間だけ
+//!   ガードを外し、アプリ由来の入れ子は記録する。
 //!
 //! Loader Lock への配慮: ランタイムの構築とフックの設置は DLL 初期化
 //! 専用スレッド（DllMain の外）で行う。記録経路では Agent の
@@ -13,11 +16,12 @@
 //! に従い、ここでも待機する操作は行わない（SetEvent は待たない操作）。
 
 use crate::api::{ApiDef, API_TABLE};
+use crate::capture::{OverlappedRegistry, PendingOverlapped};
 use shirusu_agent::{Agent, RecordResult};
 use shirusu_transport::notify::NotifySignal;
 use shirusu_transport::ring::WriteOutcome;
 use shirusu_transport_win::{ProcessNotify, RingNotify};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -45,6 +49,137 @@ pub fn pop_call(call_id: u64) {
             s.pop();
         }
     });
+}
+
+thread_local! {
+    /// Detour の再入ガードの深さ (G15)。0 = 記録経路の外、1 = 記録経路の実行中。
+    static REENTRANCY_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Detour の再入ガード (G15)。
+///
+/// 記録経路（capture / Agent への記録 / 通知）の実行中にフック対象 API が
+/// 呼ばれた場合、その呼び出しは Agent 自身のものであり記録しない。
+/// 入口で [`ReentrancyGuard::try_enter`] が `None` を返したら、呼び出し側は
+/// 元関数を素通しで呼ぶこと（`engine::prepare` がこの判定を集約する）。
+///
+/// A42 の `PublishGuard`（転送層・公開区間だけの短いガード）とは別層の
+/// ガードである。あちらは Ring への公開区間だけを覆うが、こちらは Detour
+/// の記録経路全体（capture・`ensure_thread`・Agent への記録・通知）を覆う。
+/// 旧実装は記録経路がフック対象の 4 API を呼ばないことに暗黙に依存して
+/// いたが、API 表が増える（L03）とその前提が崩れるため、機構として持つ。
+///
+/// 元の API 呼び出しの間だけ [`ReentrancyGuard::suspend`] でガードを外す:
+/// 元の呼び出しの中でアプリ由来の入れ子呼び出し（コールバック経由を含む）が
+/// 起きた場合は、従来どおり親子として記録される (A43)。
+/// ガードは同時に 1 つだけ保持できる（suspend 中の入れ子は別のガード）。
+/// Drop で必ず外れる（suspend したまま drop しても深さは 0 のまま）。
+pub struct ReentrancyGuard {
+    suspended: bool,
+}
+
+impl ReentrancyGuard {
+    /// Detour 入口で呼ぶ。再入中なら `None` を返す。
+    pub fn try_enter() -> Option<Self> {
+        REENTRANCY_DEPTH.with(|d| {
+            if d.get() > 0 {
+                None
+            } else {
+                d.set(1);
+                Some(Self { suspended: false })
+            }
+        })
+    }
+
+    /// 記録経路の実行中か。
+    pub fn is_active() -> bool {
+        REENTRANCY_DEPTH.with(|d| d.get() > 0)
+    }
+
+    /// 元の API 呼び出しの直前に呼ぶ: ガードを一時的に外す。
+    pub fn suspend(&mut self) {
+        if !self.suspended {
+            REENTRANCY_DEPTH.with(|d| d.set(0));
+            self.suspended = true;
+        }
+    }
+
+    /// 元の API 呼び出しの直後に呼ぶ: ガードを戻す。
+    pub fn resume(&mut self) {
+        if self.suspended {
+            REENTRANCY_DEPTH.with(|d| d.set(1));
+            self.suspended = false;
+        }
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        // suspend 中は深さは既に 0。保持中の場合だけ 0 に戻す。
+        if !self.suspended {
+            REENTRANCY_DEPTH.with(|d| d.set(0));
+        }
+    }
+}
+
+/// 中断した呼び出しの記録ガード (L08)。
+///
+/// Detour が enter を記録して呼出スタックへ積んだ直後に作り、元の API
+/// 呼び出しが正常に戻ったら [`CallGuard::complete`] で武装解除する。
+/// 元の呼び出しが例外（C++ 例外 / SEH / Rust パニック）で戻らなかった
+/// 場合、巻き戻しでこのガードの Drop が走り、呼出スタックから外して
+/// `CallAborted` を記録する。例外自体は一切捕捉しないため、呼び出し側
+/// へ伝わる例外は Detour が無い場合と同一である。
+///
+/// 前提: Windows では Rust のフレームも SEH アンワインド情報を持つため、
+/// 外来の例外が Detour フレームを巻き戻すときにこの Drop は走る。
+/// 仮に走らなかった場合の失敗モードは「中断の記録漏れ」だけで、例外の
+/// 伝播や対象プロセスの挙動は変わらない（記録漏れは Host 側の
+/// UnknownTermination として別途扱われる）。
+///
+/// Drop 中の記録は失敗してもプロセスを落とさないこと: 巻き戻し中の
+/// Drop でパニックするとプロセスが abort するため、記録は
+/// `catch_unwind` で包んで結果を捨てる。
+pub struct CallGuard {
+    rt: Arc<HookRuntime>,
+    thread_id: u64,
+    api: &'static ApiDef,
+    call_id: u64,
+    armed: bool,
+}
+
+impl CallGuard {
+    pub fn new(rt: &Arc<HookRuntime>, thread_id: u64, api: &'static ApiDef, call_id: u64) -> Self {
+        Self {
+            rt: Arc::clone(rt),
+            thread_id,
+            api,
+            call_id,
+            armed: true,
+        }
+    }
+
+    /// 元の呼び出しが正常に戻った: 武装解除し、Drop しても何もしない。
+    pub fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        pop_call(self.call_id);
+        let rt = Arc::clone(&self.rt);
+        let (thread_id, api, call_id) = (self.thread_id, self.api, self.call_id);
+        // 巻き戻し中の Drop でパニックすると abort するため、記録の
+        // 成否は問わず、パニックもここで吸収する（例外の伝播には触れない）。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.record_aborted(thread_id, api, call_id);
+        }));
+    }
 }
 
 /// Detour の記録区間への入場証 (レビュー #4 の #9)。
@@ -179,6 +314,9 @@ pub struct HookRuntime {
     /// 記録区間に入っている Detour の数。終了手順は新規記録を
     /// 無効化してから、これが 0 になるのを待って IAT を復元する。
     in_flight: AtomicUsize,
+    /// 完了待ちの非同期 I/O 操作の登録表（F27）。完了は別スレッドで
+    /// 観測されることがある（IOCP）ため、セッション全体で共有する。
+    pending_overlapped: OverlappedRegistry,
 }
 
 impl HookRuntime {
@@ -196,6 +334,7 @@ impl HookRuntime {
             seen_threads: Mutex::new(HashSet::new()),
             recording_enabled: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
+            pending_overlapped: OverlappedRegistry::new(),
         }
     }
 
@@ -326,6 +465,59 @@ impl HookRuntime {
         self.signal_if_needed(&result);
         result
     }
+
+    /// 中断した呼び出しを記録する（L08）。`CallGuard` の Drop から呼ぶ。
+    /// 記録の成否は呼び出し側の例外伝播に影響しない（結果は捨てる）。
+    pub fn record_aborted(&self, thread_id: u64, api: &ApiDef, call_id: u64) {
+        let parent = current_parent_call();
+        let result = self.agent.record_aborted(
+            thread_id,
+            api.api_id,
+            api.leave_schema_id(),
+            call_id,
+            parent,
+        );
+        self.signal_if_needed(&result);
+    }
+
+    /// 非同期 I/O の完了を記録する（F27）。完了を観測した Detour から
+    /// 呼ぶ。`api` は元の呼び出し（ReadFile / WriteFile）の定義で、
+    /// payload はその leave Schema の値列。
+    pub fn record_completion(
+        &self,
+        thread_id: u64,
+        api: &ApiDef,
+        call_id: u64,
+        payload: &[u8],
+    ) -> RecordResult {
+        let parent = current_parent_call();
+        let result = self.agent.record_completion(
+            thread_id,
+            api.api_id,
+            api.leave_schema_id(),
+            call_id,
+            parent,
+            payload,
+        );
+        self.signal_if_needed(&result);
+        result
+    }
+
+    /// 完了待ちの非同期 I/O 操作を登録する（F27）。鍵は OVERLAPPED
+    /// 構造体のアドレス。
+    pub fn register_pending_overlapped(&self, overlapped_addr: u64, pending: PendingOverlapped) {
+        self.pending_overlapped.register(overlapped_addr, pending);
+    }
+
+    /// 完了した非同期 I/O 操作を取り出す（F27）。未登録なら None。
+    pub fn take_pending_overlapped(&self, overlapped_addr: u64) -> Option<PendingOverlapped> {
+        self.pending_overlapped.take(overlapped_addr)
+    }
+
+    /// 完了待ちの操作の数（テスト用）。
+    pub fn pending_overlapped_count(&self) -> usize {
+        self.pending_overlapped.len()
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +574,137 @@ mod tests {
             batch.events[2].descriptor.schema_id,
             create.leave_schema_id()
         );
+    }
+
+    #[test]
+    fn pending_overlapped_register_take_and_record_completion() {
+        // F27: 登録した完了待ち操作は OVERLAPPED アドレスで取り出せ、
+        // 完了イベントは元の API の leave Schema で Ring へ記録される。
+        use crate::capture::{OverlappedDirection, PendingOverlapped};
+        use shirusu_transport::descriptor::EventKind;
+        let (agent, rt) = runtime();
+        let tid = 4244u64;
+        rt.ensure_thread(tid);
+        let read = api_by_id(API_READ_FILE).unwrap();
+        let call_id = rt.alloc_call_id();
+        rt.register_pending_overlapped(
+            0x8000,
+            PendingOverlapped {
+                api_id: API_READ_FILE,
+                call_id,
+                handle: 0x1234,
+                buffer: 0x4000,
+                requested_len: 100,
+                direction: OverlappedDirection::Read,
+                bytes_addr: 0x5000,
+            },
+        );
+        assert_eq!(rt.pending_overlapped_count(), 1);
+        let pending = rt.take_pending_overlapped(0x8000).expect("registered");
+        assert_eq!(pending.call_id, call_id);
+        assert_eq!(pending.direction, OverlappedDirection::Read);
+        assert_eq!(rt.pending_overlapped_count(), 0);
+        assert!(rt.take_pending_overlapped(0x8000).is_none());
+        let r = rt.record_completion(tid, read, call_id, b"completed-args");
+        assert!(matches!(r, RecordResult::Written(_)));
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            batch.events[0].descriptor.kind_enum(),
+            Some(EventKind::CallCompleted)
+        );
+        assert_eq!(batch.events[0].descriptor.schema_id, read.leave_schema_id());
+        assert_eq!(batch.events[0].payload, b"completed-args");
+    }
+
+    #[test]
+    fn call_guard_records_aborted_when_dropped_armed() {
+        // L08: 元の呼び出しが戻らずにガードが drop されたら、
+        // CallAborted が記録され、呼出スタックから外れる。
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let tid = 4243u64;
+        rt.ensure_thread(tid);
+        let create = api_by_id(API_CREATE_FILE_W).unwrap();
+        let call_id = rt.alloc_call_id();
+        assert!(matches!(
+            rt.record_enter(tid, create, call_id, b"enter-args"),
+            RecordResult::Written(_)
+        ));
+        push_call(call_id);
+        {
+            let _guard = CallGuard::new(&rt, tid, create, call_id);
+            // 完了させずに drop（元の呼び出しが例外で中断したのと同じ）。
+        }
+        assert_eq!(current_parent_call(), 0, "aborted call pops the stack");
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(
+            batch.events[1].descriptor.kind_enum(),
+            Some(shirusu_transport::descriptor::EventKind::CallAborted)
+        );
+        assert_eq!(batch.events[1].descriptor.call_id, call_id);
+    }
+
+    #[test]
+    fn call_guard_completed_drop_records_nothing() {
+        // L08: 正常に戻った呼び出しは complete() で武装解除し、
+        // drop しても CallAborted は記録されない。
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let tid = 4244u64;
+        rt.ensure_thread(tid);
+        let create = api_by_id(API_CREATE_FILE_W).unwrap();
+        let call_id = rt.alloc_call_id();
+        rt.record_enter(tid, create, call_id, b"enter-args");
+        push_call(call_id);
+        {
+            let mut guard = CallGuard::new(&rt, tid, create, call_id);
+            guard.complete();
+        }
+        pop_call(call_id);
+        rt.record_leave(tid, create, call_id, b"leave-args");
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(
+            batch.events[1].descriptor.kind_enum(),
+            Some(shirusu_transport::descriptor::EventKind::CallLeave)
+        );
+    }
+
+    #[test]
+    fn call_guard_records_aborted_on_panic_and_panic_propagates() {
+        // L08: 例外は捕捉しない。パニックがガードを巻き戻して抜けるとき
+        // CallAborted が記録され、パニック自体はそのまま伝わる。
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let tid = 4245u64;
+        rt.ensure_thread(tid);
+        let create = api_by_id(API_CREATE_FILE_W).unwrap();
+        let call_id = rt.alloc_call_id();
+        rt.record_enter(tid, create, call_id, b"enter-args");
+        push_call(call_id);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CallGuard::new(&rt, tid, create, call_id);
+            panic!("simulated original-call exception");
+        }));
+        assert!(caught.is_err(), "the panic must propagate unchanged");
+        assert_eq!(current_parent_call(), 0);
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(
+            batch.events[1].descriptor.kind_enum(),
+            Some(shirusu_transport::descriptor::EventKind::CallAborted)
+        );
+        assert_eq!(batch.events[1].descriptor.call_id, call_id);
     }
 
     #[test]
@@ -501,5 +824,110 @@ mod tests {
         assert_eq!(current_parent_call(), 10);
         pop_call(10);
         assert_eq!(current_parent_call(), 0);
+    }
+
+    #[test]
+    fn reentrancy_guard_blocks_nested_entry() {
+        // G15: 記録経路の実行中は、同じスレッドからの再入を素通しにする。
+        assert!(!ReentrancyGuard::is_active());
+        let guard = ReentrancyGuard::try_enter().expect("first entry");
+        assert!(ReentrancyGuard::is_active());
+        assert!(
+            ReentrancyGuard::try_enter().is_none(),
+            "nested entry is blocked"
+        );
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+        assert!(
+            ReentrancyGuard::try_enter().is_some(),
+            "re-entry after drop"
+        );
+    }
+
+    #[test]
+    fn reentrancy_guard_suspend_resume_allows_nested_entry() {
+        // G15: 元の API 呼び出しの間（suspend 中）は、アプリ由来の入れ子
+        // 呼び出しとして再び入れる (A43)。
+        let mut guard = ReentrancyGuard::try_enter().expect("entry");
+        guard.suspend();
+        assert!(!ReentrancyGuard::is_active());
+        let nested = ReentrancyGuard::try_enter().expect("nested entry while suspended");
+        assert!(ReentrancyGuard::is_active());
+        drop(nested);
+        assert!(!ReentrancyGuard::is_active());
+        guard.resume();
+        assert!(ReentrancyGuard::is_active());
+        assert!(ReentrancyGuard::try_enter().is_none());
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+    }
+
+    #[test]
+    fn reentrancy_guard_drop_while_suspended_releases() {
+        // suspend したまま drop してもガードは解除される。
+        let mut guard = ReentrancyGuard::try_enter().expect("entry");
+        guard.suspend();
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+        assert!(ReentrancyGuard::try_enter().is_some());
+    }
+
+    #[test]
+    fn reentrancy_guard_is_thread_local() {
+        // 他スレッドのガードはこのスレッドに影響しない。
+        let guard = ReentrancyGuard::try_enter().expect("entry");
+        assert!(ReentrancyGuard::is_active());
+        let other = std::thread::spawn(|| {
+            assert!(!ReentrancyGuard::is_active());
+            let g = ReentrancyGuard::try_enter().expect("other thread entry");
+            assert!(ReentrancyGuard::is_active());
+            drop(g);
+            assert!(!ReentrancyGuard::is_active());
+        });
+        other.join().unwrap();
+        assert!(ReentrancyGuard::is_active());
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+    }
+
+    #[test]
+    fn reentrancy_guard_detour_flow_keeps_parent_chain() {
+        // G15: Detour の一連の流れ（記録→元の呼び出し→記録）で、
+        // ガードの suspend/resume が呼出スタックと Ring の内容を壊さない。
+        let (agent, rt) = runtime();
+        let tid = 5150u64;
+        rt.ensure_thread(tid);
+        let create = api_by_id(API_CREATE_FILE_W).unwrap();
+        let outer = rt.alloc_call_id();
+
+        let mut guard = ReentrancyGuard::try_enter().expect("entry");
+        let r = rt.record_enter(tid, create, outer, b"enter-args");
+        assert!(matches!(r, RecordResult::Written(_)));
+        push_call(outer);
+        // 元の API 呼び出しの間: ガードを外し、アプリ由来の入れ子は入れる
+        guard.suspend();
+        assert!(!ReentrancyGuard::is_active());
+        let nested = ReentrancyGuard::try_enter().expect("app nested call during original");
+        assert_eq!(
+            current_parent_call(),
+            outer,
+            "nested call sees outer as parent"
+        );
+        drop(nested);
+        guard.resume();
+        assert!(ReentrancyGuard::is_active());
+        pop_call(outer);
+        rt.record_leave(tid, create, outer, b"leave-args");
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+
+        // Ring には外側の enter/leave だけが残る（入れ子の素通しは記録しない）
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert!(batch.integrity_error.is_none());
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].descriptor.call_id, outer);
+        assert_eq!(batch.events[1].descriptor.call_id, outer);
     }
 }

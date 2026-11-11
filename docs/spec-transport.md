@@ -40,7 +40,7 @@ pub struct EventDescriptor {
     pub payload_position: u64,
     pub api_id: u32,           // AgentとHostの間の内部ID
     pub schema_id: u32,        // 公開TraceのSchema IDへ変換する
-    pub reserved: u64,
+    pub global_order: u64,     // L11: 全スレッド共通の観測順序番号（0 = 未割当）
 }
 // size = 64 bytes（x86とx64で同じ）
 ```
@@ -48,8 +48,18 @@ pub struct EventDescriptor {
 - 固定幅整数と明示的なアラインメントだけを使い、32bit Agentと64bit Hostが同じレイアウトで読めるようにする。`size_of`と`offset_of`を両ターゲットで静的に検査する。
 - Process IDとThread IDはRingの管理情報に持ち、イベントごとには持たない。
 - `payload_position`は対象プロセスのポインタではなく、Payload Ring内の単調増加する論理オフセットである。
-- PayloadはAgent–Host間で独立したIDを持たない。Hostは検証済みのRing識別情報、Generation、Sequence、Payloadの論理オフセットから内部管理用の一時キーを生成する。HostがPayloadのBLAKE3を計算してBlobを保存した後、公開TraceではBlob IDを参照する。一時キーは公開形式に含めない（A72 の確定仕様）。一時キーは shirusu-host の `TemporaryPayloadKey`（`process_id: ProcessInstanceId`、`ring_id: RingId`、`generation: u64`、`sequence: u64`、`payload_position: u64`）として実装する。`ring_id` と `generation` は Host が管理する値を用い、Capture Session 内で使う（別 Session と統合する場合は Session ID も含める）。欠落した Payload には一時キーを生成せず、欠落理由を Loss として保持する。`reserved` は 0 のままで、検証も維持する。
+- PayloadはAgent–Host間で独立したIDを持たない。Hostは検証済みのRing識別情報、Generation、Sequence、Payloadの論理オフセットから内部管理用の一時キーを生成する。HostがPayloadのBLAKE3を計算してBlobを保存した後、公開TraceではBlob IDを参照する。一時キーは公開形式に含めない（A72 の確定仕様）。一時キーは shirusu-host の `TemporaryPayloadKey`（`process_id: ProcessInstanceId`、`ring_id: RingId`、`generation: u64`、`sequence: u64`、`payload_position: u64`）として実装する。`ring_id` と `generation` は Host が管理する値を用い、Capture Session 内で使う（別 Session と統合する場合は Session ID も含める）。欠落した Payload には一時キーを生成せず、欠落理由を Loss として保持する。~~`reserved` は 0 のままで、検証も維持する。~~（2026-11-11 L11 による修正：64B 中の唯一の空き 8B だった `reserved` を `global_order` に転用した。A72 の中核——Payload ID を持たない・Host 生成の一時キー・公開 Trace は Blob ID——は不変。`global_order` は Payload の識別子ではなく、per-thread `sequence` のプロセス全体版の順序番号である。検証は条件付きで維持する：セッションが全体順序を有効にしていない場合、非 0 は拒否する。詳細は下記「全体順序（L11）」）
 - Cursorは64bitの単調増加値とし、8バイト境界に置く。i686での64bitアトミック操作（`cmpxchg8b`等で実現される）のコストが問題になれば、32bitの折り返しカウンタに切り替える。
+
+### 全体順序（L11、2026-11-11）
+
+overview「転送形式とディスク形式」節：`--order=global`を付けると、フックの観測点ごとに全スレッド共通の番号を振る。この番号はアトミックカウンタを更新した順序であり、API処理の完了順やメモリ操作全体の順序を保証しない。別のPCで取ったTraceどうしは時刻の原点が異なるので、時刻だけで対応づけない。
+
+- Agent はプロセス全体で 1 個の `AtomicU64` カウンタ（1 始まり）を持ち、`Agent::record()` 内、書き込み確定の直前（DETACH チェック後）に採番して Descriptor の `global_order`（オフセット 56、64B レイアウト維持）に刻む。書き込みが確定しなかったイベントは番号を消費しない（欠落したイベントの分は欠番になり、Sequence の欠番と同じ扱い）。
+- `global_order` は順序番号であって Payload の識別子ではない。A72 の「Payload は Agent–Host 間で独立した ID を持たない」は不変であり、Host の一時キー生成には使わない。
+- Host は `CaptureSessionConfig.order_global` が真のセッションでのみ非 0 を受け入れる。無効なセッションで非 0 の Descriptor は `GlobalOrderNotAllowed` として拒否する（旧 `ReservedNonZero` から改名。条件付き検証）。
+- Agent DLL への受け渡しは Bootstrap v4 の `order_global: u32` フィールド（0 = 無効。v3 の末尾パディング 4B を埋めたため総サイズ 584 のまま）。
+- 公開 Trace 側は `TraceEvent.global_order: Option<u64>`（0 → None）。詳細は trace-format.md「全体順序 (--order=global)」参照。
 
 ## イベントの確定とPayloadの管理
 

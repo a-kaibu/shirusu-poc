@@ -351,3 +351,150 @@ fn agent_to_host_to_trace_end_to_end() {
     let fin = trace.finalization.as_ref().unwrap();
     assert_eq!(fin.total_blobs, 1);
 }
+
+/// L09: 記録モード用の ReceivedEvent 構築（種別・API・時刻・call_id
+/// を指定できる）。sequence は単調に振る。
+fn received_call(
+    sequence: u64,
+    kind: EventKind,
+    api_id: u32,
+    timestamp_qpc: u64,
+    call_id: u64,
+) -> ReceivedEvent {
+    let mut d = EventDescriptor::new(kind, sequence);
+    d.flags = CaptureState::Captured.to_flags();
+    d.timestamp_qpc = timestamp_qpc;
+    d.call_id = call_id;
+    d.parent_call_id = 0;
+    d.api_id = api_id;
+    ReceivedEvent {
+        descriptor: d,
+        payload: Vec::new(),
+    }
+}
+
+/// L09: `filtered` は指定した API のイベントだけを保存する。Loss
+/// Record は API によらず残る。sequence の欠番は許容される（回帰の
+/// 拒否だけが Writer の不変条件）。
+#[test]
+fn filtered_mode_keeps_only_listed_apis() {
+    use shirusu_host::trace_convert::RecordMode;
+    use std::collections::BTreeSet;
+    let mut rec = TraceRecorder::from_environment(Vec::new(), environment()).unwrap();
+    rec.set_record_mode(RecordMode::Filtered {
+        apis: BTreeSet::from([1, 3]),
+    });
+    let events: Vec<ReceivedEvent> = [1u32, 2, 3, 4]
+        .iter()
+        .enumerate()
+        .map(|(i, api)| {
+            received_call(
+                i as u64 + 1,
+                EventKind::CallEnter,
+                *api,
+                1000 + i as u64,
+                100 + i as u64,
+            )
+        })
+        .collect();
+    rec.record_batch(&ctx(3), &events).unwrap();
+    let bytes = rec.finish(&IntegrityReport::default()).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.issues.is_empty(), "issues: {:?}", trace.issues);
+    let kept: Vec<u32> = trace
+        .batches
+        .iter()
+        .flat_map(|b| b.events.iter().map(|e| e.api_id))
+        .collect();
+    assert_eq!(kept, vec![1, 3]);
+}
+
+/// L09: `profile` は個別イベントを保存せず、API ごとに呼び出し回数・
+/// 分布・所要時間を集計して ProfileSummary Block として書く。enter /
+/// leave の対応付けは (thread, call_id) で行い、Batch をまたいでも
+/// 対になる。対応の無い enter / leave は calls に数えず、enters /
+/// leaves だけに数える。CallEnter / CallLeave 以外の種別は集計の
+/// 対象外だが `total_events_seen` には数える。
+#[test]
+fn profile_mode_aggregates_enter_leave_pairs() {
+    use shirusu_host::trace_convert::RecordMode;
+    let mut rec = TraceRecorder::from_environment(Vec::new(), environment()).unwrap();
+    rec.set_record_mode(RecordMode::Profile);
+    // Batch 1: api 1 の enter（leave は次の Batch）と api 2 の対。
+    rec.record_batch(
+        &ctx(3),
+        &[
+            received_call(1, EventKind::CallEnter, 1, 1000, 1001),
+            received_call(2, EventKind::CallEnter, 2, 2000, 1002),
+            received_call(3, EventKind::CallLeave, 2, 2600, 1002),
+        ],
+    )
+    .unwrap();
+    // Batch 2: Batch 1 の enter に対する leave、対の無い enter /
+    // leave、CallEnter / CallLeave 以外の種別。
+    rec.record_batch(
+        &ctx(3),
+        &[
+            received_call(4, EventKind::CallLeave, 1, 1500, 1001),
+            received_call(5, EventKind::CallEnter, 1, 3000, 1003),
+            received_call(6, EventKind::CallLeave, 2, 4000, 9999),
+            received_call(7, EventKind::SnapshotFragment, 0, 5000, 0),
+        ],
+    )
+    .unwrap();
+    let bytes = rec.finish(&IntegrityReport::default()).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.issues.is_empty(), "issues: {:?}", trace.issues);
+    // 個別イベントは保存されない。
+    assert!(trace.batches.is_empty());
+    assert_eq!(trace.finalization.as_ref().unwrap().total_events, 0);
+    let summary = trace.profile_summary.expect("profile summary block");
+    assert_eq!(summary.qpc_frequency, 10_000_000);
+    assert_eq!(summary.total_events_seen, 7);
+    assert_eq!(summary.apis.len(), 2);
+    let api1 = &summary.apis[0];
+    assert_eq!(api1.api_id, 1);
+    assert_eq!(api1.calls, 1);
+    assert_eq!(api1.enters, 2);
+    assert_eq!(api1.leaves, 1);
+    assert_eq!(api1.total_duration_qpc, 500);
+    assert_eq!(api1.min_duration_qpc, 500);
+    assert_eq!(api1.max_duration_qpc, 500);
+    let api2 = &summary.apis[1];
+    assert_eq!(api2.api_id, 2);
+    assert_eq!(api2.calls, 1);
+    assert_eq!(api2.enters, 1);
+    assert_eq!(api2.leaves, 2);
+    assert_eq!(api2.total_duration_qpc, 600);
+    assert_eq!(api2.min_duration_qpc, 600);
+    assert_eq!(api2.max_duration_qpc, 600);
+}
+
+/// L09: `full`（既定）では何も間引かない。`--mode` を指定しない
+/// 場合の既定値が Full であることのピン。
+#[test]
+fn default_record_mode_is_full() {
+    use shirusu_host::trace_convert::RecordMode;
+    assert_eq!(RecordMode::default(), RecordMode::Full);
+}
+
+/// L09: API 名から api_id への解決。素の関数名と `module!関数` の
+/// 両方を受け付け、関数名はケース敏感、未知の名前はエラーにする。
+#[test]
+fn resolve_api_names_accepts_bare_and_qualified_names() {
+    use shirusu_host::trace_convert::resolve_api_names;
+    assert_eq!(
+        resolve_api_names(&["CreateFileW".to_string()]).unwrap(),
+        std::collections::BTreeSet::from([1])
+    );
+    assert_eq!(
+        resolve_api_names(&["kernel32!ReadFile".to_string()]).unwrap(),
+        std::collections::BTreeSet::from([2])
+    );
+    assert_eq!(
+        resolve_api_names(&["WriteFile".to_string(), "CloseHandle".to_string()]).unwrap(),
+        std::collections::BTreeSet::from([3, 4])
+    );
+    assert!(resolve_api_names(&["NoSuchApi".to_string()]).is_err());
+    assert!(resolve_api_names(&["kernel32!createfilew".to_string()]).is_err());
+}

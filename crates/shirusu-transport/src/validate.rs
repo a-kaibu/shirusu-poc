@@ -40,7 +40,9 @@ pub enum IntegrityError {
     },
     CounterRegressed,
     UnknownKind(u16),
-    ReservedNonZero,
+    /// `--order=global` が無効なセッションで `global_order` が非 0
+    /// （旧 `reserved` 0 検証。L11 で条件付き受理になった）。
+    GlobalOrderNotAllowed,
     PayloadTooLarge {
         len: u64,
         capacity: u64,
@@ -181,9 +183,14 @@ pub const MAX_DROPPED_ORIGINAL_LEN: u64 = u32::MAX as u64;
 /// 比較しない (元の長さには `MAX_DROPPED_ORIGINAL_LEN` の上限が別にある)。
 /// 以前はフラグ無関係に容量と比較していたため、容量を超える Payload を
 /// 落とした正規の劣化イベントを破損として誤拒否していた (R6)。
+///
+/// L11: `global_order` はセッションが `--order=global` を有効にした場合
+/// にのみ非 0 を受理する (`allow_global_order`)。無効なセッションでの
+/// 非 0 は破損像として弾く（旧 `reserved` 0 検証の維持）。
 pub fn decode_descriptor(
     bytes: &[u8],
     known: &KnownConfig,
+    allow_global_order: bool,
 ) -> Result<EventDescriptor, IntegrityError> {
     if bytes.len() < 64 {
         return Err(IntegrityError::ImageTooSmall);
@@ -192,8 +199,8 @@ pub fn decode_descriptor(
     if EventKind::from_u16(d.kind).is_none() || d.kind == EventKind::Unknown as u16 {
         return Err(IntegrityError::UnknownKind(d.kind));
     }
-    if d.reserved != 0 {
-        return Err(IntegrityError::ReservedNonZero);
+    if !allow_global_order && d.global_order != 0 {
+        return Err(IntegrityError::GlobalOrderNotAllowed);
     }
     if d.payload_dropped() {
         if d.payload_len as u64 > MAX_DROPPED_ORIGINAL_LEN {
@@ -244,8 +251,9 @@ pub fn decode_descriptor_checked(
     bytes: &[u8],
     known: &KnownConfig,
     expected: &DescriptorExpectation,
+    allow_global_order: bool,
 ) -> Result<EventDescriptor, IntegrityError> {
-    let d = decode_descriptor(bytes, known)?;
+    let d = decode_descriptor(bytes, known, allow_global_order)?;
     // Sequence: 書き手は 1 から振る。確定済みスロットに 0 が現れるのは
     // 未公開スロットの混入（write_cursor だけが進んだ壊れた像）であり矛盾。
     if d.sequence < expected.sequence_at_least {
@@ -315,6 +323,9 @@ pub struct ValidatingReader {
     /// 次に期待する Payload 論理位置（None は未確立＝初めて見る Descriptor）。
     expected_payload_position: Option<u64>,
     stopped: bool,
+    /// セッションが `--order=global` を有効にしている場合にのみ
+    /// `global_order` の非 0 を受理する（L11）。既定は false。
+    allow_global_order: bool,
 }
 impl ValidatingReader {
     pub fn new(known: KnownConfig, expected_generation: u64) -> Self {
@@ -328,7 +339,19 @@ impl ValidatingReader {
             expected_generation,
             expected_payload_position: None,
             stopped: false,
+            allow_global_order: false,
         }
+    }
+    /// `--order=global` 有効なセッションとして検証する（Host が
+    /// `CaptureSessionConfig::order_global` から設定する）。
+    pub fn with_global_order(mut self, allow: bool) -> Self {
+        self.allow_global_order = allow;
+        self
+    }
+    /// 既存の Reader に対して `--order=global` の可否を後から設定する
+    /// （DrainWorker / ValidatingHost 経由。検証開始前に呼ぶこと）。
+    pub fn set_global_order(&mut self, allow: bool) {
+        self.allow_global_order = allow;
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped
@@ -413,7 +436,8 @@ impl ValidatingReader {
         } else {
             let idx = slot_index(snap.read_cursor - 1, self.known.descriptor_capacity) as usize;
             let off = cfg.descriptors_offset() + idx * 64;
-            let desc = decode_descriptor(&image[off..off + 64], &self.known)?;
+            let desc =
+                decode_descriptor(&image[off..off + 64], &self.known, self.allow_global_order)?;
             let stored_end = desc.payload_position + stored_payload_len(&desc);
             if stored_end != snap.payload_read_position {
                 return Err(IntegrityError::PayloadPositionNotContiguous {
@@ -471,7 +495,12 @@ impl ValidatingReader {
                 payload_position: self.expected_payload_position,
                 payload_write_position: snap.payload_write_position,
             };
-            let desc = decode_descriptor_checked(&desc_copy, &self.known, &expectation)?;
+            let desc = decode_descriptor_checked(
+                &desc_copy,
+                &self.known,
+                &expectation,
+                self.allow_global_order,
+            )?;
             if desc.sequence > self.expected_sequence {
                 self.sequence_gaps += desc.sequence - self.expected_sequence;
             }
@@ -521,7 +550,7 @@ mod proofs {
             payload_capacity: 1024,
             mapping_len: usize::MAX,
         };
-        if let Ok(d) = decode_descriptor(&bytes, &known) {
+        if let Ok(d) = decode_descriptor(&bytes, &known, false) {
             assert!(d.payload_len <= 1024);
         }
     }
@@ -602,24 +631,26 @@ mod proofs {
         }
     }
 
-    /// Descriptor 解釈の安全性: 受理されるのは既知 Kind・reserved 0 のもの
-    /// だけであり、格納長は容量以内 (落とした Payload は格納長 0 で、元の
-    /// 長さは u32 の表現範囲内であることだけを見る。R6)。
+    /// Descriptor 解釈の安全性: 受理されるのは既知 Kind・長さ上限内
+    /// （落とした Payload は格納長 0 で、元の長さは u32 の表現範囲内の
+    /// ものだけであり、R6）。`global_order` は `--order=global` 有効な
+    /// セッションでのみ非 0 を受理する（L11）。
     #[kani::proof]
     fn decode_descriptor_accepts_only_safe_descriptors() {
         let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
         d.kind = kani::any();
         d.payload_len = kani::any();
-        d.reserved = kani::any();
+        d.global_order = kani::any();
+        let allow: bool = kani::any();
         let known = KnownConfig {
             descriptor_capacity: 4,
             payload_capacity: 64,
             mapping_len: usize::MAX,
         };
-        if let Ok(ok) = decode_descriptor(&d.to_bytes(), &known) {
+        if let Ok(ok) = decode_descriptor(&d.to_bytes(), &known, allow) {
             assert!(EventKind::from_u16(ok.kind).is_some());
             assert!(ok.kind != EventKind::Unknown as u16);
-            assert!(ok.reserved == 0);
+            assert!(allow || ok.global_order == 0);
             assert!(ok.payload_len <= 64 || ok.payload_dropped());
         }
     }
@@ -741,13 +772,13 @@ mod tests {
         let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
         d.kind = 999;
         assert!(matches!(
-            decode_descriptor(&d.to_bytes(), &known()),
+            decode_descriptor(&d.to_bytes(), &known(), false),
             Err(IntegrityError::UnknownKind(999))
         ));
         let mut d2 = EventDescriptor::new(EventKind::CallEnter, 1);
         d2.payload_len = u32::MAX;
         assert!(matches!(
-            decode_descriptor(&d2.to_bytes(), &known()),
+            decode_descriptor(&d2.to_bytes(), &known(), false),
             Err(IntegrityError::PayloadTooLarge { .. })
         ));
     }
@@ -763,10 +794,12 @@ mod tests {
         d.payload_position = 10;
         d.payload_len = 4;
         // 正常: 期待どおりの Sequence・位置・書き込み済み範囲内
-        assert!(decode_descriptor_checked(&d.to_bytes(), &known, &exp(3, Some(10), 14)).is_ok());
+        assert!(
+            decode_descriptor_checked(&d.to_bytes(), &known, &exp(3, Some(10), 14), false).is_ok()
+        );
         // Sequence が下限未満（欠番は許すが後退は許さない）
         assert!(matches!(
-            decode_descriptor_checked(&d.to_bytes(), &known, &exp(4, Some(10), 14)),
+            decode_descriptor_checked(&d.to_bytes(), &known, &exp(4, Some(10), 14), false),
             Err(IntegrityError::SequenceRegressed {
                 expected_at_least: 4,
                 found: 3
@@ -776,7 +809,7 @@ mod tests {
         let mut zero = EventDescriptor::new(EventKind::CallEnter, 0);
         zero.payload_len = 0;
         assert!(matches!(
-            decode_descriptor_checked(&zero.to_bytes(), &known, &exp(1, Some(0), 0)),
+            decode_descriptor_checked(&zero.to_bytes(), &known, &exp(1, Some(0), 0), false),
             Err(IntegrityError::SequenceRegressed {
                 expected_at_least: 1,
                 found: 0
@@ -784,7 +817,7 @@ mod tests {
         ));
         // 位置が前件の終端と連続していない
         assert!(matches!(
-            decode_descriptor_checked(&d.to_bytes(), &known, &exp(3, Some(11), 14)),
+            decode_descriptor_checked(&d.to_bytes(), &known, &exp(3, Some(11), 14), false),
             Err(IntegrityError::PayloadPositionNotContiguous {
                 expected: 11,
                 found: 10
@@ -792,7 +825,7 @@ mod tests {
         ));
         // 位置＋格納長が書き込み済み範囲を超えている
         assert!(matches!(
-            decode_descriptor_checked(&d.to_bytes(), &known, &exp(3, Some(10), 13)),
+            decode_descriptor_checked(&d.to_bytes(), &known, &exp(3, Some(10), 13), false),
             Err(IntegrityError::PayloadPositionOutOfRange {
                 position: 10,
                 end: 14,
@@ -805,14 +838,38 @@ mod tests {
         dropped.payload_position = 10;
         dropped.payload_len = 5;
         dropped.flags = crate::descriptor::flags::PAYLOAD_DROPPED;
-        assert!(
-            decode_descriptor_checked(&dropped.to_bytes(), &known, &exp(3, Some(10), 10)).is_ok()
-        );
+        assert!(decode_descriptor_checked(
+            &dropped.to_bytes(),
+            &known,
+            &exp(3, Some(10), 10),
+            false
+        )
+        .is_ok());
         // アンカー未確立（初めて見る Descriptor）の場合は位置の連続性を問わない
         let mut far = EventDescriptor::new(EventKind::CallEnter, 7);
         far.payload_position = 999;
         far.payload_len = 0;
-        assert!(decode_descriptor_checked(&far.to_bytes(), &known, &exp(7, None, 999)).is_ok());
+        assert!(
+            decode_descriptor_checked(&far.to_bytes(), &known, &exp(7, None, 999), false).is_ok()
+        );
+    }
+    #[test]
+    fn decode_descriptor_global_order_is_conditional() {
+        // L11: global_order は --order=global 有効なセッションでのみ受理する。
+        let known = known();
+        for g in [1u64, u64::MAX] {
+            let mut d = EventDescriptor::new(EventKind::CallEnter, 1);
+            d.global_order = g;
+            assert!(matches!(
+                decode_descriptor(&d.to_bytes(), &known, false),
+                Err(IntegrityError::GlobalOrderNotAllowed)
+            ));
+            assert!(decode_descriptor(&d.to_bytes(), &known, true).is_ok());
+        }
+        // 未割当 (0) はどちらのセッションでも受理する。
+        let d = EventDescriptor::new(EventKind::CallEnter, 1);
+        assert!(decode_descriptor(&d.to_bytes(), &known, false).is_ok());
+        assert!(decode_descriptor(&d.to_bytes(), &known, true).is_ok());
     }
 
     #[test]
@@ -834,6 +891,7 @@ mod tests {
                 parent_call_id: 0,
                 payload: p,
                 capture_state: crate::descriptor::CaptureState::Captured,
+                global_order: 0,
             });
         }
         // 2 件目の Descriptor の payload_position だけを +1 ずらす
@@ -874,6 +932,7 @@ mod tests {
             parent_call_id: 0,
             payload: b"one",
             capture_state: crate::descriptor::CaptureState::Captured,
+            global_order: 0,
         });
         // write_cursor だけを 2 に進め、slot 1 に Sequence 0 の Descriptor を置く
         // （書き手は 1 から振るため、確定済みスロットの 0 は未公開スロットの混入＝矛盾）
@@ -920,6 +979,7 @@ mod tests {
                 parent_call_id: 0,
                 payload,
                 capture_state: state,
+                global_order: 0,
             })
         };
         write(&mut w, crate::descriptor::CaptureState::Captured, b"abc");

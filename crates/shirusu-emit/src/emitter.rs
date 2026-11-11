@@ -35,10 +35,9 @@ use shirusu_trace::error::{CompactError, TraceError};
 use shirusu_trace::model::{EventBatch, PayloadRef, TraceEvent};
 use shirusu_trace::proto::{CaptureEnvironment, LossRecord, SessionMetadata};
 use shirusu_trace::schema::{CapturedValue, EventCapture, Ty};
-use shirusu_trace::writer::{FinalizationInfo, TraceWriter};
+use shirusu_trace::writer::{DurableWrite, FinalizationInfo, TraceWriter, WriterOptions};
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write;
 
 /// 転送 Descriptor の kind と同じ番号（CallEnter / CallLeave）。
 pub const KIND_ENTER: u16 = 1;
@@ -224,16 +223,27 @@ impl ThreadState {
 
 /// 外部レコーダ向けエミッタ。`TraceWriter` の上に薄く乗り、
 /// 規約に沿ったイベント列の構築だけを担う。
-pub struct Emitter<W: Write> {
+pub struct Emitter<W: DurableWrite> {
     writer: TraceWriter<W>,
     set: ApiSet,
     cfg: SessionConfig,
     threads: HashMap<u64, ThreadState>,
 }
 
-impl<W: Write> Emitter<W> {
+impl<W: DurableWrite> Emitter<W> {
     /// Header / Environment を書き、ApiSet の全 Schema を登録する。
+    /// 永続化は既定の `Durability::Buffered`（`flush` のみ）。
     pub fn new(inner: W, set: ApiSet, cfg: SessionConfig) -> Result<Self> {
+        Self::with_options(inner, set, cfg, WriterOptions::default())
+    }
+
+    /// 永続化設定を指定して作る（F21）。
+    pub fn with_options(
+        inner: W,
+        set: ApiSet,
+        cfg: SessionConfig,
+        options: WriterOptions,
+    ) -> Result<Self> {
         let environment = CaptureEnvironment {
             session: SessionMetadata {
                 session_id: cfg.session_id,
@@ -247,8 +257,10 @@ impl<W: Write> Emitter<W> {
             capture_config: cfg.capture_config.clone(),
             feature_flags: 0,
             target_description: cfg.target_description.clone(),
+            // L07: 外部エミッタはモジュール分類をまだ記録しない（空）。
+            modules: Vec::new(),
         };
-        let mut writer = TraceWriter::new(inner, environment)?;
+        let mut writer = TraceWriter::with_options(inner, environment, options)?;
         for def in set.schemas() {
             writer.register_schema(def)?;
         }
@@ -283,7 +295,7 @@ impl<W: Write> Emitter<W> {
             .api_id(api)
             .ok_or_else(|| EmitError::UnknownApi(api.to_string()))?;
         let spec = self.set.spec(api_id).expect("api_id from set");
-        let types: Vec<Ty> = spec.enter_fields.iter().map(|(_, t, _)| *t).collect();
+        let types: Vec<Ty> = spec.enter_fields.iter().map(|(_, t, _, _)| *t).collect();
         let args = encode_args(&types, values)?;
         let payload = self.resolve_payload(meta.payload)?;
         let state = self.threads.entry(thread_id).or_default();
@@ -304,6 +316,7 @@ impl<W: Write> Emitter<W> {
             capture: meta.capture,
             payload,
             args,
+            global_order: None,
         });
         if state.pending.len() >= BATCH_FLUSH_EVENTS {
             self.flush_thread(thread_id)?;
@@ -328,7 +341,7 @@ impl<W: Write> Emitter<W> {
             .set
             .spec(token.api_id)
             .ok_or_else(|| EmitError::UnknownApi(format!("api_id {}", token.api_id)))?;
-        let types: Vec<Ty> = spec.leave_fields.iter().map(|(_, t, _)| *t).collect();
+        let types: Vec<Ty> = spec.leave_fields.iter().map(|(_, t, _, _)| *t).collect();
         let args = encode_args(&types, values)?;
         let payload = self.resolve_payload(meta.payload)?;
         let state = self
@@ -360,6 +373,7 @@ impl<W: Write> Emitter<W> {
             capture: meta.capture,
             payload,
             args,
+            global_order: None,
         });
         if state.pending.len() >= BATCH_FLUSH_EVENTS {
             self.flush_thread(token.thread_id)?;

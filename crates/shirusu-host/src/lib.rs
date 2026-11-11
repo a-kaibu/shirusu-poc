@@ -1,6 +1,7 @@
 //! shirusu-host: 読み手側。Ring 毎に単一 Drain Worker 前提の取出し、検証、Loss Event 生成、
 //! Enter/Leave 対応付けと終了不明判定、スレッド終了確認後の Slot 解放、完全性報告。
 
+pub mod child_tree;
 pub mod expansion;
 pub mod recorder;
 #[cfg(windows)]
@@ -219,6 +220,13 @@ pub struct DrainWorker {
     pub payload_keys: Vec<TemporaryPayloadKey>,
     pub loss_events: Vec<LossEvent>,
     pub unknown_terminations: Vec<u64>,
+    /// 中断した呼び出し（CallAborted）の回収数（L08）。Host 側の
+    /// 「終了不明」とは別で、異常終了したことが分かっているもの。
+    pub aborted_calls: u64,
+    /// 完了した非同期 I/O（CallCompleted）の回収数（F27）。leave は
+    /// 既に回収済みのため、呼び出しの開閉には通常影響しない。leave が
+    /// 欠落していた場合にだけ開いた呼び出しを閉じる。
+    pub completed_calls: u64,
     pub total_events: u64,
     /// 共有メモリの矛盾で Ring を停止したかどうか。
     pub integrity_lost: bool,
@@ -245,6 +253,8 @@ impl DrainWorker {
             payload_keys: Vec::new(),
             loss_events: Vec::new(),
             unknown_terminations: Vec::new(),
+            aborted_calls: 0,
+            completed_calls: 0,
             total_events: 0,
             integrity_lost: false,
             degraded_seen: 0,
@@ -283,6 +293,11 @@ impl DrainWorker {
     /// 格納済み Payload の一時キーを `payload_keys` に生成する。
     pub fn set_identity(&mut self, identity: RingIdentity) {
         self.identity = Some(identity);
+    }
+    /// `--order=global` 有効なセッションとして検証する（L11）。
+    /// 回収開始前（最初の drain より前）に呼ぶこと。
+    pub fn set_global_order(&mut self, allow: bool) {
+        self.reader.set_global_order(allow);
     }
     pub fn identity(&self) -> Option<RingIdentity> {
         self.identity
@@ -416,6 +431,30 @@ impl DrainWorker {
             {
                 self.closed_calls.insert(e.descriptor.call_id);
             }
+            // L08: 中断した呼び出しも「閉じた」ものとして扱う。Leave と
+            // 同じく開いた呼び出しを閉じ、finalize での「終了不明」に
+            // しない。対応する Enter が無い Aborted は無視する（孤立した
+            // Leave と同じ扱い）。
+            Some(EventKind::CallAborted)
+                if self.open_calls.remove(&e.descriptor.call_id).is_some() =>
+            {
+                self.closed_calls.insert(e.descriptor.call_id);
+                self.aborted_calls += 1;
+            }
+            // F27: 完了した非同期 I/O。leave は既に回収されて呼び出しを
+            // 閉じているのが通常で、その場合は数を数えるだけ。leave が
+            // 欠落してまだ開いている場合にだけ、Aborted と同じくここで
+            // 閉じる。対応する Enter が無いものは無視する（孤立した
+            // Leave と同じ扱い）。完了は別スレッドで観測されることが
+            // あるが、ここは call_id だけで追跡するためスレッドは問わない。
+            Some(EventKind::CallCompleted) => {
+                if self.open_calls.remove(&e.descriptor.call_id).is_some() {
+                    self.closed_calls.insert(e.descriptor.call_id);
+                }
+                if self.closed_calls.contains(&e.descriptor.call_id) {
+                    self.completed_calls += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -433,6 +472,14 @@ impl DrainWorker {
     }
     pub fn open_call_count(&self) -> usize {
         self.open_calls.len()
+    }
+    /// 回収した CallAborted の数（L08）。
+    pub fn aborted_call_count(&self) -> u64 {
+        self.aborted_calls
+    }
+    /// 回収した CallCompleted の数（F27）。
+    pub fn completed_call_count(&self) -> u64 {
+        self.completed_calls
     }
     pub fn integrity_report(
         &self,
@@ -609,6 +656,11 @@ impl ValidatingHost {
     pub fn set_identity(&mut self, identity: RingIdentity) {
         self.identity = Some(identity);
     }
+    /// `--order=global` 有効なセッションとして検証する（L11）。
+    /// 回収開始前に呼ぶこと。
+    pub fn set_global_order(&mut self, allow: bool) {
+        self.reader.set_global_order(allow);
+    }
     pub fn drain_image(&mut self, image: &[u8]) -> Result<Vec<ReceivedEvent>, IntegrityError> {
         match self.reader.drain_image(image) {
             Ok(events) => {
@@ -741,6 +793,7 @@ mod tests {
             parent_call_id: 0,
             payload,
             capture_state: CaptureState::Captured,
+            global_order: 0,
         }
     }
     #[test]
@@ -757,6 +810,40 @@ mod tests {
             .loss_events
             .iter()
             .any(|l| matches!(l, LossEvent::UnknownTermination { call_id: 2 })));
+    }
+    #[test]
+    fn completed_call_counts_without_reopening() {
+        // F27: CallCompleted は leave が閉じた呼び出しを数えるだけで、
+        // 開き直さない。leave が欠落していた場合はここで閉じる。
+        let (_rg, mut w, mut host) = setup();
+        w.write(ev(EventKind::CallEnter, 1, b"a"));
+        w.write(ev(EventKind::CallLeave, 1, b"b"));
+        w.write(ev(EventKind::CallCompleted, 1, b"c"));
+        w.write(ev(EventKind::CallEnter, 2, b"d")); // leave missing
+        w.write(ev(EventKind::CallCompleted, 2, b"e"));
+        w.write(ev(EventKind::CallCompleted, 3, b"f")); // enter 無しは無視
+        host.drain_all();
+        assert_eq!(host.open_call_count(), 0);
+        assert_eq!(host.completed_call_count(), 2);
+        assert_eq!(host.finalize_thread(), Vec::<u64>::new());
+    }
+    #[test]
+    fn aborted_call_closes_open_call_not_unknown_termination() {
+        // L08: 中断した呼び出しは「終了不明」ではない。CallAborted で
+        // 開いた呼び出しが閉じ、finalize で UnknownTermination にならない。
+        let (_rg, mut w, mut host) = setup();
+        w.write(ev(EventKind::CallEnter, 1, b"a"));
+        w.write(ev(EventKind::CallAborted, 1, b""));
+        w.write(ev(EventKind::CallEnter, 2, b"c")); // leave missing
+        host.drain_all();
+        assert_eq!(host.open_call_count(), 1);
+        assert_eq!(host.aborted_call_count(), 1);
+        let unterminated = host.finalize_thread();
+        assert_eq!(unterminated, vec![2]);
+        assert!(!host
+            .loss_events
+            .iter()
+            .any(|l| matches!(l, LossEvent::UnknownTermination { call_id: 1 })));
     }
     #[test]
     fn loss_counters_become_loss_events() {

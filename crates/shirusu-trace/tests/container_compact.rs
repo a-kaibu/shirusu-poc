@@ -209,6 +209,8 @@ fn block_type_and_compression_codes() {
         (BlockType::Index, 7),
         (BlockType::Finalization, 8),
         (BlockType::Loss, 9),
+        (BlockType::BlobUpdate, 10),
+        (BlockType::ProfileSummary, 11),
     ] {
         assert_eq!(ty.code(), code);
         assert_eq!(BlockType::from_code(code), ty);
@@ -267,13 +269,14 @@ fn values_roundtrip_all_types() {
 
 #[test]
 fn values_capture_states_roundtrip() {
-    let types = vec![Ty::U64; 5];
+    let types = vec![Ty::U64; 6];
     let states = [
         ValueCapture::Captured,
         ValueCapture::Unreadable,
         ValueCapture::Truncated,
         ValueCapture::Unsupported,
         ValueCapture::LimitExceeded,
+        ValueCapture::Stale, // F20: 符号化 5
     ];
     let values: Vec<CapturedValue> = states
         .iter()
@@ -398,6 +401,7 @@ fn sample_batch() -> EventBatch {
                 capture: EventCapture::Captured,
                 payload: PayloadRef::Blob(blob),
                 args: Some(vec![1, 2, 3]),
+                global_order: None,
             },
             TraceEvent {
                 kind: 2,
@@ -410,6 +414,7 @@ fn sample_batch() -> EventBatch {
                 capture: EventCapture::Captured,
                 payload: PayloadRef::Inline(vec![9, 8]),
                 args: None,
+                global_order: None,
             },
             TraceEvent {
                 kind: 1,
@@ -425,6 +430,7 @@ fn sample_batch() -> EventBatch {
                     reason: PayloadLossReason::Backpressure,
                 },
                 args: None,
+                global_order: None,
             },
             TraceEvent {
                 kind: 6,
@@ -437,6 +443,7 @@ fn sample_batch() -> EventBatch {
                 capture: EventCapture::Other(200), // 未知の取得状態は往復で保持
                 payload: PayloadRef::None,
                 args: None,
+                global_order: None,
             },
         ],
     }
@@ -490,6 +497,7 @@ fn event_chunk_corruption_cases() {
             capture: EventCapture::Captured,
             payload: PayloadRef::None,
             args: None,
+            global_order: None,
         }],
         ..sample_batch()
     };

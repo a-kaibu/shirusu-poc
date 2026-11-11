@@ -20,7 +20,7 @@ shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC
 | `crates/shirusu-agent-dll` | Agent DLL。対象プロセスへ注入され、Bootstrap 初期化でフックを設置する cdylib（Phase 3） | あり |
 | `crates/shirusu-trace` | 公開 Trace 形式 v1（`docs/trace-format.md`）。Block Container + Protobuf メタデータ（手書きワイヤ形式）+ Compact Binary + BLAKE3 Blob + Zstd チャンク、Trace Writer / Reader（回復意味論） | なし |
 | `crates/shirusu-analysis` | 公開 Trace の解析ビュー（共有基盤）。イベント復号・表示・完全性サマリ・JSON 出力（Phase 4） | なし |
-| `crates/shirusu-cli` | 解析 CLI。inspect / dump / export（Phase 4） | なし |
+| `crates/shirusu-cli` | 解析・記録 CLI。inspect / dump / export / repair / capture・attach（Phase 4） | なし |
 | `crates/shirusu-compare` | 正規化つき差分エンジン。非決定値の正規化とオブジェクト相関による Trace 間比較（Phase 4） | なし |
 | `crates/shirusu-test` | shirusu-test 基礎。言語非依存 JSON 仕様による Trace 期待ルールの評価（Phase 4） | なし |
 | `crates/shirusu-emit` | 外部レコーダ向けエミッタキット（Phase 5）。shirusu 本体以外の実装（sake 等）が公開 Trace 仕様に適合した Trace を出すための高水準 API：セッション管理、共有 API セットの Schema 登録、sequence / call_id の自動採番、Enter/Leave 対応の保証 | なし |
@@ -57,6 +57,7 @@ cargo build --workspace
 # Windows: x86 producer + x64 host のプロセス間実テスト
 #   $env:SHIRUSU_E2E_PRODUCER = "target\i686-pc-windows-msvc\debug\shirusu-e2e-producer.exe"
 #   .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --cross-arch
+#   .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --memory-order-stress
 ```
 
 CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1` / `windows-x86.ps1` /
@@ -69,24 +70,24 @@ CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1`
 
 | 検証 | ローカル (Linux) | CI (GHA) |
 |---|---|---|
-| Unit / 統合 / 仕様テスト表 19 項目 + 境界スイート 69 件 | 通過（下記テスト総数参照） | 初回 push で確認予定 |
-| PBT (参照モデル / Overflow / Fragment / Slot / DST 故障混入 + 損失会計保存則 / Snapshot 故障モデル / 通知意味論 / Slot 影モデル / Enter-Leave 対応付けの新規 6 プロパティ) | 通過（主要プロパティ 1024 cases、DST 512 cases。`SHIRUSU_PBT_CASES` で調整可） | 初回 push で確認予定 |
-| loom (小容量モデル、18 件: Claim 競合 / Slot 再利用 / 世代ガード / 待機インテント回復性 / Slot 回収の操作列転写モデル (R3) / 旧順序 should_panic 回帰 (D53) / Control 初期化の公開順序モデル 2 件 (K04)) | 通過 | 初回 push で確認予定 |
-| ストレステスト (SPSC 並行ソーク、release で 1000 万 ops・整合性確認済み、破壊耐性など。規模は `SHIRUSU_STRESS_OPS` で調整可) | 通過 | 初回 push で確認予定 |
-| E2E シナリオ (16 件: Host 再起動再開 / 公開途中 kill / 32 スレッドストーム / 100 万イベント会計突合 / 共有メモリ破壊注入 / DETACH ストーム等) | 通過 (supervisor `--all`、同期ポイントのみで同期) | 初回 push で確認予定 |
-| Windows x64 / i686 の cargo check | 通過 (この VM から両ターゲット。README の手順どおりの `-p shirusu-transport-win -p shirusu-agent -p shirusu-host` は x64・i686 とも通過。`--workspace` での i686 は loom-tests 経由の第三者クレート `generator 0.8.12` が i686 用 asm を持たず失敗する既存の問題で、自クレートは `--exclude shirusu-loom-tests` で通過。CI の i686 ジョブでは loom-tests の除外が必要——所感参照） | 初回 push で確認予定 |
-| Windows 実機テスト (windows-latest, WoW64 含む) | 未実行 (Linux のため) | CI で実行予定、初回 push で確認 |
-| Windows E2E プロセス間 (File Mapping + 継承ハンドル) | 未実行 (Linux のため) | CI で実行予定、初回 push で確認 |
+| Unit / 統合 / 仕様テスト表 19 項目 + 境界スイート 69 件 | 通過（下記テスト総数参照） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| PBT (参照モデル / Overflow / Fragment / Slot / DST 故障混入 + 損失会計保存則 / Snapshot 故障モデル / 通知意味論 / Slot 影モデル / Enter-Leave 対応付けの新規 6 プロパティ) | 通過（主要プロパティ 1024 cases、DST 512 cases。`SHIRUSU_PBT_CASES` で調整可） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| loom (小容量モデル、18 件: Claim 競合 / Slot 再利用 / 世代ガード / 待機インテント回復性 / Slot 回収の操作列転写モデル (R3) / 旧順序 should_panic 回帰 (D53) / Control 初期化の公開順序モデル 2 件 (K04)) | 通過 | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| ストレステスト (SPSC 並行ソーク、release で 1000 万 ops・整合性確認済み、破壊耐性など。規模は `SHIRUSU_STRESS_OPS` で調整可) | 通過 | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| E2E シナリオ (16 件: Host 再起動再開 / 公開途中 kill / 32 スレッドストーム / 100 万イベント会計突合 / 共有メモリ破壊注入 / DETACH ストーム等。Windows ではプロセス間 3 件を加え 19 件) | 通過 (supervisor `--all`、同期ポイントのみで同期) | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| Windows x64 / i686 の cargo check | 通過 (この VM から両ターゲット。README の手順どおりの `-p shirusu-transport-win -p shirusu-agent -p shirusu-host` は x64・i686 とも通過。`--workspace` での i686 は loom-tests 経由の第三者クレート `generator 0.8.12` が i686 用 asm を持たず失敗する既存の問題で、自クレートは `--exclude shirusu-loom-tests` で通過。CI の i686 ジョブでは loom-tests の除外が必要——所感参照） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| Windows 実機テスト (windows-latest, WoW64 含む) | 未実行 (Linux のため) | run #6 の windows-x64 / windows-x86-wow64 / windows-x64-win2022 ジョブで実行し成功。ジョブログ本文は未読のため、ジョブ内の個別テスト単位の確認は traceability の実装済み未検証に残る |
+| Windows E2E プロセス間 (File Mapping + 継承ハンドル) | 未実行 (Linux のため) | run #6 の windows-x64 / windows-x86-wow64 / windows-x64-win2022 ジョブで実行し成功。ジョブログ本文は未読のため、ジョブ内の個別テスト単位の確認は traceability の実装済み未検証に残る |
 | Kani (14 harness: Cursor 演算 / 占有量 / Slot 割当 / Snapshot 分割 / Descriptor 解釈 / Payload 範囲 / 損失差分) | **全 14 harness が VERIFICATION SUCCESSFUL、0 failures**（`cargo kani -p shirusu-transport`）。証明の入力範囲は CBMC の実力に合わせて絞った箇所があり、理由と代替カバーは各 harness のコメントに明記 | CI ジョブあり (continue-on-error) |
 | Miri (UB 検査) | **実施済み・UB 検出なし**（transport lib 38 件 + boundary 61 件、純粋演算テスト 1 件のみ解釈コストで除外。開始時に SharedRegion の provenance 違反など 3 種の UB を検出して修正済み——所感参照）。spec_table からは c03/c14/c15/c17 が Miri で通過（約 2 秒）。c01/c08 も小規模で通過（c01 は OPS=200 で 1.86 秒、c08 は OPS=20 で 0.52 秒）。注意: Miri は既定でホストの環境変数を転送しないため、繰り返し回数の指定には `MIRIFLAGS="-Zmiri-env-forward=SHIRUSU_SPEC_TABLE_C01_OPS"` が要る（指定なしでは既定の 100,000 件で回る。D59 の罠だった——所感参照） | CI ジョブなし（nightly 前提、ローカルで回すもの） |
 | cargo-mutants (shirusu-transport 全件) | **実施済み**: 554 件中 caught 431 / missed 75 / unviable 41 / timeout 7。missed のうち 50 件は `#[cfg(kani)]` 証明本体内で cargo test からは原理的に倒せず (Kani が担当)、数件は等価 mutant と判断 (理由を所感に明記)。倒せる中核 mutant はテスト追加で kill 済み (追試で確認) | CI ジョブなし（長時間のためローカルで回すもの） |
 | コードカバレッジ (cargo-llvm-cov) | **測定済み**: 中核モジュールは全て行 96% 以上 (clock/context/crc32c/descriptor/layout/notify/slot は 100%、ring 99.6%、validate 98.9%、snapshot 96.1%)。e2e 除き全体 98.5%。未達行は到達不能な防御分岐・スタブの失敗経路等で、内訳は所感に明記。e2e は supervisor 実行のため本測定では 0% になる (別途 16 シナリオ通過で確認) | CI ジョブなし（ローカルで回すもの） |
 | cargo-fuzz 4 targets (10 分ずつ) | **長時間実行済み・クラッシュなし**: validate_control 15,132,063 runs/600s、decode_descriptor 16,332,921 runs/600s、decode_payload 12,909,484 runs/600s、snapshot_fragments (4 本目として追加) 404,754 runs/600s、合計約 4478 万 runs。成長したコーパスは hex 種 79 件に書き戻し済み | CI ジョブあり (continue-on-error、短時間版) |
-| Phase 2: Trace 形式の単体・PBT・回復意味論テスト (shirusu-trace 69 件 + host 変換 9 件) | **通過**（往復・前方参照禁止・チャンク分割・回復意味論は形式仕様の表の各行に対応するケーステスト、手組みバイト列のテストベクター、破壊入力 PBT） | 初回 push で確認予定 |
+| Phase 2: Trace 形式の単体・PBT・回復意味論テスト (shirusu-trace 88 件 + host 変換 9 件) | **通過**（往復・前方参照禁止・チャンク分割・回復意味論は形式仕様の表の各行に対応するケーステスト、手組みバイト列のテストベクター、破壊入力 PBT） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
 | Phase 2: cargo-fuzz 2 targets (decode_compact / recover_trace) | **実行済み・クラッシュなし**: decode_compact 5,843,310 runs/75s、recover_trace 1,120,017 runs/75s（2026-11-09 ローカル）。test.md の 5 ターゲットが全て揃った | CI ジョブあり (continue-on-error、短時間版) |
-| Phase 2: Windows x64 / i686 の cargo check (shirusu-trace / shirusu-host) | **通過**（この VM から両ターゲット。blake3 は `pure` フィーチャで純 Rust 実装に固定——所感参照） | 初回 push で確認予定 |
-| Phase 5: ippai 連携基盤のテスト (emit 8 + conformance 12 + probe 8 = 28 件) | **通過**（エミッタ往復、規約違反注入→該当項目のみ Fail、通しシナリオ「emit→適合→compare→バンドル→ルールが左 pass / 右 fail を再現」、CLI 終了コード。sake 側の実装は本 repo に無く、対象外——所感参照） | 初回 push で確認予定 |
-| Phase 5: Windows x64 / i686 の cargo check (shirusu-emit / shirusu-conformance / shirusu-probe) | **通過**（この VM から両ターゲット。windows-check-targets に matrix.json の最小変更で追加済み） | 初回 push で確認予定 |
+| Phase 2: Windows x64 / i686 の cargo check (shirusu-trace / shirusu-host) | **通過**（この VM から両ターゲット。blake3 は `pure` フィーチャで純 Rust 実装に固定——所感参照） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| Phase 5: ippai 連携基盤のテスト (emit 8 + conformance 12 + probe 8 = 28 件) | **通過**（エミッタ往復、規約違反注入→該当項目のみ Fail、通しシナリオ「emit→適合→compare→バンドル→ルールが左 pass / 右 fail を再現」、CLI 終了コード。sake 側の実装は本 repo に無く、対象外——所感参照） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
+| Phase 5: Windows x64 / i686 の cargo check (shirusu-emit / shirusu-conformance / shirusu-probe) | **通過**（この VM から両ターゲット。windows-check-targets に matrix.json の最小変更で追加済み） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
 | TLA+ / TLC | **実行済み・エラーなし**: 990,889 状態生成 / 310,249 相異状態 / 深さ 28 / 13s（MaxCursor=4、Generation<=2 の制約下。全 7 不変条件が成立）。Slot 再利用は段階分割（ReclaimBegin → PublishFree）でモデル化し、旧順序の変種モデルでは `ClaimedGenerationIsCurrent` の違反を 924 状態で検出（モデルが競合を表現できる証跡。詳細は docs/verification.md） | CI ジョブあり |
 | 待機方式ベンチマーク (shirusu-wait-bench) | **実行済み・選定あり**: 50 ラウンドで event を選定（中央値 14µs / p95 24µs、sleep 方式は中央値 48µs / p95 97µs）。spin / yield は遅延は小さいが CPU を焼くため不採用 | CI ジョブなし（参考計測。ローカルで回すもの） |
 | 調整値ベンチマーク (shirusu-tuning-bench, A73) | **実行済み・全既定値を維持**: Ring 容量・BOUNDED_WAIT 上限・再確認周期・復帰閾値・Slot 数を掃引測定し、現行既定値（4096 件 / 1MiB、1ms、2ms、50%、32 スロット・低水位 8）を維持と決定。詳細は「調整値の測定による決定」節 | CI ジョブなし（参考計測。ローカルで回すもの） |
@@ -97,11 +98,11 @@ CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1`
 
 ### テスト総数（ローカル実測）
 
-`cargo test --workspace` で **1796 件**がローカルで通過
-（2026-11-10 18:29 JST に再実行し 1,796 passed / 0 failed を確認。実行ログは goal の hidden_files 参照）。
-下の内訳は 1773 件時点（2026-11-09 18:17 測定）の分解で、現在の実測（1796 件、+23 件）とは
+`cargo test --workspace` で **1890 件**がローカルで通過
+（2026-11-11 08:29 JST に再実行し 1,890 passed / 0 failed を確認。実行ログは goal の hidden_files 参照）。
+下の内訳は 1773 件時点（2026-11-09 18:17 測定）の分解で、現在の実測（1856 件、+83 件）とは
 loom 13→18、transport lib 52→54、host lib 21→24、行列 slot 28→29、writer/reader 7→9、
-回復意味論 14→15、invalid_handle_width 新規 7 件、F24 の 2 件（container_compact・recovery 各 +1）などの増加分で食い違う。
+回復意味論 14→15、invalid_handle_width 新規 7 件、F24 の 2 件（container_compact・recovery 各 +1）、F17 の 3 件（recovery +3）、F23 の 3 件（recovery +3）、H14 の 3 件（cli +3）、F21 の 4 件（durability 新規）、F19 の 4 件（schema 2 + hook api 1 + capture 1）、F20 の 9 件（schema 4 + hook api 1 + capture 1 + emit 1 + compare 1 + view 1）、F22 の 5 件（writer/reader 3 + analysis 1 + cli 1）、G15 の 6 件（hook runtime 5 + engine 1）、F18 の 13 件（blob_schema 4 + writer/reader 3 + recovery 4 + conformance 2）、F25 の 3 件（writer/reader +3）、L12 の 8 件（cli +8）、L11 の 24 件（transport 2 + agent 5 + trace 7 + host 3 + cli 6 + hook 1）、A77 の 10 件（e2e lib の検証ロジック）などの増加分で食い違う。
 1773 件時点の内訳は 1559 件 + Phase 2 の 78 件
 （shirusu-trace 69（proto 16 + container/compact 16 + blob/schema 9 + writer/reader 7 +
 回復意味論 14 + テストベクター 3 + PBT 4）+ host 変換 9）+ Phase 3 の 36 件 + Phase 4 の 40 件
@@ -117,7 +118,7 @@ Agent→検証 Host E2E 2 + レビュー第2回デルタ 9（Reader 多層防御
 host サービス 4 + 往復 E2E 2））がローカルで通過（全実行 約 40 秒）。なお transport lib 52 件には A70 の Slot 追加 4 件が含まれており、A70 拡張フロー 19 件との重複 4 件を除くと内訳の合計は 1559 件になる（総数 1749 件は cargo test の実測と一致）。行列スイートは
 拡充第2弾（2026-11-09）で追加したもので、各ケースが境界・状態・エラー経路の
 実在の違いを参照式や遷移表と照合する。E2E supervisor のシナリオはプロセス内 15 件 + 子プロセススモーク 1 件の
-全 16 件がローカル (Linux) で通過（Windows プロセス間の 2 件＝cross_arch と production_path は CI 待ち）。
+全 16 件がローカル (Linux) で通過（Windows プロセス間の 3 件＝cross_arch と production_path と memory_order_stress は CI 待ち）。
 失敗したテストを緑に見せることはしません。落ちたら原因と直し方を所感に残します。
 
 ## 調整値の測定による決定 (A73)
@@ -1236,6 +1237,276 @@ README を全文読み直したら、実装の進みを追い切れていない�
 ### 2026-11-10 18:29 — F24: 予約フィールドの検証は「書く側」と「読む側」の両輪
 
 Header payload の header_flags は Writer が常に 0 を書くのに、Reader の `FileHeader::decode` は Magic と長さしか見ず、0 でない値を無視して受理していた。Block ヘッダーの reserved は Reader が厳格に検証するのに、File Header の payload だけ穴が空いていた——同じ「予約 0」でも、検証が入っている場所と入っていない場所がある。修正は `decode` で bytes[14..16] != 0 を None とする 3 行で、Reader の先頭 Block 厳格検証経由で NotATrace になる（先頭 Block は回復対象外のため issue 記録ではなく拒否とした。Block ヘッダーの reserved と同じ扱い）。テストは decode レベルと Reader レベルの 2 件を赤→緑で追加した。Reader レベルのテストでは payload を改変したあと `serialize_header` で CRC を付け直しており、失敗の原因が header_flags の検証だけになるようにした——CRC まで壊してしまうと「何を検証したテストか」が曖昧になる。verification.md の再読監査（第3回）は新規項目 0 件で、監査の収穫は逓減している。残る未着手は 30 件で、次は F17（Reader のセッション一致検証）が同じ系統の小粒な項目として残っている。
+
+### 2026-11-10 18:51 — run #6 全緑: 「検証済み」が初めて 0 を離れた
+
+一括 push #5（リモート 2f480c6）を受けた GitHub Actions run #6（id 42793559424）が、全 12 ジョブ成功で終わった。plan / linux / windows-x64 / windows-x86-wow64 / windows-x64-win2022 / windows-check-targets / macos-validation / msrv / kani / fuzz-short / tla / done——run #5 で落ちた Windows 3 ジョブと linux が緑になり、msrv は `--all-targets` 化（K02）のうえでも通過した。これで「ローカル＋CI の両方で通過を確認した」という検証済みの定義を初めて満たせるようになり、docs/traceability.md の 245 項目を検証済みに反転した（0 → 245 / 298、進捗率 82.2%）。反転に先立って `cargo test --workspace` を再実行し、1,796 passed / 0 failed を自分でも確認している。
+
+ただし、全緑をそのまま全部の裏付けにはしなかった。Windows ジョブは終了コード伝播＋カナリアで「スクリプト内の全ネイティブステップが exit 0」を保証するが、ジョブログ本文は GitHub のサインインが要り未読のため、ジョブ内部のテスト／シナリオ単位の確認は推論に留まる。検証の中核がその実動にある 24 件（フックエンジン・Agent DLL・起動ドライバ・capture-e2e・production_path・プロセス間 E2E・shutdown 実動・再アタッチ往復など）は、不足する証跡を状態欄に書いて実装済み未検証のまま据え置いた。週次でしか走らない D80、ローカル実測だけの A65、判断項目の A75 も同様に残した。「緑のジョブがある」と「その項目の検証が済んだ」の間には距離があり、今回の反転はその距離を項目ごとに測って線を引いた作業だった。残りは未着手 29 件（L 節の大物と F17 等）と、この 24 件の実動確認で、後者は kota にジョブログを読んでもらうか、ジョブログを読める手段ができれば一気に進む。
+
+### 2026-11-10 19:29 — F17: issue の新設はコンパイラが波及を教えてくれる
+
+18:29 の所感で「次は F17」と書いたとおり、Reader のセッション一致検証（F17）を実施した。`RecoveryIssue::SessionMismatch { what, expected, found }` を新設し、`read_trace_with_limits` が走査後に Environment / 各 Batch の session_id と Header の一致を検証して、不一致を issue として記録する（内容は読み捨てない。同一 session_id の不一致は 1 回だけ）。テスト 3 件を回帰テスト先行で追加し、Reader 側 2 件の赤を確認してから緑にした。
+
+実装の副次として面白かったのは、新しい issue バリアントを追加した瞬間に `shirusu-analysis`（view.rs の issue 表示）と `shirusu-conformance`（clean-scan）の非網羅マッチがコンパイルエラーで検出されたことだ。`RecoveryIssue` に網羅マッチが 2 か所あるおかげで、「Reader が新しい問題を記録できるようになったのに、表示と適合性検査がそれを知らない」という齟齬がビルド時に見つかる。`clean-scan` では SessionMismatch を damaging 扱いにした：内容は読めるが、Header と別セッションの内容が混ざったファイルは「きれいな capture」ではないからだ。Reader が寛容に読み、適合性検査が厳しく見る——この二層が F11 の回復意味論の意図どおりに働いた。
+
+テスト設計では F24 と同じ手筋を使った。Environment の session_id を 42 から 43 に変える（同じ varint 長 1 バイト）ことで Block 長を変えず、保存 Index を有効なままにして、失敗の原因がセッション不一致だけになるようにした。trace-format.md の再読監査（第3回）は新規項目 0 件で、監査の収穫は逓減している。残る未着手は 28 件で、同じ系統の小粒な項目としては F23（Reader の前方参照の扱い）が次に残っている。
+
+### 2026-11-10 20:29 — F23: 順序の検証には「位置」を残しておく必要がある
+
+19:29 の所感で「次は F23」と書いたとおり、Reader の前方参照の扱い（F23）を実施した。`RecoveryIssue::ForwardBlobReference { id }` を新設し、Blob Chunk が参照する Event Chunk より後に現れた場合に issue として記録する。内容は解決して保持し、拒否はしない——F11 の回復意味論どおり、読めるものは読んで、違反は値として残す。`clean-scan` では damaging 扱いにした：順序規則を破ったファイルは「きれいな capture」ではないからだ。
+
+実装上の要点は、順序を検証するには走査時の「位置」を残しておかなければならないことだ。従来の Reader は走査後に `blobs` の HashMap で一括解決しており、どの Batch がファイルのどこにあり、どの Blob がどこで初めて現れたかという情報は捨てていた。そこで `Scan` に `batch_offsets`（`batches` と並行する受理オフセット）と `blob_offsets`（Blob ID ごとの初出オフセット）を追加し、走査後に両者を比べて前方参照を判定した。DuplicateBlob の 2 回目以降は初出を残すので、重複 Blob が前方参照の判定を歪めることはない。BlobHashMismatch で受理されなかった Blob は `blob_offsets` に載らず、MissingBlob としてだけ現れる——「無いもの」と「順序が違うもの」を取り違えない。
+
+テストは 3 件を回帰テスト先行で追加した。Block の並びだけを入れ替える捏造ヘルパー（各 Block 自体は CRC ごと無傷）で前方参照を作り、issue の記録と Payload の解決保持を確認する。赤は新バリアント未定義のコンパイルエラーで、F17 のときの実行時失敗とは違う形だったが、「テストが先に要求するものを実装がまだ持っていない」という点では同じ赤だ。今回も新バリアント追加の瞬間に view.rs と clean-scan の非網羅マッチがコンパイルエラーで検出され、表示と適合性検査の波及を漏らさずに済んだ。残る未着手は 27 件で、同じ系統の小粒な項目としては F18〜F22・H14 が次に残っている。
+
+### 2026-11-10 21:29 — H14: 終了ステータスは「判定の再利用」であって「判定の新設」ではない
+
+F23 の所感の末尾で「次は F18〜F22・H14」と書いたとおり、H14（`shirusu inspect` の incomplete な Trace の終了ステータス）を実施した。`cmd_inspect` が表示を出したあと `IntegritySummary::has_event_loss()` を見て、損失があれば終了 1 にする。表示は先に出す——終了コードは「表示を見たうえでの失敗の合図」であって、表示の代わりではない。
+
+実装上の要点は、incomplete の判定を新設しなかったことだ。`has_event_loss()` は shirusu-test の `no-integrity-loss` ルールがすでに使っているレビュー済みの述語で、Loss Record・落ちた Payload・欠落 Blob・event_integrity 非 Complete の四つを見る。CLI が独自の判定を持てば、二つの場所で「incomplete の意味」がずれていく。判定が一か所にしかないことは、仕様の文言（「Event Integrityを失ったTraceはincomplete」）とコードの述語が一対一で対応していることでもある。`inspect` の出力と JSON に `status: complete / incomplete` を足したのは、終了コードだけでは「なぜ失敗したか」が伝わらないからだ。ゴールデンはその 1 行だけの差分で更新した。
+
+境界の決定として、Finalization なし（Unknown）や回復 issue のみは incomplete としなかった。overview の incomplete は「Event Integrityを失った」場合で、H03 が「確定できない」と表示する Unknown とは別扱いだからだ。TruncatedTail のような回復 issue は conformance の clean-scan が damaging として別途扱う。もし kota が「クラッシュで切れた Trace も inspect で失敗させたい」と判断すれば、判定は一行の変更で広げられる。その判断材料として、境界は traceability の H14 行に明記した。
+
+テストは 3 件を回帰テスト先行で追加した。Finalization の event_integrity=Degraded、Dropped Payload のある Trace、`--json` の Degraded。赤は終了 0（従来どおり Ok）の実行時失敗で、F23 のコンパイルエラー型とは違う、素直な赤だった。`run_cli` を `run_cli_bytes` に分け、終了コードまで返すようにしたので、今後の CLI の終了コード回帰も同じ型で書ける。fmt で import の並びを一度直された（`cargo fmt --check` は `cargo test` の前に回す癖をつける）。i686-pc-windows-gnu ターゲットはこの VM に入っていない（入っているのは msvc）ため、Windows チェックは x86_64-pc-windows-gnu と i686-pc-windows-msvc で代用した。
+
+あわせて overview.md の再読監査（第4回）で F25・F26・G15 を追加し、分母が 298→301 になった。F25 はチャンクサイズのベンチマーク決定（現行は 256 KiB を測定なしに採用）、F26 は 4 指標の分離測定、G15 は Detour の再入制御（転送層・Agent 側のガードはあるが Detour 側が無かった）。監査のたびに「コードはあるが項目が無い」ものが見つかるのは、チェックリストが仕様の網羅性を測る物差しとして機能している証拠だ。残る未着手は 29 件で、次に小粒なのは F18〜F22 の Trace 形式系と G15 だ。
+
+### 2026-11-10 22:29 — F21: 永続化の保証は sync だけでは完結しない
+
+H14 の所感の末尾で「次は F18〜F22」と書いたとおり、F21（Writer の永続化設定）を実施した。`Durability`（Buffered 既定 / SyncOnFinish / SyncPerBlock）と `DurableWrite` トレイト（`File` は `File::sync_all` へ委譲、`Vec<u8>`/`Cursor` は no-op、`BufWriter` は flush してから委譲）を新設し、`TraceWriter::with_options` / `WriterOptions` で設定する。SyncPerBlock は各 Block 書き込み後に、`finish` は `Buffered` 以外で最終 flush 後に sync_all する。`CaptureSessionConfig::durability` から実記録経路へ配線し、`Emitter::with_options` も追加した。
+
+設計上の要点は二つある。一つは、sync する能力を書き先の型に持たせたことだ。`TraceWriter` の境界を `W: Write` から `W: DurableWrite` へ変えたため、`TraceRecorder` と `Emitter` の境界も連れて変わった。波及は `File`・`Vec<u8>`・`BufWriter`・テスト用 SharedBuf の実装で吸収でき、呼び出し側の変更は `CaptureSessionConfig` に `durability` を足すだけだった。ワークスペース全体で自作の `Write` 実装が SharedBuf ひとつしか無かったのが幸いした——もし書き先の種類が多ければ、トレイトではなく `Box<dyn FnMut()>` のようなコールバックで逃げる設計になっていただろう。
+
+もう一つは、「最後に永続化されたチャンクまで」という保証が sync だけでは完結しないことだ。SyncPerBlock でも、OS がクラッシュする瞬間に最後の Block が半分だけ書かれていることはあり得る。その半端な Block を「読める範囲」として扱えるのは、F11 の回復意味論が末尾切断を `TruncatedTail` として切り分けるからだ。sync が「バイトをディスクに届ける」ことを保証し、回復読みが「届いた範囲を壊れずに読む」ことを保証する——保証範囲の表を trace-format.md に書くとき、この二段を分けて書かないと、SyncPerBlock を選べばクラッシュ時の損失がゼロになるような誤読を招く。設定の既定を Buffered のままにしたのも同じ理由で、記録中の性能を優先する従来の挙動を変えず、強い保証が要る場合だけ選ぶ形にした。
+
+小さな罠も二つあった。`cargo fmt --check` は `cargo test` の前に回す癖がついたが（H14 の所感どおり）、今回は import 行の折り返しを `cargo fmt` に直されたあと、clippy で `Durability` の未使用 import を指摘された。doc コメント内の `[`Durability::Buffered`]` というリンクは、rustc の未使用 import 判定では「使用」と数えられない——リンク解決は rustdoc の仕事で、rustc の lint には届かない。doc だけのために import を残す手もあるが、素直にリンクを外して素のコード表記にした。もう一つは、ワークスペース全体のテストを 2 回回したことだ。1 回目は `tail -5` で件数を捨ててしまい、合計を知るために 2 回目を回す羽目になった。次回からは 1 回の実行で `test result` 行を残す。
+
+あわせて spec-transport.md の再読監査（第4回）を実施し、新規項目 0 件だった。Mapping 追加中の Host 停止は C11、Host 停止時の記録無効化＋素通しは A44、通知なしスレッド終了の Host 検出は A39/A59、Host 検証 5 手順は A46〜A51 と、疑った箇所はすべて項目化済みだった。監査の収穫は逓減しているが、仕様の再読が分母を増やさなくなったこと自体が、チェックリストの網羅性が上がった証拠でもある。残る未着手は 28 件で、次は F19・F20・F22・G15 あたりの小粒な項目が候補だ。
+
+### 2026-11-10 23:29 — F19: 取得タイミングは Schema の flags に載せるのが筋だった
+
+F21 の所感の末尾で候補に挙げた F19（メモリの取得タイミング）を実施した。`CaptureTiming`（Unspecified / Before / After / Completion / Both）を新設し、FieldDef.flags の bit5..=7 に格納する。bit0/bit1 は inout/省略可能、bit2..=4 は ValueKind が既に使っているため、空いていた bit5 から 3 ビットを取った。ValueKind と同じ手筋（from_flags / flags、未知値は Unspecified へ丸める前方互換、flags が content_hash の入力に含まれる）で揃えた。
+
+フック表と emit の共有セットは両方とも 4 API の全フィールドにタイミングを付けた。enter 側はすべて Before、leave 側はすべて After。タイミングの宣言と実際の取得点が一致することは、WriteFile の data が enter で呼び出し前の内容を取ることと、ReadFile の data が leave で書き込み後の内容を取ることの二つのテストで縛った。共有セットとフック表の content_hash 一致テストがそのまま通ったのは、両表を同じ変更で揃えたからだ。片方だけ直していたら、ハッシュ不一致で即座に落ちる——このテストが「二つの表は同一定義」という約束を守ってくれている。
+
+Completion と Both は「宣言はあるが実例はまだ無い」という正直な状態で残した。Completion は非同期 I/O の完了時取得を宣言する値だが、現行フックは OVERLAPPED 指定の leave 時点で Unsupported として記録するだけで、完了を捕捉する仕組みは無い。overview の条項「非同期 I/O は完了時に取得する」に対応する機構が無いことは、F19 の実施中に見つけた漏れとして F27 として新規項目化した（分母 301→302）。Both も現行 4 API には入出力共用バッファが無く実例は無いが、規則（enter と leave の両 Schema に現れ、それぞれ別々のスナップショットとして保存する）は trace-format.md に書いた。L03 の API 拡張時に初めて実例が現れる。
+
+あわせて README の再読監査（第3回）を実施した。検証表の CI 欄が 11 行とも「初回 push で確認予定」のままだった。push #5 と run #6 の全緑（2026-11-10 18:51）のあと、検証済みの反転は traceability.md だけで行われ、README の表は追いついていなかった。CI 欄を run #6 での確認に更新し、Windows 実機の 2 行だけは「ジョブログ本文は未読のため個別テスト単位の確認は実装済み未検証に残る」という留保を付けた。緑のジョブと項目の検証済みは別物だという線引きは、README でも同じにしておく必要がある。
+
+小さな罠もあった。ワークスペース全体のテストを 2 回回してしまった（F21 の所感で「次回からは 1 回の実行で test result 行を残す」と書いたのに、同じ過ちを繰り返した）。1 回目は `tail -6` で件数を捨て、合計を知るために 2 回目を回す羽目になった。所感に書いた反省は、次回の自分が読むとは限らない——次回はコマンド自体を `grep -E "^test result:"` 付きで 1 回だけ回すことにする。
+
+残る未着手は 28 件で、次は F20・F22・G15 あたりの小粒な項目が候補だ。
+
+### 2026-11-11 00:29 — F20: 「意味のある値」は取得状態で区別するのが筋だった
+
+F19 の所感の末尾で候補に挙げた F20（GetLastError の生値と意味のある値の区別）を実施した。`LastErrorMeaning`（Unspecified / Always / WhenReturnIsFalse / WhenReturnIsInvalidHandle）を新設し、FieldDef.flags の bit8..=10 に格納する。F19 の CaptureTiming と同じ手筋（from_flags / flags、未知値は Unspecified へ丸める前方互換、flags が content_hash の入力に含まれる）で揃えた。bit8 から取ったのは、bit0..=7 が埋まっていたからだ。
+
+意味条件は API ごとの宣言としてフック表の ApiDef に載せ、leave Schema の `last_error` フィールドの flags へ写した。emit の共有セットも同じ宣言を持ち、content_hash 一致テストが両表の一致を守る。取得側は `last_error_value` で条件と戻り値を判定し、条件を満たさない生値を `ValueCapture::Stale`（符号化 5）として記録する。値本体は生値を保持する——「生の値とデコードした値の両方を保持する」という overview の方針どおり、再検証のために残す。表示は `<stale>`、比較は状態名だけで比較する。Stale を新しい取得状態にしたのは、compare の規則 5（`ValueCapture != Captured` は状態名で比較）がそのまま使え、比較エンジンに手を入れずに残留値の違いを差分から消せたからだ。意味のある last_error の違いは従来どおり ReturnDifference として検出される。
+
+設計で迷ったのは、Stale を取得状態にするか、Schema の規則と戻り値だけで読む側が判定するかにした点だ。後者だと、古い Schema（Unspecified）や Schema を持たない読み手は区別できない。取得時点で状態として刻んでおけば、値そのものが「この生値は古い」と語る。符号化に 1 バイト（コード 5）を追加する代わりに、区別が値に内在する。旧来の Reader は符号化 5 を含む値列を復号できないが、v1 開発途上の追加として trace-format.md に明記した。
+
+途中の罠: emit 側のテストを編集中に、既存の `file_io_schemas_match_hook_table_hashes` テスト本体を誤って消してしまった（edit の old_text に本体を含めてしまった）。復旧して再実行し、通ることを確認した。長いテスト本体を含む edit は、new_text に本体を残すことを意識すること。
+
+あわせて集計ブロックの陳腐化を見つけた。F19 実施分が未反映で、実装済み未検証 28 項目・未着手 28 項目・分母 301 のままだった。正しくは実装済み未検証 30 項目（F19・F20 を含む）・未着手 27 項目・分母 302。21:29 の実行でも同じ陳腐化を直したばかりだった。集計ブロックは「最終更新」行と行末の 3 行の二箇所に数が分散していて、片方だけ直すとずれる。次回以降、行の状態を数えて照合すること（未着手は行から列挙して数え直した）。
+
+残る未着手は 27 件で、次は F22・G15 あたりの小粒な項目が候補だ。F18 は設計が大きく、F25/F26 は測定系で別途まとめてやるのがよい。
+
+### 2026-11-11 01:29 — F22: Checkpoint 方式で十分、ただし書かれなければ空文になる
+
+F20 の所感の末尾で候補に挙げた F22（Event Chunk の独立デコード可能性）を実施した。決定は Checkpoint 方式で十分とする（字面どおりのチャンク毎の部分集合埋め込みはしない）。根拠は三つある。第一に、チャンクの構造復号（イベント境界・sequence・timestamp・api_id・kind・args の生バイト列）は Schema を要しない。第二に、Reader はファイル全体を走査して Schema / Schema Checkpoint の定義を 1 つのレジストリに集めるため、ファイル内のどこかに定義のコピーが 1 つ残っていれば全チャンクの型付き解釈ができる。第三に、埋め込みはセッション全体で共有される Schema 集合を全チャンクに重複させるだけで、新しい情報を増やさない。Checkpoint は Schema の変化回数に比例するコストで同じ回復性を得る。
+
+ただし、ここで一つ正直な問題があった。Checkpoint の仕組みは形式にも Writer の手動 API にも既にあったが、実運用の記録経路では一度も呼ばれていなかった。`write_schema_checkpoint` の呼び出し元はテストと Host の未使用の委譲だけだった。決定だけ書いて機構を動かさなければ、「Checkpoint 方式で十分」は空文になる。そこで Writer の `flush_schemas` が Schema Block の直後に、その時点までの全定義の複製を Schema Checkpoint Block として自動で書くようにした。Schema Block が増えるたびに 1 個の複製が増えるだけで、チャンク数には比例しない。手動の `write_schema_checkpoint` は、長時間記録の途中で任意の時点に複製を追加で置くために残した。
+
+保証は二層に分けて trace-format.md に書いた。構造復号と API 呼び出しの検索はチャンク単独で可能（Schema 不要）。型付き解釈は、ファイル内のいずれかの Schema / Checkpoint に定義が残っている限り可能。Schema Block とその Checkpoint の両方が壊れると型付き解釈はできないが、その場合もイベント列は残り、args の生バイト列もイベントに残る（両方破損のテストで縛った）。「リソース復元可能」との区別も明記した。Blob が壊れても API 呼び出し自体は検索できるが、Blob 内容の復元はできない——独立デコード可能とリソース復元可能は別物だ。
+
+テストは 5 件で、赤→緑を確認したのは Checkpoint の 2 件（直後の Checkpoint が無いこと、Schema 破損時に型付き解釈が失われること）だけだった。Blob 破損時の検索 2 件（analysis の名前・api_id 検索と、実バイナリの `dump --api`）は実施前から緑だった。MissingBlob でイベントを残す回復意味論が既にあり、F22 の要求を固定する回帰ピンとしての追加だ。赤にならないテストも、要求を固定する意味がある——F11/F23 の回復意味論が将来の変更で崩れたら、この 2 件が最初に知らせてくれる。
+
+小さな罠もあった。traceability.md の表は `| ID | 項目 | 実装 | 状態 |` の 4 列で、状態は末尾列だ。F22 行の更新スクリプトで状態と実装の列順を逆に書き、数え直しで発覚して直した。F20 の所感で「行の状態を数えて照合すること」と書いたとおり、行を数えて照合した結果、検証済み 245・実装済み未検証 31・未着手 26＝分母 302 が一致した。あわせて集計の先頭行の陳腐化も直した（F25〜F27・G15 追加後の F 27・G 15・分母 302 が、F 24・G 14・298 項目のままだった）。
+
+残る未着手は 26 件で、次は G15（Detour の再入制御）あたりの小粒な項目が候補だ。F18 は設計が大きく、F25/F26 は測定系で別途まとめてやるのがよい。
+
+### 2026-11-11 02:29 — G15: 再入制御は「記録経路の外側」に置くのが筋だった
+
+前回候補に挙げた G15（Detour の再入制御）を実施した。問題は、記録経路がフック対象 API を呼ばないという暗黙の前提にコードが依存していたことだ。現行の 4 API では、通知に使うのはフック対象外の SetEvent だけで、メモリ読み取りも VirtualQuery + 直接コピーだけだから動いている。だが L03 で API 表が増えれば、その前提はいつ崩れるか分からない。動いている今のうちに、機構として持つことにした。
+
+設計の要点は二つある。第一に、ガードを張る範囲は「Detour の記録経路全体」であって、Ring の公開区間だけではない。A42 の PublishGuard は公開区間だけを覆うが、capture・`ensure_thread`・通知も記録経路であり、将来どれがフック対象を呼ぶかは分からない。だから別層のガードを runtime.rs に置いた。第二に、元の API 呼び出しの間だけガードを外すこと。外さなければ、元の呼び出しの中で起きたアプリ由来の入れ子呼び出し（コールバック経由を含む）まで素通しにしてしまい、A43 の親子記録を壊す。suspend/resume の往復がこの区別を担う。ガードは同時に 1 つだけ保持でき、suspend 中の入れ子は別のガードになる。
+
+判定は 4 Detour の共通入口 `prepare()` に一本化した。各 Detour が自分で判定すると、将来 Detour が増えたときに漏れる。`prepare()` が ReentrancyGuard を立てて Record に持たせ、Detour は suspend/resume だけをする。再入時は元関数ポインタだけ引いて素通しで呼ぶ。呼出スタックには触らないので、Agent 自身の呼び出しは Trace に現れない。
+
+テストは 6 件で、赤→緑を確認したのは runtime.rs の 5 件（再入の遮断・suspend/resume での入れ子許可・suspend 中の drop による解除・スレッドローカル性・Detour 流れでの親子関係維持と Ring 内容）だ。engine.rs の 1 件は Windows 専用で、`prepare` の再入時 Passthrough と suspend 中の再入 Record を直接確かめる。Linux ではコンパイルすらされないため、Windows 両ターゲットの `cargo check --tests` でコンパイルを確認し、実行は CI の windows ジョブ待ち。Detour 本体は Linux では検証できないという制約は、G06 と同じ留保だ。
+
+副次的な発見として、shirusu-agent-dll に `drained` の未使用代入の警告が 1 件、変更前から残っていることを確認した（K06 の shutdown 実動の周辺）。今回は G15 の範囲外のため直さないが、run #7 までに直す候補として記録しておく。
+
+残る未着手は 25 件で、次は F18（Blob の部分的な更新）の設計検討か、F25/F26 の測定系あたりが候補だ。
+
+### 2026-11-11 03:29 — F18: 部分更新は「差分の表現」であって「差分の保存」ではない
+
+前回候補に挙げた F18（Blob の部分的な更新）を実施した。overview の一行「部分的な更新は、Resource ID、オフセット、サイズ、更新内容で表す」だけが仕様で、Resource ID の定義も、更新の適用順序も、失敗時の扱いも決まっていなかった。決めたことは次のとおり。
+
+第一に、Resource ID は新しい ID 空間を作らず、基底 Blob の ID（内容の BLAKE3）とした。リソースの同一性は「最初に確立した内容のハッシュ」で表す。更新は長さを変えない置き換えで、範囲外は無効とした。第二に、新版 ID は更新が宣言する。Writer は基底の全体内容を保持しないため、新版 ID の正しさを Writer では検証できない。検証は Reader が畳み込み結果のハッシュと照合して行う。Blob ID は内容ハッシュそのもの、という設計を更新経路でも守るための配置だ。第三に、失敗した更新は適用せず issue として記録する。基底が無い・範囲外・ハッシュ不一致の 3 種で、いずれも conformance の clean-scan では damaging とした。内容を推測で作らない、という Reader の原則どおりだ。
+
+実装中に、ハッシュ照合の guard がテストの誤りを検出した。連鎖更新のテストで、1 件目の期待値を「全体が 'b' に変わった内容」と書いたが、更新は先頭 8 バイトしか置き換えない。畳み込み結果のハッシュが宣言と食い違い、BlobUpdateHashMismatch が出た。実装のバグではなくテストの期待値の誤りで、期待値を訂正して緑にした。guard が無ければ、誤った期待値を「通る実装」に合わせてしまうところだった。
+
+副次として、ReadTrace にフィールドを 2 つ足したため、リテラルで構築しているテスト用ヘルパ 2 か所（probe の trim.rs、conformance の check.rs）のコンパイルが壊れた。構造体にフィールドを足すと全構築箇所が壊れるのは、網羅マッチと同じく「漏れをコンパイルエラーで検出する」仕組みとして機能している。F17/F23 で view.rs と conformance の非網羅マッチが新 issue を検出したのと同じ筋だ。
+
+残る未着手は 24 件で、次は F25/F26 の測定系か、A77（Windows プロセス間ストレステスト）の検討あたりが候補だ。
+
+### 2026-11-11 04:29 — F25/F26: 測る前に「測れているか」を疑え
+
+前回候補に挙げた測定系 F25（チャンクサイズの決定）と F26（4 指標の分離測定）をまとめて実施した。ベンチ `shirusu-trace-bench` を新設し、20,000 イベントの決定的な合成ワークロードで 128 KiB / 256 KiB / 512 KiB / 1 MiB を掃引した。結果は、総バイト数 555,459 / 550,193 / 542,515 / 542,515 B、Event Chunk 数 8 / 4 / 2 / 2。決定規則（仕様範囲 256 KiB〜1 MiB の中で、1 MiB に対し総バイト数 +1% 以内・デコード最速の +5% 以内を満たす最小値）により、既定値を 256 KiB から 512 KiB に変更した。書き込み・デコード時間は全目標値で差が無かった。
+
+実施中に二つ、測定そのものの欠陥を見つけた。第一に、初版のワークロードは Batch 500 件で、符号化サイズが約 20 KiB しかなく、どの目標値でも分割が起きなかった。全目標値で 40 チャンクという「差の無い結果」は、測定が何も測れていなかっただけだった。Batch を 10,000 件（約 400 KiB）に増やして掃引し直し、チャンク数が 8 / 4 / 2 / 2 と分かれることを確認してから決定した。ベンチを書いたら、まず「掃引の軸が結果に効いているか」を確かめる。効いていない測定は、決めた気になるだけだ。
+
+第二に、共有 VM では時間の中央値が実行ごとに数十%ぶれる。再実行では書き込み 33.0→66.8 ms、デコード 12.5→41.1 ms と変わったが、総バイト数は完全一致した。だから決定は決定的な総バイト数を主軸にし、時間は +5% の門番にしか使わなかった。時間の絶対値を根拠に既定値を決めるのは、この環境では危うい。trace-format.md の測定節にもその旨を明記した。
+
+4 指標の分離測定は、M1 Agent の観測コスト 219.1 ns/イベント、M2 Host の処理量 228,517 イベント/秒、M3 ファイルサイズ 27.1 B/イベント、M4 デコード速度 1,595,958 イベント/秒。M2 の 75.8 B/イベントが M3 より大きいのは、M2 のワークロードが 50,000 件すべて異なる Payload だからで、別ワークロードの数値として読み分ける必要がある。M1 は記録経路だけで、Windows の Detour 自体のコストは含まない（L06 の範囲）。
+
+副次として、F21 の漏れを見つけた。Windows 専用コード `shirusu-capture-e2e.rs` の `CaptureSessionConfig` リテラルに `durability` が無く、Windows ターゲットの check が壊れていた。Linux では `cfg(windows)` のため見えず、F21 の定時実行の check 対象にも e2e が無かったため見逃されていた。Windows 専用コードの網羅は、対象クレートを列挙する check では漏れる。`cargo check --workspace --tests --target` で全ターゲットを見る習慣が必要だ。今回は `durability: Buffered` を追加し、両ターゲットの check を通した。
+
+残る未着手は 22 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、A77（Windows プロセス間ストレステスト）の検討あたりが候補だ。
+
+### 2026-11-11 05:29 — L12: repair は「捨てる判断の列挙」だった
+
+前回候補に挙げた L12（`shirusu repair` CLI）を実施した。ライブラリ側の回復意味論（F11）は既にあり、残っていたのは CLI としての配線と報告だった。実装してみると、repair の本質は「何を残すか」より「何を捨てて、どう数えるか」だった。捨てる判断は 3 種に集約される。参照先 Blob が無いイベント（MissingBlob。内容を推測して補わない）、Header と session_id が異なる Batch（SessionMismatch。書き換えて取り込まない）、同一スレッドで sequence が退行する Batch（Writer の不変条件に反するため、並べ替えて取り込まない）。いずれも「推測で作らない」という overview の一行の具体化で、捨てた分は原因別に数えて報告に残す。修復の出力が「読めたものだけ」であることは、報告の lost_events を見れば検証できる。
+
+Writer の不変条件は CLI 側で事前に鏡写しした。sequence の退行検査を validate_batch と同じ規則で先に行い、write_batch の失敗を「起きないはずの防御」にした。ただし完全ではない。add_payload（Blob の追加）が write_batch より先に走るため、万一 write_batch が失敗した場合、追加済みの Blob が未参照のまま出力に残る。事前検査で実質到達しない経路だが、Blob の追加と Batch の書き込みが別操作である以上、原理的には残る。次にこの辺りを触るなら、Blob の追加を Batch の成否に紐付ける設計を検討する。
+
+テストでは、TraceWriter では書けない入力をブロック単位で合成した。EventChunk を Finalization の後に追記し、session_id の不一致と sequence の退行を作る。Reader は Finalization の後でも走査を続けるため、この合成が通る。回復意味論の「走査は Block 列を順に読むだけ」という性質を、テストがそのまま利用している形だ。
+
+編集ミスを一つした。usage() に repair 行を追加するとき、文字列リテラルの途中に閉じ引用符を入れてしまい、後続の行が文字列の外に出た。コンパイラが即座に 30 件以上のエラーを出したのですぐ気付けたが、`\n\` で継続する長い文字列リテラルへの行追加は、閉じ位置の確認を一呼吸置いてやる必要がある。
+
+残る未着手は 21 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、A77（Windows プロセス間ストレステスト）の検討あたりが候補だ。
+
+### 2026-11-11 06:29 — L11: `reserved` の転用は A72 の修正であって破棄ではない
+
+前回候補に挙げた L11（`--order=global`）を実施した。Agent の AtomicU64 カウンタで観測点ごとに全スレッド共通の番号を振り、Descriptor の `global_order` に刻んで Trace まで運ぶ。`dump --order=global` は全 Batch をその番号でマージして表示する。
+
+設計上の核心は、64B Descriptor の唯一の空き 8B だった `reserved` を `global_order` に転用したことだ。これは A72 段落の「`reserved` は 0 のままで、検証も維持する」と字面が衝突する。判断として、A72 の中核は「Payload ID を持たない・Host 生成の一時キー・公開 Trace は Blob ID」であって、「reserved を空けておくこと」そのものではない。`global_order` は Payload の識別子ではなく、per-thread `sequence` のプロセス全体版の順序番号であり、一時キーの生成には使わない。検証も「無条件に 0」から「セッションが無効なら非 0 を拒否する条件付き検証」に切り替えた。仕様書には dated amendment を付けて、この切り替えを明記した。ただしこれは Nana の判断であり、kota の確認待ちとして traceability に明記してある。仕様の文言を変えるときは、変えた理由と「何が不変か」を同じ場所に書く。そうしないと、後から読んだ人が「A72 が覆されたのか」と迷う。
+
+Windows 専用コードの漏れを、また一つ見つけた。`shirusu-capture-e2e.rs` の `CaptureSessionConfig` リテラルに `order_global` が無く、Windows ターゲットの check が壊れていた。F21 のときの `durability` の漏れとまったく同じ形で、Linux では `cfg(windows)` のため見えない。F25 の所感で「`cargo check --workspace --tests --target` で全ターゲットを見る習慣が必要だ」と書いたが、今回はその教訓どおり e2e を check 対象に入れたので見つかった。教訓は書くだけでなく、対象リストに入れて回すことで初めて効く。`order_global: false` を追加し、両ターゲットの check を通した。
+
+なお、kota の「Windows は実 cargo build で検証する」という要求に対し、この VM では `link.exe` が無く、cdylib・バイナリ・テストバイナリのリンクができない。lib クレートは `cargo build --lib` で実ビルドを通し、残りは `cargo check --all-targets` で全コードのコンパイルを通した。リンクまで含む実ビルドは CI の Windows ジョブ（run #7）に委ねる。ローカルで「build を通した」と書くときは、どこまでが build でどこからが check かを区別して書く。
+
+残る未着手は 20 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、A77（Windows プロセス間ストレステスト）の検討あたりが候補だ。
+
+### 2026-11-11 08:29 — A77: 欠落は「数える」のであって「無いことにする」のではない
+
+前回候補に挙げた A77（Windows プロセス間メモリ順序ストレステスト）を実施した。producer（別プロセス）が実 Agent で 100 万件を順に書き、supervisor（x64 Host）が検証付き DrainWorker で回収する。D77 が 2,200 件・2 フェーズで Slot 再利用を確かめるものなら、A77 は「プロセスを越えて公開順が保たれるか」を高負荷で確かめるものだ。spec の不変条件節が「単一プロセス内のユニットテストでは確かめられない」と書くのは、この一点のためだ。
+
+検証ロジックは `verify_memory_order_stress` としてプラットフォーム非依存の純粋関数に切り出した。判定は 5 つの保存則だ。順序・内容（payload が 0..N を順にちょうど 1 回ずつ）、payload_keys が N 件、integrity_lost が立っていないこと、欠落会計（SequenceGap の合計 == 書き手が報告した dropped_events）、劣化会計（回収した descriptor 総数 == N + degraded_events）。この切り出しの狙いは、Windows 実走部（supervisor の起動・待機・回収）は CI でしか動かせないが、判定そのものは Linux で 10 件の合成ストリームで先に縛れることだ。判定がプラットフォーム非依存なら、実走の失敗を「判定のバグか、実走の問題か」に切り分けられる。
+
+欠落会計の鍵は、Dropped と PublishedDegraded の違いだ。Dropped は sequence を払って欠番を作る（descriptor は残らない）。producer は同じ call_id を書き直すので、欠番は必ず dropped と 1 対 1 で対応する。だから gaps == dropped が成り立たなければ、それは説明のつかない欠落だ。逆に PublishedDegraded は descriptor を残すので、回収総数に現れる。total == N + degraded が成り立たなければ、descriptor の数え落としだ。「欠落が無いこと」を主張するのではなく、「欠落があれば必ず会計に現れる」ことを主張する形にした。D51 のソークが同じ保存則を単一プロセスで確かめているのと対になる。
+
+二つ、実装中の罠があった。第一に、`cargo test` は `./target/debug/` の通常バイナリを更新しない。`--list` の確認で新シナリオが出てこず、`--memory-order-stress` が無視されて `--all` が走った。ビルド成果物の確認には `cargo build` が要る。第二に、Windows 専用関数 `agent_from_mapping` の戻り値に `Arc<SlotPool>` と書いたら、関数内の `use` はシグネチャに効かず E0425 になった。Linux ビルドではその関数はコンパイル対象外のため、この誤りは Windows の check でしか見えない。F21・L11 のときと同じ「Windows 専用コードの誤りは Linux では見えない」という話の三度目で、対策も同じく `cargo check --target` を回すことだ。今回は x64 の `--workspace --all-targets` と i686 の e2e `--all-targets` を通した。
+
+チェックリスト自体の不整合も一つ見つけた。L04 の状態は run #6 の反転で「検証済み」だが、項目文は「CLI には inspect/dump/export しか無い。`shirusu capture` / `shirusu attach` のサブコマンド配線と、来歴不明の記録が必要」と要求している。CLI に capture / attach が無いことを grep で確認した。検証済みの範囲はライブラリ層（`LaunchedCapture::attach`）までとし、CLI 配線と来歴不明の記録を L22 として分離して新規項目化した。分母は 302→303 になり、検証済み表示率は 81.1%→80.9% に下がったが、検証済み項目数 245 は不変だ。反転のときに「項目文の要求」と「検証した範囲」を突き合わせていなかった、という反転側の見落としだ。
+
+残る未着手は 20 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、D79（Shuttle / Verus の追加検討）の評価あたりが候補だ。
+
+### 2026-11-11 09:29 — L22: CLI は「配線」だけを担い、実働はライブラリ層に委ねる
+
+前回分離した L22（`shirusu capture` / `shirusu attach` の CLI 配線と来歴不明の記録）を実施した。実働は `LaunchedCapture`（L04 で検証済みのライブラリ層）に委ね、CLI が担うのは引数の検証・設定の組み立て・要約の表示だけにした。Ring の詳細（`RingConfig::PRODUCTION`）や永続化（既定 Buffered）は e2e と同じ既定値を使い、CLI には露出しない。新しい設定は `--output` / `--dll` / `--timeout` / `--order=global` の 4 つだけだ。設定が増えるたびに CLI がライブラリの内部を知るようでは、配線が太っていく。CLI は「何を記録するか」を決める場所ではなく、「記録を頼む」場所だ。
+
+来歴不明の記録は、形式を変えずに既存の文字列欄（`CaptureEnvironment.capture_config`）へ明記した。attach は途中から入るため、アタッチ前の呼び出しや既存オブジェクトの来歴は分からない——この「分からない」を Trace の中に残すことが L22 の要求だ。新しいフィールドや Block 種別を足す手もあったが、`shirusu inspect` が既に `capture_config` を表示するため、明記だけで要件は満たせる。形式の変更は、読む側（Reader・比較・適合性検査）すべてへの波及を伴う。表示で済むものを形式で解かない。
+
+引数の検証はプラットフォームゲートの前に行った。Windows 以外でも、PID の誤りや `--timeout` の誤りは終了 2（使い方の誤り）で返し、制限そのものは終了 1 で「capture and attach are only available on Windows」と明言する。プラットフォームで分岐するコマンドでは、「どこまでが共通の検証で、どこからがプラットフォーム固有か」の線引きが曖昧になりやすい。検証を先に済ませることで、Linux でも使い方の誤りは同じ終了コードで返せる。実働の有無と使い方の正しさは別の話だ。
+
+実装中の罠が一つあった。シェルの heredoc 経由で Rust コードを追記したら、JSON の引用符エスケープが一段剥がれて `\"` が `"` になり、34 件のコンパイルエラーになった。直し方として、追記部分を切り戻してからファイルツール（append）で書き直した。教訓：シェル経由でコードを書かない。引用符を含む内容はファイルツールで扱う。エラーの山を見たときは、まず「どこまでが自分の書いたコードか」を切り分ける——今回は usage() の文字列を途中で閉じてしまった編集ミスも混ざっており、原因は二つあった。
+
+テストは 22 件を回帰テスト先行で追加した。統合 9 件は先に書いて未知コマンドでの全失敗（赤）を確認し、単体 13 件は E0425（未定義関数）を確認してから緑にした。単体の 1 件（Windows 形式パスの既定出力）は Linux で失敗した——`Path::file_stem` は OS の区切り文字でしか切らないためで、テスト側を OS ごとの意味論に合わせて直した。実装は OS の Path 意味論に任せるのが正しく、テストが Windows の挙動を Linux に期待していたのが誤りだった。
+
+D79（Shuttle / Verus の追加検討、2026-11-11 10:29）は判断項目として実施した。結論は両方とも当面は追加しない。Shuttle は loom に着想を得た乱択検査で、loom の網羅検査より大きなケースに届く代わりに sound ではない（docs.rs の Shuttle 0.9.10 の説明）。shirusu の並行性の核は loom 18 シナリオ＋TLA+ 7 不変条件＋PBT 参照モデル＋実プロセス間ストレスで既に多層化されており、Shuttle は同じくモデルであるため、verification.md が自認するギャップ（TLA+ はメモリ順序を検査しない、loom モデルは実装そのものではない）を埋めない。Shuttle が loom より強い高位のスレッド協調も、shirusu では DrainWorker が共有メモリ・ファイル I/O・Windows イベントと直結しており、Shuttle は OS 呼び出し・FFI・プロセス間共有メモリを仮想化できない。Verus は ghost permission により unsafe コードの推論も可能だが、核の Windows 意味論は対象外で、Rust コード側の性質は Kani 14 ハーネス＋TLA+＋PBT/fuzz が担っている。無界の証明が Kani の有界性を上回るのはループ不変条件など無界の性質が求められる場合に限られるが、現行コードでその要求は具体化していない。16 クレートへの仕様注釈と独自ツールチェーンの導入コストに見合わない。判断と再検討条件（実スレッド協調の不具合が逃げた場合／Kani の有界性では不十分な無界の性質が具体化した場合／安定ツールチェーンで使えるようになった場合）は docs/verification.md「Shuttle / Verus の追加検討（D79）」節に記録した。D79 は A75 と同じく検証対象の挙動が無い判断項目のため、状態は実装済み未検証とした。
+
+残る未着手は 18 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、L07（モジュール分類）あたりが候補だ。
+
+### 2026-11-11 11:29 — L07: 分類は「判定基準の優先順位」であって「名前の一致」ではない
+
+前回候補に挙げた L07（モジュール分類）を実施した。分類器の核心は、4 分類の「判定基準」を優先順位付きの規則に落とすことだった。難しいのは Windows と Runtime の境界で、msvcp140.dll や ucrtbase.dll は System32 にあり Microsoft 署名付きなので、表の Windows 基準（配置＋署名）だけを読めば Windows になる。しかし overview は「`fopen` 経由の `CreateFileW` も記録される」と書いており、`fopen` は ucrtbase / msvcp の関数だ。Runtime から Windows API への呼び出しを記録するのが標準の境界なら、これらは Runtime でなければならない。だから既知の実行基盤の判定を Windows 判定より先に置いた。表の「名前ではなく判定基準で分類」という一行は、「名前で分類するな」という意味ではなく、「分類はモジュールが何者か（実行基盤か、OS の一部か）で決め、ファイル名はその識別の手がかりに過ぎない」という意味だと読んだ。実行基盤の一覧はその識別規則として module.rs のコメントに明記した。
+
+API Set の扱いも、契約名と実装モジュールの「両方を記録する」が肝だった。契約名だけでは「何が実行されたか」が分からず、実装モジュールだけでは「呼び出し側が何を要求したか」が分からない。`ModuleClassification` は両方を持ち、解決できなかった場合は Unknown として不確実フラグを立てる。解決の連鎖は深さ 2 までで打ち切り、自己参照の契約名が無限ループにならないようにした。
+
+CLI の上書きは「当たらなければ残す」にした。capture 開始時に分かるモジュールは起動対象の exe だけで、`--module-class kernel32.dll=windows` のような上書きは、その時点では必ず「当たらない」。当たらなかった上書きを捨てれば、利用者の指定は黙って消える。だから未一致の上書きは上書きエントリとして Trace に残し、後から現れるモジュールに適用できるようにした。「指定したのに効かない」は、黙って消えるより、Trace に残って後から分かる方がましだ。
+
+副次として、`CaptureEnvironment` にフィールドを足すと、リテラル構築が 5 か所、関連して `CaptureSessionConfig` が 3 か所で壊れた。いずれも `..Default::default()` を付けていない全フィールド列挙のリテラルだ。フィールド追加のたびに壊れるリテラルは、構造体にフィールドを足すコストそのものだ。今回も全部直したが、リテラルを全列挙するテストヘルパーが多いほど、このコストは増える。次に構造体へフィールドを足すときは、テストヘルパーを `..Default::default()` に寄せるか、コンストラクタに寄せるかを先に決める。
+
+Windows 側の残作業（ロード済みモジュールの列挙・署名検証・フック時の呼び出し元分類）は L23 として分離した。分類器と Trace 記録と CLI は Linux でも検証できるが、列挙と署名検証とフック時強制は Windows 実働そのものだ。L04→L22 と同じ分離で、項目文の要求と検証した範囲を一致させた。
+
+残る未着手は 18 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、L09（記録モード profile / filtered）あたりが候補だ。
+
+### 2026-11-11 12:29 — L09: 「記録しない」は「捨てる」ではなく「集計する」か「選ぶ」かだ
+
+前回候補に挙げた L09（記録モード profile / filtered）を実施した。設計の核心は、3 モードを「保存するイベントの集合の違い」ではなく「保存の仕方の違い」として分けることだった。`full` は全保存、`filtered` は選んで保存、`profile` は保存せずに集計する。3 つを同じ `record_batch` の入口で振り分けるのは、モードが Host の変換層の性質であって、Agent や転送層の性質ではないからだ。Agent はどのモードでも全イベントを Ring へ書く。Agent 側で間引けば Ring の圧迫は減るが、間引きの判断を Agent に持たせると「Agent が何を落としたか」が Host から見えなくなる。落とす判断は Host の一か所に集め、Agent は「全部送る」に徹する方が、欠落の会計（Loss Record と Finalization の三指標）が一貫する。
+
+`profile` の集計で難しかったのは、enter / leave の対応付けの鍵だった。DrainWorker の `track_call` が既に (call_id) で対応付けているが、あれはスレッド単位の Worker の中で閉じている。Recorder は複数スレッドの Batch を順に受けるため、鍵は (thread, call_id) にした。対応の無い enter / leave は「欠落」ではなく「未対応」として calls に数えず、enters / leaves だけに数える。未対応を欠落（Loss）として扱わなかったのは、記録の終わり方（対象がまだ動いている・leave が次の Batch にある）では未対応は正常だからだ。`calls` は「揃ったものだけ」という厳密な定義にし、`enters` / `leaves` との差が未対応の量を表すようにした。
+
+`filtered` の落としどころも、Blob 化の前にした。Payload を Blob にしてから落とすと、不要な Blob がファイルに残る。`record_batch` の入口で落とすと、sequence の欠番だけが残る。Writer の不変条件は退行の拒否だけで欠番は許容されるため、欠番は Loss として扱わない。欠番と Loss Record は別物だ、という区別がここでも要った。
+
+副次として、構造体にフィールドを足すたびに壊れるリテラルの問題がまた出た。今回は `ReadTrace` が 2 か所（probe・conformance）、`CaptureSessionConfig` が 3 か所（host テスト 2 件・e2e）で壊れた。e2e の漏れは Linux のテストでは見えず、Windows の check で見つかった。F21 のときとまったく同じ見逃しパターンで、Windows 専用コードは Linux の `cargo test --workspace` では検証されない。Windows の check を毎回回す運用が、ここでも効いた。
+
+残る未着手は 17 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、L23（Windows 側のモジュール列挙・署名検証）あたりが候補だ。
+
+### 2026-11-11 13:29 — L08: 例外は「捕捉しない」ことで透過する
+
+前回候補に挙げた L08（例外の透過と CallAborted）を実施した。設計の核心は、例外を「捕まえて記録する」のではなく「捕まえずに、通り過ぎるのを見届ける」ことだった。Detour が例外を catch すれば、例外の型・ペイロード・巻き戻しの経路のどれかで対象アプリの挙動を変えてしまう危険がある。代わりに enter の直後に RAII ガードを立て、正常に戻ったら武装解除し、例外で巻き戻されたときだけ Drop で CallAborted を記録する。ガードは例外を見ないし触らない。例外の伝播は Detour が無い場合と同一で、記録だけが残る。
+
+この設計が成り立つのは、Windows では Rust のフレームも SEH アンワインド情報を持つからだ。外来の C++ 例外や SEH 例外が Detour フレームを巻き戻すとき、Rust の Drop は走る。仮に走らなかった場合でも、失敗モードは「中断の記録漏れ」だけで、例外の伝播は変わらない。漏れた分は Host が「終了不明」（UnknownTermination）として別途扱うので、記録の欠落が無言で消えることはない。Drop 中の記録自体も catch_unwind で包んだ。巻き戻し中の Drop でパニックするとプロセスが abort するため、記録の失敗が例外の伝播を壊す経路は塞いでおく必要があった。
+
+波及の面では、Phase に Aborted を足したことで、コンパイラが「相を網羅で扱っている場所」を全部教えてくれた。view の api_stats と compare の正規化だ。compare では中断を Leave と同じ「呼び出しを閉じるもの」として扱いつつ、NormCall には aborted として別に持たせた。中断と正常終了を同じ leave に畳むと、両者の違いが差分に出なくなるからだ。ただしオブジェクト生成 API では、中断すると生成物が無いため整列で対にならず、MissingCall と ObjectStateDifference として出る。初版のテストはここを CallShapeDifference と期待して失敗した。エンジンの整列が「オブジェクトへの関与」で対応づけを決めている以上、中断した生成呼び出しは対にならないのが正しい振る舞いだ。テストの期待値を直す判断は、エンジンの設計を読み直してから行った。
+
+残る未着手は 16 件で、次は F27（非同期 I/O の完了時取得）の設計検討か、L23（Windows 側のモジュール列挙・署名検証）あたりが候補だ。
+
+### 2026-11-11 14:29 — F27: 完了は「新しい種別のイベント」であって「leave の書き換え」ではない
+
+前回候補に挙げた F27（非同期 I/O の完了時取得）を実施した。非同期の ReadFile / WriteFile は leave 時点ではまだ完了しておらず、バッファの中身も転送バイト数も決まっていない。leave に「後で埋める」欄を作る手もあったが、leave は元の API が戻った時点のスナップショットであるべきで、完了時の値を後から書き換えると、leave の意味が「戻り時点」と「完了時点」の二重になってしまう。代わりに転送に `CallCompleted`（kind 8）という新しい種別を足し、完了を観測した時点で、元の API の leave Schema の値列をそのまま載せたイベントを別に記録する。leave は「保留のまま」を正直に残し、完了が「実値」を別イベントで補う。compare は実効 leave として完了の値を優先するので、非同期の完了と同期の leave は値が同じなら一致する。
+
+完了の観測先は、完了を「知らせる」API だけに絞った。GetOverlappedResult と GetQueuedCompletionStatus である。WaitForSingleObject で hEvent を待つ経路や、GetOverlappedResultEx、APC の完了ルーチン経由は対象外として明記した。完了の観測には「いつ、どの操作が、どの値で完了したか」の対応づけが要るが、待機 API は完了を通知しないため、観測のしようがないからだ。対象を広げるなら、まず「完了の通知を受け取る仕組み」そのものを設計し直す必要がある。
+
+登録表の鍵は OVERLAPPED 構造体のアドレスにした。完了は別のスレッド（IOCP の取り出し側）で観測されうるため、表はセッション全体で共有し、スレッドローカルには置かない。Win32 では 1 つの OVERLAPPED を完了前に再利用してはいけないので、同じアドレスでの再登録は上書きでよい。転送バイト数は lpNumberOfBytesTransferred が NULL なら OVERLAPPED.InternalHigh（オフセット 8）から読む。読めなければ完了は記録しない。「分からない値を推測で埋める」より「記録しない」ほうが、Trace の正直さを保てる。
+
+実施後の全体テストで、kind 8 を未知とする前提のテスト 5 件が失敗した。roundtrip の Schema 数と transport の境界テスト 3 系統である。kind の追加は「新しい値を足す」だけでは済まず、「未知の境界をどこに置くか」を決め直す作業でもある。今回は 8 を有効、9 を未知とした。境界テストは「今の境界」を固定するピンであって、境界が動いたらピンも動かすのが正しい。ただし、テストの期待値を動かすときは、動かす理由が「仕様の変更」であることを確認する。今回の 5 件はすべて「kind 8 が有効になった」という仕様変更の直接の帰結で、期待値の安易な緩和ではない。
+
+数え方の罠も一つあった。F27 で追加したテストは 17 件だが、そのうち engine の 1 件は `#[cfg(windows)]` モジュールのため Linux ではコンパイルされず、実行総数の増分は +16 件にしかならない。境界テストの更新で正味 +2 件あり、実行総数は 1,977→1,995 件（+18）になった。静的なテスト件数と実行されるテスト件数が一致するとは限らない。Windows 専用コードのテストは、Linux での総数には現れない。総数を報告するときは、`cargo test --workspace -- --list` で HEAD との差分を取り、追加と削除を別に数えて確認するのが確実だった。
+
+残る未着手は 15 件で、次は L01（Inline Hook）、L02（COM）、L03（Metadata Generator）、L05（子プロセス追跡）、L06（ABI 適合性テスト）、L10（性能目標）、L13（静的依存情報）、L14（WinRT）、L15（内部呼び出し）、L16（コールバック）、L17（検証用アプリ）、L18（Golden）、L19（前提条件検査）、L20（Probe exe / JSON Runner）、L23（Windows 側のモジュール列挙・署名検証・フック時呼び出し元分類）あたりが候補だ。
+
+### 2026-11-11 16:29 — L05: 子は「別 Trace」に分け、来歴は pid で辿る
+
+前回候補に挙げた L05（子プロセス追跡）を実施した。設計の判断は、子をルートと同じ Trace に混ぜないことだった。Trace のイベントは現行 1 プロセス 1 Trace の前提で書かれており、複数プロセスを 1 ファイルに混ぜると、スレッド ID・sequence・session_id のどれも「どのプロセスのものか」を区別できなくなる。代わりに子は `<stem>.child-<pid><ext>` の別ファイルに記録し、子の session_id はルートのものに pid を足して派生させた。来歴はファイル名の pid と、子の Environment の capture_config（`child process pid=<pid> of root pid=<root>`）で辿れる。session_id の派生が wrapping_add である以上、理論上は衝突しうるが、pid が小さい現実の範囲では衝突しない。衝突がありうる設計にしておいて「現実には起きない」で済ませるのは気になるが、session_id 自体が起動時刻のナノ秒という衝突しうる値の上に成り立っているため、同じ強さの前提に載せた。
+
+子孫の判定は ppid の連鎖を辿る。ここで既知の pid を中間のリンクとして使ったのは、親が既に終了してスナップショットに無くても孫を見つけるためだ。Windows では親が死んでも子の ppid は元の親 pid のまま残るので、既知の pid をリンクに使うのは正しい。逆に、スナップショットに無い pid へのリンクは辿れない。親が一度も発見されなかった子の孫は見つからないが、その親は次のスナップショットで発見されるか、既に知っているかのどちらかなので、実運用では稀なはずだ。pid の再利用については保守側に倒した。一度知った pid は二度と返さないため、別ツリーのプロセスが同じ pid を再利用しても誤って注入しない。代わりに、取りこぼしの可能性は残る。完璧な判定には pid と開始時刻の組が必要だが、Toolhelp の PROCESSENTRY32 には開始時刻が無い。将来、開始時刻を取るなら NtQuerySystemInformation への依存が要る。
+
+列挙の失敗は 50 回連続まで許容した。CreateToolhelp32Snapshot は負荷時に失敗することがある古典的な API で、1 回の失敗で記録全体を落とすのは割に合わない。50 回という数は、2ms 間隔の回収ループでは 100ms 相当で、長く待たせすぎず、かつ一過性の失敗は吸収できる、という勘定だ。回数が妥当かは実測していない。Windows 実走の E2E（`--child-tree`）で初めて確かめられる。
+
+副次として、i686 の `--workspace --all-targets` check で依存クレート `generator` が i686-pc-windows-msvc でコンパイルできない問題にまた当たった。README の検証表 78 行目に既に記録済みの既知の問題（`generator 0.8.12` とあるが、Cargo.lock は 0.8.11 で同じ asm モジュール無しの失敗）で、今回の変更とは無関係。対象パッケージを指定した i686 check は従来どおり通過した。`--workspace` での i686 check は loom-tests 経由でこの問題を踏むため、対象パッケージ指定の運用を続ける。
+
+残る未着手は 14 件で、次は L01（Inline Hook）、L02（COM）、L03（Metadata Generator）、L06（ABI 適合性テスト）、L10（性能目標）、L13（静的依存情報）、L14（WinRT）、L15（内部呼び出し）、L16（コールバック）、L17（検証用アプリ）、L18（Golden）、L19（前提条件検査）、L20（Probe exe / JSON Runner）、L23（Windows 側のモジュール列挙・署名検証・フック時呼び出し元分類）あたりが候補だ。
+
+### 2026-11-11 17:29 — L06: ABI 適合性の正解は「Hook なしの実行」そのものだ
+
+前回候補に挙げた L06（全 Hook 共通の ABI 適合性テスト）を実施した。設計の判断は、Probe に期待値をハードコードしないことだった。浮動小数点の合計が何になるか、構造体の各欄が何になるかは、Probe 自身は知らない。知っているのは「Hook なしで実行したときの値」だけだ。正解を別に持つと、Probe と正解の両方を保守することになり、どちらかがずれたときに「Probe が間違っているのか、Hook が壊したのか」が分からなくなる。Hook なしの実行を正解にすれば、比較が壊れたら Hook が何かを変えた、という一つの結論だけになる。比較器は `ABI_PROBE` 行だけを見て、名前・順序・値を位置ごとに比べる。Probe 行以外の stdout（TARGET_* 行など）は無視する。順序まで比べるのは、Probe の実行順が変わること自体が、フックによる実行経路の変化を示すからだ。
+
+Hook あり実行の成否は `ABI_PROBE_DONE ok` 行で見ている。`LaunchedCapture` が対象の終了コードを返さないためだ。対象がクラッシュしても、TARGET_FAIL で非 0 終了しても、DONE 行は欠けるので比較は失敗する。終了コードを取る API を足す手もあったが、L06 の範囲を超える。DONE 行は「最後まで走り切った」という事実だけを保証し、「結果が正しい」は比較器が保証する、という分担にした。
+
+境界として、SEH 例外が Detour の実行中に起きる経路は扱わなかった。現行 4 API の呼び出しでは SEH を起こす引数が作れない。不正なバッファはカーネルがエラーで返すので、ユーザーモードには例外として届かない。例外 Probe は Rust のパニックの伝播と、巻き戻し後のフック健全性（後続のファイル操作が正常なこと）を対象とした。Detour の途中で例外が起きたときの CallAborted の実動は、L08 の CallGuard の単体テストの範囲に留まる。SEH を起こせる API（たとえばコールバックを呼ぶ API）がフック対象に増えたら、そのときに Probe を足す。
+
+実装中の Rust の落とし穴が二つあった。一つは `unsafe { WriteFile(...) } != 0` が構文エラーになること。ブロック式の直後に二項演算子は置けない。変数に束縛してから比べる。二つは `Path` が DST でワイドポインタのため、`&Path` を `*mut c_void` にキャストできないこと。スレッドプロシージャへ渡すポインタは `&PathBuf`（シン・ポインタ）にした。どちらもコンパイラが教えてくれるので実害は小さいが、FFI の境界では「ポインタの幅」を意識する癖が要る。
+
+残る未着手は 13 件で、次は L01（Inline Hook）、L02（COM）、L03（Metadata Generator）、L10（性能目標）、L13（静的依存情報）、L14（WinRT）、L15（内部呼び出し）、L16（コールバック）、L17（検証用アプリ）、L18（Golden）、L19（前提条件検査）、L20（Probe exe / JSON Runner）、L23（Windows 側のモジュール列挙・署名検証・フック時呼び出し元分類）あたりが候補だ。
+
+### 2026-11-11 18:29 — L10: 性能の倍率は「測るもの」を間違えると嘘になる
+
+前回候補に挙げた L10（性能目標と測定）を実施した。倍率は 1.004x（gui-mix）と 0.987x（high-load）で、どちらも上限（3 倍・5 倍）を大きく下回った。だがこの数字に至るまでに、測定器の側の欠陥を三つ直している。どれも「測れているつもり」の測定だった。
+
+一つ目は Ring の大きさだ。初回は欠落を避けて 64MiB の Payload Ring で測り、gui-mix が 1.300x になった。原因は `DrainWorker::drain_all` が毎回リージョン全体像をコピーすることだ。64MiB の像を 200µs ごとに写す消費者が、producer の CPU を食っていた。実運用の Ring は 4096 件 / 1MiB で像は約 1.3MB だから、本番サイズで測り直すと 1.004x になった。Host の drain コストは Ring サイズに比例する、という設計上の事実を、測定条件がそのまま数値にしていた。
+
+二つ目は `record_batch` の粒度だ。drain のたびに渡すと EventChunk が細切れになり、Trace は 10.4 B/event になった。5,000 件ずつ溜めて渡すと 5.0 B/event になる。ファイルサイズの測定値は、形式の性質ではなく呼び出し側のバッチングを測っていた。F25/F26 が 10,000 件ずつで測っていたのは、このためだったのだと後から分かった。
+
+三つ目は消費者スレッドの終了条件だ。drain→done 確認の順だと、drain の直後に公開された最後の 1 件を落とすレースがあり、20,000 件中 1 件の取りこぼしで発覚した。done 確認を先に行い、最終 drain で全公開を見る順序に直した。1 件の欠落は「誤差」ではなく、終了条件の設計ミスだった。
+
+数字の読み方も整理した。倍率が上限を大きく下回るのは、モデル化したワークロードでは API 本体コスト（平均 26.6µs / 203µs）が記録コスト（0.3〜0.5µs/呼び出し）を大きく上回るためで、記録が速い証拠ではない。短い API 単体では 3 倍を超える。だからこそ損益分岐（3 倍で 136〜265ns）を別に測り、基準は「代表的なワークロードに対するもの」であって「短い API 単体には適用しない」と明記した。バースト測定では本番 Ring が満杯になり 19〜28% が欠落した。`full` が記録を保証しないことの、測定による裏づけでもある。
+
+残る未着手は 12 件で、次は L01（Inline Hook）、L02（COM）、L03（Metadata Generator）、L13（静的依存情報）、L14（WinRT）、L15（内部呼び出し）、L16（コールバック）、L17（検証用アプリ）、L18（Golden）、L19（前提条件検査）、L20（Probe exe / JSON Runner）、L23（Windows 側のモジュール列挙・署名検証・フック時呼び出し元分類）あたりが候補だ。
 
 ## ライセンス
 

@@ -85,6 +85,9 @@ pub struct EventInput<'a> {
     pub payload: &'a [u8],
     /// Payload の取得結果が既に劣化している場合に指定する。
     pub capture_state: CaptureState,
+    /// 全スレッド共通の観測順序番号（L11）。0 は未割当。
+    /// Agent が `--order=global` 有効時に観測点で採番して入れる。
+    pub global_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +424,7 @@ impl RingWriter {
         d.payload_position = payload_position;
         d.payload_len = stored_len;
         d.flags = input.capture_state.to_flags() | extra_flags;
+        d.global_order = input.global_order;
         d
     }
 
@@ -623,6 +627,8 @@ pub struct RingReader {
     expected_payload_position: Option<u64>,
     /// 一度検出した破損。以後は drain が即座に同じ理由を返す (Ring 停止)。
     integrity_error: Option<IntegrityError>,
+    /// `--order=global` 有効なセッションとして検証する (L11)。既定は false。
+    allow_global_order: bool,
 }
 unsafe impl Send for RingReader {}
 
@@ -636,13 +642,34 @@ impl RingReader {
             expected_sequence: 1,
             expected_payload_position: None,
             integrity_error: None,
+            allow_global_order: false,
         }
+    }
+    /// `--order=global` 有効なセッションとして検証する。
+    pub fn with_global_order(mut self, allow: bool) -> Self {
+        self.allow_global_order = allow;
+        self
     }
     pub fn write_cursor(&self) -> u64 {
         load(self.base, OFF_WRITE_CURSOR, Ordering::Acquire)
     }
     pub fn read_cursor(&self) -> u64 {
         load(self.base, OFF_READ_CURSOR, Ordering::Relaxed)
+    }
+    /// 未回収の Descriptor 数（write_cursor - read_cursor）。バッファ使用率の
+    /// 観測用（L10）。Cursor は進めない。読み取りだけなので回収中の
+    /// DrainWorker と並行して使える。
+    pub fn descriptor_used(&self) -> u64 {
+        self.write_cursor().saturating_sub(self.read_cursor())
+    }
+    /// 未回収の Payload バイト数（payload_write_position -
+    /// payload_read_position）。同上。
+    pub fn payload_used(&self) -> u64 {
+        load(self.base, OFF_PAYLOAD_WRITE_POSITION, Ordering::Acquire).saturating_sub(load(
+            self.base,
+            OFF_PAYLOAD_READ_POSITION,
+            Ordering::Acquire,
+        ))
     }
     /// 書き手が空き待ち中かどうか（Host が `space_available` 通知の要否を判断する）。
     pub fn writer_waiting(&self) -> bool {
@@ -727,8 +754,8 @@ impl RingReader {
         if EventKind::from_u16(desc.kind).is_none() || desc.kind == EventKind::Unknown as u16 {
             return Err(IntegrityError::UnknownKind(desc.kind));
         }
-        if desc.reserved != 0 {
-            return Err(IntegrityError::ReservedNonZero);
+        if !self.allow_global_order && desc.global_order != 0 {
+            return Err(IntegrityError::GlobalOrderNotAllowed);
         }
         if desc.sequence < self.expected_sequence {
             return Err(IntegrityError::SequenceRegressed {
@@ -805,6 +832,7 @@ mod tests {
             parent_call_id: 0,
             payload,
             capture_state: CaptureState::Captured,
+            global_order: 0,
         }
     }
 
@@ -840,6 +868,7 @@ mod tests {
             parent_call_id: 0,
             payload: b"dddd",
             capture_state: CaptureState::DroppedByBackpressure,
+            global_order: 0,
         };
         w.write(dropped);
         w.write(input(EventKind::CallEnter, 5, b"e"));

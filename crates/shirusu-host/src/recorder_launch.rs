@@ -15,12 +15,17 @@
 //!    進行中 Detour の完了待ち → IAT 復元）を済ませてから最終回収・
 //!    確定を行う（レビュー #4 の #9）。
 //!
+//! 子プロセス追跡（L05）は `TreeCapture` が担う： ルートの起動後に
+//! プロセス一覧を定期的に見て、ルートの子孫として新しく現れた
+//! プロセスへ Agent を自動注入する（対象はルートのツリーに限る）。
+//!
 //! 制約（Phase 3 の範囲として正直に残す）:
 //! - 注入は同一ビットネス間のみ（x64 Host → x64 対象、x86 → x86）。
 //! - DLL の初期化エントリは PE エクスポート表から RVA を引き、
 //!   Toolhelp で得たモジュールベースに足して解決する。x86 の
 //!   stdcall 名デコレーション（`_shirusu_agent_init@4`）にも対応する。
 
+use crate::child_tree::{child_trace_path, ChildTracker, ProcessEntry};
 use crate::recorder::{
     CaptureSession, CaptureSessionConfig, RingSpec, SessionError, SessionSummary, ShutdownOutcome,
 };
@@ -198,6 +203,169 @@ impl Drop for LaunchedCapture {
     }
 }
 
+/// 子プロセス追跡付きの記録（L05）の集計。ルートの要約と、注入に
+/// 成功した子ごとの (pid, 要約)、注入できなかった子の (pid, 理由)。
+#[derive(Debug)]
+pub struct TreeSummary {
+    pub root: SessionSummary,
+    pub children: Vec<(u32, SessionSummary)>,
+    pub uninjectable: Vec<(u32, String)>,
+}
+
+/// 子プロセス追跡付きの起動ドライバ（L05）。
+///
+/// ルートを `LaunchedCapture::launch` で起動し、回収ループの中で
+/// プロセス一覧を定期的に見て、ルートの子孫として新しく現れた
+/// プロセスへ Agent を自動注入する。対象はルートのプロセスツリーに
+/// 限り、無関係なプロセスは決して注入しない（`ChildTracker` が
+/// ppid の連鎖で判定する）。注入できなかった子は記録の欠落として
+/// ルートの Capture Coverage に残す。
+///
+/// 子はルートとは別の Trace ファイル
+/// (`<stem>.child-<pid><ext>`) に記録する（1 プロセス 1 Trace の
+/// 前提を保つため）。子の session_id はルートのものに pid を足して
+/// 派生させる（Trace 間の取り違えを避ける）。
+pub struct TreeCapture {
+    root: LaunchedCapture,
+    children: Vec<LaunchedCapture>,
+    child_summaries: Vec<(u32, SessionSummary)>,
+    tracker: ChildTracker,
+    launch_cfg: LaunchConfig,
+    root_trace: PathBuf,
+    uninjectable: Vec<(u32, String)>,
+    /// プロセス一覧の取得に連続で失敗した回数。一時的な失敗
+    /// （CreateToolhelp32Snapshot は負荷時に失敗することがある）は
+    /// 許容し、一定回数を超えたらエラーとして返す。
+    scan_failures: u32,
+}
+
+/// プロセス一覧の取得失敗を連続で許容する回数。
+const MAX_CONSECUTIVE_SCAN_FAILURES: u32 = 50;
+
+/// 子用の起動設定をルートの設定から派生させる。session_id は
+/// ルートのものに pid を足して一意にし、Environment の session_id
+/// と来歴（capture_config）も合わせて更新する。
+fn child_launch_config(base: &LaunchConfig, pid: u32, root_pid: u32) -> LaunchConfig {
+    let mut cfg = base.clone();
+    cfg.session.session_id = base.session.session_id.wrapping_add(pid as u64);
+    cfg.session.environment.session.session_id = cfg.session.session_id;
+    cfg.session.environment.capture_config = format!(
+        "child process pid={pid} of root pid={root_pid}; discovered by child tracking (L05)"
+    );
+    cfg
+}
+
+impl TreeCapture {
+    /// ルートを起動して Agent を注入し、追跡を開始する。
+    pub fn launch(
+        cmdline: &str,
+        trace_path: impl AsRef<Path>,
+        cfg: LaunchConfig,
+    ) -> Result<Self, SessionError> {
+        let root_trace = trace_path.as_ref().to_path_buf();
+        let root = LaunchedCapture::launch(cmdline, &root_trace, cfg.clone())?;
+        let tracker = ChildTracker::new(root.pid());
+        Ok(Self {
+            root,
+            children: Vec::new(),
+            child_summaries: Vec::new(),
+            tracker,
+            launch_cfg: cfg,
+            root_trace,
+            uninjectable: Vec::new(),
+            scan_failures: 0,
+        })
+    }
+
+    pub fn root_pid(&self) -> u32 {
+        self.root.pid()
+    }
+
+    /// プロセス一覧から新しい子を探し、見つけた子へ Agent を注入する。
+    /// 注入に失敗した子は Coverage に残すため記録だけして続ける。
+    fn scan_once(&mut self) -> Result<(), SessionError> {
+        let entries = win::enumerate_processes()?;
+        let snapshot: Vec<ProcessEntry> = entries
+            .iter()
+            .map(|(pid, ppid)| ProcessEntry {
+                pid: *pid,
+                ppid: *ppid,
+            })
+            .collect();
+        for pid in self.tracker.update(&snapshot) {
+            let child_trace = child_trace_path(&self.root_trace, pid);
+            let child_cfg = child_launch_config(&self.launch_cfg, pid, self.root.pid());
+            match LaunchedCapture::attach(pid, &child_trace, child_cfg) {
+                Ok(child) => self.children.push(child),
+                Err(e) => self.uninjectable.push((pid, e.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// ルートと全ての子が終了するまで回収を続け、終了した子の Trace を
+    /// 順次閉じる。ルートが終了しても生きている子がいれば、その子が
+    /// 終了する（または新しい孫が現れる）まで続ける。最後の掃引で
+    /// 新しい子が見つからなければ終わる。
+    pub fn run_tree_to_completion(
+        mut self,
+        poll_interval: Duration,
+    ) -> Result<TreeSummary, SessionError> {
+        loop {
+            // 終了した子を回収して Trace を閉じる
+            let mut i = 0;
+            while i < self.children.len() {
+                if self.children[i].target_exited() {
+                    let child = self.children.remove(i);
+                    let pid = child.pid();
+                    let summary = child.finish()?;
+                    self.child_summaries.push((pid, summary));
+                } else {
+                    i += 1;
+                }
+            }
+            let root_exited = self.root.target_exited();
+            match self.scan_once() {
+                Ok(()) => self.scan_failures = 0,
+                Err(e) => {
+                    self.scan_failures += 1;
+                    if self.scan_failures >= MAX_CONSECUTIVE_SCAN_FAILURES {
+                        return Err(e);
+                    }
+                }
+            }
+            self.root.session().poll_once()?;
+            for child in &mut self.children {
+                child.session().poll_once()?;
+            }
+            if root_exited && self.children.is_empty() {
+                break;
+            }
+            std::thread::sleep(poll_interval);
+        }
+        self.finish()
+    }
+
+    /// 注入できなかった子をルートの Coverage に残してから、ルートと
+    /// 残っている子の Trace を閉じる。
+    pub fn finish(mut self) -> Result<TreeSummary, SessionError> {
+        for (pid, reason) in &self.uninjectable {
+            self.root.session().note_uninjectable_child(*pid, reason);
+        }
+        let root = self.root.finish()?;
+        let mut children = std::mem::take(&mut self.child_summaries);
+        for child in self.children.drain(..) {
+            let pid = child.pid();
+            children.push((pid, child.finish()?));
+        }
+        Ok(TreeSummary {
+            root,
+            children,
+            uninjectable: std::mem::take(&mut self.uninjectable),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +417,62 @@ mod tests {
             shutdown_outcome_from_call(Err(WinError::Unsupported)),
             ShutdownOutcome::CallFailed(_)
         ));
+    }
+
+    /// テスト用の最小セッション設定（実記録はしない）。
+    fn test_session_config() -> CaptureSessionConfig {
+        use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
+        use shirusu_trace::writer::Durability;
+        use shirusu_transport::RingConfig;
+        CaptureSessionConfig {
+            session_id: 4242,
+            ring_config: RingConfig::new(64, 4096),
+            environment: CaptureEnvironment {
+                session: SessionMetadata {
+                    session_id: 4242,
+                    created_by: "shirusu-host test (recorder_launch)".into(),
+                    qpc_frequency: 10_000_000,
+                },
+                ..Default::default()
+            },
+            qpc_frequency: 10_000_000,
+            durability: Durability::Buffered,
+            order_global: false,
+            record_runtime_apis: false,
+            record_mode: crate::trace_convert::RecordMode::Full,
+        }
+    }
+
+    #[test]
+    fn child_launch_config_derives_distinct_session_ids() {
+        // L05: 子の session_id はルートのものから pid で派生させ、
+        // Environment の session_id と来歴も合わせて更新する。
+        let base = LaunchConfig::new(test_session_config(), PathBuf::from("agent.dll"));
+        let c1 = child_launch_config(&base, 111, 100);
+        let c2 = child_launch_config(&base, 222, 100);
+        assert_ne!(c1.session.session_id, base.session.session_id);
+        assert_ne!(c1.session.session_id, c2.session.session_id);
+        assert_eq!(
+            c1.session.environment.session.session_id,
+            c1.session.session_id
+        );
+        assert!(c1
+            .session
+            .environment
+            .capture_config
+            .contains("child process pid=111 of root pid=100"));
+    }
+
+    #[test]
+    fn tree_capture_launch_with_bad_exe_fails() {
+        // L05: 存在しない exe の起動は失敗する（Windows 実働の入口）。
+        let cfg = LaunchConfig::new(test_session_config(), PathBuf::from("no-such-agent.dll"));
+        let r = TreeCapture::launch(
+            "no-such-target.exe",
+            std::env::temp_dir().join("shirusu-tree-test.trace"),
+            cfg,
+        );
+        assert!(r.is_err());
     }
 }
 
@@ -371,6 +595,8 @@ fn inject_and_prepare(
     bootstrap.data_ready_handle = data_dup as u64;
     bootstrap.init_done_handle = init_dup as u64;
     bootstrap.host_process_handle = host_dup as u64;
+    // L11: セッションの --order=global を Agent DLL へ伝える (Bootstrap v4)。
+    bootstrap.order_global = u32::from(cfg.session.order_global);
 
     session.start()?;
 

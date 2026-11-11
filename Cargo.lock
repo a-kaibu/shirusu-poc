@@ -441,7 +441,9 @@ name = "shirusu-cli"
 version = "0.1.0"
 dependencies = [
  "shirusu-analysis",
+ "shirusu-host",
  "shirusu-trace",
+ "shirusu-transport",
 ]
 
 [[package]]

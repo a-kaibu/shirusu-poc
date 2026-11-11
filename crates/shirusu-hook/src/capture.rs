@@ -9,12 +9,22 @@
 //!   （Unreadable / Truncated / Unsupported）を必ず付ける。
 //! - 文字列・バッファには上限を設け、超過分は Truncated として記録する。
 //! - 入力バッファは呼び出し前（before)、出力バッファは元の API が
-//!   書き込んだ後（after）に取得する。取得タイミングは API ごとに
-//!   enter/leave のどちらで値を埋めるかで表す。
+//!   書き込んだ後（after）に取得する。取得タイミングは Schema の
+//!   `CaptureTiming` として引数ごとに宣言され（F19）、enter Schema の
+//!   フィールドは Before、leave Schema のフィールドは After を持つ。
+//!   非同期 I/O の完了時取得は `Completion` と宣言されるが、完了を捕捉
+//!   する仕組みは別途必要になる（F27）。
+//! - GetLastError の生値は、API の意味条件（Schema の
+//!   `LastErrorMeaning`。戻り値が失敗を示す場合等）を満たす場合に
+//!   だけ「その呼び出しのエラー値」として意味を持つ。満たさない生値は
+//!   古い残留値のため `ValueCapture::Stale` として記録する（値本体は
+//!   生値を保持する。F20）。
 
 use crate::api::ApiDef;
 use shirusu_trace::compact::encode_values;
-use shirusu_trace::schema::{schema_types, CapturedValue, TypedValue, ValueCapture};
+use shirusu_trace::schema::{
+    schema_types, CapturedValue, LastErrorMeaning, TypedValue, ValueCapture,
+};
 use shirusu_trace::CompactError;
 
 /// UTF-16 文字列の取得上限（終端 NUL を除く単位数）。
@@ -178,6 +188,20 @@ fn unsupported_u32() -> CapturedValue {
     cap(TypedValue::U32(0), ValueCapture::Unsupported)
 }
 
+/// GetLastError の生値を、API の意味条件と戻り値で分類して記録する
+/// （F20）。条件を満たせば生値を Captured として記録し、満たさな
+/// ければ生値は古い残留値のため `ValueCapture::Stale` として記録する。
+/// Stale でも値本体は生値を保持する（再検証のため）。`return_value` は
+/// leave Schema の `return` フィールドの生値（HANDLE は U64、BOOL は
+/// I32 の生値を u64 へ写したもの）。
+pub fn last_error_value(meaning: LastErrorMeaning, return_value: u64, raw: u32) -> CapturedValue {
+    if meaning.is_meaningful(return_value) {
+        u32v(raw)
+    } else {
+        cap(TypedValue::U32(raw), ValueCapture::Stale)
+    }
+}
+
 // ---- API ごとの取得（フィールド順は api.rs の定義と一致させる） ----
 
 #[allow(clippy::too_many_arguments)]
@@ -203,7 +227,14 @@ pub fn create_file_w_enter(
 }
 
 pub fn create_file_w_leave(return_handle: u64, last_error: u32) -> Vec<CapturedValue> {
-    vec![u64v(return_handle), u32v(last_error)]
+    vec![
+        u64v(return_handle),
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsInvalidHandle,
+            return_handle,
+            last_error,
+        ),
+    ]
 }
 
 pub fn read_file_enter(handle: u64, buffer: u64, bytes_to_read: u32) -> Vec<CapturedValue> {
@@ -226,7 +257,11 @@ pub fn read_file_leave(
             i32v(success),
             unsupported_u32(),
             unsupported_bytes(),
-            u32v(last_error),
+            last_error_value(
+                LastErrorMeaning::WhenReturnIsFalse,
+                success as u64,
+                last_error,
+            ),
         ];
     }
     let bytes_read = if bytes_read_addr == 0 {
@@ -246,7 +281,16 @@ pub fn read_file_leave(
         }
         None => (unsupported_u32(), unsupported_bytes()),
     };
-    vec![i32v(success), count_value, data, u32v(last_error)]
+    vec![
+        i32v(success),
+        count_value,
+        data,
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsFalse,
+            success as u64,
+            last_error,
+        ),
+    ]
 }
 
 pub fn write_file_enter(
@@ -278,7 +322,94 @@ pub fn write_file_leave(
         Some(n) => u32v(n),
         None => unsupported_u32(),
     };
-    vec![i32v(success), count, u32v(last_error)]
+    vec![
+        i32v(success),
+        count,
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsFalse,
+            success as u64,
+            last_error,
+        ),
+    ]
+}
+
+/// OVERLAPPED 操作の転送バイト数を、完了を観測した時点で読む
+/// （F27）。`bytes_addr`（lpNumberOfBytesTransferred 等）が非 NULL
+/// ならそこから、NULL なら OVERLAPPED.InternalHigh から読む。どちらも
+/// 読めなければ None（完了イベントは記録できない）。
+pub fn read_overlapped_transferred(
+    mem: &dyn MemoryReader,
+    bytes_addr: u64,
+    overlapped_addr: u64,
+) -> Option<u32> {
+    if bytes_addr != 0 {
+        if let Some(n) = mem.read_u32(bytes_addr) {
+            return Some(n);
+        }
+    }
+    read_overlapped_internal_high(mem, overlapped_addr).map(|n| n as u32)
+}
+
+pub fn get_overlapped_result_enter(file: u64, overlapped: u64, wait: i32) -> Vec<CapturedValue> {
+    vec![u64v(file), u64v(overlapped), i32v(wait)]
+}
+
+/// GetOverlappedResult の leave。転送バイト数が読めなければ
+/// Unsupported（完了イベントの記録も同じ理由でできない）。
+pub fn get_overlapped_result_leave(
+    success: i32,
+    transferred: Option<u32>,
+    last_error: u32,
+) -> Vec<CapturedValue> {
+    vec![
+        i32v(success),
+        match transferred {
+            Some(n) => u32v(n),
+            None => unsupported_u32(),
+        },
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsFalse,
+            success as u64,
+            last_error,
+        ),
+    ]
+}
+
+pub fn get_queued_completion_status_enter(
+    port: u64,
+    bytes_transferred: u64,
+    completion_key: u64,
+    overlapped: u64,
+    milliseconds: u32,
+) -> Vec<CapturedValue> {
+    vec![
+        u64v(port),
+        u64v(bytes_transferred),
+        u64v(completion_key),
+        u64v(overlapped),
+        u32v(milliseconds),
+    ]
+}
+
+/// GetQueuedCompletionStatus の leave。転送バイト数が読めなければ
+/// Unsupported。
+pub fn get_queued_completion_status_leave(
+    success: i32,
+    transferred: Option<u32>,
+    last_error: u32,
+) -> Vec<CapturedValue> {
+    vec![
+        i32v(success),
+        match transferred {
+            Some(n) => u32v(n),
+            None => unsupported_u32(),
+        },
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsFalse,
+            success as u64,
+            last_error,
+        ),
+    ]
 }
 
 pub fn close_handle_enter(handle: u64) -> Vec<CapturedValue> {
@@ -286,7 +417,159 @@ pub fn close_handle_enter(handle: u64) -> Vec<CapturedValue> {
 }
 
 pub fn close_handle_leave(success: i32, last_error: u32) -> Vec<CapturedValue> {
-    vec![i32v(success), u32v(last_error)]
+    vec![
+        i32v(success),
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsFalse,
+            success as u64,
+            last_error,
+        ),
+    ]
+}
+
+/// Win32 の非同期 I/O 完了関連のエラー値（F27）。
+/// `ERROR_IO_PENDING` (997): 操作は開始したがまだ完了していない。
+/// `ERROR_IO_INCOMPLETE` (996): GetOverlappedResult で未完了。
+pub const ERROR_IO_PENDING: u32 = 997;
+pub const ERROR_IO_INCOMPLETE: u32 = 996;
+
+/// OVERLAPPED 構造体の InternalHigh フィールドのオフセット。
+/// OVERLAPPED = { Internal, InternalHigh, Offset, OffsetHigh, hEvent }
+/// で、InternalHigh（転送済みバイト数）は x86/x64 ともに先頭から
+/// 8 バイト目にある。
+pub const OVERLAPPED_INTERNAL_HIGH_OFFSET: u64 = 8;
+
+/// 完了待ちの非同期 I/O 操作（F27）。ReadFile / WriteFile の Detour が
+/// OVERLAPPED 指定で ERROR_IO_PENDING を返したときに登録し、完了の
+/// 観測（GetOverlappedResult / GetQueuedCompletionStatus）で取り出す。
+/// 完了は別スレッドで観測されることがある（IOCP）ため、登録表は
+/// プロセス全体で共有する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlappedDirection {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingOverlapped {
+    /// 元の呼び出しの API（ReadFile / WriteFile）。
+    pub api_id: u32,
+    /// 元の呼び出しの call_id。完了イベントは同じ call_id で記録する。
+    pub call_id: u64,
+    pub handle: u64,
+    /// 入出力バッファのアドレス。
+    pub buffer: u64,
+    pub requested_len: u32,
+    pub direction: OverlappedDirection,
+    /// lpNumberOfBytesRead / lpNumberOfBytesWritten のアドレス（0 なら NULL）。
+    pub bytes_addr: u64,
+}
+
+/// 完了待ちの非同期 I/O 操作の登録表（F27）。鍵は OVERLAPPED 構造体
+/// のアドレス。同じ構造体で完了前に再登録された場合は古い方を上書き
+/// する（Win32 は完了前の構造体再利用を禁じているため、古い操作の
+/// 完了は以後対応付けできない）。
+#[derive(Debug, Default)]
+pub struct OverlappedRegistry {
+    pending: std::sync::Mutex<std::collections::HashMap<u64, PendingOverlapped>>,
+}
+
+impl OverlappedRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn register(&self, overlapped_addr: u64, pending: PendingOverlapped) {
+        if overlapped_addr == 0 {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(overlapped_addr, pending);
+    }
+    pub fn take(&self, overlapped_addr: u64) -> Option<PendingOverlapped> {
+        self.pending.lock().unwrap().remove(&overlapped_addr)
+    }
+    pub fn len(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// OVERLAPPED.InternalHigh（転送済みバイト数）を読む。同期完了した
+/// 操作は leave 時点で既に値が入っている。読めなければ None。
+pub fn read_overlapped_internal_high(mem: &dyn MemoryReader, overlapped_addr: u64) -> Option<u64> {
+    if overlapped_addr == 0 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    if mem.read_exact(overlapped_addr + OVERLAPPED_INTERNAL_HIGH_OFFSET, &mut b) {
+        Some(u64::from_le_bytes(b))
+    } else {
+        None
+    }
+}
+
+/// 完了時の ReadFile leave 値列（F27）。leave Schema と同じフィールド順
+/// （return / lpNumberOfBytesRead / data / last_error）で、完了時点の
+/// 転送バイト数とバッファ内容を取る。失敗時は同期 leave と同じく
+/// バイト数は Unsupported、データは空として記録する。
+pub fn complete_read_file_leave(
+    mem: &dyn MemoryReader,
+    buffer: u64,
+    transferred: u32,
+    success: bool,
+    last_error: u32,
+) -> Vec<CapturedValue> {
+    let success_i32 = if success { 1 } else { 0 };
+    if success {
+        vec![
+            i32v(success_i32),
+            u32v(transferred),
+            read_buffer(mem, buffer, transferred as usize),
+            last_error_value(
+                LastErrorMeaning::WhenReturnIsFalse,
+                success_i32 as u64,
+                last_error,
+            ),
+        ]
+    } else {
+        vec![
+            i32v(success_i32),
+            unsupported_u32(),
+            CapturedValue::captured(TypedValue::Bytes(Vec::new())),
+            last_error_value(
+                LastErrorMeaning::WhenReturnIsFalse,
+                success_i32 as u64,
+                last_error,
+            ),
+        ]
+    }
+}
+
+/// 完了時の WriteFile leave 値列（F27）。leave Schema と同じフィールド順
+/// （return / lpNumberOfBytesWritten / last_error）。
+pub fn complete_write_file_leave(
+    transferred: u32,
+    success: bool,
+    last_error: u32,
+) -> Vec<CapturedValue> {
+    let success_i32 = if success { 1 } else { 0 };
+    vec![
+        i32v(success_i32),
+        if success {
+            u32v(transferred)
+        } else {
+            unsupported_u32()
+        },
+        last_error_value(
+            LastErrorMeaning::WhenReturnIsFalse,
+            success_i32 as u64,
+            last_error,
+        ),
+    ]
 }
 
 /// 取得した値列を、その API の Schema で Compact Binary へ符号化する。
@@ -424,5 +707,226 @@ mod tests {
         );
         let leave = write_file_leave(&m, 1, 0, false, 0);
         assert_eq!(leave[1].capture, ValueCapture::Unsupported, "null out-ptr");
+    }
+
+    #[test]
+    fn timing_declarations_match_capture_points() {
+        // F19: Schema の取得タイミング宣言と実際の取得点が一致する。
+        use shirusu_trace::schema::CaptureTiming;
+        let write = api_by_id(API_WRITE_FILE).unwrap();
+        let read = api_by_id(API_READ_FILE).unwrap();
+        // WriteFile の data は Before: enter で呼び出し前の内容を取る。
+        let mut m = MapMemory::new();
+        m.write(0x6000, &[9, 8, 7]);
+        let enter = write_file_enter(&m, 0x1234, 0x6000, 3);
+        assert_eq!(
+            CaptureTiming::from_flags(write.enter_schema().fields[1].flags),
+            CaptureTiming::Before
+        );
+        assert_eq!(
+            enter[1],
+            CapturedValue::captured(TypedValue::Bytes(vec![9, 8, 7]))
+        );
+        // ReadFile の data は After: leave で API が書き込んだ後の内容を取る。
+        m.write(0x4000, b"after-call");
+        m.write_u32(0x5000, 10);
+        let leave = read_file_leave(&m, 1, 0x4000, 0x5000, false, 0);
+        assert_eq!(
+            CaptureTiming::from_flags(read.leave_schema().fields[2].flags),
+            CaptureTiming::After
+        );
+        assert_eq!(
+            leave[2],
+            CapturedValue::captured(TypedValue::Bytes(b"after-call".to_vec()))
+        );
+        // OVERLAPPED (非同期) の data は完了時に取得するものだが、leave
+        // 時点では完了していないため Unsupported として記録する。完了時
+        // の取得そのものは F27 の対象。
+        let ov = read_file_leave(&m, 1, 0x4000, 0x5000, true, 0);
+        assert_eq!(ov[2].capture, ValueCapture::Unsupported);
+    }
+
+    #[test]
+    fn overlapped_registry_register_take_and_overwrite() {
+        // F27: 完了待ちの登録表は OVERLAPPED アドレスを鍵にし、take で
+        // 取り出したら消える。同じ構造体の再登録は古い方を上書きする。
+        let reg = OverlappedRegistry::new();
+        assert!(reg.is_empty());
+        let first = PendingOverlapped {
+            api_id: API_READ_FILE,
+            call_id: 10,
+            handle: 0x1234,
+            buffer: 0x4000,
+            requested_len: 100,
+            direction: OverlappedDirection::Read,
+            bytes_addr: 0x5000,
+        };
+        reg.register(0x8000, first);
+        assert_eq!(reg.len(), 1);
+        // NULL の OVERLAPPED は登録しない
+        reg.register(0, first);
+        assert_eq!(reg.len(), 1);
+        // 別スレッドからの take でも同じ鍵で取り出せる
+        assert_eq!(reg.take(0x8000), Some(first));
+        assert!(reg.is_empty());
+        assert_eq!(reg.take(0x8000), None);
+        // 再登録は上書き
+        reg.register(0x8000, first);
+        let second = PendingOverlapped {
+            call_id: 11,
+            ..first
+        };
+        reg.register(0x8000, second);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.take(0x8000), Some(second));
+    }
+
+    #[test]
+    fn overlapped_internal_high_reads_at_offset_8() {
+        // F27: OVERLAPPED.InternalHigh は先頭から 8 バイト目。
+        let mut m = MapMemory::new();
+        m.write(0x1008, &42u64.to_le_bytes());
+        assert_eq!(read_overlapped_internal_high(&m, 0x1000), Some(42));
+        assert_eq!(read_overlapped_internal_high(&m, 0), None);
+        assert_eq!(read_overlapped_internal_high(&m, 0x9000), None);
+    }
+
+    #[test]
+    fn complete_read_file_leave_captures_buffer_at_completion() {
+        // F27: 完了時点の転送バイト数とバッファ内容を、leave Schema と
+        // 同じフィールド順で取る。成功時は last_error は残留値 (Stale)。
+        let api = api_by_id(API_READ_FILE).unwrap();
+        let mut m = MapMemory::new();
+        m.write(0x4000, b"async-data-99");
+        let values = complete_read_file_leave(&m, 0x4000, 13, true, 0);
+        assert_eq!(values[0], i32v(1));
+        assert_eq!(values[1], u32v(13));
+        assert_eq!(
+            values[2],
+            CapturedValue::captured(TypedValue::Bytes(b"async-data-99".to_vec()))
+        );
+        assert_eq!(values[3].capture, ValueCapture::Stale);
+        // leave Schema で往復する
+        let bytes = encode_leave(api, &values).expect("encode");
+        let types = schema_types(&api.leave_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), values);
+        // 失敗時はバイト数 Unsupported・データ空・last_error は意味あり
+        let failed = complete_read_file_leave(&m, 0x4000, 0, false, 5);
+        assert_eq!(failed[0], i32v(0));
+        assert_eq!(failed[1].capture, ValueCapture::Unsupported);
+        assert_eq!(
+            failed[2],
+            CapturedValue::captured(TypedValue::Bytes(Vec::new()))
+        );
+        assert_eq!(failed[3], u32v(5));
+    }
+
+    #[test]
+    fn complete_write_file_leave_captures_transferred_count() {
+        // F27: 完了時の WriteFile leave 値列。
+        let api = api_by_id(API_WRITE_FILE).unwrap();
+        let values = complete_write_file_leave(7, true, 0);
+        assert_eq!(
+            values,
+            vec![i32v(1), u32v(7), {
+                let mut v = u32v(0);
+                v.capture = ValueCapture::Stale;
+                v
+            }]
+        );
+        let bytes = encode_leave(api, &values).expect("encode");
+        let types = schema_types(&api.leave_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), values);
+        let failed = complete_write_file_leave(0, false, 5);
+        assert_eq!(failed[1].capture, ValueCapture::Unsupported);
+        assert_eq!(failed[2], u32v(5));
+    }
+
+    #[test]
+    fn overlapped_transferred_prefers_bytes_addr_then_internal_high() {
+        // F27: 転送バイト数は lpNumberOfBytesTransferred から、NULL なら
+        // OVERLAPPED.InternalHigh から読む。
+        let mut m = MapMemory::new();
+        m.write_u32(0x5000, 77);
+        m.write(0x1008, &55u64.to_le_bytes());
+        assert_eq!(read_overlapped_transferred(&m, 0x5000, 0x1000), Some(77));
+        assert_eq!(read_overlapped_transferred(&m, 0, 0x1000), Some(55));
+        assert_eq!(read_overlapped_transferred(&m, 0x9000, 0x1000), Some(55));
+        assert_eq!(read_overlapped_transferred(&m, 0, 0x9000), None);
+    }
+
+    #[test]
+    fn completion_observation_leaves_encode_and_decode() {
+        // F27: 完了観測 API の leave 値列は各 API の leave Schema で往復する。
+        let gor = api_by_id(API_GET_OVERLAPPED_RESULT).unwrap();
+        let enter = get_overlapped_result_enter(0x1234, 0x8000, 1);
+        let bytes = encode_enter(gor, &enter).expect("encode");
+        let types = schema_types(&gor.enter_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), enter);
+        let leave = get_overlapped_result_leave(1, Some(13), 0);
+        assert_eq!(leave[1], u32v(13));
+        assert_eq!(leave[2].capture, ValueCapture::Stale);
+        let bytes = encode_leave(gor, &leave).expect("encode");
+        let types = schema_types(&gor.leave_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), leave);
+        // 転送バイト数が読めなければ Unsupported
+        let missing = get_overlapped_result_leave(0, None, 996);
+        assert_eq!(missing[1].capture, ValueCapture::Unsupported);
+        assert_eq!(missing[2], u32v(996));
+
+        let gqcs = api_by_id(API_GET_QUEUED_COMPLETION_STATUS).unwrap();
+        let enter = get_queued_completion_status_enter(0x7777, 0x5000, 0x1234, 0x9000, 1000);
+        let bytes = encode_enter(gqcs, &enter).expect("encode");
+        let types = schema_types(&gqcs.enter_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), enter);
+        let leave = get_queued_completion_status_leave(1, Some(9), 0);
+        let bytes = encode_leave(gqcs, &leave).expect("encode");
+        let types = schema_types(&gqcs.leave_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), leave);
+    }
+
+    #[test]
+    fn last_error_meaning_matches_declaration() {
+        // F20: Schema の宣言と実際の取得が一致する。失敗時は生値を
+        // Captured、成功時は残留値として Stale（生値は保持）。
+        use shirusu_trace::schema::LastErrorMeaning;
+        for api in API_TABLE {
+            let declared =
+                LastErrorMeaning::from_flags(api.leave_schema().fields.last().unwrap().flags);
+            assert_eq!(declared, api.last_error_meaning, "{}", api.function);
+        }
+        // CreateFileW: INVALID_HANDLE_VALUE なら意味あり、有効ハンドルなら Stale
+        let failed = create_file_w_leave(u64::MAX, 2);
+        assert_eq!(failed[1], u32v(2));
+        let failed32 = create_file_w_leave(0x0000_0000_ffff_ffff, 2);
+        assert_eq!(failed32[1], u32v(2), "32bit INVALID_HANDLE_VALUE");
+        let create_ok = create_file_w_leave(0x1234, 5);
+        assert_eq!(create_ok[1].capture, ValueCapture::Stale);
+        assert_eq!(
+            create_ok[1].value,
+            TypedValue::U32(5),
+            "stale keeps the raw value"
+        );
+        // ReadFile: FALSE なら意味あり、TRUE なら Stale
+        let m = MapMemory::new();
+        let failed = read_file_leave(&m, 0, 0x4000, 0, false, 5);
+        assert_eq!(failed[3], u32v(5));
+        let ok = read_file_leave(&m, 1, 0x4000, 0, false, 5);
+        assert_eq!(ok[3].capture, ValueCapture::Stale);
+        assert_eq!(ok[3].value, TypedValue::U32(5));
+        // WriteFile / CloseHandle も同様
+        let failed = write_file_leave(&m, 0, 0, false, 5);
+        assert_eq!(failed[2], u32v(5));
+        let ok = write_file_leave(&m, 1, 0, false, 5);
+        assert_eq!(ok[2].capture, ValueCapture::Stale);
+        let failed = close_handle_leave(0, 6);
+        assert_eq!(failed[1], u32v(6));
+        let ok = close_handle_leave(1, 6);
+        assert_eq!(ok[1].capture, ValueCapture::Stale);
+        // Stale 値も Compact Binary を往復する（符号化 5）。
+        let api = api_by_id(API_CREATE_FILE_W).unwrap();
+        let bytes = encode_leave(api, &create_ok).expect("encode");
+        let types = schema_types(&api.leave_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), create_ok);
     }
 }

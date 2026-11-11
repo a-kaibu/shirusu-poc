@@ -55,6 +55,7 @@ fn trace_bytes() -> Vec<u8> {
                 capture: EventCapture::Captured,
                 payload: PayloadRef::None,
                 args: Some(encode_values(types, &values).unwrap()),
+                global_order: None,
             }
         };
     let events = vec![

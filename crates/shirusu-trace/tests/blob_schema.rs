@@ -174,3 +174,111 @@ fn schema_types_unknown_tag() {
     reg.register(def).unwrap();
     assert_eq!(reg.types(1), None);
 }
+
+// ---- F18: Blob の部分的な更新 ----
+
+#[test]
+fn blob_update_encode_decode_roundtrip() {
+    use shirusu_trace::blob::BlobUpdate;
+    let base = BlobId::of_content(b"0123456789abcdef");
+    let new_version = BlobId::of_content(b"01234XXXXXabcdef");
+    let u = BlobUpdate {
+        resource_id: base,
+        new_version_id: new_version,
+        offset: 5,
+        data: b"XXXXX".to_vec(),
+    };
+    let encoded = u.encode();
+    // 32 (resource) + 32 (new version) + 8 (offset) + 4 (size) + 5 (data)
+    assert_eq!(encoded.len(), 76 + 5);
+    let decoded = BlobUpdate::decode(&encoded).expect("roundtrip decodes");
+    assert_eq!(decoded, u);
+}
+
+#[test]
+fn blob_update_decode_rejects_size_mismatch_and_truncation() {
+    use shirusu_trace::blob::BlobUpdate;
+    let base = BlobId::of_content(b"0123456789abcdef");
+    let new_version = BlobId::of_content(b"01234XXXXXabcdef");
+    let u = BlobUpdate {
+        resource_id: base,
+        new_version_id: new_version,
+        offset: 5,
+        data: b"XXXXX".to_vec(),
+    };
+    let mut encoded = u.encode();
+    // 宣言サイズと実データ長が食い違う（size 欄を +1 する）
+    encoded[72..76].copy_from_slice(&6u32.to_le_bytes());
+    assert!(
+        BlobUpdate::decode(&encoded).is_none(),
+        "size mismatch rejected"
+    );
+    // 76 バイト未満は切り詰め
+    assert!(BlobUpdate::decode(&encoded[..40]).is_none());
+    assert!(BlobUpdate::decode(&[]).is_none());
+}
+
+#[test]
+fn apply_update_to_splices_and_rejects_out_of_range() {
+    use shirusu_trace::blob::apply_update_to;
+    let base = b"0123456789abcdef";
+    assert_eq!(
+        apply_update_to(base, 5, b"XXXXX").unwrap(),
+        b"01234XXXXXabcdef".to_vec()
+    );
+    // 先頭と末尾ちょうど
+    assert_eq!(
+        apply_update_to(base, 0, b"AB").unwrap(),
+        b"AB23456789abcdef".to_vec()
+    );
+    assert_eq!(
+        apply_update_to(base, 14, b"XY").unwrap(),
+        b"0123456789abcdXY".to_vec()
+    );
+    // 空の更新は無変更
+    assert_eq!(apply_update_to(base, 3, b"").unwrap(), base.to_vec());
+    // 範囲外は None（末尾を 1 バイトでも超えると不可）
+    assert!(apply_update_to(base, 15, b"XY").is_none());
+    assert!(
+        apply_update_to(base, 16, b"").is_some(),
+        "offset == len with empty data is ok"
+    );
+    assert!(apply_update_to(base, 17, b"").is_none());
+    // u64 オーバーフローする offset も範囲外
+    assert!(apply_update_to(base, u64::MAX, b"X").is_none());
+}
+
+#[test]
+fn blob_store_apply_update_folds_and_dedups() {
+    use shirusu_trace::blob::BlobStore;
+    let root = temp_root("apply-update");
+    let mut store = BlobStore::open(&root).unwrap();
+    let base = b"0123456789abcdef";
+    let (base_id, is_new) = store.put(base).unwrap();
+    assert!(is_new);
+    // 未知の基底は None（何も書かない）
+    let unknown = BlobId::of_content(b"no such blob here");
+    assert_eq!(store.apply_update(&unknown, 0, b"X").unwrap(), None);
+    assert_eq!(store.stored_count(), 1);
+    // 畳み込み：新版が格納され、ID は畳み込み内容のハッシュ
+    let folded = b"01234XXXXXabcdef".to_vec();
+    let expected_id = BlobId::of_content(&folded);
+    let (new_id, is_new) = store
+        .apply_update(&base_id, 5, b"XXXXX")
+        .unwrap()
+        .expect("base exists");
+    assert_eq!(new_id, expected_id);
+    assert!(is_new);
+    assert_eq!(store.get_verified(&new_id).unwrap().unwrap(), folded);
+    // 同じ更新の再適用は重複排除で is_new=false
+    let (again_id, is_new) = store
+        .apply_update(&base_id, 5, b"XXXXX")
+        .unwrap()
+        .expect("base exists");
+    assert_eq!(again_id, expected_id);
+    assert!(!is_new);
+    assert_eq!(store.stored_count(), 2);
+    // 範囲外はエラー
+    assert!(store.apply_update(&base_id, 15, b"XY").is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}

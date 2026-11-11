@@ -30,12 +30,17 @@
 //!    ポインタとして扱う（Scalar 宣言がある場合だけ値を比較する）。
 //!    Unspecified の U64 は従来規約（ハンドル/ポインタ級）で扱う。
 //! 5. **取得状態**: `ValueCapture != Captured` の値は本体がダミーの
-//!    ため、値ではなく取得状態そのものを比較対象にする。
+//!    ため、値ではなく取得状態そのものを比較対象にする。例外は
+//!    `Stale`（F20）で、本体は読み取った生値を保持するが、古い残留値
+//!    のため比較対象にしない（状態名だけで比較する）。
 //! 6. **Payload**: Blob 参照は内容で比較する（Blob ID は内容ハッシュ
 //!    なので、Inline と Blob の表現差は吸収される）。欠落した
 //!    Payload は「落ちた」という事実と元長・理由を残す。
 //! 7. **戻り値・last_error・引数の意味値**（整数、文字列、バイト列、
 //!    浮動小数点のビット列）は正規化しない。ここが差分の本体である。
+//!    ただし `last_error` が `Stale`（呼び出しが成功し、生値が古い
+//!    残留値）の場合は規則 5 により状態名だけで比較し、残留値の違いは
+//!    差分にしない（F20）。
 
 use shirusu_analysis::{Phase, TraceView};
 use shirusu_trace::reader::ReadTrace;
@@ -168,7 +173,15 @@ pub struct NormCall {
     pub raw_call_id: u64,
     pub enter: Option<NormEvent>,
     pub leave: Option<NormEvent>,
-    /// Enter/Leave でない単独イベント（kind が 1/2 以外）。
+    /// 中断した呼び出しの終了イベント（L08）。CallLeave の代わりに
+    /// 記録される。leave と同時に存在しない。
+    pub aborted: Option<NormEvent>,
+    /// 非同期 I/O の完了イベント（F27）。leave の後に記録され、leave
+    /// Schema の値列を持つ。leave と同時に存在しうる（leave は未完了
+    /// の Unsupported 値列、completed が完了時点の実値）。比較では
+    /// completed があればそれを実効 leave として使う。
+    pub completed: Option<NormEvent>,
+    /// Enter/Leave でない単独イベント（kind が 1/2/7 以外）。
     pub solo: Option<NormEvent>,
     /// この呼び出しが生成したオブジェクト。
     pub created: Option<ObjectKey>,
@@ -297,6 +310,11 @@ impl NormTrace {
         let mut threads: Vec<Vec<usize>> = Vec::new();
         let mut calls: Vec<NormCall> = Vec::new();
         let mut pending: HashMap<(usize, u64), usize> = HashMap::new();
+        // F27: leave が済んだ呼び出しの call_id -> 呼び出し index。
+        // 完了は leave の後に来て、別スレッドで観測されることがある
+        // ため、スレッドを問わず call_id だけで引く（Host の track_call
+        // と同じ鍵。call_id はセッション内で一意）。
+        let mut completed_lookup: HashMap<u64, usize> = HashMap::new();
         let mut object_calls: HashMap<ObjectKey, Vec<usize>> = HashMap::new();
 
         let norm_event = |ev: &shirusu_analysis::EventView| -> NormEvent {
@@ -351,12 +369,51 @@ impl NormTrace {
                     raw_call_id: ev.call_id,
                     enter: None,
                     leave: None,
+                    aborted: None,
+                    completed: None,
                     solo: Some(norm_event(ev)),
                     created: None,
                     referenced: Vec::new(),
                     first_sequence: ev.sequence,
                 });
                 threads[thread].push(idx);
+                continue;
+            }
+            // F27: 完了は leave が済んだ呼び出しに付ける。leave は
+            // call_id で引く（完了は別スレッドで観測されることがある
+            // ため、スレッドは問わない）。leave が欠落していた場合は、
+            // call_id が一致する最新の呼び出しに付ける。どちらも無ければ
+            // 単独イベント扱い。二重の完了は最初のものを残す。
+            if phase == Phase::Completed {
+                let nev = norm_event(ev);
+                if let Some(&idx) = completed_lookup.get(&ev.call_id) {
+                    if calls[idx].completed.is_none() {
+                        calls[idx].completed = Some(nev);
+                    }
+                } else if let Some(idx) = calls.iter().rposition(|c| {
+                    c.raw_call_id == ev.call_id
+                        && c.completed.is_none()
+                        && (c.leave.is_some() || c.enter.is_some())
+                }) {
+                    calls[idx].completed = Some(nev);
+                } else {
+                    let idx = calls.len();
+                    calls.push(NormCall {
+                        thread,
+                        position: threads[thread].len(),
+                        api,
+                        raw_call_id: ev.call_id,
+                        enter: None,
+                        leave: None,
+                        aborted: None,
+                        completed: None,
+                        solo: Some(nev),
+                        created: None,
+                        referenced: Vec::new(),
+                        first_sequence: ev.sequence,
+                    });
+                    threads[thread].push(idx);
+                }
                 continue;
             }
             let pkey = (thread, ev.call_id);
@@ -388,6 +445,8 @@ impl NormTrace {
                         raw_call_id: ev.call_id,
                         enter: None,
                         leave: None,
+                        aborted: None,
+                        completed: None,
                         solo: None,
                         created: None,
                         referenced: Vec::new(),
@@ -406,8 +465,17 @@ impl NormTrace {
                         calls[idx].created = Some(key.clone());
                     }
                     calls[idx].leave = Some(nev);
+                    completed_lookup.insert(ev.call_id, idx);
                     pending.remove(&pkey);
                 }
+                // L08: 中断は Leave と同じく呼び出しを閉じるが、正常終了
+                // とは区別する（比較で形の相違になる）。
+                Phase::Aborted => {
+                    calls[idx].aborted = Some(nev);
+                    pending.remove(&pkey);
+                }
+                // F27: Completed は上で処理済み。ここには来ない。
+                Phase::Completed => unreachable!(),
                 Phase::Other(_) => unreachable!(),
             }
         }
@@ -416,7 +484,13 @@ impl NormTrace {
         // 自分が生成したものは参照から除く）。
         for (idx, call) in calls.iter_mut().enumerate() {
             let mut referenced: Vec<ObjectKey> = Vec::new();
-            for side in [&call.enter, &call.leave, &call.solo] {
+            for side in [
+                &call.enter,
+                &call.leave,
+                &call.aborted,
+                &call.completed,
+                &call.solo,
+            ] {
                 let Some(ev) = side else { continue };
                 for f in &ev.fields {
                     if let NormValue::Object(key) = &f.value {

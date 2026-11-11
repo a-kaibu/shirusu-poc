@@ -65,8 +65,7 @@ impl Ty {
     }
 }
 
-/// フィールド値の意味種別（FieldDef.flags の bit2..=4 に格納する）。
-///
+/// フィールド値の意味種別（FieldDef.flags の bit2..=4 に格納する）。///
 /// 型 (Ty) だけでは「64bit 整数が個数なのか、ハンドルなのか、
 /// アドレスなのか」は決まらない。正規化や比較が型だけで推定すると
 /// スカラーの変化を見落とすため (レビュー #4 の #7)、Schema が
@@ -119,6 +118,133 @@ impl ValueKind {
     }
 }
 
+/// メモリの取得タイミング（FieldDef.flags の bit5..=7 に格納する）。
+///
+/// overview「型付きの値」節の決定: メモリの取得タイミングは Schema で
+/// 引数ごとに定める。入力バッファは呼び出し前 (Before)、出力バッファは
+/// 元の API が書き込んだ後 (After)、非同期 I/O は完了時 (Completion) に
+/// 取得する。入出力が同じバッファなら前後の両方 (Both) を保存できる
+/// ようにする。enter / leave の Schema が分かれているため、通常は
+/// enter 側の全フィールドが Before、leave 側の全フィールドが After に
+/// なる。Both のフィールドは enter と leave の両 Schema に現れ、それ
+/// ぞれの時点で別々のスナップショットとして保存する。
+/// Completion は「完了時に取得する」という宣言であり、完了の捕捉機構
+/// 自体は別途必要になる（現行フックは OVERLAPPED 指定の leave 時点で
+/// 未完了のため Unsupported として記録する。完了時取得は F27 の対象）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureTiming {
+    /// 未指定（タイミングビットが 0）。取得タイミングを宣言しない
+    /// 旧来の Schema 用。利用側は enter / leave の Schema どちらに
+    /// 属するかで読み替える。
+    Unspecified,
+    /// 呼び出し前（enter）。入力バッファの内容はここで取る。
+    Before,
+    /// 元の API が書き込んだ後（leave）。出力バッファの内容はここで取る。
+    After,
+    /// 非同期 I/O の完了時。leave 時点ではまだ完了していないため、
+    /// 完了を捕捉する仕組みが値を供給するまで取得できない。
+    Completion,
+    /// 入出力が同じバッファで、前後両方のスナップショットを保存する。
+    /// フィールドは enter と leave の両 Schema に現れる。
+    Both,
+}
+
+/// CaptureTiming を格納するフラグビット範囲 (bit5..=7)。
+pub const CAPTURE_TIMING_SHIFT: u32 = 5;
+pub const CAPTURE_TIMING_MASK: u32 = 0b111 << CAPTURE_TIMING_SHIFT;
+
+impl CaptureTiming {
+    pub fn from_flags(flags: u32) -> Self {
+        match (flags & CAPTURE_TIMING_MASK) >> CAPTURE_TIMING_SHIFT {
+            1 => Self::Before,
+            2 => Self::After,
+            3 => Self::Completion,
+            4 => Self::Both,
+            _ => Self::Unspecified,
+        }
+    }
+    /// flags へ埋め込む値（他のビットは含まない）。
+    pub fn flags(self) -> u32 {
+        let v = match self {
+            Self::Unspecified => 0,
+            Self::Before => 1,
+            Self::After => 2,
+            Self::Completion => 3,
+            Self::Both => 4,
+        };
+        v << CAPTURE_TIMING_SHIFT
+    }
+}
+
+/// GetLastError の生値が「API 仕様上意味のあるエラー値」である条件
+/// （FieldDef.flags の bit8..=10 に格納する）。
+///
+/// overview「型付きの値」節の決定: `GetLastError` は生の値と、API 仕様上
+/// 意味のあるエラー値を区別する。Windows の規約では、多くの API は
+/// 失敗を示す戻り値の場合にだけ LastError を設定する。呼び出しが成功
+/// したときに TEB に残っている生値は、以前の失敗呼び出しの残留値であり、
+/// この呼び出しのエラーではない。条件は API ごとに Schema で宣言し、
+/// 取得側は条件を満たさない生値を `ValueCapture::Stale` として記録する
+/// （値本体は生値を保持し、再検証に使える）。`is_meaningful` は
+/// leave イベントの戻り値（生値）で判定する。
+/// 未指定 (Unspecified) の旧来 Schema では従来どおり生値をそのまま
+/// 意味のある値として扱う（フォールバック）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LastErrorMeaning {
+    /// 未指定（条件ビットが 0）。条件を宣言しない旧来の Schema 用。
+    /// 利用側は生値を意味のある値として扱う。
+    Unspecified,
+    /// 常に意味を持つ（`GetLastError` 自体など、戻り値がエラー値
+    /// そのものである API 用）。
+    Always,
+    /// 戻り値が FALSE / 0 の場合にだけ意味を持つ（BOOL 戻り値の API。
+    /// ReadFile / WriteFile / CloseHandle）。
+    WhenReturnIsFalse,
+    /// 戻り値が INVALID_HANDLE_VALUE の場合にだけ意味を持つ
+    /// （HANDLE 戻り値の API。CreateFileW）。
+    WhenReturnIsInvalidHandle,
+}
+
+/// LastErrorMeaning を格納するフラグビット範囲 (bit8..=10)。
+pub const LAST_ERROR_MEANING_SHIFT: u32 = 8;
+pub const LAST_ERROR_MEANING_MASK: u32 = 0b111 << LAST_ERROR_MEANING_SHIFT;
+
+impl LastErrorMeaning {
+    pub fn from_flags(flags: u32) -> Self {
+        match (flags & LAST_ERROR_MEANING_MASK) >> LAST_ERROR_MEANING_SHIFT {
+            1 => Self::Always,
+            2 => Self::WhenReturnIsFalse,
+            3 => Self::WhenReturnIsInvalidHandle,
+            _ => Self::Unspecified,
+        }
+    }
+    /// flags へ埋め込む値（他のビットは含まない）。
+    pub fn flags(self) -> u32 {
+        let v = match self {
+            Self::Unspecified => 0,
+            Self::Always => 1,
+            Self::WhenReturnIsFalse => 2,
+            Self::WhenReturnIsInvalidHandle => 3,
+        };
+        v << LAST_ERROR_MEANING_SHIFT
+    }
+
+    /// 戻り値の生値に対して、この API の LastError 生値が意味を持つか。
+    /// `return_value` は leave Schema の `return` フィールドの生値
+    /// （HANDLE は U64、BOOL は I32 の生値として u64 へ写したもの）。
+    pub fn is_meaningful(self, return_value: u64) -> bool {
+        match self {
+            Self::Unspecified | Self::Always => true,
+            Self::WhenReturnIsFalse => return_value == 0,
+            Self::WhenReturnIsInvalidHandle => {
+                // INVALID_HANDLE_VALUE はポインタ幅依存（64bit: 全ビット 1、
+                // 32bit: 下位 32 ビットのみ 1。レビュー第5回 #5）。
+                return_value == u64::MAX || return_value == 0x0000_0000_ffff_ffff
+            }
+        }
+    }
+}
+
 /// 型付き値。生ビット列を保持する方針（浮動小数点はビットで保持し、
 /// NaN ペイロードを失わない）に従い、F32/F64 はビット表現で持つ。
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +287,8 @@ impl TypedValue {
 /// 値ごとの取得状態（Compact Binary の値列で使う 1 バイト）。
 /// 読めなかった値を NULL として保存しないための区別であり、
 /// Unreadable / Unsupported の値本体はダミー（0 / 空）が入る。
+/// Stale だけは例外で、値本体は読み取った生値を保持する（再検証のため）。
+/// 比較・表示では意味のある値として扱ってはならない（F20）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueCapture {
     Captured,
@@ -168,6 +296,10 @@ pub enum ValueCapture {
     Truncated,
     Unsupported,
     LimitExceeded,
+    /// 値は読めたが生値が古い（この呼び出しのエラーではない）。
+    /// GetLastError の生値が、戻り値が成功を示す場合に残る残留値で
+    /// あることを表す（F20）。値本体は生値を保持する。
+    Stale,
 }
 
 impl ValueCapture {
@@ -178,6 +310,7 @@ impl ValueCapture {
             Self::Truncated => 2,
             Self::Unsupported => 3,
             Self::LimitExceeded => 4,
+            Self::Stale => 5,
         }
     }
     pub fn from_code(code: u8) -> Option<Self> {
@@ -187,6 +320,7 @@ impl ValueCapture {
             2 => Self::Truncated,
             3 => Self::Unsupported,
             4 => Self::LimitExceeded,
+            5 => Self::Stale,
             _ => return None,
         })
     }
@@ -387,5 +521,150 @@ mod tests {
             vec![("return".into(), Ty::U64, ValueKind::CreatedObject.flags())],
         );
         assert_ne!(scalar.content_hash, created.content_hash);
+    }
+
+    #[test]
+    fn capture_timing_flags_roundtrip() {
+        for timing in [
+            CaptureTiming::Unspecified,
+            CaptureTiming::Before,
+            CaptureTiming::After,
+            CaptureTiming::Completion,
+            CaptureTiming::Both,
+        ] {
+            assert_eq!(CaptureTiming::from_flags(timing.flags()), timing);
+            // タイミングは bit0/bit1 (inout/省略可能) と ValueKind の
+            // bit2..=4 に触れない
+            assert_eq!(timing.flags() & 0b1_1111, 0);
+        }
+        // 未知のタイミング値は Unspecified として読む (前方互換)
+        assert_eq!(
+            CaptureTiming::from_flags(7 << CAPTURE_TIMING_SHIFT),
+            CaptureTiming::Unspecified
+        );
+        assert_eq!(CaptureTiming::from_flags(0), CaptureTiming::Unspecified);
+        // ValueKind と合成しても互いに読み戻せる
+        let both = ValueKind::Handle.flags() | CaptureTiming::After.flags();
+        assert_eq!(ValueKind::from_flags(both), ValueKind::Handle);
+        assert_eq!(CaptureTiming::from_flags(both), CaptureTiming::After);
+    }
+
+    #[test]
+    fn capture_timing_changes_content_hash() {
+        // 取得タイミングが違う Schema は別物として判定される (flags は
+        // content_hash の入力に含まれる)。
+        let before = make_schema(
+            1,
+            "a!B/enter",
+            vec![(
+                "data".into(),
+                Ty::Bytes,
+                ValueKind::Scalar.flags() | CaptureTiming::Before.flags(),
+            )],
+        );
+        let after = make_schema(
+            1,
+            "a!B/enter",
+            vec![(
+                "data".into(),
+                Ty::Bytes,
+                ValueKind::Scalar.flags() | CaptureTiming::After.flags(),
+            )],
+        );
+        assert_ne!(before.content_hash, after.content_hash);
+    }
+
+    #[test]
+    fn last_error_meaning_flags_roundtrip() {
+        // F20: GetLastError の生値が「API 仕様上意味のあるエラー値」で
+        // ある条件を Schema で宣言する。
+        for meaning in [
+            LastErrorMeaning::Unspecified,
+            LastErrorMeaning::Always,
+            LastErrorMeaning::WhenReturnIsFalse,
+            LastErrorMeaning::WhenReturnIsInvalidHandle,
+        ] {
+            assert_eq!(LastErrorMeaning::from_flags(meaning.flags()), meaning);
+            // 意味条件は bit0..=7 (inout/省略可能・ValueKind・
+            // CaptureTiming) に触れない
+            assert_eq!(meaning.flags() & 0xff, 0);
+        }
+        // 未知の条件値は Unspecified として読む (前方互換)
+        assert_eq!(
+            LastErrorMeaning::from_flags(7 << LAST_ERROR_MEANING_SHIFT),
+            LastErrorMeaning::Unspecified
+        );
+        assert_eq!(
+            LastErrorMeaning::from_flags(0),
+            LastErrorMeaning::Unspecified
+        );
+        // ValueKind・CaptureTiming と合成しても互いに読み戻せる
+        let combined = ValueKind::Scalar.flags()
+            | CaptureTiming::After.flags()
+            | LastErrorMeaning::WhenReturnIsFalse.flags();
+        assert_eq!(ValueKind::from_flags(combined), ValueKind::Scalar);
+        assert_eq!(CaptureTiming::from_flags(combined), CaptureTiming::After);
+        assert_eq!(
+            LastErrorMeaning::from_flags(combined),
+            LastErrorMeaning::WhenReturnIsFalse
+        );
+    }
+
+    #[test]
+    fn last_error_meaning_changes_content_hash() {
+        // 条件が違う Schema は別物として判定される (flags は
+        // content_hash の入力に含まれる)。
+        let on_false = make_schema(
+            1,
+            "a!B/leave",
+            vec![(
+                "last_error".into(),
+                Ty::U32,
+                ValueKind::Scalar.flags()
+                    | CaptureTiming::After.flags()
+                    | LastErrorMeaning::WhenReturnIsFalse.flags(),
+            )],
+        );
+        let on_handle = make_schema(
+            1,
+            "a!B/leave",
+            vec![(
+                "last_error".into(),
+                Ty::U32,
+                ValueKind::Scalar.flags()
+                    | CaptureTiming::After.flags()
+                    | LastErrorMeaning::WhenReturnIsInvalidHandle.flags(),
+            )],
+        );
+        assert_ne!(on_false.content_hash, on_handle.content_hash);
+    }
+
+    #[test]
+    fn last_error_meaningfulness_matrix() {
+        // F20: 生値が意味を持つのは、宣言した条件が戻り値で満たされた
+        // 場合だけ。成功時の生値は古い残留値であり意味を持たない。
+        use LastErrorMeaning::*;
+        assert!(Unspecified.is_meaningful(0));
+        assert!(Unspecified.is_meaningful(1));
+        assert!(Always.is_meaningful(0));
+        assert!(Always.is_meaningful(1));
+        assert!(WhenReturnIsFalse.is_meaningful(0));
+        assert!(!WhenReturnIsFalse.is_meaningful(1));
+        assert!(WhenReturnIsInvalidHandle.is_meaningful(u64::MAX));
+        // 32bit 形の INVALID_HANDLE_VALUE (WoW64。レビュー第5回 #5)
+        assert!(WhenReturnIsInvalidHandle.is_meaningful(0x0000_0000_ffff_ffff));
+        assert!(!WhenReturnIsInvalidHandle.is_meaningful(0x1234));
+        assert!(!WhenReturnIsInvalidHandle.is_meaningful(0));
+    }
+
+    #[test]
+    fn stale_capture_code_roundtrip() {
+        // F20: 取得状態 Stale (5)。値は読めたが生値が古い
+        // （この呼び出しのエラーではない）ことを表す。値本体は生値を
+        // 保持する（再検証のため）が、比較・表示では意味のあるエラー値
+        // として扱ってはならない。
+        assert_eq!(ValueCapture::Stale.code(), 5);
+        assert_eq!(ValueCapture::from_code(5), Some(ValueCapture::Stale));
+        assert_eq!(ValueCapture::from_code(6), None);
     }
 }

@@ -198,6 +198,34 @@ fn check_clean_scan(trace: &ReadTrace) -> CheckFinding {
             }
             RecoveryIssue::IndexMismatch => Some("stored index does not match scan".into()),
             RecoveryIssue::LimitExceeded { what } => Some(format!("reader limit exceeded: {what}")),
+            RecoveryIssue::SessionMismatch {
+                what,
+                expected,
+                found,
+            } => Some(format!(
+                "session mismatch in {what}: header session {expected} but found {found}"
+            )),
+            RecoveryIssue::ForwardBlobReference { id: blob } => Some(format!(
+                "blob {blob} is referenced before its chunk (forward reference)"
+            )),
+            RecoveryIssue::BlobUpdateMissingBase { resource_id } => Some(format!(
+                "blob update for resource {resource_id} has no base blob to fold onto"
+            )),
+            RecoveryIssue::BlobUpdateOutOfRange {
+                resource_id,
+                offset,
+                size,
+                base_len,
+            } => Some(format!(
+                "blob update for resource {resource_id} out of range: offset {offset} + size {size} exceeds base length {base_len}"
+            )),
+            RecoveryIssue::BlobUpdateHashMismatch {
+                resource_id,
+                expected,
+                computed,
+            } => Some(format!(
+                "blob update for resource {resource_id} folded to {computed}, not the declared new version {expected}"
+            )),
             RecoveryIssue::Resync { .. } | RecoveryIssue::MissingBlob { .. } => None,
         })
         .collect();
@@ -413,6 +441,36 @@ fn check_enter_leave_pairing(view: &TraceView) -> CheckFinding {
                     }
                 }
             }
+            // L08: 中断した呼び出しは Leave と同じく開いた Enter を閉じる。
+            // 対応する Enter が無ければ Leave と同じく違反。
+            Phase::Aborted => {
+                let calls = open.entry(key).or_default();
+                match calls.get_mut(&ev.call_id) {
+                    Some(n) if *n > 0 => *n -= 1,
+                    _ => {
+                        return CheckFinding::fail(
+                            id,
+                            format!(
+                                "aborted for call {} on thread {} has no matching enter",
+                                ev.call_id, ev.thread_id
+                            ),
+                        );
+                    }
+                }
+            }
+            // F27: 完了した非同期 I/O。leave が既に Enter を閉じている
+            // のが通常で、その場合は何もしない。leave が欠落してまだ
+            // 開いている場合にだけ、同じスレッドの Enter を閉じる。
+            // 完了は別スレッドで観測されることがあるが、その場合は
+            // leave が既に閉じているため、ここでは対応付けしない。
+            Phase::Completed => {
+                let calls = open.entry(key).or_default();
+                if let Some(n) = calls.get_mut(&ev.call_id) {
+                    if *n > 0 {
+                        *n -= 1;
+                    }
+                }
+            }
             Phase::Other(_) => {}
         }
     }
@@ -428,7 +486,8 @@ fn check_enter_leave_pairing(view: &TraceView) -> CheckFinding {
     if unclosed.is_empty() {
         CheckFinding::pass(
             id,
-            "every enter has a matching leave (by call_id, per thread)".into(),
+            "every enter has a matching leave, aborted or completed (by call_id, per thread)"
+                .into(),
         )
     } else {
         CheckFinding::fail(
@@ -590,6 +649,7 @@ fn check_integrity_consistency(trace: &ReadTrace, view: &TraceView) -> CheckFind
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shirusu_analysis::{KIND_ABORTED, KIND_COMPLETED};
     use shirusu_trace::container::FileHeader;
     use shirusu_trace::model::{EventBatch, PayloadRef, TraceEvent};
     use shirusu_trace::proto::{CaptureEnvironment, Finalization, SessionMetadata};
@@ -607,6 +667,7 @@ mod tests {
             capture: EventCapture::Captured,
             payload: PayloadRef::None,
             args: None,
+            global_order: None,
         }
     }
 
@@ -653,6 +714,8 @@ mod tests {
                 events: vec![ev(1, 1, 1, 1), ev(2, 2, 1, 2)],
             }],
             blobs: Default::default(),
+            blob_updates: Vec::new(),
+            resource_versions: Default::default(),
             loss_records: Vec::new(),
             stored_index: None,
             index_matches_scan: false,
@@ -661,6 +724,8 @@ mod tests {
                 ..Default::default()
             }),
             finalized_cleanly: true,
+            // L09: profile 集計の無い Trace（`full` 相当）。
+            profile_summary: None,
             blocks: Vec::new(),
             issues: Vec::new(),
         }
@@ -741,6 +806,56 @@ mod tests {
         // 対応する Enter の無い Leave。
         let mut t = valid_trace();
         t.batches[0].events[0].call_id = 42;
+        let report = check_trace(&t);
+        assert_eq!(status(&report, "enter-leave-pairing"), CheckStatus::Fail);
+    }
+
+    #[test]
+    fn completed_call_passes_pairing() {
+        // F27: Enter の後に Leave があり、さらに CallCompleted が来ても
+        // pairing は通る（完了は leave が閉じた呼び出しの値列の到着）。
+        // Leave が欠落していて同じスレッドで完了が来れば、完了が Enter
+        // を閉じる。別スレッドの完了は対応付けしない。
+        let mut t = valid_trace();
+        t.batches[0].events.push(ev(KIND_COMPLETED, 3, 1, 2));
+        t.finalization.as_mut().unwrap().total_events = 3;
+        let report = check_trace(&t);
+        assert_eq!(status(&report, "enter-leave-pairing"), CheckStatus::Pass);
+
+        // Leave 欠落 + 同じスレッドの完了で閉じる。
+        let mut t = valid_trace();
+        t.batches[0].events[1] = ev(KIND_COMPLETED, 2, 1, 2);
+        let report = check_trace(&t);
+        assert_eq!(status(&report, "enter-leave-pairing"), CheckStatus::Pass);
+
+        // Leave 欠落 + 別スレッドの完了は閉じない。
+        let mut t = valid_trace();
+        t.batches[0].events.pop(); // leave 欠落
+        t.batches.push(EventBatch {
+            session_id: 7,
+            process_id: 1,
+            raw_pid: 100,
+            thread_id: 99,
+            qpc_frequency: 10_000_000,
+            events: vec![ev(KIND_COMPLETED, 2, 1, 2)],
+        });
+        let report = check_trace(&t);
+        assert_eq!(status(&report, "enter-leave-pairing"), CheckStatus::Fail);
+    }
+
+    #[test]
+    fn aborted_call_passes_pairing() {
+        // L08: Enter の後が CallAborted なら、呼び出しは異常終了した
+        // ことが分かっているので pairing は通る。対応の無い Aborted
+        // だけは Leave と同じく違反。
+        let mut t = valid_trace();
+        t.batches[0].events[1] = ev(KIND_ABORTED, 2, 1, 2);
+        let report = check_trace(&t);
+        assert_eq!(status(&report, "enter-leave-pairing"), CheckStatus::Pass);
+
+        let mut t = valid_trace();
+        t.batches[0].events[0].call_id = 42;
+        t.batches[0].events[1] = ev(KIND_ABORTED, 2, 1, 2);
         let report = check_trace(&t);
         assert_eq!(status(&report, "enter-leave-pairing"), CheckStatus::Fail);
     }

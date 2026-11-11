@@ -3,6 +3,8 @@
 //! 止めたり終了させたりする。競合は Sleep ではなく同期ポイントで作る。
 //! 同期ポイントはテスト用に有効化されたときだけ効き、本番相当の構成では無効。
 
+pub mod perf;
+
 use shirusu_transport::clock::{system_clock, Clock, ManualClock};
 use shirusu_transport::context::HostMonitor;
 use shirusu_transport::ring::{
@@ -70,6 +72,7 @@ pub fn ev(call: u64, payload: &[u8]) -> EventInput<'_> {
         parent_call_id: 0,
         payload,
         capture_state: CaptureState::Captured,
+        global_order: 0,
     }
 }
 pub fn writer_over(region: &SharedRegion, no_wait: bool) -> RingWriter {
@@ -807,4 +810,320 @@ pub fn run_all_in_process() -> Vec<ScenarioReport> {
         scenario_corruption_injection_stops_ring(),
         scenario_detach_publish_storm(),
     ]
+}
+
+/// A77: Windows プロセス間メモリ順序ストレステストの検証ロジック。
+///
+/// supervisor が回収した観測だけから判定する（プラットフォーム非依存のため
+/// Linux でも単体テストできる）。Windows 実走では supervisor が
+/// `DrainWorker` の観測をこの構造体に詰めて呼ぶ。
+///
+/// 検証する保存則:
+/// - 順序・内容: 回収した payload は 0..N をちょうど 1 回ずつ、順番どおり
+///   （単一書き手スレッドの公開順がプロセスを越えて保たれること）。
+/// - 格納: payload_keys が N 件（欠落 Payload にはキーが付かない）。
+/// - 完全性: integrity_lost が立っていないこと。
+/// - 欠落会計: SequenceGap の合計 == 書き手が報告した dropped_events
+///   （Dropped は sequence を払って欠番を作る。リトライで同じ call_id を
+///   書き直すため、欠番は必ず dropped と 1 対 1 で対応する）。
+/// - 劣化会計: 回収した descriptor 総数 == N + degraded_events
+///   （PublishedDegraded は descriptor を残すため、回収総数に現れる）。
+#[derive(Debug, Clone)]
+pub struct StressObservation<'a> {
+    pub payloads: &'a [u64],
+    pub expected: u64,
+    pub payload_keys: usize,
+    pub total_events: u64,
+    pub integrity_lost: bool,
+    pub sequence_gaps: u64,
+    pub dropped_reported: u64,
+    pub degraded_reported: u64,
+}
+
+pub fn verify_memory_order_stress(obs: &StressObservation) -> Result<String, String> {
+    if obs.integrity_lost {
+        return Err("integrity lost: validating reader stopped the ring".to_string());
+    }
+    if obs.payloads.len() as u64 != obs.expected {
+        return Err(format!(
+            "payload count mismatch: got {} want {}",
+            obs.payloads.len(),
+            obs.expected
+        ));
+    }
+    for (i, p) in obs.payloads.iter().enumerate() {
+        if *p != i as u64 {
+            return Err(format!(
+                "payload mismatch at index {i}: got {p} want {i} (order/content broken)"
+            ));
+        }
+    }
+    if obs.payload_keys as u64 != obs.expected {
+        return Err(format!(
+            "payload_keys mismatch: got {} want {}",
+            obs.payload_keys, obs.expected
+        ));
+    }
+    if obs.sequence_gaps != obs.dropped_reported {
+        return Err(format!(
+            "unaccounted sequence gaps: gaps={} dropped_reported={}",
+            obs.sequence_gaps, obs.dropped_reported
+        ));
+    }
+    if obs.total_events != obs.expected + obs.degraded_reported {
+        return Err(format!(
+            "total events mismatch: got {} want {} + degraded {}",
+            obs.total_events, obs.expected, obs.degraded_reported
+        ));
+    }
+    Ok(format!(
+        "memory order stress: {} events in order, keys={}, gaps={} (dropped={}), degraded={}",
+        obs.expected,
+        obs.payload_keys,
+        obs.sequence_gaps,
+        obs.dropped_reported,
+        obs.degraded_reported
+    ))
+}
+
+/// L06: ABI Probe の名前一覧。対象（shirusu-hook-target --abi-probe）
+/// と比較器で共有する正準リスト。Probe を増やすときはここにも追加する。
+pub const ABI_PROBE_NAMES: &[&str] = &[
+    "float",
+    "struct-return",
+    "callback",
+    "exception",
+    "lasterror-success",
+    "lasterror-failure",
+];
+
+/// L06: ABI Probe 出力（Hook なし＝baseline と Hook あり）の比較。
+/// `ABI_PROBE <name> <value...>` 行だけを対象にし、名前・順序・値が
+/// すべて一致すれば空を返す。不一致は人間可読の差分行を返す。
+/// `ABI_PROBE_DONE ok` 行の有無も比べる：対象が最後まで走り切って
+/// いない（異常終了・クラッシュ）場合に DONE 行が欠けるため、
+/// LaunchedCapture が対象の終了コードを返さない代わりの成功シグナル
+/// として使う。Probe 行以外の stdout（TARGET_* 行など）は無視する。
+pub fn compare_abi_probe_outputs(baseline: &str, hooked: &str) -> Vec<String> {
+    fn probe_lines(out: &str) -> Vec<(&str, &str)> {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("ABI_PROBE "))
+            .filter_map(|rest| rest.split_once(' '))
+            .collect()
+    }
+    let base = probe_lines(baseline);
+    let hook = probe_lines(hooked);
+    let mut diffs = Vec::new();
+    let base_done = baseline.lines().any(|l| l == "ABI_PROBE_DONE ok");
+    let hook_done = hooked.lines().any(|l| l == "ABI_PROBE_DONE ok");
+    if base_done != hook_done {
+        diffs.push(format!(
+            "ABI_PROBE_DONE differs: baseline={base_done} hooked={hook_done} (target did not run to completion in one of the runs)"
+        ));
+    }
+    // 名前・順序・値を位置ごとに比べる。長さが違えば余りも報告する。
+    for (i, ((bn, bv), (hn, hv))) in base.iter().zip(hook.iter()).enumerate() {
+        if bn != hn {
+            diffs.push(format!(
+                "probe #{i} name differs: baseline={bn} hooked={hn}"
+            ));
+        } else if bv != hv {
+            diffs.push(format!(
+                "probe {bn} value differs: baseline={bv} hooked={hv}"
+            ));
+        }
+    }
+    if base.len() != hook.len() {
+        let common = base.len().min(hook.len());
+        let (longer, which) = if base.len() > hook.len() {
+            (&base[common..], "baseline")
+        } else {
+            (&hook[common..], "hooked")
+        };
+        for (n, _) in longer {
+            diffs.push(format!("probe {n} present only in {which}"));
+        }
+    }
+    diffs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obs(payloads: &[u64], expected: u64) -> StressObservation<'_> {
+        StressObservation {
+            payloads,
+            expected,
+            payload_keys: expected as usize,
+            total_events: expected,
+            integrity_lost: false,
+            sequence_gaps: 0,
+            dropped_reported: 0,
+            degraded_reported: 0,
+        }
+    }
+
+    #[test]
+    fn stress_clean_passes() {
+        let o = obs(&[0, 1, 2, 3, 4], 5);
+        assert!(verify_memory_order_stress(&o).is_ok());
+    }
+
+    #[test]
+    fn stress_accounted_gaps_pass() {
+        // Dropped 2 件はリトライで書き直され、欠番として gaps=2 に現れる。
+        let mut o = obs(&[0, 1, 2, 3, 4], 5);
+        o.sequence_gaps = 2;
+        o.dropped_reported = 2;
+        assert!(verify_memory_order_stress(&o).is_ok());
+    }
+
+    #[test]
+    fn stress_accounted_degraded_pass() {
+        // PublishedDegraded 2 件は descriptor を残すため回収総数に現れる。
+        let mut o = obs(&[0, 1, 2, 3, 4], 5);
+        o.total_events = 7;
+        o.degraded_reported = 2;
+        assert!(verify_memory_order_stress(&o).is_ok());
+    }
+
+    #[test]
+    fn stress_unaccounted_gap_fails() {
+        let mut o = obs(&[0, 1, 2, 3, 4], 5);
+        o.sequence_gaps = 2;
+        o.dropped_reported = 1;
+        let e = verify_memory_order_stress(&o).unwrap_err();
+        assert!(e.contains("unaccounted"), "{e}");
+    }
+
+    #[test]
+    fn stress_duplicate_fails() {
+        let o = obs(&[0, 1, 1, 3, 4], 5);
+        assert!(verify_memory_order_stress(&o).is_err());
+    }
+
+    #[test]
+    fn stress_out_of_order_fails() {
+        let o = obs(&[0, 2, 1, 3, 4], 5);
+        assert!(verify_memory_order_stress(&o).is_err());
+    }
+
+    #[test]
+    fn stress_missing_fails() {
+        let o = obs(&[0, 1, 2, 3], 5);
+        assert!(verify_memory_order_stress(&o).is_err());
+    }
+
+    #[test]
+    fn stress_keys_mismatch_fails() {
+        let mut o = obs(&[0, 1, 2, 3, 4], 5);
+        o.payload_keys = 4;
+        assert!(verify_memory_order_stress(&o).is_err());
+    }
+
+    #[test]
+    fn stress_integrity_lost_fails() {
+        let mut o = obs(&[0, 1, 2, 3, 4], 5);
+        o.integrity_lost = true;
+        assert!(verify_memory_order_stress(&o).is_err());
+    }
+
+    #[test]
+    fn stress_degraded_mismatch_fails() {
+        let mut o = obs(&[0, 1, 2, 3, 4], 5);
+        o.total_events = 6;
+        o.degraded_reported = 0;
+        assert!(verify_memory_order_stress(&o).is_err());
+    }
+
+    // L06: ABI Probe 出力の比較。`ABI_PROBE <name> <value>` 行だけを
+    // 対象にし、名前・順序・値が両方で一致すれば空（＝一致）を返す。
+    fn probe_output(pairs: &[(&str, &str)]) -> String {
+        pairs
+            .iter()
+            .map(|(n, v)| format!("ABI_PROBE {n} {v}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn abi_compare_identical_passes() {
+        let out = probe_output(&[
+            ("float", "0123456789abcdef"),
+            ("struct-return", "ok"),
+            ("callback", "ok"),
+            ("exception", "caught"),
+            ("lasterror-success", "1234"),
+            ("lasterror-failure", "2"),
+        ]);
+        assert!(compare_abi_probe_outputs(&out, &out).is_empty());
+    }
+
+    #[test]
+    fn abi_compare_ignores_non_probe_lines() {
+        // TARGET_* 行や stdout の雑音は比較対象外（両方にあってよい）。
+        let base = format!(
+            "TARGET_PATH C:\\temp\\x.tmp\n{}",
+            probe_output(&[("float", "aa")])
+        );
+        let hooked = format!("{}\nTARGET_DONE ok", probe_output(&[("float", "aa")]));
+        assert!(compare_abi_probe_outputs(&base, &hooked).is_empty());
+    }
+
+    #[test]
+    fn abi_compare_changed_value_fails() {
+        let base = probe_output(&[("float", "aa"), ("callback", "ok")]);
+        let hooked = probe_output(&[("float", "bb"), ("callback", "ok")]);
+        let diffs = compare_abi_probe_outputs(&base, &hooked);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert!(diffs[0].contains("float"), "{}", diffs[0]);
+    }
+
+    #[test]
+    fn abi_compare_missing_probe_fails() {
+        let base = probe_output(&[("float", "aa"), ("callback", "ok")]);
+        let hooked = probe_output(&[("float", "aa")]);
+        let diffs = compare_abi_probe_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("callback")), "{diffs:?}");
+    }
+
+    #[test]
+    fn abi_compare_extra_probe_fails() {
+        let base = probe_output(&[("float", "aa")]);
+        let hooked = probe_output(&[("float", "aa"), ("callback", "ok")]);
+        let diffs = compare_abi_probe_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("callback")), "{diffs:?}");
+    }
+
+    #[test]
+    fn abi_compare_reordered_fails() {
+        let base = probe_output(&[("float", "aa"), ("callback", "ok")]);
+        let hooked = probe_output(&[("callback", "ok"), ("float", "aa")]);
+        assert!(!compare_abi_probe_outputs(&base, &hooked).is_empty());
+    }
+
+    #[test]
+    fn abi_compare_missing_done_line_fails() {
+        // DONE 行が無い＝対象が最後まで走り切っていない（異常終了）。
+        let base = probe_output(&[("float", "aa")]) + "ABI_PROBE_DONE ok\n";
+        let hooked = probe_output(&[("float", "aa")]);
+        let diffs = compare_abi_probe_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("DONE")), "{diffs:?}");
+    }
+
+    #[test]
+    fn abi_probe_names_cover_all_probes() {
+        // 比較器が要求する Probe 名と、対象が実装する Probe 名は一致する。
+        assert_eq!(
+            ABI_PROBE_NAMES,
+            [
+                "float",
+                "struct-return",
+                "callback",
+                "exception",
+                "lasterror-success",
+                "lasterror-failure",
+            ]
+        );
+    }
 }

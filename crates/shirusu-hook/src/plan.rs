@@ -132,9 +132,18 @@ mod tests {
         let plan = build_plan(&sites);
         let got: Vec<u32> = plan.entries.iter().map(|e| e.api.api_id).collect();
         assert_eq!(got, vec![API_CREATE_FILE_W, API_READ_FILE, API_WRITE_FILE]);
-        // CloseHandle はこのモジュール経由でフックできない = Coverage 欠落
-        assert_eq!(plan.missing.len(), 1);
-        assert_eq!(plan.missing[0].api_id, API_CLOSE_HANDLE);
+        // CloseHandle と完了観測の 2 API はこのモジュール経由で
+        // フックできない = Coverage 欠落
+        assert_eq!(plan.missing.len(), 3);
+        let missing_ids: Vec<u32> = plan.missing.iter().map(|a| a.api_id).collect();
+        assert_eq!(
+            missing_ids,
+            vec![
+                API_CLOSE_HANDLE,
+                API_GET_OVERLAPPED_RESULT,
+                API_GET_QUEUED_COMPLETION_STATUS
+            ]
+        );
     }
 
     #[test]

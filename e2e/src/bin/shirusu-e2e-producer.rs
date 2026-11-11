@@ -5,6 +5,10 @@
 //!       --data-ready <h> --phase-done <h> --reclaim-ok <h>
 //!       (Windows: 本番経路 D77。実 shirusu_agent::Agent を agent-dll と
 //!        同じ手順で構築し、Slot 再利用を挟んで 2 フェーズ記録する)
+//!   --agent-stress --mapping <handle> --len <bytes> [--count <n>]
+//!       --data-ready <h> --phase-done <h>
+//!       (Windows: プロセス間メモリ順序ストレステスト A77。実 Agent で
+//!        単一スレッドが大量イベント (既定 100 万件) を順に記録する)
 //!   --file <path> --count <n>   (フォールバック: レコードをファイルへ。共有メモリではない)
 //!   --selftest                  (自己完結で書込/回収を検証)
 
@@ -70,6 +74,19 @@ fn main() {
         }
     }
 
+    if args.iter().any(|a| a == "--agent-stress") {
+        #[cfg(windows)]
+        {
+            agent_stress(&args);
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("producer agent-stress: Windows only");
+            std::process::exit(2);
+        }
+    }
+
     if let Some(handle) = arg(&args, "--mapping") {
         #[cfg(windows)]
         {
@@ -118,30 +135,23 @@ fn main() {
     }
 
     eprintln!(
-        "usage: --selftest | --file <path> --count <n> | --mapping <handle> --len <n> --count <n>"
+        "usage: --selftest | --file <path> --count <n> | --mapping <handle> --len <n> --count <n> | --agent-path ... | --agent-stress ..."
     );
     std::process::exit(2);
 }
 
-/// D77 の本番経路 (producer 側): 実 `shirusu_agent::Agent` を Agent DLL と
-/// 同じ手順 (空の SlotPool + register_slot_mapping) で構築し、共有メモリへ
-/// 記録する。フェーズ 1 の記録 → DETACH → Host の回収確認 (reclaim-ok
-/// イベント) → Slot 再利用 → フェーズ 2 の記録、までを行う。
-///
-/// Host の確認をイベントで受けるのはテスト用同期ポイント (D34) であり、
-/// 本番では Host プロセスがスレッド終了確認と回収完了を判断し、Agent
-/// 側の管理経路が回収を駆動する (A70 の管理スレッドの役割)。ここでは
-/// その判断結果だけをイベントで受け取り、回収操作は自プロセスの
-/// SlotPool に対して host_release_slot で行う。
+/// D77/A77 共通: `--mapping`/`--len` から実 `shirusu_agent::Agent` を
+/// agent-dll と同じ手順 (空の SlotPool + register_slot_mapping) で構築する。
+/// 戻り値は (agent, pool)。
 #[cfg(windows)]
-fn agent_path(args: &[String]) {
-    use shirusu_agent::{Agent, RecordResult};
+fn agent_from_mapping(
+    args: &[String],
+) -> (shirusu_agent::Agent, Arc<shirusu_transport::slot::SlotPool>) {
+    use shirusu_agent::Agent;
     use shirusu_transport::context::HostMonitor;
     use shirusu_transport::expansion::ExpansionDelivery;
     use shirusu_transport::slot::SlotPool;
     use shirusu_transport::{RingConfig, EXPANDED_SLOT_GENERATION};
-    use shirusu_transport_win::{EventObject, ProcessNotify};
-    use std::time::{Duration, Instant};
 
     let parse = |name: &str| -> usize {
         arg(args, name)
@@ -150,8 +160,6 @@ fn agent_path(args: &[String]) {
     };
     let mapping_handle = parse("--mapping");
     let len = parse("--len");
-    let count1 = parse("--count1") as u64;
-    let count2 = parse("--count2") as u64;
     let cfg = RingConfig::new(4096, 1024 * 1024);
     assert_eq!(len, cfg.required_len(), "mapping len mismatch");
 
@@ -167,6 +175,110 @@ fn agent_path(args: &[String]) {
         .register_slot_mapping(delivery)
         .expect("register_slot_mapping");
     assert_eq!(slot_index, 0);
+    (agent, pool)
+}
+
+/// A77 のストレステスト (producer 側): 実 `shirusu_agent::Agent` で
+/// 単一スレッドが大量イベント (既定 100 万件、D51 ソークと同規模) を
+/// 別プロセスから共有メモリへ順に記録する。call_id = 0..N、payload は
+/// call_id の LE 8 バイト。容量不足で Published 以外になった書き込みは
+/// yield して同じ call_id を書き直す (D77 と同じリトライ。Dropped は
+/// sequence を払って欠番を作るため、欠落会計は supervisor 側で gaps と
+/// counters の突き合わせで検証する)。Host が死んで Ring が詰まったままに
+/// なると無限スピンするため、記録ループには 180 秒の期限を設ける。
+#[cfg(windows)]
+fn agent_stress(args: &[String]) {
+    use shirusu_agent::RecordResult;
+    use shirusu_transport::WriteOutcome;
+    use shirusu_transport_win::{EventObject, ProcessNotify};
+    use std::time::{Duration, Instant};
+
+    let parse = |name: &str| -> usize {
+        arg(args, name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("missing/invalid {name}"))
+    };
+    let count = arg(args, "--count")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1_000_000);
+    let (agent, _pool) = agent_from_mapping(args);
+
+    // SAFETY: いずれも Host (supervisor) が継承可能にして渡した、この
+    // プロセスで有効なイベントハンドル。所有は持たない (forget する)。
+    let data_ready = ProcessNotify {
+        data_ready: unsafe { EventObject::from_handle_value(parse("--data-ready"), true) },
+    };
+    let phase_done = unsafe { EventObject::from_handle_value(parse("--phase-done"), true) };
+
+    let handle = agent.thread_begin(1).expect("thread_begin");
+    assert_eq!(
+        handle.generation,
+        shirusu_transport::EXPANDED_SLOT_GENERATION
+    );
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(180);
+    let mut dropped_retries = 0u64;
+    let mut degraded_retries = 0u64;
+    for i in 0..count {
+        let p = i.to_le_bytes();
+        loop {
+            if Instant::now() > deadline {
+                eprintln!("producer agent-stress: record deadline exceeded at {i}/{count}");
+                std::process::exit(3);
+            }
+            match agent.record_enter(1, 100, 200, i, 0, &p) {
+                RecordResult::Written(WriteOutcome::Published { .. }) => break,
+                RecordResult::Written(WriteOutcome::PublishedDegraded { .. }) => {
+                    degraded_retries += 1;
+                    std::thread::yield_now();
+                }
+                RecordResult::Written(WriteOutcome::Dropped { .. }) => {
+                    dropped_retries += 1;
+                    std::thread::yield_now();
+                }
+                other => panic!("record failed at {i}: {other:?}"),
+            }
+        }
+        // 本番経路の通知: 公開後に data_ready を立てる (A15/A17)。
+        let _ = data_ready.notify_data_ready();
+    }
+    assert!(agent.thread_detach(1), "thread_detach");
+    let _ = phase_done.set();
+
+    std::mem::forget(data_ready);
+    std::mem::forget(phase_done);
+    println!(
+        "producer agent-stress: recorded={count} dropped_retries={dropped_retries} \
+         degraded_retries={degraded_retries} elapsed={:?}",
+        start.elapsed()
+    );
+}
+
+/// D77 の本番経路 (producer 側): 実 `shirusu_agent::Agent` を Agent DLL と
+/// 同じ手順 (空の SlotPool + register_slot_mapping) で構築し、共有メモリへ
+/// 記録する。フェーズ 1 の記録 → DETACH → Host の回収確認 (reclaim-ok
+/// イベント) → Slot 再利用 → フェーズ 2 の記録、までを行う。
+///
+/// Host の確認をイベントで受けるのはテスト用同期ポイント (D34) であり、
+/// 本番では Host プロセスがスレッド終了確認と回収完了を判断し、Agent
+/// 側の管理経路が回収を駆動する (A70 の管理スレッドの役割)。ここでは
+/// その判断結果だけをイベントで受け取り、回収操作は自プロセスの
+/// SlotPool に対して host_release_slot で行う。
+#[cfg(windows)]
+fn agent_path(args: &[String]) {
+    use shirusu_agent::{Agent, RecordResult};
+    use shirusu_transport::EXPANDED_SLOT_GENERATION;
+    use shirusu_transport_win::{EventObject, ProcessNotify};
+    use std::time::{Duration, Instant};
+
+    let parse = |name: &str| -> usize {
+        arg(args, name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("missing/invalid {name}"))
+    };
+    let count1 = parse("--count1") as u64;
+    let count2 = parse("--count2") as u64;
+    let (agent, pool) = agent_from_mapping(args);
 
     // SAFETY: いずれも Host (supervisor) が継承可能にして渡した、この
     // プロセスで有効なイベントハンドル。所有は持たない (forget する)。

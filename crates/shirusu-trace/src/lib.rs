@@ -21,19 +21,20 @@ pub mod compact;
 pub mod container;
 pub mod error;
 pub mod model;
+pub mod module;
 pub mod proto;
 pub mod reader;
 pub mod schema;
 pub mod writer;
 
-pub use blob::{BlobId, BlobStore};
+pub use blob::{BlobId, BlobStore, BlobUpdate};
 pub use error::{CompactError, ProtoError, Result, TraceError};
 pub use model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};
 pub use reader::{
     read_trace, read_trace_with_limits, ReadTrace, ReaderLimits, RecoveryIssue, ScannedBlock,
 };
 pub use schema::{CapturedValue, EventCapture, SchemaRegistry, Ty, TypedValue, ValueCapture};
-pub use writer::{FinalizationInfo, TraceWriter};
+pub use writer::{Durability, DurableWrite, FinalizationInfo, TraceWriter, WriterOptions};
 
 /// fuzz ターゲット `recover_trace` の入口であり、利用側の回復読みの
 /// 既定経路。壊れた入力でも panic せず、Trace でなければ

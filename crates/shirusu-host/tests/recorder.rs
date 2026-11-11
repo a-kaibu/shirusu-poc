@@ -47,6 +47,12 @@ fn config() -> CaptureSessionConfig {
             ..Default::default()
         },
         qpc_frequency: 10_000_000,
+        durability: shirusu_trace::writer::Durability::Buffered,
+        order_global: false,
+        // L07: Runtime 独自の API は既定で記録しない。
+        record_runtime_apis: false,
+        // L09: 既定は `full`（間引きなし）。
+        record_mode: shirusu_host::trace_convert::RecordMode::Full,
     }
 }
 
@@ -459,5 +465,32 @@ fn partial_and_full_hook_coverage_levels() {
     let summary = session.stop().unwrap();
     assert_eq!(summary.hook_coverage, Some((4, 0)));
     assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Complete);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn uninjectable_child_degrades_capture_coverage() {
+    // L05: 注入できなかった子プロセスは Capture Coverage の劣化として
+    // Finalization の注記に残る。同じ pid の二重記録は 1 件にまとめる。
+    let path = temp_trace("uninjectable-child");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.note_uninjectable_child(4321, "access denied (protected process)");
+    session.note_uninjectable_child(4321, "access denied (protected process)");
+    session.note_uninjectable_child(9876, "exited before injection");
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.uninjectable_children.len(), 2);
+    assert_eq!(summary.uninjectable_children[0].0, 4321);
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Degraded);
+    assert!(
+        summary.integrity.notes.iter().any(|n| n.contains("4321")),
+        "notes: {:?}",
+        summary.integrity.notes
+    );
+    assert!(
+        summary.integrity.notes.iter().any(|n| n.contains("9876")),
+        "notes: {:?}",
+        summary.integrity.notes
+    );
     let _ = std::fs::remove_file(&path);
 }

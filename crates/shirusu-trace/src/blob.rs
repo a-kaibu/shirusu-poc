@@ -48,6 +48,81 @@ impl fmt::Display for BlobId {
     }
 }
 
+/// Blob の部分的な更新（F18。overview「チャンク、圧縮、Blob」節）。
+///
+/// 1 件の更新は「Resource ID、オフセット、サイズ、更新内容」で表す。
+/// Resource ID は、そのリソースを最初に確立した基底 Blob の ID
+/// （内容の BLAKE3 ハッシュ）である。更新は基底内容の
+/// `[offset..offset+size)` を `data` で置き換える。長さは変わらない
+/// （範囲外の更新は無効）。`new_version_id` は更新適用後の内容全体の
+/// BLAKE3 であり、呼び出し側（更新後の全体内容を観測した記録側）が
+/// 求めて渡す。Reader は畳み込み結果のハッシュと照合し、食い違えば
+/// その更新を適用しない（Blob ID は内容ハッシュそのもの、という
+/// 設計を更新経路でも守る）。
+///
+/// 符号化（payload。Block レベルの Zstd / 無圧縮は可逆圧縮のみ）:
+/// `resource_id` 32 バイト＋`new_version_id` 32 バイト＋`offset`
+/// u64 LE＋`size` u32 LE（`data` の長さと等しくなければならない）
+/// ＋`data` `size` バイト。`size` が残りバイト数と違う場合は破損。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobUpdate {
+    /// 更新対象のリソース（基底 Blob）の ID。
+    pub resource_id: BlobId,
+    /// 更新適用後の内容全体の BLAKE3。
+    pub new_version_id: BlobId,
+    /// 置き換え開始位置（基底内容の先頭からのバイトオフセット）。
+    pub offset: u64,
+    /// 置き換えるバイト列。
+    pub data: Vec<u8>,
+}
+
+/// `BlobUpdate::encode` の固定ヘッダー長
+/// （resource 32 + new version 32 + offset 8 + size 4）。
+pub const BLOB_UPDATE_HEADER_LEN: usize = 76;
+
+impl BlobUpdate {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(BLOB_UPDATE_HEADER_LEN + self.data.len());
+        out.extend_from_slice(self.resource_id.as_bytes());
+        out.extend_from_slice(self.new_version_id.as_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+    /// 復号する。短すぎる、または宣言サイズが残りと食い違う場合は None。
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < BLOB_UPDATE_HEADER_LEN {
+            return None;
+        }
+        let size = u32::from_le_bytes(bytes[72..76].try_into().ok()?) as usize;
+        if bytes.len() != BLOB_UPDATE_HEADER_LEN + size {
+            return None;
+        }
+        Some(Self {
+            resource_id: BlobId::from_bytes(bytes[0..32].try_into().ok()?),
+            new_version_id: BlobId::from_bytes(bytes[32..64].try_into().ok()?),
+            offset: u64::from_le_bytes(bytes[64..72].try_into().ok()?),
+            data: bytes[BLOB_UPDATE_HEADER_LEN..].to_vec(),
+        })
+    }
+}
+
+/// 基底内容へ部分更新を 1 件適用する。`offset + data.len()` が基底長を
+/// 超える（u64 オーバーフローを含む）場合は None。空の更新は無変更
+/// （`offset == base.len()` まで許容）。呼び出し側は戻り値のハッシュが
+/// 宣言した新版 ID と一致することを別途確かめる（Reader が行う）。
+pub fn apply_update_to(base: &[u8], offset: u64, data: &[u8]) -> Option<Vec<u8>> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(data.len())?;
+    if end > base.len() {
+        return None;
+    }
+    let mut out = base.to_vec();
+    out[offset..end].copy_from_slice(data);
+    Some(out)
+}
+
 /// ディレクトリ配置の Blob ストア。`<root>/<先頭2hex>/<全体hex>` の2段。
 /// 書き込みは「無ければ書く」。同一内容の再 put は格納しない。
 pub struct BlobStore {
@@ -129,5 +204,29 @@ impl BlobStore {
                 Ok(Some(data))
             }
         }
+    }
+
+    /// 基底 Blob へ部分更新を 1 件適用し、更新後の内容を新版として
+    /// 格納する（F18）。基底が無ければ `Ok(None)`（何も書かない）。
+    /// 範囲外の更新は `Err(InvalidInput)`。新版の ID は畳み込み内容の
+    /// BLAKE3 であり、既出なら格納せず同じ ID を返す（重複排除）。
+    /// 戻り値は `Some((新版 ID, 新規に格納したか))`。
+    pub fn apply_update(
+        &mut self,
+        base: &BlobId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<(BlobId, bool)>> {
+        let Some(base_data) = self.get(base)? else {
+            return Ok(None);
+        };
+        let Some(folded) = apply_update_to(&base_data, offset, data) else {
+            return Err(TraceError::InvalidInput(format!(
+                "blob update out of range: offset {offset} + size {} exceeds base length {}",
+                data.len(),
+                base_data.len()
+            )));
+        };
+        Ok(Some(self.put(&folded)?))
     }
 }

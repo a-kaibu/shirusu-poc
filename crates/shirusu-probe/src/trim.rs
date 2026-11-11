@@ -223,6 +223,7 @@ mod tests {
             capture: EventCapture::Captured,
             payload: PayloadRef::None,
             args: None,
+            global_order: None,
         }
     }
 
@@ -275,6 +276,8 @@ mod tests {
                 ],
             }],
             blobs: Default::default(),
+            blob_updates: Vec::new(),
+            resource_versions: Default::default(),
             loss_records: Vec::new(),
             stored_index: None,
             index_matches_scan: false,
@@ -283,6 +286,8 @@ mod tests {
                 ..Default::default()
             }),
             finalized_cleanly: true,
+            // L09: profile 集計の無い Trace（`full` 相当）。
+            profile_summary: None,
             blocks: Vec::new(),
             issues: Vec::new(),
         }
