@@ -10,7 +10,12 @@
 //!    再開する（アタッチ時は再開は無い）。初期化の成否とは別に、
 //!    DLL が Bootstrap へ書き戻したフック設置/欠落件数を読み戻し、
 //!    Capture Coverage へ反映する（レビュー #4 の #8）。
-//! 5. 対象を生かしたまま終える場合は `shirusu_agent_shutdown` を
+//! 5. L23: 再開後にロード済みモジュールを列挙（安定化待ち）し、注入
+//!    直後の分と合成して Environment の modules へ載せてから Trace
+//!    ファイルを作る（Environment ブロックは作成時に書き込まれるため、
+//!    列挙は作成の前に済ませる必要がある）。列挙に失敗しても capture
+//!    は失敗させない（CLI の exe 分類だけが残る）。
+//! 6. 対象を生かしたまま終える場合は `shirusu_agent_shutdown` を
 //!    リモートスレッドで呼び、Agent 側の終了手順（記録無効化 →
 //!    進行中 Detour の完了待ち → IAT 復元）を済ませてから最終回収・
 //!    確定を行う（レビュー #4 の #9）。
@@ -29,6 +34,7 @@ use crate::child_tree::{child_trace_path, ChildTracker, ProcessEntry};
 use crate::recorder::{
     CaptureSession, CaptureSessionConfig, RingSpec, SessionError, SessionSummary, ShutdownOutcome,
 };
+use shirusu_hook::api::API_COUNT;
 use shirusu_hook::bootstrap::{
     AgentBootstrap, SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK,
 };
@@ -78,53 +84,75 @@ pub struct LaunchedCapture {
 
 impl LaunchedCapture {
     /// CREATE_SUSPENDED で起動し、Agent を初期化してから再開する。
+    /// L23: 注入と初期化を先に行い、モジュール列挙は Trace ファイルの
+    /// 作成の前に済ませる。列挙は対象の実行開始後にしか完全にならない
+    /// ため、注入直後の分と再開後の安定化待ちの分を合成する。
     pub fn launch(
         cmdline: &str,
         trace_path: impl AsRef<Path>,
         cfg: LaunchConfig,
     ) -> Result<Self, SessionError> {
         let spawned = win::spawn_suspended(cmdline)?;
-        let prepared = inject_and_prepare(trace_path, &cfg, spawned.process, spawned.pid);
-        match prepared {
-            Ok((session, shutdown_addr)) => {
-                if let Err(e) = win::resume_main_thread(spawned.thread) {
-                    // 再開できない対象は止めたまま放置しない
-                    let _ = win::terminate_process(spawned.process, 1);
-                    win::close_handle_value(spawned.thread);
-                    win::close_handle_value(spawned.process);
-                    return Err(e.into());
-                }
-                win::close_handle_value(spawned.thread);
-                Ok(Self {
-                    session: Some(session),
-                    process: spawned.process,
-                    pid: spawned.pid,
-                    shutdown_addr,
-                })
-            }
+        let injected = match inject_and_init(&cfg, spawned.process, spawned.pid) {
+            Ok(i) => i,
             Err(e) => {
                 let _ = win::terminate_process(spawned.process, 1);
                 win::close_handle_value(spawned.thread);
                 win::close_handle_value(spawned.process);
-                Err(e)
+                return Err(e);
             }
+        };
+        // 注入直後（再開前）の列挙。対象はまだ停止中のため、exe と ntdll、
+        // Agent DLL とその依存だけが見える。失敗しても空のまま進む
+        // （再開後の列挙が本命）。
+        let pre_modules = crate::modules::enumerate_modules_for_process(spawned.pid);
+        if let Err(e) = win::resume_main_thread(spawned.thread) {
+            // 再開できない対象は止めたまま放置しない
+            let _ = win::terminate_process(spawned.process, 1);
+            win::close_handle_value(spawned.thread);
+            win::close_handle_value(spawned.process);
+            return Err(e.into());
         }
+        win::close_handle_value(spawned.thread);
+        let (session, shutdown_addr) =
+            match finalize_session(trace_path, spawned.pid, injected, pre_modules) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = win::terminate_process(spawned.process, 1);
+                    win::close_handle_value(spawned.process);
+                    return Err(e);
+                }
+            };
+        Ok(Self {
+            session: Some(session),
+            process: spawned.process,
+            pid: spawned.pid,
+            shutdown_addr,
+        })
     }
 
     /// 動作中のプロセスへ Agent を入れる。対象は終了させない。
+    /// アタッチ対象は既に実行中のため、注入直後の列挙は不要で、再開後
+    /// の安定化待ち列挙だけで完全な一覧が得られる。
     pub fn attach(
         pid: u32,
         trace_path: impl AsRef<Path>,
         cfg: LaunchConfig,
     ) -> Result<Self, SessionError> {
         let process = win::open_process_for_injection(pid)?;
-        match inject_and_prepare(trace_path, &cfg, process, pid) {
-            Ok((session, shutdown_addr)) => Ok(Self {
-                session: Some(session),
-                process,
-                pid,
-                shutdown_addr,
-            }),
+        match inject_and_init(&cfg, process, pid) {
+            Ok(injected) => match finalize_session(trace_path, pid, injected, Vec::new()) {
+                Ok((session, shutdown_addr)) => Ok(Self {
+                    session: Some(session),
+                    process,
+                    pid,
+                    shutdown_addr,
+                }),
+                Err(e) => {
+                    win::close_handle_value(process);
+                    Err(e)
+                }
+            },
             Err(e) => {
                 win::close_handle_value(process);
                 Err(e)
@@ -439,6 +467,7 @@ mod tests {
             durability: Durability::Buffered,
             order_global: false,
             record_runtime_apis: false,
+            diagnostic_query_interface: false,
             record_mode: crate::trace_convert::RecordMode::Full,
         }
     }
@@ -476,13 +505,18 @@ mod tests {
     }
 }
 
-/// Bootstrap の初期化結果（設置数・欠落数・復元失敗数）。
+/// Bootstrap の初期化結果（設置数・欠落数・復元失敗数・COM Factory 設置数）。
 struct BootstrapResult {
     hooked: usize,
     missing: usize,
     /// 設置失敗時にロールバックでも復元できず、対象に残存した
     /// IAT スロットの数 (レビュー第5回 #8)。通常は 0。
     unrestored: usize,
+    /// DLL が設置した COM Factory 関数の Detour の数 (L02)。通常は 2。
+    com_factories: usize,
+    /// DLL が設置した WinRT アクティベーション関数の Detour の数
+    /// (L14)。通常は 2。
+    winrt_activations: usize,
 }
 
 /// Bootstrap の初期化結果を対象メモリから読み戻す。
@@ -502,15 +536,30 @@ fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<Boo
     win::read_process_memory(process, remote, bytes.as_mut_ptr(), bytes.len()).ok()?;
     let (hooked, missing) = buf.hook_outcome();
     let unrestored = buf.unrestored_count();
+    let com_factories = buf.com_factory_count();
+    let winrt_activations = buf.winrt_activation_count();
     // 対象 API の総数を超える報告は信用しない（書かれていない
-    // 領域の読み違い等を Coverage として採用しない）。
-    if hooked + missing > 64 || unrestored > 64 {
+    // 領域の読み違い等を Coverage として採用しない）。上限は表の
+    // API 数（API_COUNT）に連動させる。旧値は 64 の固定値で、L03 で
+    // 表が 78 件になった時点で合計が常に上限を超え、報告が常に破棄
+    // される状態になっていた（L01 で発見し修正）。
+    if hooked as usize + missing as usize > API_COUNT || unrestored as usize > API_COUNT {
+        return None;
+    }
+    // L02: COM Factory の設置数は Factory 関数の数（2）を超えない。
+    if com_factories as usize > shirusu_hook::com::COM_FACTORY_COUNT {
+        return None;
+    }
+    // L14: WinRT アクティベーション関数の設置数は関数の数（2）を超えない。
+    if winrt_activations as usize > shirusu_hook::winrt::WINRT_ACTIVATION_COUNT {
         return None;
     }
     Some(BootstrapResult {
         hooked: hooked as usize,
         missing: missing as usize,
         unrestored: unrestored as usize,
+        com_factories: com_factories as usize,
+        winrt_activations: winrt_activations as usize,
     })
 }
 
@@ -539,12 +588,39 @@ fn dll_pointer_width(image: &[u8]) -> Option<u32> {
     pe::is_pe64(image).map(|is64| if is64 { 64 } else { 32 })
 }
 
-fn inject_and_prepare(
-    trace_path: impl AsRef<Path>,
+/// 注入済みの対象と、セッション確定に必要な材料。L23 の分割で
+/// `inject_and_prepare` を 2 段にした：注入・初期化（`inject_and_init`）
+/// と、モジュール列挙後のセッション作成（`finalize_session`）。
+struct InjectedTarget {
+    /// Trace 作成時に使うセッション設定（DLL の PE から決めた
+    /// pointer_width を反映済み）。
+    session_cfg: CaptureSessionConfig,
+    /// Ring ごとの共有 Mapping・space_available 通知・登録仕様。
+    rings: Vec<(
+        win::SharedMapping,
+        std::sync::Arc<win::RingNotify>,
+        RingSpec,
+    )>,
+    /// DLL が Bootstrap へ書き戻したフック設置/欠落件数。
+    hook_coverage: Option<(usize, usize)>,
+    /// DLL が Bootstrap へ書き戻した COM Factory 関数の設置数 (L02)。
+    com_factory_count: Option<usize>,
+    /// DLL が Bootstrap へ書き戻した WinRT アクティベーション関数の
+    /// 設置数 (L14)。
+    winrt_activation_count: Option<usize>,
+    /// Agent 終了エントリのアドレス（解決できた場合）。
+    shutdown_addr: Option<usize>,
+}
+
+/// Mapping とイベントを用意し、DLL を注入して初期化を確認する。
+/// 起動（suspended）とアタッチで共通の手順。Trace ファイルはまだ作ら
+/// ない（L23：Environment へ載せるモジュール列挙は、対象の実行開始
+/// 後にしか完全にならないため、作成は `finalize_session` へ遅らせる）。
+fn inject_and_init(
     cfg: &LaunchConfig,
     process: win::HandleValue,
     pid: u32,
-) -> Result<(CaptureSession, Option<usize>), SessionError> {
+) -> Result<InjectedTarget, SessionError> {
     // Agent DLL の PE は先に読んでおく (後段のエクスポート解決でも使う)。
     let file_bytes = std::fs::read(&cfg.dll_path)?;
     let image = pe::map_file_to_image(&file_bytes)
@@ -559,7 +635,6 @@ fn inject_and_prepare(
         session_cfg.environment.pointer_width = width;
     }
     let ring_len = session_cfg.ring_config.required_len();
-    let mut session = CaptureSession::create_file(trace_path, session_cfg)?;
 
     let notify = win::ProcessNotify::new()?;
     let init_done = win::EventObject::new(false, false)?;
@@ -569,22 +644,20 @@ fn inject_and_prepare(
     win::close_handle_value(host_proc);
     let host_dup = host_dup?;
 
+    let mut rings = Vec::with_capacity(cfg.ring_count);
     let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(cfg.ring_count);
     for i in 0..cfg.ring_count {
         let mapping = win::SharedMapping::create(ring_len)?;
         let ring_notify = std::sync::Arc::new(win::RingNotify::new()?);
         let mapping_dup = mapping.duplicate_to_process(pid)?;
         let space_dup = ring_notify.space_available.duplicate_to_process(pid)?;
-        session.add_shared_mapping(
-            mapping,
-            RingSpec {
-                process_id: TARGET_PROCESS_ID,
-                raw_pid: pid,
-                thread_id: (i + 1) as u64,
-                expected_generation: EXPANDED_SLOT_GENERATION,
-            },
-            Some(ring_notify),
-        )?;
+        let spec = RingSpec {
+            process_id: TARGET_PROCESS_ID,
+            raw_pid: pid,
+            thread_id: (i + 1) as u64,
+            expected_generation: EXPANDED_SLOT_GENERATION,
+        };
+        rings.push((mapping, ring_notify, spec));
         pairs.push((mapping_dup as u64, space_dup as u64));
     }
     let data_dup = notify.data_ready.duplicate_to_process(pid)?;
@@ -597,8 +670,11 @@ fn inject_and_prepare(
     bootstrap.host_process_handle = host_dup as u64;
     // L11: セッションの --order=global を Agent DLL へ伝える (Bootstrap v4)。
     bootstrap.order_global = u32::from(cfg.session.order_global);
-
-    session.start()?;
+    // L23: Runtime 独自の API の記録可否を Agent DLL へ伝える (Bootstrap v5)。
+    bootstrap.record_runtime_apis = u32::from(cfg.session.record_runtime_apis);
+    // L02: 診断用の追加 QueryInterface の可否を Agent DLL へ伝える
+    // (Bootstrap v6, bit0)。
+    bootstrap.com_options = u32::from(cfg.session.diagnostic_query_interface);
 
     let dll_path_str = cfg.dll_path.to_string_lossy().into_owned();
     win::remote_load_library(process, &dll_path_str)?;
@@ -664,8 +740,66 @@ fn inject_and_prepare(
             "agent did not signal init_done before timeout".into(),
         ));
     }
-    if let Some(result) = outcome {
-        session.set_hook_coverage(result.hooked, result.missing);
+    let hook_coverage = outcome
+        .as_ref()
+        .map(|result| (result.hooked, result.missing));
+    let com_factory_count = outcome.as_ref().map(|result| result.com_factories);
+    let winrt_activation_count = outcome.as_ref().map(|result| result.winrt_activations);
+    Ok(InjectedTarget {
+        session_cfg,
+        rings,
+        hook_coverage,
+        com_factory_count,
+        winrt_activation_count,
+        shutdown_addr,
+    })
+}
+
+/// Trace ファイルを作り、Ring を結線して記録を開始する。L23: 作成前に
+/// 対象プロセスのモジュールを列挙して Environment へ載せる（Header と
+/// Environment は作成時に書き込まれるため、列挙はこの前に済ませる）。
+/// `pre_modules` は注入直後（起動時は再開前）に取ったスナップショット
+/// で、再開後の安定化待ち列挙と合成する（起動対象が再開直後に終了して
+/// しまった場合でも、注入直後の分は残る）。列挙に失敗・空の場合は CLI
+/// が作った `environment.modules` をそのまま使う（capture を失敗させない）。
+fn finalize_session(
+    trace_path: impl AsRef<Path>,
+    pid: u32,
+    injected: InjectedTarget,
+    pre_modules: Vec<shirusu_transport_win::modules::LoadedModule>,
+) -> Result<(CaptureSession, Option<usize>), SessionError> {
+    let mut session_cfg = injected.session_cfg;
+    let settled = crate::modules::enumerate_modules_settled(pid);
+    let merged = crate::modules::merge_module_snapshots(pre_modules, settled);
+    if !merged.is_empty() {
+        let classified = crate::modules::classify_module_list(&merged);
+        let existing = std::mem::take(&mut session_cfg.environment.modules);
+        session_cfg.environment.modules =
+            crate::modules::merge_environment_modules(existing, classified);
+        session_cfg.environment.capture_config = format!(
+            "{}; modules={} (L23)",
+            session_cfg.environment.capture_config,
+            session_cfg.environment.modules.len()
+        );
+    } else {
+        session_cfg.environment.capture_config = format!(
+            "{}; modules=unavailable (L23 enumeration failed)",
+            session_cfg.environment.capture_config
+        );
     }
-    Ok((session, shutdown_addr))
+    let mut session = CaptureSession::create_file(trace_path, session_cfg)?;
+    for (mapping, notify, spec) in injected.rings {
+        session.add_shared_mapping(mapping, spec, Some(notify))?;
+    }
+    if let Some((hooked, missing)) = injected.hook_coverage {
+        session.set_hook_coverage(hooked, missing);
+    }
+    if let Some(count) = injected.com_factory_count {
+        session.set_com_factory_count(count);
+    }
+    if let Some(count) = injected.winrt_activation_count {
+        session.set_winrt_activation_count(count);
+    }
+    session.start()?;
+    Ok((session, injected.shutdown_addr))
 }

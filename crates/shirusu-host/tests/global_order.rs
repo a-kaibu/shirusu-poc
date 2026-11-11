@@ -42,6 +42,7 @@ fn config(order_global: bool) -> CaptureSessionConfig {
         order_global,
         // L07: Runtime 独自の API は既定で記録しない。
         record_runtime_apis: false,
+        diagnostic_query_interface: false,
         // L09: 既定は `full`（間引きなし）。
         record_mode: shirusu_host::trace_convert::RecordMode::Full,
     }

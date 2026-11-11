@@ -51,6 +51,7 @@ fn config() -> CaptureSessionConfig {
         order_global: false,
         // L07: Runtime 独自の API は既定で記録しない。
         record_runtime_apis: false,
+        diagnostic_query_interface: false,
         // L09: 既定は `full`（間引きなし）。
         record_mode: shirusu_host::trace_convert::RecordMode::Full,
     }
@@ -492,5 +493,64 @@ fn uninjectable_child_degrades_capture_coverage() {
         "notes: {:?}",
         summary.integrity.notes
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn session_follows_ring_reincarnation_after_slot_reuse() {
+    // レビュー #6 P1-4: Agent がスレッド終了で Slot を回収し、別の
+    // スレッドが同じ Mapping を新しい Generation で再利用しても、
+    // セッションは Worker を張り替えて記録を続ける。旧来は世代
+    // 不一致で Ring が止まっていた (Host 側は固定の期待世代)。
+    let path = temp_trace("reincarnation");
+    let cfg = RingConfig::new(64, 4096);
+    // Host が所有する領域を Agent の追加 Slot へ配送する (実経路の
+    // Bootstrap Mapping と同じ形)。base は incarnation をまたいで不変。
+    let region = SharedRegion::new(cfg, 0, 0);
+    let base = region.base();
+    let pool = Arc::new(SlotPool::new(0));
+    let agent = Arc::new(
+        Agent::new(pool, cfg, Arc::new(HostMonitor::always_alive())).with_policy(WriterPolicy {
+            max_wait: std::time::Duration::ZERO,
+            ..Default::default()
+        }),
+    );
+    let delivery = shirusu_transport::expansion::ExpansionDelivery {
+        len: cfg.required_len(),
+        base: Some(base),
+        handle_value: None,
+        generation: shirusu_transport::EXPANDED_SLOT_GENERATION,
+    };
+    assert_eq!(agent.register_slot_mapping(delivery), Some(0));
+
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(base, cfg.required_len(), spec(0))
+            .unwrap();
+    }
+    session.start().unwrap();
+    // incarnation 1: TID 11 が世代 0 で記録する
+    let h1 = agent.thread_begin(11).expect("slot");
+    assert_eq!(h1.generation, 0);
+    record_file_io(&agent, 11);
+    let stats = session.poll_once().unwrap();
+    assert_eq!(stats.events, 6);
+    // スレッド終了 → セッションが最終回収 → Agent が Slot を回収する
+    assert!(agent.thread_exit(11));
+    let _ = session.poll_once().unwrap();
+    assert_eq!(agent.poll_reclaims(), 1);
+    // incarnation 2: 別の TID が同じ Slot を世代 1 で使う
+    let h2 = agent.thread_begin(222).expect("recycled slot");
+    assert_eq!(h2.index, h1.index);
+    assert_eq!(h2.generation, 1);
+    record_file_io(&agent, 222);
+    let stats = session.poll_once().unwrap();
+    assert_eq!(stats.events, 6, "new incarnation must be drained");
+    assert_eq!(stats.stopped_rings, 0);
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.total_events, 12);
+    assert_eq!(summary.rings_stopped, 0);
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
     let _ = std::fs::remove_file(&path);
 }

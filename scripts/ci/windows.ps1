@@ -48,6 +48,19 @@ Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --
 # L06: ABI 適合性テスト（浮動小数点引数・構造体の戻り値・コールバック・
 # 例外・LastError の Probe を Hook ありとなしで実行して結果を比べる）。
 Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --abi } "capture-e2e --abi"
+# L17: 検証用アプリ 3 種（コンソール / GUI / COM）の E2E。Hook なしと Hook ありで
+# アプリの観測結果が同じことと、ファイル I/O が Trace に記録されることを検証する。
+# レジストリ・USER32・GDI・DIB・COM の未記録分はカバレッジ評価として報告される。
+Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --verify-apps } "capture-e2e --verify-apps"
+# L01: Inline Hook の E2E（GetProcAddress 経由の呼び出しが Trace に
+# 記録されることと、生成 API の Inline Hook を検証する）。
+Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --inline } "capture-e2e --inline"
+# L23: モジュール列挙・署名検証・API Set 解決・フック時呼び出し元分類の E2E。
+# Trace の Environment.modules に列挙・分類されたモジュールが載ることと、
+# 直接呼び出しのファイル I/O が記録されることを検証する（record_runtime_apis の
+# on/off 両方）。CRT 経由の呼び出しは L01 の Inline Hook で Detour に届き、
+# 既定では L23 の呼び出し元分類で抑制されること（on では記録されること）を検証する。
+Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --modules } "capture-e2e --modules"
 # A74: 64bit アトミック操作のコスト測定 (x64 側の対照値。判断は i686 側の実測で行う)
 Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (x64)"
 Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe } "atomic bench (x64)"

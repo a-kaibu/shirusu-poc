@@ -57,6 +57,18 @@ mod win {
         fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
         fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
         fn Sleep(ms: u32);
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    // CRT のファイル I/O（ucrtbase.dll）。`fopen` は内部で `CreateFileW`
+    // を呼ぶが、その呼び出しは ucrtbase.dll 自身の IAT 経由のため、
+    // 現行のメインモジュール限定 IAT では Detour に届かない。
+    // L23 の呼び出し元分類の検証対象（L01 後に抑制の実動を確認する）。
+    extern "C" {
+        fn fopen(path: *const std::ffi::c_char, mode: *const std::ffi::c_char) -> *mut c_void;
+        fn fwrite(ptr: *const c_void, size: usize, count: usize, stream: *mut c_void) -> usize;
+        fn fclose(stream: *mut c_void) -> i32;
     }
 
     /// STARTUPINFOW（CreateProcessW 用。cb だけが必須）。
@@ -203,6 +215,247 @@ mod win {
             }
         }
         println!("TARGET_DONE ok");
+        0
+    }
+
+    /// L23: 直接呼び出しと CRT 経由の呼び出しを両方行う。直接の方は
+    /// exe の IAT 経由で Detour が見て、呼び出し元は Application。
+    /// CRT 経由の方は ucrtbase.dll 内の呼び出しで、L01 の Inline Hook
+    /// で Detour に届き、L23 の呼び出し元分類で抑制される（既定では
+    /// 記録されない。capture-e2e --modules が両方を検証する）。
+    /// `dir` に 2 つの一時ファイルを作り、パスを標準出力へ出す。
+    pub fn run_runtime_caller(dir: &str) -> i32 {
+        let pid = std::process::id();
+        let direct =
+            std::path::PathBuf::from(dir).join(format!("shirusu-runtime-caller-direct-{pid}.tmp"));
+        let crt =
+            std::path::PathBuf::from(dir).join(format!("shirusu-runtime-caller-crt-{pid}.tmp"));
+        if let Err(e) = write_and_read_back(&direct, CONTENT) {
+            println!("TARGET_FAIL direct: {e}");
+            return 2;
+        }
+        // CRT 経由。fopen/fwrite/fclose は ucrtbase.dll 内で CreateFileW /
+        // WriteFile / CloseHandle を呼ぶ。
+        let Ok(crt_c) = std::ffi::CString::new(crt.to_string_lossy().as_bytes()) else {
+            println!("TARGET_FAIL crt path");
+            return 3;
+        };
+        let Ok(mode_c) = std::ffi::CString::new("wb") else {
+            println!("TARGET_FAIL crt mode");
+            return 3;
+        };
+        // SAFETY: crt_c/mode_c は NUL 終端の有効な文字列。
+        let stream = unsafe { fopen(crt_c.as_ptr(), mode_c.as_ptr()) };
+        if stream.is_null() {
+            println!("TARGET_FAIL fopen");
+            return 4;
+        }
+        // SAFETY: stream は fopen の戻り、CONTENT は生存期間内。
+        let n = unsafe { fwrite(CONTENT.as_ptr() as *const c_void, 1, CONTENT.len(), stream) };
+        // SAFETY: stream は fopen の戻り。
+        let closed = unsafe { fclose(stream) };
+        if n != CONTENT.len() || closed != 0 {
+            println!("TARGET_FAIL crt write n={n} closed={closed}");
+            return 5;
+        }
+        println!("RUNTIME_CALLER direct {}", direct.display());
+        println!("RUNTIME_CALLER crt {}", crt.display());
+        println!("RUNTIME_CALLER_DONE ok");
+        0
+    }
+
+    /// L01: `GetProcAddress` で取得した関数ポインタ経由の呼び出し。
+    /// IAT を通らないため、Inline Hook だけが捕捉できる。ファイル 4 API
+    /// （kernel32）と RegCreateKeyExW / RegCloseKey（advapi32）を動的
+    /// 解決し、通常のファイル操作とレジストリ 1 件を行う。成功すれば
+    /// `GETPROCADDRESS_DONE ok` を出し終了 0。
+    pub fn run_getprocaddress() -> i32 {
+        type CreateFileWFn = unsafe extern "system" fn(
+            *const u16,
+            u32,
+            u32,
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+        ) -> *mut c_void;
+        type WriteFileFn =
+            unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+        type ReadFileFn =
+            unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
+        type SetFilePointerFn = unsafe extern "system" fn(*mut c_void, i32, *mut i32, u32) -> u32;
+        type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
+        type RegCreateKeyExWFn = unsafe extern "system" fn(
+            *mut c_void,
+            *const u16,
+            u32,
+            *mut u16,
+            u32,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+            *mut u32,
+        ) -> i32;
+        type RegCloseKeyFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        fn resolve(module: &str, name: &str) -> Option<*mut c_void> {
+            let wide: Vec<u16> = module.encode_utf16().chain([0]).collect();
+            // SAFETY: モジュール名はヌル終端済み。
+            let handle = unsafe { GetModuleHandleW(wide.as_ptr()) };
+            if handle.is_null() {
+                return None;
+            }
+            let Ok(cname) = std::ffi::CString::new(name) else {
+                return None;
+            };
+            // SAFETY: handle はロード済みモジュール、cname はヌル終端済み。
+            let proc = unsafe { GetProcAddress(handle, cname.as_ptr() as *const u8) };
+            if proc.is_null() {
+                None
+            } else {
+                Some(proc)
+            }
+        }
+        // SAFETY: 解決したアドレスを宣言した型の関数ポインタへ写す。
+        // 名前と DLL が一致するため、型は対象 API のものと一致する。
+        let create_file_w: CreateFileWFn = match resolve("kernel32.dll", "CreateFileW") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress CreateFileW");
+                return 2;
+            }
+        };
+        let write_file: WriteFileFn = match resolve("kernel32.dll", "WriteFile") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress WriteFile");
+                return 2;
+            }
+        };
+        let read_file: ReadFileFn = match resolve("kernel32.dll", "ReadFile") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress ReadFile");
+                return 2;
+            }
+        };
+        let set_file_pointer: SetFilePointerFn = match resolve("kernel32.dll", "SetFilePointer") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress SetFilePointer");
+                return 2;
+            }
+        };
+        let close_handle: CloseHandleFn = match resolve("kernel32.dll", "CloseHandle") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress CloseHandle");
+                return 2;
+            }
+        };
+        let reg_create: RegCreateKeyExWFn = match resolve("advapi32.dll", "RegCreateKeyExW") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress RegCreateKeyExW");
+                return 2;
+            }
+        };
+        let reg_close: RegCloseKeyFn = match resolve("advapi32.dll", "RegCloseKey") {
+            Some(p) => unsafe { std::mem::transmute(p) },
+            None => {
+                println!("TARGET_FAIL getprocaddress RegCloseKey");
+                return 2;
+            }
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "shirusu-hook-target-gpa-{}.tmp",
+            std::process::id()
+        ));
+        let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
+        // SAFETY: ポインタはいずれも生存期間内のローカルを指す。
+        unsafe {
+            let h = create_file_w(
+                wide.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                2,
+                0x80,
+                std::ptr::null_mut(),
+            );
+            if h.is_null() || h as usize == usize::MAX {
+                println!("TARGET_FAIL create error={}", GetLastError());
+                return 3;
+            }
+            let mut written = 0u32;
+            if write_file(
+                h,
+                CONTENT.as_ptr(),
+                CONTENT.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            ) == 0
+                || written as usize != CONTENT.len()
+            {
+                println!("TARGET_FAIL write error={}", GetLastError());
+                return 4;
+            }
+            if set_file_pointer(h, 0, std::ptr::null_mut(), 0) == u32::MAX {
+                println!("TARGET_FAIL seek error={}", GetLastError());
+                return 5;
+            }
+            let mut buf = [0u8; 64];
+            let mut read = 0u32;
+            if read_file(
+                h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                println!("TARGET_FAIL read error={}", GetLastError());
+                return 6;
+            }
+            if &buf[..read as usize] != CONTENT {
+                println!("TARGET_FAIL content mismatch read={read}");
+                return 7;
+            }
+            if close_handle(h) == 0 {
+                println!("TARGET_FAIL close error={}", GetLastError());
+                return 8;
+            }
+            // レジストリ 1 件（生成 API 経由の Inline Hook も確認する）。
+            let subkey: Vec<u16> = "Software\\ShirusuInlineHookTest"
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let mut key: *mut c_void = std::ptr::null_mut();
+            let mut disp = 0u32;
+            let rc = reg_create(
+                0x8000_0001 as *mut c_void, // HKEY_CURRENT_USER
+                subkey.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                0x0002_0000, // KEY_SET_VALUE
+                std::ptr::null_mut(),
+                &mut key,
+                &mut disp,
+            );
+            if rc != 0 || key.is_null() {
+                println!("TARGET_FAIL regcreate rc={rc}");
+                return 9;
+            }
+            if reg_close(key) != 0 {
+                println!("TARGET_FAIL regclose");
+                return 10;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        println!("TARGET_PATH {}", path.display());
+        println!("GETPROCADDRESS_DONE ok");
         0
     }
 
@@ -649,6 +902,20 @@ fn main() {
                 .find(|w| w[0] == "--abi-out")
                 .map(|w| w[1].as_str());
             std::process::exit(win::run_abi_probe(out));
+        }
+        if args.iter().any(|a| a == "--runtime-caller") {
+            // L23: 直接呼び出しと CRT 経由の呼び出し。--runtime-caller <dir>
+            // が無ければ一時ディレクトリを使う。
+            let dir = args
+                .windows(2)
+                .find(|w| w[0] == "--runtime-caller")
+                .map(|w| w[1].clone())
+                .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+            std::process::exit(win::run_runtime_caller(&dir));
+        }
+        if args.iter().any(|a| a == "--getprocaddress") {
+            // L01: GetProcAddress 経由の呼び出し（Inline Hook の検証用）。
+            std::process::exit(win::run_getprocaddress());
         }
         if args.iter().any(|a| a == "--child") {
             // 子プロセスとして起動された場合：ドライバの発見・注入に

@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// L23: ロード済みモジュールの列挙・署名検証・API Set 契約の解決。
+pub mod modules;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WinError {
     Unsupported,

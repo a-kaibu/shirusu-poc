@@ -67,6 +67,12 @@ pub struct Agent {
     /// 管理パス専用の登録表。record の通常経路はこのロックを取らない
     /// (TLS キャッシュで完結する)。低速経路でも読みロックは取得の間だけ。
     threads: RwLock<HashMap<u64, Arc<ThreadSlotState>>>,
+    /// スレッド終了済みで、Host の drain 完了を待つ Slot の保持
+    /// (レビュー #6 P1-4)。状態 (領域と書き手) を生かしたまま保持し、
+    /// Ring が drain されたことを共有 Control で確認できたら
+    /// [`Agent::poll_reclaims`] が Slot を回収する。ここで保持する間、
+    /// 領域は解放されない。
+    pending_reclaim: Mutex<Vec<Arc<ThreadSlotState>>>,
     /// 追加 Slot (A70) へ紐付けた Mapping の登録表 (Slot index → Mapping)。
     /// 管理スレッドだけが書き込む。ThreadSlotState が drop されても
     /// (thread_forget / Slot 再利用)、Slot への紐付けは残る。
@@ -168,6 +174,7 @@ impl Agent {
             space_clocks: RwLock::new(HashMap::new()),
             host_monitor,
             threads: RwLock::new(HashMap::new()),
+            pending_reclaim: Mutex::new(Vec::new()),
             expanded_regions: Arc::new(Mutex::new(HashMap::new())),
             order_global: false,
             next_global_order: AtomicU64::new(1),
@@ -599,6 +606,98 @@ impl Agent {
             let _in_flight_done = state.writer.lock().unwrap();
         }
     }
+
+    /// スレッド終了の通知 (レビュー #6 P1-4): DETACH 相当の遷移と
+    /// 登録表からの引退と、回収待ちへの登録を 1 回で行う。
+    ///
+    /// `thread_detach` (DRAINING へ移すだけ) と `thread_forget`
+    /// (Host 主導の後始末) は、単体では「終了したスレッドの Slot を
+    /// 再利用可能にする」経路になっていなかった。実 Capture 経路
+    /// (Agent DLL) は `DisableThreadLibraryCalls` のため
+    /// DLL_THREAD_DETACH が届かず、この入口は FLS デストラクタ
+    /// (shirusu-hook の `fls`) から終了するスレッド自身の文脈で
+    /// 呼ばれる。戻り値は対象スレッドの状態があったかどうか。
+    ///
+    /// 処理: 登録表から外して引退印を付ける (同じ OS スレッド ID が
+    /// 再利用されても、新しいスレッドは新しい状態と Generation で
+    /// 始まる)。書き手を DETACH 済みにして Slot を DRAINING へ移し、
+    /// 状態を回収待ちへ登録する。FREE への回収は
+    /// [`Agent::poll_reclaims`] が Host の drain 完了を確認してから
+    /// 行う。
+    pub fn thread_exit(&self, thread_id: u64) -> bool {
+        let removed = self.threads.write().unwrap().remove(&thread_id);
+        let Some(state) = removed else {
+            return false;
+        };
+        state.retired.store(true, Ordering::Release);
+        {
+            // 書き手ロックの取得自体が、進行中の記録の完了待ちになる。
+            let mut writer = state.writer.lock().unwrap();
+            writer.mark_detached();
+        }
+        // この Ring への space_available 結線はこの incarnation の
+        // ものであるため外す (再利用時は ensure 経路が結び直す)。
+        self.space_clocks.write().unwrap().remove(&thread_id);
+        self.pool.begin_detach(&state.handle);
+        self.pending_reclaim.lock().unwrap().push(state);
+        true
+    }
+
+    /// 回収待ち Slot のうち、Host が読み終えたものを再利用可能へ
+    /// 進める (管理パス)。進めた件数を返す。
+    ///
+    /// drain 完了の判定は共有 Control の読み位置で行う: 読み位置が
+    /// 書き込み位置へ到達していれば、公開済みイベントは全て Host が
+    /// 取り出したことになる (書き手は終了済みのため以後は増えない)。
+    /// 判定が通れば、既存の転送層の仕組み
+    /// (`host_confirm_ended_and_drained` → `host_reclaim`) で
+    /// DRAINING → RECLAIMABLE → FREE (Generation +1) へ進める。
+    /// プロセス間ではこの確認と回収は Agent プロセス内で行い、
+    /// Host の寄与は読み位置の前進そのものである。
+    pub fn poll_reclaims(&self) -> usize {
+        let mut pending = self.pending_reclaim.lock().unwrap();
+        let mut reclaimed = 0usize;
+        let mut i = 0;
+        while i < pending.len() {
+            let state = &pending[i];
+            if !ring_is_drained(state.region.base()) {
+                i += 1;
+                continue;
+            }
+            let _ = self
+                .pool
+                .host_confirm_ended_and_drained(&state.handle, true, true);
+            if self.pool.host_reclaim(&state.handle) {
+                reclaimed += 1;
+                pending.remove(i);
+                continue;
+            }
+            if self.pool.slot(state.handle.index).generation() != state.handle.generation {
+                // 世代が進んでいる = 外部 (Host 主導の回収等) で既に
+                // 回収・再利用された。保持を解く。
+                pending.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+        reclaimed
+    }
+
+    /// 回収待ちの Slot 数 (観測用)。
+    pub fn pending_reclaim_count(&self) -> usize {
+        self.pending_reclaim.lock().unwrap().len()
+    }
+}
+
+/// Ring が drain 済みか (回収判定。レビュー #6 P1-4)。
+/// 書き手は終了済みであることが前提で、読み位置が書き込み位置へ
+/// 到達していれば公開済みイベントは全て読み手が取り出した。
+fn ring_is_drained(base: *const u8) -> bool {
+    let write_cursor = layout::load(base, layout::OFF_WRITE_CURSOR, Ordering::Acquire);
+    let read_cursor = layout::load(base, layout::OFF_READ_CURSOR, Ordering::Acquire);
+    let write_pos = layout::load(base, layout::OFF_PAYLOAD_WRITE_POSITION, Ordering::Acquire);
+    let read_pos = layout::load(base, layout::OFF_PAYLOAD_READ_POSITION, Ordering::Acquire);
+    read_cursor >= write_cursor && read_pos >= write_pos
 }
 
 #[cfg(test)]
@@ -810,6 +909,45 @@ mod tests {
         assert_ne!(h1.index, h2.index);
         assert_eq!(a.pool().free_count(), 0);
     }
+    #[test]
+    fn thread_exit_reclaim_survives_short_lived_thread_churn() {
+        // レビュー #6 P1-4: 短命スレッドを大量に作って捨てても、Host
+        // が drain すれば Slot は回収され枯渇しない。OS スレッド ID
+        // の再利用 (同じ ID の繰り返し) も含む。Pool は 2 スロット
+        // しかないため、回収が無ければ 3 回目で枯渇する。
+        use shirusu_transport::ring::RingReader;
+        let a = agent(2);
+        let cfg = RingConfig::new(16, 512);
+        let mut generations = std::collections::HashSet::new();
+        for i in 0..30u64 {
+            let tid = 100 + (i % 3); // 終了済み TID の再利用を含む
+            let handle = a.thread_begin(tid).expect("slot must be recycled");
+            generations.insert(handle.generation);
+            assert!(matches!(
+                a.record_enter(tid, 10, 20, 1000 + i, 0, b"x"),
+                RecordResult::Written(_)
+            ));
+            let base = unsafe { a.thread_region_base(tid) }.expect("region");
+            assert!(a.thread_exit(tid), "exit of a begun thread");
+            // Host がまだ読んでいない間は回収されない
+            assert_eq!(a.poll_reclaims(), 0);
+            assert_eq!(a.pending_reclaim_count(), 1);
+            // Host 側が drain する (実 Host では DrainWorker が共有
+            // 読み位置を進める。ここでは RingReader で同じことをする)
+            let mut reader = unsafe { RingReader::new(base, cfg) };
+            let batch = reader.drain_all();
+            assert_eq!(batch.events.len(), 1);
+            assert_eq!(batch.events[0].descriptor.call_id, 1000 + i);
+            // drain 済みになれば回収され、Slot は次のスレッドへ回る
+            assert_eq!(a.poll_reclaims(), 1);
+            assert_eq!(a.pending_reclaim_count(), 0);
+        }
+        // 世代が進んでいる (同じ Slot が別の世代で再利用された)
+        assert!(generations.len() > 1, "generations: {generations:?}");
+        // 始まっていないスレッドへの thread_exit は false
+        assert!(!a.thread_exit(999_999));
+    }
+
     #[test]
     fn record_inside_publish_guard_is_skipped() {
         let a = agent(2);

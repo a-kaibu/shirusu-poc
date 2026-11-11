@@ -23,7 +23,7 @@
 use crate::api::ApiDef;
 use shirusu_trace::compact::encode_values;
 use shirusu_trace::schema::{
-    schema_types, CapturedValue, LastErrorMeaning, TypedValue, ValueCapture,
+    schema_types, CapturedValue, LastErrorMeaning, Ty, TypedValue, ValueCapture,
 };
 use shirusu_trace::CompactError;
 
@@ -93,6 +93,12 @@ pub fn u32v(v: u32) -> CapturedValue {
 }
 pub fn i32v(v: i32) -> CapturedValue {
     CapturedValue::captured(TypedValue::I32(v))
+}
+pub fn i64v(v: i64) -> CapturedValue {
+    CapturedValue::captured(TypedValue::I64(v))
+}
+pub fn boolv(v: bool) -> CapturedValue {
+    CapturedValue::captured(TypedValue::Bool(v))
 }
 
 /// UTF-16 文字列（NUL 終端）を Str16 値として取得する。
@@ -342,12 +348,24 @@ pub fn read_overlapped_transferred(
     bytes_addr: u64,
     overlapped_addr: u64,
 ) -> Option<u32> {
+    read_overlapped_transferred_with_width(mem, bytes_addr, overlapped_addr, size_of::<usize>())
+}
+
+/// ポインタ幅を指定する版（レビュー #6 P0-2）。InternalHigh の
+/// レイアウトは対象のポインタ幅で決まるため、幅の異なる対象の
+/// Fixture でも検証できるよう分離してある。
+pub fn read_overlapped_transferred_with_width(
+    mem: &dyn MemoryReader,
+    bytes_addr: u64,
+    overlapped_addr: u64,
+    pointer_width: usize,
+) -> Option<u32> {
     if bytes_addr != 0 {
         if let Some(n) = mem.read_u32(bytes_addr) {
             return Some(n);
         }
     }
-    read_overlapped_internal_high(mem, overlapped_addr).map(|n| n as u32)
+    read_overlapped_internal_high_with_width(mem, overlapped_addr, pointer_width).map(|n| n as u32)
 }
 
 pub fn get_overlapped_result_enter(file: u64, overlapped: u64, wait: i32) -> Vec<CapturedValue> {
@@ -433,11 +451,17 @@ pub fn close_handle_leave(success: i32, last_error: u32) -> Vec<CapturedValue> {
 pub const ERROR_IO_PENDING: u32 = 997;
 pub const ERROR_IO_INCOMPLETE: u32 = 996;
 
-/// OVERLAPPED 構造体の InternalHigh フィールドのオフセット。
-/// OVERLAPPED = { Internal, InternalHigh, Offset, OffsetHigh, hEvent }
-/// で、InternalHigh（転送済みバイト数）は x86/x64 ともに先頭から
-/// 8 バイト目にある。
-pub const OVERLAPPED_INTERNAL_HIGH_OFFSET: u64 = 8;
+/// OVERLAPPED.InternalHigh（転送済みバイト数）の先頭からのオフセット。
+///
+/// OVERLAPPED = { Internal: ULONG_PTR, InternalHigh: ULONG_PTR, Offset,
+/// OffsetHigh, hEvent } で、InternalHigh は 2 番目のフィールドである。
+/// オフセットと読み取り幅はどちらもポインタ幅に等しい: x64 では 8、
+/// x86 では 4。旧実装は 8 固定であり、x86 ではオフセット 8 以降の
+/// Offset フィールド（ファイル位置）を転送バイト数として誤読して
+/// いた（レビュー #6 P0-2）。
+pub fn overlapped_internal_high_offset(pointer_width: usize) -> u64 {
+    pointer_width as u64
+}
 
 /// 完了待ちの非同期 I/O 操作（F27）。ReadFile / WriteFile の Detour が
 /// OVERLAPPED 指定で ERROR_IO_PENDING を返したときに登録し、完了の
@@ -500,12 +524,27 @@ impl OverlappedRegistry {
 
 /// OVERLAPPED.InternalHigh（転送済みバイト数）を読む。同期完了した
 /// 操作は leave 時点で既に値が入っている。読めなければ None。
+/// レイアウトは自プロセスのポインタ幅（`size_of::<usize>()`）で決める。
 pub fn read_overlapped_internal_high(mem: &dyn MemoryReader, overlapped_addr: u64) -> Option<u64> {
-    if overlapped_addr == 0 {
+    read_overlapped_internal_high_with_width(mem, overlapped_addr, size_of::<usize>())
+}
+
+/// ポインタ幅を指定する版（レビュー #6 P0-2）。オフセット = 幅 =
+/// `pointer_width` で読み、値は u64 へゼロ拡張する。幅として受理
+/// するのは 4 (x86) と 8 (x64) だけであり、それ以外は None。
+pub fn read_overlapped_internal_high_with_width(
+    mem: &dyn MemoryReader,
+    overlapped_addr: u64,
+    pointer_width: usize,
+) -> Option<u64> {
+    if overlapped_addr == 0 || !matches!(pointer_width, 4 | 8) {
         return None;
     }
     let mut b = [0u8; 8];
-    if mem.read_exact(overlapped_addr + OVERLAPPED_INTERNAL_HIGH_OFFSET, &mut b) {
+    if mem.read_exact(
+        overlapped_addr + overlapped_internal_high_offset(pointer_width),
+        &mut b[..pointer_width],
+    ) {
         Some(u64::from_le_bytes(b))
     } else {
         None
@@ -581,6 +620,65 @@ pub fn encode_enter(api: &ApiDef, values: &[CapturedValue]) -> Result<Vec<u8>, C
 pub fn encode_leave(api: &ApiDef, values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
     let types = schema_types(&api.leave_schema()).expect("hook schemas use known tags only");
     encode_values(&types, values)
+}
+
+/// L1 生成 API（L03）の汎用取得。生の引数値（usize を u64 へ写した
+/// もの）を、その API の enter Schema の型に沿って値列へ変換する。
+///
+/// 生成表は整数・ポインタ型だけを使う（U32 / I32 / U64 / I64 / Bool）。
+/// 文字列・バッファの中身、構造体の参照先は L1 では取得しない
+/// （ポインタ値だけを記録する。L2 で手書き仕様により拡張する）。
+/// 対応外の型が表に現れたら panic する：生成表はコンパイル時に固定
+/// され、テストで型の制限を検査するためである（encode_enter の
+/// expect と同じ方針）。
+pub fn generic_enter(api: &ApiDef, args: &[u64]) -> Vec<CapturedValue> {
+    assert_eq!(
+        args.len(),
+        api.enter_fields.len(),
+        "{}: generic detour arity mismatch (args {} vs fields {})",
+        api.function,
+        args.len(),
+        api.enter_fields.len()
+    );
+    api.enter_fields
+        .iter()
+        .zip(args.iter())
+        .map(|((name, ty, _, _), raw)| raw_to_value(api.function, name, *ty, *raw))
+        .collect()
+}
+
+/// L1 生成 API（L03）の汎用 leave 取得。leave Schema の `return`
+/// フィールドを戻り値の生値から、`last_error` フィールドを
+/// `last_error_value`（F20 の意味条件）で作る。void 戻りの API は
+/// `return` フィールドを持たず `last_error` だけになる。
+pub fn generic_leave(api: &ApiDef, return_value: u64, last_error: u32) -> Vec<CapturedValue> {
+    api.leave_fields
+        .iter()
+        .map(|(name, ty, _, _)| match *name {
+            "return" => raw_to_value(api.function, name, *ty, return_value),
+            "last_error" => last_error_value(api.last_error_meaning, return_value, last_error),
+            other => panic!(
+                "{}: unexpected leave field {other} in generated table",
+                api.function
+            ),
+        })
+        .collect()
+}
+
+/// 生の u64 値を Schema の型に沿った `CapturedValue` へ変換する。
+/// 32bit 型は下位ビット、64bit 型は全ビット、Bool は 0 以外を真とする。
+/// 生成表で使わない型（Str16 / Bytes 等）は panic する。
+fn raw_to_value(function: &str, name: &str, ty: Ty, raw: u64) -> CapturedValue {
+    match ty {
+        Ty::U32 => u32v(raw as u32),
+        Ty::I32 => i32v(raw as i32),
+        Ty::U64 => u64v(raw),
+        Ty::I64 => i64v(raw as i64),
+        Ty::Bool => boolv(raw != 0),
+        other => {
+            panic!("{function}: field {name} uses unsupported Ty {other:?} for generic L1 capture")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -792,6 +890,59 @@ mod tests {
     }
 
     #[test]
+    fn overlapped_internal_high_x86_layout_uses_offset_and_width_4() {
+        // レビュー #6 P0-2: x86 の OVERLAPPED は Internal (ULONG_PTR = 4B)
+        // の直後、オフセット 4 に InternalHigh (4B) がある。オフセット 8
+        // 以降は Offset / OffsetHigh (ファイル位置) であり別物。
+        let mut m = MapMemory::new();
+        m.write_u32(0x1000, 0x1111_2222); // Internal
+        m.write_u32(0x1004, 77); // InternalHigh = 転送バイト数
+        m.write_u32(0x1008, 0xDEAD_BEEF); // Offset (転送量ではない)
+        m.write_u32(0x100C, 0); // OffsetHigh
+        assert_eq!(
+            read_overlapped_internal_high_with_width(&m, 0x1000, 4),
+            Some(77)
+        );
+        assert_eq!(
+            read_overlapped_transferred_with_width(&m, 0, 0x1000, 4),
+            Some(77)
+        );
+        // 旧実装 (オフセット 8・幅 8 固定) はこの Fixture で Offset を
+        // 読んで 0xDEAD_BEEF を転送量として返していた。
+        // lpNumberOfBytesTransferred があればそちらが優先 (幅に依らない)。
+        m.write_u32(0x5000, 99);
+        assert_eq!(
+            read_overlapped_transferred_with_width(&m, 0x5000, 0x1000, 4),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn overlapped_internal_high_x64_layout_uses_offset_and_width_8() {
+        // x64: Internal (8B) の直後、オフセット 8 に InternalHigh (8B)。
+        let mut m = MapMemory::new();
+        m.write(0x1000, &0x1111_2222_3333_4444u64.to_le_bytes()); // Internal
+        m.write(0x1008, &123_456u64.to_le_bytes()); // InternalHigh
+        assert_eq!(
+            read_overlapped_internal_high_with_width(&m, 0x1000, 8),
+            Some(123_456)
+        );
+        assert_eq!(
+            read_overlapped_transferred_with_width(&m, 0, 0x1000, 8),
+            Some(123_456)
+        );
+        // 本番ラッパは自プロセスの幅を使う (このテスト環境は 64bit)。
+        assert_eq!(read_overlapped_internal_high(&m, 0x1000), Some(123_456));
+        assert_eq!(overlapped_internal_high_offset(4), 4);
+        assert_eq!(overlapped_internal_high_offset(8), 8);
+        // 4 / 8 以外の幅は受理しない
+        assert_eq!(
+            read_overlapped_internal_high_with_width(&m, 0x1000, 2),
+            None
+        );
+    }
+
+    #[test]
     fn complete_read_file_leave_captures_buffer_at_completion() {
         // F27: 完了時点の転送バイト数とバッファ内容を、leave Schema と
         // 同じフィールド順で取る。成功時は last_error は残留値 (Stale)。
@@ -890,7 +1041,7 @@ mod tests {
         // F20: Schema の宣言と実際の取得が一致する。失敗時は生値を
         // Captured、成功時は残留値として Stale（生値は保持）。
         use shirusu_trace::schema::LastErrorMeaning;
-        for api in API_TABLE {
+        for api in api_table() {
             let declared =
                 LastErrorMeaning::from_flags(api.leave_schema().fields.last().unwrap().flags);
             assert_eq!(declared, api.last_error_meaning, "{}", api.function);
@@ -928,5 +1079,182 @@ mod tests {
         let bytes = encode_leave(api, &create_ok).expect("encode");
         let types = schema_types(&api.leave_schema()).unwrap();
         assert_eq!(decode_values(&types, &bytes).unwrap(), create_ok);
+    }
+
+    /// L03 の生成 API 用のテスト定義（RegCloseKey 相当）。
+    fn reg_close_key_def() -> ApiDef {
+        use shirusu_trace::schema::{CaptureTiming, LastErrorMeaning, ValueKind};
+        ApiDef {
+            api_id: 900,
+            module: "advapi32.dll",
+            function: "RegCloseKey",
+            level: 1,
+            level_note: "test",
+            enter_fields: &[("hKey", Ty::U64, ValueKind::Handle, CaptureTiming::Before)],
+            leave_fields: &[
+                ("return", Ty::U32, ValueKind::Scalar, CaptureTiming::After),
+                (
+                    "last_error",
+                    Ty::U32,
+                    ValueKind::Scalar,
+                    CaptureTiming::After,
+                ),
+            ],
+            last_error_meaning: LastErrorMeaning::Never,
+        }
+    }
+
+    #[test]
+    fn generic_enter_and_leave_roundtrip() {
+        // L03: 生の引数値を Schema の型に沿って変換し、符号化が往復する。
+        let api = reg_close_key_def();
+        let enter = generic_enter(&api, &[0x1234_5678_9abc_def0]);
+        assert_eq!(enter, vec![u64v(0x1234_5678_9abc_def0)]);
+        // 戻り値 0 (ERROR_SUCCESS) でも Never なら last_error は Stale。
+        let leave = generic_leave(&api, 0, 5);
+        assert_eq!(leave[0], u32v(0));
+        assert_eq!(leave[1].capture, ValueCapture::Stale);
+        assert_eq!(leave[1].value, TypedValue::U32(5));
+        let bytes = encode_enter(&api, &enter).expect("encode enter");
+        let types = schema_types(&api.enter_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), enter);
+        let bytes = encode_leave(&api, &leave).expect("encode leave");
+        let types = schema_types(&api.leave_schema()).unwrap();
+        assert_eq!(decode_values(&types, &bytes).unwrap(), leave);
+    }
+
+    #[test]
+    fn generic_enter_truncates_and_sign_extends() {
+        // L03: 32bit 型は下位ビット、64bit 型は全ビット、Bool は 0 以外を真。
+        use shirusu_trace::schema::{CaptureTiming, LastErrorMeaning, ValueKind};
+        let api = ApiDef {
+            api_id: 901,
+            module: "kernel32.dll",
+            function: "FakeMixed",
+            level: 1,
+            level_note: "test",
+            enter_fields: &[
+                ("a", Ty::U32, ValueKind::Scalar, CaptureTiming::Before),
+                ("b", Ty::I32, ValueKind::Scalar, CaptureTiming::Before),
+                ("c", Ty::U64, ValueKind::Scalar, CaptureTiming::Before),
+                ("d", Ty::I64, ValueKind::Scalar, CaptureTiming::Before),
+                ("e", Ty::Bool, ValueKind::Scalar, CaptureTiming::Before),
+            ],
+            leave_fields: &[
+                ("return", Ty::I32, ValueKind::Scalar, CaptureTiming::After),
+                (
+                    "last_error",
+                    Ty::U32,
+                    ValueKind::Scalar,
+                    CaptureTiming::After,
+                ),
+            ],
+            last_error_meaning: LastErrorMeaning::WhenReturnIsFalse,
+        };
+        let enter = generic_enter(
+            &api,
+            &[
+                0x1_0000_0002,
+                0xffff_ffff,
+                0x1234_5678_9abc_def0,
+                0xffff_ffff_ffff_ffff,
+                2,
+            ],
+        );
+        assert_eq!(
+            enter,
+            vec![
+                u32v(2),
+                i32v(-1),
+                u64v(0x1234_5678_9abc_def0),
+                i64v(-1),
+                boolv(true),
+            ]
+        );
+        // 戻り値 0 (FALSE) なら last_error は意味あり、非 0 なら Stale。
+        assert_eq!(generic_leave(&api, 0, 5)[1], u32v(5));
+        assert_eq!(generic_leave(&api, 1, 5)[1].capture, ValueCapture::Stale);
+    }
+
+    #[test]
+    fn generic_leave_handles_null_return_and_void_return() {
+        // L03: HANDLE 返し (WhenReturnIsNull) は NULL 時のみ意味あり。
+        use shirusu_trace::schema::{CaptureTiming, LastErrorMeaning, ValueKind};
+        let api = ApiDef {
+            api_id: 902,
+            module: "kernel32.dll",
+            function: "FakeHandle",
+            level: 1,
+            level_note: "test",
+            enter_fields: &[("a", Ty::U32, ValueKind::Scalar, CaptureTiming::Before)],
+            leave_fields: &[
+                ("return", Ty::U64, ValueKind::Handle, CaptureTiming::After),
+                (
+                    "last_error",
+                    Ty::U32,
+                    ValueKind::Scalar,
+                    CaptureTiming::After,
+                ),
+            ],
+            last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+        };
+        assert_eq!(generic_leave(&api, 0, 5)[1], u32v(5));
+        assert_eq!(
+            generic_leave(&api, 0x1234, 5)[1].capture,
+            ValueCapture::Stale
+        );
+        // void 戻りは leave が last_error だけになる。
+        let void_api = ApiDef {
+            api_id: 903,
+            module: "kernel32.dll",
+            function: "FakeVoid",
+            level: 1,
+            level_note: "test",
+            enter_fields: &[("a", Ty::U32, ValueKind::Scalar, CaptureTiming::Before)],
+            leave_fields: &[(
+                "last_error",
+                Ty::U32,
+                ValueKind::Scalar,
+                CaptureTiming::After,
+            )],
+            last_error_meaning: LastErrorMeaning::Never,
+        };
+        let leave = generic_leave(&void_api, 0, 5);
+        assert_eq!(leave.len(), 1);
+        assert_eq!(leave[0].capture, ValueCapture::Stale);
+    }
+
+    #[test]
+    #[should_panic(expected = "arity mismatch")]
+    fn generic_enter_rejects_arity_mismatch() {
+        let api = reg_close_key_def();
+        let _ = generic_enter(&api, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported Ty")]
+    fn generic_enter_rejects_unsupported_type() {
+        // L03: 生成表に Str16 等が混ざると panic する（表の検査は
+        // api.rs のテストが担い、ここでは変換側の防御を確認する）。
+        use shirusu_trace::schema::{CaptureTiming, LastErrorMeaning, ValueKind};
+        let api = ApiDef {
+            api_id: 904,
+            module: "kernel32.dll",
+            function: "FakeString",
+            level: 1,
+            level_note: "test",
+            enter_fields: &[("s", Ty::Str16, ValueKind::Scalar, CaptureTiming::Before)],
+            leave_fields: &[
+                ("return", Ty::I32, ValueKind::Scalar, CaptureTiming::After),
+                (
+                    "last_error",
+                    Ty::U32,
+                    ValueKind::Scalar,
+                    CaptureTiming::After,
+                ),
+            ],
+            last_error_meaning: LastErrorMeaning::WhenReturnIsFalse,
+        };
+        let _ = generic_enter(&api, &[0x1000]);
     }
 }

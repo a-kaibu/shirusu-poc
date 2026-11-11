@@ -11,9 +11,15 @@ shirusu-transport = { path = "../shirusu-transport" }
 shirusu-transport-win = { path = "../shirusu-transport-win" }
 shirusu-agent = { path = "../shirusu-agent" }
 shirusu-trace = { path = "../shirusu-trace" }
+# L01: Inline Hook の命令再配置に使う。デコーダ＋BlockEncoder
+# （トランポリンへの再配置・分岐の拡大・RIP 相対の修正）のみで、
+# フォーマッタ等は不要。プラットフォーム非依存のコアは Linux でも
+# テストするため、通常依存として置く。
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "block_encoder", "instr_info"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+# L01: スレッド停止に ToolHelp（スレッド列挙）と Kernel（CONTEXT）を追加。
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel"] }
 
 [dev-dependencies]
 proptest = "1"

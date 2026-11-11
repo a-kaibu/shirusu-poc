@@ -259,6 +259,8 @@ impl<W: DurableWrite> Emitter<W> {
             target_description: cfg.target_description.clone(),
             // L07: 外部エミッタはモジュール分類をまだ記録しない（空）。
             modules: Vec::new(),
+            // L13: 外部エミッタは静的依存もまだ記録しない（空）。
+            static_dependencies: Vec::new(),
         };
         let mut writer = TraceWriter::with_options(inner, environment, options)?;
         for def in set.schemas() {

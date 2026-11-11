@@ -171,6 +171,16 @@ message CaptureEnvironment {
   string target_description = 8;    // 対象プロセスの説明（任意）
   repeated ModuleClassification modules = 9;  // L07: モジュール分類。
                                     // 空のときは書かないので旧ファイルと同じバイト列
+  repeated StaticDependency static_dependencies = 10;  // L13: 静的依存。
+                                    // 空のときは書かないので旧ファイルと同じバイト列
+}
+message StaticDependency {          // L13: 1 DLL への静的依存
+  string module = 1;                // インポートテーブルに書かれたままの DLL 名
+  repeated StaticImport imports = 2; // テーブルに現れた順
+}
+message StaticImport {              // L13: インポートされた関数 1 件
+  string name = 1;                  // 名前インポート（ある場合のみ）
+  uint32 ordinal = 2;               // 序数インポート（ある場合のみ）
 }
 message ModuleClassification {      // L07: 1 モジュールの分類結果
   string module_name = 1;           // ロードされたままの名前・パス
@@ -206,8 +216,9 @@ message FieldDef {
                                     // タイミングも content_hash の入力に含まれる
                                     // bit8..=10: GetLastError の意味条件 LastErrorMeaning
                                     // (0=未指定 1=常に意味あり 2=戻り値 FALSE 時のみ
-                                    // 3=戻り値 INVALID_HANDLE_VALUE 時のみ)。last_error
-                                    // フィールドだけに付ける。条件も content_hash の入力
+                                    // 3=戻り値 INVALID_HANDLE_VALUE 時のみ
+                                    // 4=戻り値 NULL 時のみ 5=意味なし 6=戻り値 -1 時のみ)。
+                                    // last_error フィールドだけに付ける。条件も content_hash の入力
 }
 message BatchHeader {
   uint64 session_id = 1;
@@ -312,6 +323,19 @@ GetLastError の生値と、API 仕様上意味のあるエラー値を区別す
   場合にだけ意味を持つ（HANDLE 戻り値の API。現行の CreateFileW）。
   INVALID_HANDLE_VALUE はポインタ幅依存（64bit: 全ビット 1、32bit:
   下位 32 ビットのみ 1。レビュー第5回 #5）。
+- `WhenReturnIsNull`（4）: 戻り値が NULL (0) の場合にだけ意味を持つ
+  （HANDLE / ポインタ戻り値の API。L03 の生成 API 用。
+  CreateMutexW / VirtualAlloc 等）。
+- `Never`（5）: GetLastError に意味がない（戻り値がエラーコード
+  そのものである API (Reg* 等) や、失敗しない・失敗を戻り値で表さない
+  API。L03 の生成 API 用）。取得側は生値を常に `Stale` として記録する。
+- `WhenReturnIsMinusOne`（6）: 戻り値が -1 (全ビット 1) の場合に
+  だけ意味を持つ（WAIT_FAILED / SOCKET_ERROR 等の -1 返し。L03 の
+  生成 API 用）。32bit 形（下位 32 ビットのみ 1）も失敗とみなす。
+
+互換性：値 7 は未使用で、未知の条件値は `Unspecified` として読む
+（前方互換）。値 4〜6 を知らない旧来の Reader は `Unspecified`
+として読むため、生値を意味のある値として扱う（緩い読み）。
 
 取得側は、条件を満たさない生値を `ValueCapture::Stale`（符号化 5）と
 して記録する。Stale の値本体は読み取った生値を保持する（再検証のため）
@@ -733,11 +757,78 @@ Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
   Trace へ残す（理由は `CLI override (module not loaded at capture start)`）。
 - Runtime 独自の API を記録するかは設定で選ぶ：
   `CaptureSessionConfig::record_runtime_apis`（既定は false＝記録しない）
-  と CLI の `--record-runtime-apis`。設定そのものがここにあり、
-  フック時の呼び出し元分類による強制は Windows 側の残作業（L23）。
-- ロード済みモジュールの列挙と署名検証も Windows 側の残作業（L23）。
-  現行の CLI は起動対象の exe だけを分類して `modules` に載せる
-  （attach では対象モジュールが分からないため空から始める）。
+  と CLI の `--record-runtime-apis`。設定は Bootstrap v5 で Agent DLL
+  へ伝え、Detour の入口で呼び出し元の戻りアドレスからモジュールを特定
+  し、分類が Runtime で設定が無効ならその呼び出しを記録しない（元の
+  API だけ素通しで呼ぶ）。呼び出し元が特定できない場合は記録する
+  （fail-open）。戻りアドレスは `RtlCaptureStackBackTrace` で取り、
+  Agent DLL 自身のフレームを飛ばした最初の DLL 外のアドレスを使う。
+  モジュール一覧は DLL 起動時に作り、呼び出し元が一覧に無い場合にだけ
+  500ms に 1 回まで再列挙する（遅れてロードされたモジュールへの追随）。
+  DLL 側の分類は名前だけに依存する Runtime 判定が目的のため、署名検証
+  はしない（System32 のモジュールは Unknown になるが、抑制の判定は
+  Runtime かどうかだけを見るため影響しない）。
+- ロード済みモジュールの列挙と署名検証（L23）：capture 開始時に Host が
+  対象プロセスの全モジュールを列挙する（`EnumProcessModulesEx` 等）。
+  起動時は注入直後（再開前）の分と、再開後の安定化待ち（10ms 間隔・
+  最大 200ms・2 回連続で同じ一覧になったら確定）の分を合成する。
+  アタッチ時は対象が既に実行中のため安定化待ち列挙だけで完全な一覧が
+  得られる。列挙は Trace ファイルの作成（Environment ブロックの書き込み）
+  の前に済ませ、署名は `WinVerifyTrust`（失効確認なし）＋署名者証明書の
+  表示名が "Microsoft Corporation" であることで確認し、
+  `ModuleEvidence.microsoft_signed` へ渡す。API Set 契約名はローダ経由
+  （`GetModuleHandleW(契約名)` が apisets スキーマを参照して返す実装
+  モジュール）で実装モジュールへ解決する。CLI が作った既存の
+  `modules`（起動対象 exe の分類と `--module-class` の未使用エントリ）
+  と合成する：CLI の上書きは残し、それ以外の既存エントリは列挙の新しい
+  証拠（署名確認済み）で置き換え、列挙に無かった既存エントリは末尾へ残す。
+  列挙に失敗・空の場合は CLI の `modules` をそのまま使い、capture を
+  失敗させない（`capture_config` に `modules=unavailable` と残す）。
+  成功時は `capture_config` に `modules=<件数> (L23)` と残す。
+  遅れてロードされたモジュール（capture 開始後に `LoadLibrary` された
+  もの）は、この一覧には載らない。DLL 側の呼び出し元分類は再列挙で
+  追随するが、Trace の `modules` は capture 開始時のスナップショット
+  である。
+- L01 の Inline Hook により、Runtime モジュール内の呼び出し（CRT 経由
+  の `fopen` 内の `CreateFileW` 等）も Detour へ到達する。そのため抑制
+  の実動（Runtime からの呼び出しを記録しないこと）は `capture-e2e
+  --modules` で観測できる（`record_runtime_apis` 無効の既定では CRT
+  経由の呼び出しは 0 件、有効にすると 1 件以上）。IAT フックだけの
+  段階では Detour に届かず観測できなかったが、L01 で閉じた。
+  `capture-e2e --modules` は列挙・署名検証・API Set 解決と、直接
+  呼び出しの記録が壊れていないことも引き続き検証する。
+- 性能の注記：抑制の判定は `record_runtime_apis` が無効（既定）の場合
+  に全 Detour 呼び出しで走る（`RtlCaptureStackBackTrace`＋
+  `VirtualQuery`＋二分探索）。有効にした場合は判定自体を飛ばすため
+  追加コストは無い。L10 の性能測定は API 本体のモデルで行っており、
+  Detour のコストは含まない。
+
+## 静的依存情報（L13）
+
+overview「観測レベル L0〜L4」節に対応する。インポートテーブル等から
+分かる静的な依存は、レベル（L0〜L4）とは別の「静的依存」情報として
+記録する。`GetProcAddress` で取得した関数のように、静的依存が無くても
+呼ばれる API があるためで、静的依存の有無と動的解決の捕捉は別の話で
+ある（動的解決の捕捉自体は L01）。
+
+- 記録する単位は「対象 exe のインポートテーブルに現れた (DLL, 関数)」
+  で、DLL ごとにまとめて `CaptureEnvironment.static_dependencies`
+  （`StaticDependency` の列）に載せる。`shirusu inspect`（人間可読・
+  JSON）が表示する（無い Trace では出さない）。
+- 収集するのは `shirusu capture` の起動対象 exe の直接のインポート
+  （通常のインポートディレクトリ）のみ。解析は `shirusu-hook` の
+  `pe::parse_imports` を使い、境界検査つきで不正な入力には空を返す。
+  読めない（PE でない・壊れている）場合は空のままにし、capture 自体は
+  失敗させない。静的依存は診断情報であり、記録の成否を左右しない。
+- 遅延ロード・インポート（delay-load）は含まない。遅延ロードは実行時
+  に初めて解決される別経路で、ディスクリプタ形式が異なるため別途の
+  解析が要る。
+- IAT スロットの RVA は記録しない。IAT 配置はイメージ固有の詳細で
+  あり、依存そのもの（どの DLL のどの関数か）ではない。フック計画には
+  `shirusu_hook::pe::ImportSite` が既に持っている。
+- `attach` では対象 exe のパスを解決しないため空のまま。子プロセスの
+  Trace も同じ理由で空のまま。対象 exe の特定まで含むモジュール列挙は
+  L23 の範囲。
 
 ## 記録モード（L09）
 
@@ -972,6 +1063,175 @@ overview「Hookの透明性」節：浮動小数点引数、構造体の戻り�
   可変長引数 API は現行フック対象に無く、対象外。WoW64（i686）での
   `--abi` 実行は未配線（Probe コード自体は i686 ターゲットでコンパイル
   される。WoW64 での capture-e2e 実行は B07 / C17 / D35 の範囲）。
+
+## COM Interception（L02）
+
+overview「COM」節・フック実装順序 3・初期マイルストーン段階 6。
+既知の Factory 関数が返したインターフェイスを起点に追跡し、その
+vtable のメソッド呼び出しを記録する。
+
+- 方式は「オブジェクト単位の vtable 複製」：追跡対象のオブジェクト
+  ごとに vtable を複製し、複製のスロットを Detour へ向け、オブジェクト
+  の vtable ポインタだけを複製へ向ける。共有 vtable そのものは書き換え
+  ないため、同じ実装を共有する別のオブジェクトには及ばない。Proxy を
+  使わないため、アプリへ返すポインタの同一性は壊れない（オブジェクトの
+  ポインタ値そのものは変えない）。複製 vtable とその登録は解放しない
+  （Release で寿命が終わった後も、他スレッドが呼び出し中かもしれない
+  ため。プロセス終了時に OS が回収する）。そのためセッション終了後に
+  アプリが COM メソッドを呼んでも、Detour は登録から元のメソッドを引いて
+  素通しで呼べる（記録はしない）。
+- 既知インターフェイスは IUnknown / IShellLinkW / IPersistFile の 3 つ
+  （L17 の検証用 COM アプリが使うもの）。それ以外の IID は追跡対象として
+  記録するが、メソッドの Detour は設置しない（型不明のカスタム
+  インターフェイスは未対応として明記する）。
+- 既知の Factory 関数は `CoCreateInstance` / `CoGetClassObject`
+  （ole32。Inline Hook で設置）と `Direct3DCreate9`（d3d9。返す
+  IDirect3D9 のメソッド表が未定義のため、この版ではフックしない）。
+- 同一性は、対象アプリが実際に実行した `QueryInterface` の結果だけで
+  判定する。shirusu は標準では `QueryInterface` を追加で呼ばない。
+  `QueryInterface(IID_IUnknown)` の成功は同一性の確定（返す IUnknown
+  ポインタを正規キーにし、そこから派生した別面も付け替える）。それ以外
+  の IID への QI の成功は、呼び出し元の同一性を未確認のまま引き継ぐ。
+  同一性を確定できないインターフェイスは別々に保持し、関係を未確認とする。
+- `AddRef` / `Release` で寿命を追う。Release が 0 を返したら寿命終了と
+  して印を付ける（記録は残し、相関に使う）。
+- 診断用オプション `--diagnostic-query-interface`（既定は無効）が有効な
+  場合に限り、Interceptor は新規発見のインターフェイスに対して自身で
+  `QueryInterface(IID_IUnknown)` を呼んで同一性を確認する（参照カウント
+  を一時的に増やすため、実行に影響し得る。呼び出しは元の QI を直接呼び、
+  アプリの呼び出しとしては記録しない。成功したら Release で参照カウント
+  を戻す）。
+- アタッチ前に既に存在していたオブジェクトは発見できない（Factory /
+  QueryInterface / メソッド戻りを観測して初めて追跡対象になる）。途中
+  から発見したポインタは来歴不明として扱う。
+- COM メソッドの記録は L1（引数は生のスロット値列。型付きの取得は将来
+  の拡張）。メソッドの呼び出し元が Runtime の場合は L23 と同じく記録
+  しない（呼び出し元が特定できない場合は記録する）。
+
+### COM メソッドイベントの Schema
+
+COM メソッド呼び出しは API 表とは別の予約 ID で記録する
+（api_id = 1000、enter Schema = 10001、leave Schema = 10002）。
+Host はセッション開始時にこの 2 Schema を登録する（未登録だと
+Payload が Blob へ逃げる）。
+
+- enter `com!method/enter`：`object` (U64, Pointer。`this`。Factory
+  呼び出しでは 0)、`iid` (Bytes。16 バイトの IID。Factory では要求された
+  IID。読めなければ空)、`method_index` (U32。vtable インデックス。
+  Factory 呼び出しでは u32::MAX)、`method_name` (Str。
+  `IShellLinkW::SetPath` / `CoCreateInstance` のような表示名)、
+  `args` (Bytes。`this` を除く引数の生スロット値列。上限 4 スロット。
+  ポインタの中身は読まない)、`target_iid` (Bytes。もう一方の GUID がある
+  場合に 16 バイト。`QueryInterface` では要求された IID、Factory 呼び出し
+  では CLSID、それ以外は空)。
+- leave `com!method/leave`：`hresult` (I32。AddRef / Release では返された
+  参照カウントを I32 へ写したもの)、`returned_object` (U64,
+  CreatedObject。Factory 呼び出しの成功時と `QueryInterface` の成功時に
+  有効で、それ以外は 0)、`refcount` (U32。AddRef / Release が返した参照
+  カウント。それ以外は 0＝対象外)。
+- COM の leave は GetLastError の意味条件を持たない（F20 の対象は
+  Win32 API のみ）。HRESULT が誤りの経路である。ただし Detour は
+  LastError の保存・復元（P1-5）も行い、透明性を保つ。
+- 比較（shirusu-compare）の正規化は未対応：COM イベントの `object` /
+  `args` / `returned_object` には実行ごとの生ポインタ値が載るため、別
+  実行の Trace との比較では差分が出る。COM イベントの正規化（同一性の
+  解決を含む）は将来の拡張。
+
+### 検証（L02）
+
+- `shirusu-capture-e2e --verify-apps` の com アプリで、CoCreateInstance
+  の Factory イベント、IShellLinkW::SetPath / GetPath、QueryInterface、
+  Release（2 件以上）、enter/leave の対応、QueryInterface が返す別ポインタ
+  とその Release が返されたポインタで記録されること（同一性・寿命の実動）
+
+## WinRT（L14）
+
+overview「観測レベル」節・Trace 形式の API Schema 層。WinRT API は COM
+を基盤とする（全インターフェイスは `IInspectable` から派生）ため、COM
+と同じ「オブジェクト単位の vtable 複製」で追跡する。WinRT 固有の部分は
+定義表とアクティベーション関数の検出である。
+
+- 既知インターフェイスは `IInspectable` / `IActivationFactory` /
+  `IUriRuntimeClass` / `IUriRuntimeClassFactory` / `IJsonObject` /
+  `IStringable` の 6 つ（L17 の検証用 WinRT アプリが使うもの）。
+  IID と vtable のメソッド順は `windows` クレート 0.61.3 / 0.62
+  （Windows.winmd からの生成物）の Vtbl 構造体と照合して確認した。
+  それ以外の IID は追跡対象として記録するが、メソッドの Detour は
+  設置しない（型不明のカスタムインターフェイスは未対応として明記する）。
+- 既知のランタイムクラスは `Windows.Foundation.Uri`
+  （既定インターフェイス `IUriRuntimeClass`）と
+  `Windows.Data.Json.JsonObject`（既定インターフェイス `IJsonObject`）の
+  2 つ。表に無いクラスは `IInspectable` として追跡する
+  （GetIids / GetRuntimeClassName / GetTrustLevel のみ記録される）。
+  クラス名自体はアクティベーションイベントに残るため、後から表へ追加できる。
+- 検出の起点はアクティベーション関数 `RoActivateInstance` /
+  `RoGetActivationFactory`（combase.dll。Inline Hook で設置）。
+  `RoActivateInstance` が返すのはクラスの既定インターフェイス、
+  `RoGetActivationFactory` が返すのは `IActivationFactory` そのもの。
+  HSTRING のクラス名は `WindowsGetStringRawBuffer` で読む（読めなければ
+  空のまま記録する）。
+- メソッドが返すインターフェイスの追跡は、表に載せた返却メソッドに限る
+  （`IActivationFactory::ActivateInstance` /
+  `IUriRuntimeClassFactory::CreateUri` /
+  `IUriRuntimeClassFactory::CreateWithRelativeUri` /
+  `IUriRuntimeClass::CombineUri`）。それ以外のメソッドが返す
+  インターフェイスは、アプリが `QueryInterface` で取り直さない限り
+  追跡対象にならない。
+- 定義表は手書きの厳選表である。WinRT の定義は Windows.winmd にあるが、
+  これは Windows SDK にしか同梱されず、NuGet パッケージとしては配布
+  されていない（2026-11-12 に確認：`Microsoft.Windows.SDK.WinRTMetadata`
+  は NuGet に存在せず、Microsoft.Windows.CppWinRT の nupkg にも .winmd
+  は含まれない）。そのため L03 のような WinMD からの生成はできず、
+  Windows.winmd を入手できる環境での生成への置き換えは将来の拡張。
+- アタッチ前に既に存在していた WinRT オブジェクトは発見できない
+  （L02 と同じ）。
+
+### WinRT アクティベーションイベントの Schema
+
+WinRT アクティベーション呼び出しは COM メソッドイベントとは別の予約 ID
+で記録する（api_id = 1001、enter Schema = 10011、leave Schema = 10012）。
+Host はセッション開始時にこの 2 Schema を登録する（未登録だと Payload
+が Blob へ逃げる）。
+
+- enter `winrt!activation/enter`：`object` (U64, Pointer。常に 0)、
+  `class_name` (Str。HSTRING から読んだランタイムクラス名。読めなければ空)、
+  `method_name` (Str。`RoActivateInstance` / `RoGetActivationFactory`)、
+  `args` (Bytes。HSTRING ポインタと out ポインタの生スロット値列。
+  上限 4 スロット。ポインタの中身は読まない)。
+- leave `winrt!activation/leave`：`hresult` (I32。アクティベーション関数の
+  HRESULT)、`returned_object` (U64, CreatedObject。成功時に返された
+  インターフェイスのポインタ。それ以外は 0)、`refcount` (U32。常に 0＝対象外)。
+- WinRT の leave も GetLastError の意味条件を持たない（F20 の対象は
+  Win32 API のみ）。HRESULT が誤りの経路である。ただし Detour は
+  LastError の保存・復元（P1-5）も行い、透明性を保つ。
+- 比較（shirusu-compare）の正規化は未対応：COM イベントと同じく、
+  WinRT イベントの `object` / `args` / `returned_object` には実行ごとの
+  生ポインタ値が載るため、別実行の Trace との比較では差分が出る。
+  WinRT イベントの正規化（同一性の解決を含む）は将来の拡張。
+
+### 検証（L14）
+
+- `shirusu-capture-e2e --verify-apps` の winrt アプリで、RoActivateInstance
+  のアクティベーションイベント、RoGetActivationFactory（2 件以上）、
+  クラス名（`Windows.Foundation.Uri` / `Windows.Data.Json.JsonObject`）、
+  enter/leave の対応、IInspectable::GetRuntimeClassName（2 件以上）、
+  IActivationFactory::ActivateInstance / QueryInterface、
+  IUriRuntimeClassFactory::CreateUri、IUriRuntimeClass::AbsoluteUri、
+  Release（2 件以上）、COM enter（10 件以上）と enter/leave の対応
+  を確認する。Factory 関数の設置数は SessionSummary の
+  `com_factory_count`（0〜2）で確認する。
+- 方式ごとの副作用の検証：共有 vtable を書き換えないことは設計で保証する
+  （設置はオブジェクトの vtable ポインタの書き換えだけで、共有 vtable
+  への書き込みは行わない。`build_cloned_vtable` の単体テストは、置き換え
+  るのが指定スロットだけであることを確認する）。アプリへ返すポインタの
+  同一性が保たれること（Factory / QueryInterface が返すポインタ値が
+  Detour 無しの場合と同じ挙動になること）は、verify-com アプリの Hook
+  ありとなしの出力比較（`--verify-out` の VERIFY 行）と、Trace 上の
+  ポインタ値の突き合わせ（QI の返す別ポインタと、そのポインタでの
+  Release）で確認する。共有 vtable 書き換え方式と Proxy 方式は採用して
+  いないため、その副作用の実測は対象外とする。同じ実装の別オブジェクト
+  を並べて vtable ポインタの不変を直接確認する E2E は、まだ無い（将来の
+  拡張。verify-com アプリは ShellLink を 1 個しか作らない）。
 
 ## テストベクター
 

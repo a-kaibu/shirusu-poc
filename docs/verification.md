@@ -127,6 +127,36 @@ Slot の再利用は、実装の原子操作列に合わせて段階に分けて
 
 Test SupervisorがAPIを大量に呼ぶ専用プログラムを起動し、HostとAgentを意図した位置で止めたり終了させたりする。`Sleep`で競合を起こすのではなく、イベント公開の前後、Payloadコピー中、Slot再利用前などにテスト用の同期ポイントを設ける。同期ポイントは本番ビルドでは無効にする。
 
+### 検証用アプリ 4 種（L17）
+
+overview 初期マイルストーン節の「まず自作の小さなプログラムを使う」に従い、4 種の検証用アプリを用意する。いずれも `VERIFY <app> <step> <value>` 行と `VERIFY_DONE <app> ok` を出し、`--verify-out <path>` 指定時は同じ内容をファイルにも書く。
+
+| アプリ | 使う API | ステップ |
+| --- | --- | --- |
+| `shirusu-verify-console` | ファイル・レジストリ・スレッド | file / registry / thread |
+| `shirusu-verify-gui` | USER32・GDI・DIB | file / window / gdi / dib |
+| `shirusu-verify-com` | COM（ShellLink・IPersistFile） | file / com-init / shelllink / persist |
+| `shirusu-verify-winrt` | WinRT（JsonObject・Uri） | file / winrt-init / activate-json / activate-factory / create-uri / absolute-uri |
+
+`shirusu-capture-e2e --verify-apps` が各アプリを Hook なし（baseline）と Hook ありで実行し、VERIFY 出力が同じことと、Trace にファイル I/O（4 API × enter/leave ＝ 8 イベント以上）が記録されることを検証する。ステップの値は実行ごとに変わらない定数にし、pid を含む一時パスは出力に出さない。Hook ありとなしの比較が pid 差で壊れないようにするためである。
+
+レジストリは L03 の生成表で記録されるようになり、`--verify-apps` は console アプリのレジストリ 12 イベント以上（6 呼び出し × enter/leave）も検査する。USER32・GDI・DIB の API は未記録のまま。COM は L02 で記録されるようになり、`--verify-apps` は com アプリの Factory 設置数（≥1）と COM メソッドイベント（CoCreateInstance / IShellLinkW::SetPath / GetPath / QueryInterface 各 ≥1、Release ≥2 件、COM enter ≥6 件、enter/leave 件数一致）を検査する。WinRT は L14 で記録されるようになり、`--verify-apps` は winrt アプリのアクティベーション設置数（≥1）と WinRT アクティベーションイベント（RoActivateInstance ≥1、RoGetActivationFactory ≥2、クラス名 2 種、enter ≥3 件、enter/leave 件数一致）および COM メソッドイベント（IInspectable::GetRuntimeClassName ≥2、IActivationFactory::ActivateInstance / QueryInterface 各 ≥1、IUriRuntimeClassFactory::CreateUri ≥1、IUriRuntimeClass::AbsoluteUri ≥1、Release ≥2 件、COM enter ≥10 件、enter/leave 件数一致）を検査する。`--verify-apps` はその未記録分をカバレッジ評価として報告する（失敗にはしない）。「実アプリでどこまで記録できるかを評価する」ための土台であり、フック表が増えたら評価は自動的に変わる。
+
+### Win32 Metadata Generator（L03）
+
+overview 初期マイルストーンの段階 4。Win32 Metadata から幅広い API の L1 定義表と汎用 Detour を生成し、対象 API を増やせるようにする。
+
+- 入力：`Microsoft.Windows.SDK.Win32Metadata` の NuGet 固定版（`71.0.45-preview`）の `Windows.Win32.winmd`。取得は `scripts/ci/fetch-winmd.sh`（nupkg と winmd の sha256 を固定）。版は `crates/shirusu-metadata-gen/apis.toml` の `winmd_version` と同じにすること。
+- 生成器：`crates/shirusu-metadata-gen`（バイナリ `win32-metadata-gen`）。設定は `apis.toml`（対象 API と `last_error` の上書き、意図的な除外）。生成物は `crates/shirusu-hook/src/api_generated.inc`（`ApiDef` の `&[...]` 式）と `engine_generated.inc`（生成 Detour と `detour_for_generated`）で、チェックインする。最新性は `scripts/ci/linux.sh` が `--check` で検査する。
+- 生成範囲：L1（型付き引数・戻り値・GetLastError）のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）。L2 以上は手書きの記録仕様で API ごとに拡張する。
+- 型対応：プリミティブは `Ty` へ写し（8/16bit 整数は 32bit へ拡大）、enum は基底整数型、デリゲートはポインタ値、単一フィールド構造体はそのフィールドの型（`HANDLE` 等の `*mut c_void` 1 個はハンドル、`PWSTR` はポインタ、`BOOL` は I32）。複数フィールドの値渡し構造体・COM 型・浮動小数点・可変長引数は対象外としてスキップ理由とともに報告する。
+- 1 スロット制約：汎用 Detour は引数 1 個を usize 1 個で中継するため、x86 で 2 スロットを占める固定 64bit 型（I64/U64）は生成対象外（例：`SetFilePointerEx` の `LARGE_INTEGER`（I64 化）、`GetTickCount64` の U64 戻り）。ポインタ幅の型（ISize/USize/ポインタ/ハンドル）は両ターゲットで 1 スロットのため対象内。
+- `LastErrorMeaning` の既定：BOOL 返しは `WhenReturnIsFalse`、HANDLE/ポインタ返しは `WhenReturnIsNull`、WIN32_ERROR/HRESULT/NTSTATUS 返し・void・その他の整数は `Never`（戻り値自体がエラーか、失敗条件が型だけでは不明なため）。既知の失敗条件は設定で上書きする（例：`WaitForSingleObject` は `minus-one`）。
+- 意図的な除外（設定の `[[skip]]` に理由付きで記録）：`GetLastError` / `SetLastError`（Detour 自身が LastError を読む・戻すため自己参照になる）、`GlobalFree` / `LocalFree`（成功時に NULL を返す反転した意味のため L1 の意味条件では扱えない）。
+- ID の安定性：生成 API の api_id は設定の記載順に `first_api_id`（7）から連番で割り当て、新規は末尾への追加のみ。手書き表が増えたら `first_api_id` を上げる。生成 API を手書き表へ昇格させる場合は生成表から外し、ID は再利用しない（欠番のまま残す）。
+
+設計上の注意：GUI アプリは対話を一切せず、ウィンドウはメッセージ専用ウィンドウ（HWND_MESSAGE）で、GDI はメモリ DC 上でのみ描く。表示 DC を使わないため、ヘッドレスな CI ランナーでも動く。
+
 ## CIでの実行
 
 | タイミング | 実行する検証 |

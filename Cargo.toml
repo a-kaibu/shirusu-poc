@@ -7,6 +7,7 @@ members = [
     "crates/shirusu-host",
     "crates/shirusu-trace",
     "crates/shirusu-hook",
+    "crates/shirusu-metadata-gen",
     "crates/shirusu-agent-dll",
     "crates/shirusu-analysis",
     "crates/shirusu-cli",

@@ -91,6 +91,8 @@ fn env(session_id: u64) -> CaptureEnvironment {
         target_description: "bench.exe".into(),
         // L07: ベンチはモジュール分類を記録しない（空）。
         modules: Vec::new(),
+        // L13: ベンチは静的依存も記録しない（空）。
+        static_dependencies: Vec::new(),
     }
 }
 

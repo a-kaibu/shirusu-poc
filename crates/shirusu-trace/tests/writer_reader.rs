@@ -28,6 +28,7 @@ fn env(session_id: u64) -> CaptureEnvironment {
         feature_flags: 3,
         target_description: "game.exe".into(),
         modules: Vec::new(),
+        static_dependencies: Vec::new(),
     }
 }
 

@@ -32,18 +32,21 @@ pub const STATUS_UNSUPPORTED: u32 = 5;
 
 /// 終了手順の状態コード決定（純粋関数。レビュー第5回 #6）。
 /// - セッションが無い → `SHUTDOWN_NOT_INITIALIZED`
-/// - セッションがあり、進行中 Detour が完了した → `SHUTDOWN_OK`
-/// - 完了しなかった（完了待ちタイムアウト）→ `SHUTDOWN_INCOMPLETE`
+/// - セッションがあり、進行中 Detour が完了し、IAT 復元も全件できた
+///   → `SHUTDOWN_OK`
+/// - 完了しなかった（完了待ちタイムアウト）、または IAT 復元に
+///   失敗したスロットが残った (レビュー #6 P1-6) →
+///   `SHUTDOWN_INCOMPLETE`
 ///
 /// 旧実装はタイムアウトを無視して常に成功を返していた。Host は
 /// この区別を Trace の Event Integrity へ写す。
 /// (非 Windows では win::shutdown 自体が無いためテストからのみ使われる)
 #[cfg_attr(not(windows), allow(dead_code))]
-fn shutdown_status(has_session: bool, drained: bool) -> u32 {
+fn shutdown_status(has_session: bool, drained: bool, unrestored: usize) -> u32 {
     use shirusu_hook::bootstrap::{SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK};
     if !has_session {
         SHUTDOWN_NOT_INITIALIZED
-    } else if drained {
+    } else if drained && unrestored == 0 {
         SHUTDOWN_OK
     } else {
         SHUTDOWN_INCOMPLETE
@@ -115,8 +118,9 @@ pub extern "system" fn DllMain(
 mod win {
     use super::*;
     use shirusu_agent::Agent;
+    use shirusu_hook::api::api_table;
     use shirusu_hook::bootstrap::BOOTSTRAP_VERSION;
-    use shirusu_hook::engine::{self, EngineError, InstalledHooks};
+    use shirusu_hook::engine::{self, EngineError, InlineHook, InstalledHooks};
     use shirusu_hook::runtime::HookRuntime;
     use shirusu_transport::context::HostMonitor;
     use shirusu_transport::expansion::ExpansionDelivery;
@@ -130,6 +134,12 @@ mod win {
 
     struct DllState {
         installed: InstalledHooks,
+        /// L01: Inline Hook の設置状態（解除時にプロローグを戻すため保持）。
+        inline: Vec<InlineHook>,
+        /// L02: COM Factory 関数の Inline Hook の設置状態。
+        com_factories: Vec<InlineHook>,
+        /// L14: WinRT アクティベーション関数の Inline Hook の設置状態。
+        winrt_activations: Vec<InlineHook>,
     }
     static STATE: Mutex<Option<DllState>> = Mutex::new(None);
 
@@ -162,8 +172,9 @@ mod win {
             Arc::new(HostMonitor::always_alive())
         };
         // 初期 Slot 0： Ring は全て Bootstrap の Mapping から得る（A70 と
-        // 同じ登録経路）。スロットは使い切りであり、使い果たしたら
-        // Capture Coverage の欠落として数える（Phase 3 の範囲）。
+        // 同じ登録経路）。Slot はスレッド終了 (FLS で検出) と Host の
+        // drain 完了で回収され再利用される（レビュー #6 P1-4）。回収が
+        // 間に合わない間の不足は Capture Coverage の欠落として数える。
         let pool = Arc::new(SlotPool::new(0));
         let agent = Arc::new(
             Agent::new(pool, config, host_monitor)
@@ -209,10 +220,34 @@ mod win {
             };
             space_notifies.push(Arc::new(notify));
         }
-        let rt = Arc::new(HookRuntime::new(agent, space_notifies, data_ready));
+        let rt = Arc::new(
+            HookRuntime::new(agent, space_notifies, data_ready)
+                // L23: Bootstrap v5 で Host から渡された
+                // record_runtime_apis をランタイムへ渡す（既定は記録しない）。
+                .with_record_runtime_apis(b.record_runtime_apis != 0)
+                // L02: Bootstrap v6 で Host から渡された診断用 QI
+                // オプションをランタイムへ渡す（既定は無効）。
+                .with_diagnostic_query_interface(b.com_options & 1 != 0),
+        );
+        // L23: 呼び出し元分類のためのモジュール一覧を初期化時に作る。
+        // 列挙に失敗しても一覧が空のままになるだけで、呼び出し元不明
+        // として記録を続ける（fail-open）。
+        rt.refresh_caller_modules();
         if engine::set_runtime(Arc::clone(&rt)).is_err() {
             return STATUS_ALREADY_INITIALIZED;
         }
+        // レビュー #6 P1-4: スレッド終了の検出を FLS デストラクタへ
+        // 結線する。DisableThreadLibraryCalls のため DLL_THREAD_DETACH
+        // は届かないが、FLS デストラクタはスレッド終了時に呼ばれる。
+        // ハンドラは現在のランタイムを引くため、セッションをまたい
+        // でも有効であり、終了済みセッションのスレッドには no-op に
+        // なる。登録に失敗しても記録自体は継続する (Slot 再利用が
+        // 効かず、短命スレッドの多い対象では不足しうるだけである)。
+        let _ = shirusu_hook::fls::install_thread_exit_handler(Arc::new(|tid| {
+            if let Some(rt) = engine::runtime() {
+                rt.thread_exit(tid);
+            }
+        }));
         // メインモジュール（対象 EXE）の IAT をパッチする。
         // SAFETY: GetModuleHandleW(NULL) はメインモジュールを返す。
         let main_base = unsafe { GetModuleHandleW(std::ptr::null()) };
@@ -259,6 +294,42 @@ mod win {
                 return STATUS_HOOK_FAILED;
             }
         };
+        // L01: Inline Hook を IAT の後で設置する。IAT が 0 件でも
+        // GetProcAddress 経由の呼び出しは Inline で捕捉できるため、
+        // NoTargets の場合も試みる。Inline は API ごとの best-effort
+        // であり、見送りがあっても初期化は成功として継続する。
+        // SAFETY: 初期化専用スレッドからの呼び出し。対象のメイン
+        // スレッドは Host が停止させたままか、アタッチ時は他スレッドを
+        // 一時停止してからパッチするため、競合しない。
+        let inline_outcome = unsafe { engine::install_inline_hooks(&rt) };
+        // L02: COM Factory 関数の Inline Hook を Inline の後で設置する。
+        // Inline と同じく best-effort であり、見送りがあっても初期化は
+        // 成功として継続する。Factory 関数が 1 つもフックできなくても、
+        // Win32 API の記録は続く（COM メソッドの記録だけが無い）。
+        // SAFETY: 初期化専用スレッドからの呼び出し（L01 と同じ前提）。
+        let com_factory_outcome = unsafe { engine::install_com_factory_hooks(&rt) };
+        // L14: WinRT アクティベーション関数の Inline Hook を COM Factory
+        // の後で設置する。COM Factory と同じく best-effort であり、
+        // 見送りがあっても初期化は成功として継続する。アクティベーション
+        // 関数が 1 つもフックできなくても、Win32 API と COM の記録は続く
+        // （WinRT の記録だけが無い）。
+        // SAFETY: 初期化専用スレッドからの呼び出し（L01 と同じ前提）。
+        let winrt_activation_outcome = unsafe { engine::install_winrt_activation_hooks(&rt) };
+        // 設置済み API の合算（IAT と Inline の和集合）で Bootstrap へ
+        // 書き戻す。IAT では欠落していた API も Inline で捕捉できれば
+        // 「設置済み」になり、Coverage の欠落は正直に減る。
+        let iat_ids: std::collections::HashSet<u32> = installed
+            .plan
+            .entries
+            .iter()
+            .map(|e| e.api.api_id)
+            .collect();
+        let inline_ids: std::collections::HashSet<u32> =
+            inline_outcome.installed.iter().map(|h| h.api_id).collect();
+        let hooked = iat_ids.union(&inline_ids).count();
+        let missing = api_table()
+            .filter(|a| !iat_ids.contains(&a.api_id) && !inline_ids.contains(&a.api_id))
+            .count();
         // Host が読み戻せるよう、init_done を立てる前に Bootstrap へ
         // 設置/欠落件数を書き戻す。
         // SAFETY: bootstrap は Host が書き込み可能に確保した領域で、
@@ -267,11 +338,27 @@ mod win {
         unsafe {
             AgentBootstrap::write_hook_outcome(
                 bootstrap as *mut AgentBootstrap,
-                installed.slots.len() as u32,
-                installed.plan.missing.len() as u32,
+                hooked as u32,
+                missing as u32,
+            );
+            // L02: COM Factory 関数の設置数も書き戻す（Host の Coverage へ）。
+            AgentBootstrap::write_com_factory_count(
+                bootstrap as *mut AgentBootstrap,
+                com_factory_outcome.installed.len() as u32,
+            );
+            // L14: WinRT アクティベーション関数の設置数も書き戻す
+            // （Host の Coverage へ）。
+            AgentBootstrap::write_winrt_activation_count(
+                bootstrap as *mut AgentBootstrap,
+                winrt_activation_outcome.installed.len() as u32,
             );
         }
-        *STATE.lock().unwrap() = Some(DllState { installed });
+        *STATE.lock().unwrap() = Some(DllState {
+            installed,
+            inline: inline_outcome.installed,
+            com_factories: com_factory_outcome.installed,
+            winrt_activations: winrt_activation_outcome.installed,
+        });
         if b.init_done_handle != 0 {
             // SAFETY: Host が複製して渡したイベント。立てた後は所有を
             // 持たないよう forget する（Host 側の実体を閉じない）。
@@ -283,21 +370,24 @@ mod win {
     }
 
     pub fn shutdown() -> u32 {
-        // 順序（レビュー #4 の #9 + 第5回 #6/#7）: (1) 新規記録を
-        // 無効化し、以後の Detour は元関数を素通しで呼ぶ。(2) 進行中
-        // の Detour が完了するまで待つ。(3) IAT を復元する。
-        // (4) ランタイム登録を解除し、再初期化を受け入れる。
+        // 順序（レビュー #4 の #9 + 第5回 #6/#7 + #6 の P1-6 + L01 + L02）:
+        // (1) 新規記録を無効化し、以後の Detour は元関数を素通しで
+        // 呼ぶ。(2) 進行中の Detour が完了するまで待つ。(3) COM Factory
+        // と Inline のプロローグを復元する。(4) IAT を復元する。(5) 復元が全件
+        // できた場合にだけ、ランタイム登録を解除して再初期化を受け入れる。
         // Host はこの後に Ring の最終回収と Trace の確定を行う。
         //
         // 戻り値は状態を区別する（レビュー第5回 #6）: 完了待ちが
-        // タイムアウトした場合は SHUTDOWN_INCOMPLETE を返し、Host が
+        // タイムアウトした場合と、IAT 復元に失敗したスロットが
+        // 残った場合 (P1-6) は SHUTDOWN_INCOMPLETE を返し、Host が
         // Event Integrity を劣化させられるようにする。セッションが
         // 無ければ SHUTDOWN_NOT_INITIALIZED。
         let state = STATE.lock().unwrap().take();
         let Some(state) = state else {
-            return shutdown_status(false, false);
+            return shutdown_status(false, false, 0);
         };
         let mut drained = true;
+        let mut unrestored: Vec<u32> = Vec::new();
         match engine::runtime() {
             Some(rt) => {
                 rt.shutdown_recording();
@@ -306,21 +396,50 @@ mod win {
                 // だった Detour のイベントは不完全なまま Ring に残り、
                 // Host 側の完全性評価で扱われる。
                 drained = rt.wait_in_flight_drained(std::time::Duration::from_secs(5));
+                // L02: COM Factory のプロローグ復元を Inline と同じく
+                // IAT 復元より先に行う。
+                // SAFETY: 設置時に保存した Inline Hook 情報。対象モジュールは
+                // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.com_factories) });
+                // L14: WinRT アクティベーションのプロローグ復元も同じく
+                // IAT 復元より先に行う。
+                // SAFETY: 同上。
+                unrestored
+                    .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
+                // L01: Inline プロローグの復元を IAT 復元より先に行う。
+                // SAFETY: 設置時に保存した Inline Hook 情報。対象モジュールは
+                // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.inline) });
                 // SAFETY: 設置時に保存したスロット情報。対象モジュールは
                 // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
-                unsafe { engine::uninstall_hooks(&state.installed) };
-                // 登録解除は IAT 復元の後（RuntimeSlot の安全性契約）。
-                engine::clear_runtime(&rt);
+                unrestored.extend(unsafe { engine::uninstall_hooks(&state.installed) });
+                if unrestored.is_empty() {
+                    // 登録解除は IAT 復元の後（RuntimeSlot の安全性契約）。
+                    engine::clear_runtime(&rt);
+                }
+                // 復元できなかったスロットが残る間は登録を解除しない
+                // (P1-6): IAT がまだ Detour を指しており、登録が無いと
+                // 到達した Detour が元関数を引けず、対象 API が失敗値
+                // を返してアプリの挙動が変わる。記録は無効化済みの
+                // ため、以後の Detour は元関数へ素通しし挙動は保た
+                // れる。副作用として、この状態で再初期化すると
+                // ALREADY_INITIALIZED になる (Detour 残存下で新しい
+                // 設置が現在の IAT 値を「元の値」と誤認するため、
+                // 安全側の帰結である)。
             }
             None => {
                 // 設置状態はあるのにランタイム登録が無い異常系。
                 // 復元だけは行い、完了確認はできないため未完了とする。
                 // SAFETY: 同上。
-                unsafe { engine::uninstall_hooks(&state.installed) };
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.com_factories) });
+                unrestored
+                    .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.inline) });
+                unrestored.extend(unsafe { engine::uninstall_hooks(&state.installed) });
                 drained = false;
             }
         }
-        shutdown_status(true, drained)
+        shutdown_status(true, drained, unrestored.len())
     }
 }
 
@@ -331,9 +450,13 @@ mod tests {
 
     #[test]
     fn shutdown_status_distinguishes_outcomes() {
-        assert_eq!(shutdown_status(false, true), SHUTDOWN_NOT_INITIALIZED);
-        assert_eq!(shutdown_status(false, false), SHUTDOWN_NOT_INITIALIZED);
-        assert_eq!(shutdown_status(true, true), SHUTDOWN_OK);
-        assert_eq!(shutdown_status(true, false), SHUTDOWN_INCOMPLETE);
+        assert_eq!(shutdown_status(false, true, 0), SHUTDOWN_NOT_INITIALIZED);
+        assert_eq!(shutdown_status(false, false, 3), SHUTDOWN_NOT_INITIALIZED);
+        assert_eq!(shutdown_status(true, true, 0), SHUTDOWN_OK);
+        assert_eq!(shutdown_status(true, false, 0), SHUTDOWN_INCOMPLETE);
+        // レビュー #6 P1-6: IAT 復元に失敗したスロットが残れば、
+        // 進行中 Detour が完了していても完全停止とは言えない。
+        assert_eq!(shutdown_status(true, true, 1), SHUTDOWN_INCOMPLETE);
+        assert_eq!(shutdown_status(true, false, 2), SHUTDOWN_INCOMPLETE);
     }
 }

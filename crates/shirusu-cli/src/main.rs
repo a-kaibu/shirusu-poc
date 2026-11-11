@@ -90,6 +90,7 @@ fn usage() -> &'static str {
      \x20 --order=global  (record with a global observation order, L11)\n\
      \x20 --module-class <module>=<class>  (repeatable; windows/runtime/application/unknown, L07)\n\
      \x20 --record-runtime-apis  (also record the Runtime's own APIs, L07; default: off)\n\
+     \x20 --diagnostic-query-interface  (let the interceptor call QueryInterface(IID_IUnknown) to confirm identity, L02; default: off)\n\
      \x20 --mode <full|profile|filtered>  (record mode, L09; default: full)\n\
      \x20 --api <name>  (repeatable; only with --mode filtered, e.g. CreateFileW)\n\
      \x20 --follow-children  (also record child processes of the launched target, L05; capture only)\n\
@@ -263,6 +264,22 @@ fn inspect_lines(path: &str, view: &TraceView) -> Vec<String> {
                         line.push_str(" [override]");
                     }
                     out.push(line);
+                }
+            }
+            // L13: 静的依存情報（無い Trace では出さない）。
+            if !env.static_dependencies.is_empty() {
+                out.push("  static_dependencies:".into());
+                for d in &env.static_dependencies {
+                    let n = d.imports.len();
+                    out.push(format!(
+                        "    {}: {} import{}",
+                        d.module,
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    ));
+                    for imp in &d.imports {
+                        out.push(format!("      {}", imp.label()));
+                    }
                 }
             }
         }
@@ -449,6 +466,44 @@ fn inspect_json(path: &str, view: &TraceView) -> JsonValue {
                 })
                 .collect();
             fields.push(("modules", JsonValue::Array(modules)));
+        }
+        // L13: 静的依存情報（無い Trace では出さない）。
+        if !env.static_dependencies.is_empty() {
+            let deps = env
+                .static_dependencies
+                .iter()
+                .map(|d| {
+                    JsonValue::obj(vec![
+                        ("module", JsonValue::Str(d.module.clone())),
+                        (
+                            "imports",
+                            JsonValue::Array(
+                                d.imports
+                                    .iter()
+                                    .map(|imp| {
+                                        JsonValue::obj(vec![
+                                            (
+                                                "name",
+                                                imp.name
+                                                    .as_ref()
+                                                    .map(|s| JsonValue::Str(s.clone()))
+                                                    .unwrap_or(JsonValue::Null),
+                                            ),
+                                            (
+                                                "ordinal",
+                                                imp.ordinal
+                                                    .map(|o| JsonValue::U64(o as u64))
+                                                    .unwrap_or(JsonValue::Null),
+                                            ),
+                                        ])
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ])
+                })
+                .collect();
+            fields.push(("static_dependencies", JsonValue::Array(deps)));
         }
         JsonValue::obj(fields)
     });
@@ -1132,6 +1187,8 @@ struct CaptureRequest {
     module_classes: Vec<ModuleOverride>,
     /// L07: Runtime 独自の API も記録するか（既定は false）。
     record_runtime_apis: bool,
+    /// L02: 診断用の追加 QueryInterface を有効にするか（既定は false）。
+    diagnostic_query_interface: bool,
     /// L09: 記録モード（`--mode`。既定は `full`）。
     record_mode: RecordMode,
     /// L09: `--api` で指定された通りの名前列（`filtered` のときだけ
@@ -1144,7 +1201,8 @@ struct CaptureRequest {
 
 /// capture / attach の共通オプション（`--output` / `--dll` /
 /// `--timeout` / `--order=global` / `--module-class` /
-/// `--record-runtime-apis` / `--mode` / `--api` / `--follow-children`）。
+/// `--record-runtime-apis` / `--diagnostic-query-interface` /
+/// `--mode` / `--api` / `--follow-children`）。
 struct CaptureOptions {
     output: Option<String>,
     dll: Option<PathBuf>,
@@ -1152,6 +1210,8 @@ struct CaptureOptions {
     order_global: bool,
     module_classes: Vec<ModuleOverride>,
     record_runtime_apis: bool,
+    /// L02: 診断用の追加 QueryInterface を有効にするか（既定は false）。
+    diagnostic_query_interface: bool,
     /// L09: 記録モード（`--mode`。既定は `full`）。
     record_mode: RecordMode,
     /// L09: `--api` で指定された通りの名前列。
@@ -1226,6 +1286,9 @@ impl CaptureOptions {
             module_classes,
             // L07: Runtime 独自の API を記録するか（既定は記録しない）。
             record_runtime_apis: parsed.has("record-runtime-apis"),
+            // L02: 診断用の追加 QueryInterface を有効にするか
+            // （既定は無効。標準では Interceptor 自身は QI を呼ばない）。
+            diagnostic_query_interface: parsed.has("diagnostic-query-interface"),
             record_mode,
             api_names,
             // L05: 子プロセスも追跡するか（既定はしない）。
@@ -1284,6 +1347,12 @@ fn default_attach_output(pid: u32) -> String {
 /// 黙って消えないよう）上書きエントリとして残す。署名の確認は Windows
 /// 側の仕事のため、ここでは `microsoft_signed: None` の証拠で分類する
 /// （対象 exe はシステム配置でない限り Application になる）。
+/// L23: Host が capture 開始時に全モジュールを列挙・署名検証して
+/// `modules` を置き換えるため、ここのエントリは暫定のものである
+/// （列挙に失敗した場合はこちらが残る。CLI の上書きは置き換え時にも
+/// 温存される）。
+/// L13: 起動対象の exe の PE インポートテーブルから静的依存を読み、
+/// `static_dependencies` に載せる（読めなければ空のまま）。
 /// Linux では単体テスト以外に呼ぶ場所が無いため、未使用警告を抑える。
 #[cfg_attr(not(windows), allow(dead_code))]
 fn capture_environment(
@@ -1314,8 +1383,12 @@ fn capture_environment(
     // 分かるようにするため。
     let capture_config = format!("{base_config}; {}", record_mode.config_text(api_names));
     let mut modules = Vec::new();
+    let mut static_dependencies = Vec::new();
     if let CaptureMode::Launch { exe, .. } = mode {
         modules.push(classify_module(&ModuleEvidence::new(exe)));
+        // L13: 起動対象の exe の PE インポートテーブルから静的依存を
+        // 読む。読めなければ空のまま（capture を失敗させない）。
+        static_dependencies = shirusu_host::static_dep::static_dependencies_for_exe(Path::new(exe));
     }
     let unused = apply_overrides(&mut modules, overrides);
     for ov in unused {
@@ -1337,13 +1410,21 @@ fn capture_environment(
         target_description,
         capture_config,
         modules,
+        static_dependencies,
         ..Default::default()
     }
 }
 
 fn cmd_capture(args: &[String]) -> Result<(), ToolError> {
     let (opts_args, cmdline_parts) = split_dashdash(args);
-    let parsed = parse_args(opts_args, &["record-runtime-apis", "follow-children"])?;
+    let parsed = parse_args(
+        opts_args,
+        &[
+            "record-runtime-apis",
+            "diagnostic-query-interface",
+            "follow-children",
+        ],
+    )?;
     if !parsed.positional.is_empty() {
         return Err(ToolError::Usage(format!(
             "unexpected argument: {} (put the command line after --)",
@@ -1370,6 +1451,7 @@ fn cmd_capture(args: &[String]) -> Result<(), ToolError> {
         order_global: opts.order_global,
         module_classes: opts.module_classes,
         record_runtime_apis: opts.record_runtime_apis,
+        diagnostic_query_interface: opts.diagnostic_query_interface,
         record_mode: opts.record_mode,
         api_names: opts.api_names,
         follow_children: opts.follow_children,
@@ -1377,7 +1459,14 @@ fn cmd_capture(args: &[String]) -> Result<(), ToolError> {
 }
 
 fn cmd_attach(args: &[String]) -> Result<(), ToolError> {
-    let parsed = parse_args(args, &["record-runtime-apis", "follow-children"])?;
+    let parsed = parse_args(
+        args,
+        &[
+            "record-runtime-apis",
+            "diagnostic-query-interface",
+            "follow-children",
+        ],
+    )?;
     let pid_s = parsed
         .positional
         .first()
@@ -1410,6 +1499,7 @@ fn cmd_attach(args: &[String]) -> Result<(), ToolError> {
         order_global: opts.order_global,
         module_classes: opts.module_classes,
         record_runtime_apis: opts.record_runtime_apis,
+        diagnostic_query_interface: opts.diagnostic_query_interface,
         record_mode: opts.record_mode,
         api_names: opts.api_names,
         follow_children: false,
@@ -1447,8 +1537,13 @@ fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
         durability: Durability::Buffered,
         order_global: req.order_global,
         // L07: Runtime 独自の API を記録するか（既定は記録しない）。
-        // フック時の呼び出し元分類による強制は Windows 側の残作業（L23）。
+        // L23: フック時の呼び出し元分類による強制を実装済み
+        // （Bootstrap v5 で Agent DLL へ伝え、Detour の入口で Runtime
+        // からの呼び出しを記録しない。呼び出し元不明時は記録する）。
         record_runtime_apis: req.record_runtime_apis,
+        // L02: 診断用の追加 QueryInterface を有効にするか
+        // （既定は無効。Bootstrap v6 で Agent DLL へ伝える）。
+        diagnostic_query_interface: req.diagnostic_query_interface,
         // L09: 記録モード。
         record_mode: req.record_mode.clone(),
     };
@@ -1844,6 +1939,95 @@ mod tests {
         let mode = CaptureMode::Attach { pid: 1234 };
         let env = capture_environment(&mode, 4242, 10_000_000, &[], &RecordMode::Full, &[]);
         assert!(env.modules.is_empty());
+    }
+
+    // L13: 起動対象の exe の PE インポートテーブルを静的依存として記録する。
+    // attach では対象 exe のパスが分からないため空のまま。
+    fn write_synthetic_pe_file(name: &str) -> PathBuf {
+        // host の synthetic_pe_file と同じ最小 PE32+ ファイル（1 セクション、
+        // kernel32.dll の 2 インポート）。ここでは CLI の単体テスト用に
+        // 最小限の複製を持つ。
+        fn w16(b: &mut [u8], off: usize, v: u16) {
+            b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        fn w32(b: &mut [u8], off: usize, v: u32) {
+            b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        fn w64(b: &mut [u8], off: usize, v: u64) {
+            b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        fn wstr(b: &mut [u8], off: usize, s: &str) {
+            b[off..off + s.len()].copy_from_slice(s.as_bytes());
+            b[off + s.len()] = 0;
+        }
+        let mut b = vec![0u8; 0x400];
+        b[0..2].copy_from_slice(b"MZ");
+        w32(&mut b, 0x3C, 0x80);
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        w16(&mut b, coff + 2, 1);
+        w16(&mut b, coff + 16, 240);
+        let opt = coff + 20;
+        w16(&mut b, opt, 0x20B);
+        w32(&mut b, opt + 56, 0x2000);
+        w32(&mut b, opt + 60, 0x200);
+        w32(&mut b, opt + 112 + 8, 0x1000);
+        w32(&mut b, opt + 112 + 12, 40);
+        let sec = opt + 240;
+        w32(&mut b, sec + 8, 0x200);
+        w32(&mut b, sec + 12, 0x1000);
+        w32(&mut b, sec + 16, 0x200);
+        w32(&mut b, sec + 20, 0x200);
+        let s = |off: usize| 0x200 + (off - 0x1000);
+        w32(&mut b, s(0x1000), 0x1030);
+        w32(&mut b, s(0x1000) + 12, 0x1060);
+        w32(&mut b, s(0x1000) + 16, 0x1050);
+        w64(&mut b, s(0x1030), 0x1070);
+        w64(&mut b, s(0x1038), 0x8000_0000_0000_0000 | 42);
+        w64(&mut b, s(0x1040), 0);
+        wstr(&mut b, s(0x1060), "kernel32.dll");
+        w16(&mut b, s(0x1070), 0);
+        wstr(&mut b, s(0x1072), "CreateFileW");
+        let path =
+            std::env::temp_dir().join(format!("shirusu-l13-cli-{name}-{}.exe", std::process::id()));
+        std::fs::write(&path, &b).unwrap();
+        path
+    }
+
+    #[test]
+    fn launch_environment_records_static_dependencies_from_pe_file() {
+        let exe_path = write_synthetic_pe_file("launch");
+        let mode = CaptureMode::Launch {
+            cmdline: exe_path.to_string_lossy().into_owned(),
+            exe: exe_path.to_string_lossy().into_owned(),
+        };
+        let env = capture_environment(&mode, 4242, 10_000_000, &[], &RecordMode::Full, &[]);
+        let _ = std::fs::remove_file(&exe_path);
+        assert_eq!(env.static_dependencies.len(), 1);
+        assert_eq!(env.static_dependencies[0].module, "kernel32.dll");
+        assert_eq!(env.static_dependencies[0].imports.len(), 2);
+        assert_eq!(
+            env.static_dependencies[0].imports[0].name.as_deref(),
+            Some("CreateFileW")
+        );
+        assert_eq!(env.static_dependencies[0].imports[1].ordinal, Some(42));
+    }
+
+    #[test]
+    fn launch_environment_with_missing_exe_has_no_static_dependencies() {
+        let mode = CaptureMode::Launch {
+            cmdline: "no-such-target.exe".into(),
+            exe: "no-such-target.exe".into(),
+        };
+        let env = capture_environment(&mode, 4242, 10_000_000, &[], &RecordMode::Full, &[]);
+        assert!(env.static_dependencies.is_empty());
+    }
+
+    #[test]
+    fn attach_environment_has_no_static_dependencies() {
+        let mode = CaptureMode::Attach { pid: 1234 };
+        let env = capture_environment(&mode, 4242, 10_000_000, &[], &RecordMode::Full, &[]);
+        assert!(env.static_dependencies.is_empty());
     }
 
     // L09: `--mode` / `--api` の解析と、Environment への記録モードの明記。

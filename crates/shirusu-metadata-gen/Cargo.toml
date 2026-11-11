@@ -1,0 +1,19 @@
+[package]
+name = "shirusu-metadata-gen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version.workspace = true
+description = "Win32 Metadata から shirusu-hook の L1 API 定義表と汎用 Detour を生成する開発時ツール (L03)"
+
+[[bin]]
+name = "win32-metadata-gen"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+shirusu-trace = { path = "../shirusu-trace" }
+toml = "0.9"
+windows-metadata = "0.60"
+
+[dev-dependencies]

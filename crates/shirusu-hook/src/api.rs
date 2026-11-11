@@ -4,6 +4,12 @@
 //! （フック → 型付き取得 → Compact Binary → 公開 Trace）を通すことを優先する
 //! （GOAL.md Phase 3 の定義）。
 //!
+//! L03 以降は、Win32 Metadata から生成した L1 API（`api_generated.inc`）
+//! がこの表の末尾に続く。生成 API の追加は設定ファイル
+//! （crates/shirusu-metadata-gen/apis.toml）の末尾へ追加し、
+//! `win32-metadata-gen` で再生成する。手書き API と生成 API のどちらも、
+//! 追加は末尾のみとする（Schema ID の安定性のため）。
+//!
 //! Schema ID はファイル内連番であり、Agent 側（取得）と Host 側
 //! （Trace への Schema 登録）で同じ定義表から同じ順序で割り当てるため、
 //! この表の並びが ID を決める。並びを変えることは既存 Trace の意味を
@@ -110,7 +116,9 @@ const BOOL: Ty = Ty::I32; // Win32 BOOL は int
 const BEFORE: CaptureTiming = CaptureTiming::Before;
 const AFTER: CaptureTiming = CaptureTiming::After;
 
-pub const API_TABLE: &[ApiDef] = &[
+/// 手書き API の定義表（api_id 1〜6）。ファイル I/O の 4 API と非同期
+/// 完了観測の 2 API。専用の Detour と専用の取得を持つ。
+pub const HANDWRITTEN_API_TABLE: &[ApiDef] = &[
     ApiDef {
         api_id: API_CREATE_FILE_W,
         module: "kernel32.dll",
@@ -257,8 +265,26 @@ pub const API_TABLE: &[ApiDef] = &[
     },
 ];
 
+/// L03: Win32 Metadata から生成した L1 API の定義表（api_id 7〜）。
+/// 生成物は crates/shirusu-metadata-gen/apis.toml の記載順に並ぶ。
+/// 再生成: cargo run -p shirusu-metadata-gen -- --winmd <path>
+/// （--check で最新性を CI が検査する）。
+pub const GENERATED_API_TABLE: &[ApiDef] = include!("api_generated.inc");
+
+/// 全 API 数（手書き + 生成）。ランタイムの固定長表の大きさに使う。
+pub const API_COUNT: usize = HANDWRITTEN_API_TABLE.len() + GENERATED_API_TABLE.len();
+
+/// 全 API の定義表（手書き + 生成）を api_id 順に並べたもの。
+/// `&[ApiDef]` 1 枚では持てない（const でのスライス連結ができない）
+/// ため、反復子で連結して見る。
+pub fn api_table() -> impl Iterator<Item = &'static ApiDef> {
+    HANDWRITTEN_API_TABLE
+        .iter()
+        .chain(GENERATED_API_TABLE.iter())
+}
+
 pub fn api_by_id(api_id: u32) -> Option<&'static ApiDef> {
-    API_TABLE.iter().find(|a| a.api_id == api_id)
+    api_table().find(|a| a.api_id == api_id)
 }
 
 /// インポート名からの照合。DLL 名は大文字小文字と拡張子 ".dll" の有無を
@@ -279,9 +305,7 @@ pub fn api_by_import(dll: &str, function: &str) -> Option<&'static ApiDef> {
             })
     };
     let want = stem(dll);
-    API_TABLE
-        .iter()
-        .find(|a| stem(a.module) == want && a.function == function)
+    api_table().find(|a| stem(a.module) == want && a.function == function)
 }
 
 /// CLI の `--api` 等で使う名前解決（L09）。素の関数名
@@ -293,15 +317,27 @@ pub fn api_by_name(name: &str) -> Option<&'static ApiDef> {
     if let Some((module, function)) = name.split_once('!') {
         return api_by_import(module, function);
     }
-    API_TABLE.iter().find(|a| a.function == name)
+    api_table().find(|a| a.function == name)
+}
+
+/// 手書き表だけの Schema（enter/leave を api_id 順に並べたもの）。
+/// shirusu-emit の file_io 共有セットがこの 6 API と一致することを
+/// 検査するために使う。
+pub fn handwritten_schemas() -> Vec<SchemaDef> {
+    let mut v = Vec::with_capacity(HANDWRITTEN_API_TABLE.len() * 2);
+    for api in HANDWRITTEN_API_TABLE {
+        v.push(api.enter_schema());
+        v.push(api.leave_schema());
+    }
+    v
 }
 
 /// 定義表の全 Schema（enter/leave を api_id 順に並べたもの）。
 /// Host は Capture Session 開始時にこの順で TraceWriter へ登録し、
 /// Agent 側の Descriptor が指す schema_id と一致させる。
 pub fn all_schemas() -> Vec<SchemaDef> {
-    let mut v = Vec::with_capacity(API_TABLE.len() * 2);
-    for api in API_TABLE {
+    let mut v = Vec::with_capacity(API_COUNT * 2);
+    for api in api_table() {
         v.push(api.enter_schema());
         v.push(api.leave_schema());
     }
@@ -309,9 +345,12 @@ pub fn all_schemas() -> Vec<SchemaDef> {
 }
 
 /// フック由来イベントの schema_id かどうか（Host 変換で Payload を
-/// 引数値列として扱うかの判定に使う）。
+/// 引数値列として扱うかの判定に使う）。API 表の Schema（1〜2×API_COUNT）
+/// と、COM メソッドイベントの Schema（com.rs の予約 ID）のどちらか。
 pub fn is_hook_schema(schema_id: u32) -> bool {
-    schema_id >= 1 && schema_id <= (API_TABLE.len() * 2) as u32
+    (schema_id >= 1 && schema_id <= (API_COUNT * 2) as u32)
+        || schema_id == crate::com::COM_METHOD_ENTER_SCHEMA_ID
+        || schema_id == crate::com::COM_METHOD_LEAVE_SCHEMA_ID
 }
 
 #[cfg(test)]
@@ -321,12 +360,65 @@ mod tests {
 
     #[test]
     fn table_ids_are_unique_and_contiguous() {
-        let mut ids: Vec<u32> = API_TABLE.iter().map(|a| a.api_id).collect();
+        let mut ids: Vec<u32> = api_table().map(|a| a.api_id).collect();
         ids.sort_unstable();
-        assert_eq!(ids, (1..=API_TABLE.len() as u32).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=API_COUNT as u32).collect::<Vec<_>>());
         let mut sids: Vec<u32> = all_schemas().iter().map(|s| s.schema_id).collect();
         sids.sort_unstable();
-        assert_eq!(sids, (1..=(API_TABLE.len() * 2) as u32).collect::<Vec<_>>());
+        assert_eq!(sids, (1..=(API_COUNT * 2) as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn generated_entries_are_l1_and_generic_capture_compatible() {
+        // L03: 生成 API (api_id 7〜) は全て L1 で、汎用取得が扱える型
+        // (U32 / I32 / U64 / I64 / Bool) だけを使い、引数は 12 個以下。
+        // 生成表の検査はここが担う（capture::generic_enter は対応外の
+        // 型で panic するため、表の側で保証する）。
+        let generated: Vec<&ApiDef> = api_table().filter(|a| a.api_id >= 7).collect();
+        assert!(!generated.is_empty(), "generated table must not be empty");
+        assert_eq!(generated[0].api_id, 7);
+        for api in &generated {
+            assert_eq!(api.level, 1, "{} must be L1", api.function);
+            assert!(
+                api.enter_fields.len() <= 12,
+                "{} has {} params (max 12)",
+                api.function,
+                api.enter_fields.len()
+            );
+            for &(name, ty, _, _) in api.enter_fields.iter() {
+                assert!(
+                    matches!(ty, Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool),
+                    "{} enter field {name} uses unsupported {ty:?}",
+                    api.function
+                );
+            }
+            // leave は return (任意) + last_error のみ。
+            assert_eq!(api.leave_fields.last().unwrap().0, "last_error");
+            assert!(api.leave_fields.len() <= 2);
+            for &(name, ty, _, _) in api.leave_fields.iter() {
+                if name == "return" {
+                    assert!(
+                        matches!(ty, Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool),
+                        "{} return uses unsupported {ty:?}",
+                        api.function
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_has_no_duplicate_module_function_pairs() {
+        // L03: 手書きと生成を合わせても (module, function) は一意である。
+        let mut seen = std::collections::HashSet::new();
+        for api in api_table() {
+            assert!(
+                seen.insert((api.module, api.function)),
+                "duplicate {}!{}",
+                api.module,
+                api.function
+            );
+        }
     }
 
     #[test]
@@ -335,7 +427,7 @@ mod tests {
         for def in all_schemas() {
             reg.register(def).expect("hook schemas must register");
         }
-        assert_eq!(reg.len(), API_TABLE.len() * 2);
+        assert_eq!(reg.len(), API_COUNT * 2);
         // 再登録は冪等（Checkpoint 複製と同じ性質）
         for def in all_schemas() {
             reg.register(def).expect("re-register is idempotent");
@@ -376,7 +468,7 @@ mod tests {
 
     #[test]
     fn every_leave_schema_ends_with_last_error() {
-        for api in API_TABLE {
+        for api in api_table() {
             let last = api.leave_fields.last().expect("leave fields");
             assert_eq!(
                 last.0, "last_error",
@@ -489,7 +581,7 @@ mod tests {
         // enter は呼び出し前 (Before)、leave は元の API が書き込んだ後
         // (After)。現行の 6 API はすべてこの二分に従う。
         use shirusu_trace::schema::CaptureTiming;
-        for api in API_TABLE {
+        for api in api_table() {
             for f in api.enter_schema().fields {
                 assert_eq!(
                     CaptureTiming::from_flags(f.flags),

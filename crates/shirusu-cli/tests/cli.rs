@@ -953,6 +953,58 @@ fn inspect_json_includes_modules() {
     assert!(out.contains("kernel32.dll"), "{out}");
 }
 
+/// L13: 静的依存情報を Environment に持つ Trace。inspect（人間可読・
+/// JSON）で DLL とインポートが見えることの回帰用。
+fn static_deps_trace_bytes() -> Vec<u8> {
+    use shirusu_trace::static_dep::{StaticDependency, StaticImport};
+    let mut env = CaptureEnvironment {
+        session: SessionMetadata {
+            session_id: 42,
+            created_by: "cli-test".into(),
+            qpc_frequency: 10_000_000,
+        },
+        os_version: "Windows 11".into(),
+        cpu_arch: "x86_64".into(),
+        pointer_width: 64,
+        ..Default::default()
+    };
+    env.static_dependencies.push(StaticDependency {
+        module: "kernel32.dll".into(),
+        imports: vec![
+            StaticImport::named("CreateFileW"),
+            StaticImport::by_ordinal(42),
+        ],
+    });
+    env.static_dependencies.push(StaticDependency {
+        module: "user32.dll".into(),
+        imports: vec![StaticImport::named("MessageBoxW")],
+    });
+    let w = TraceWriter::new(Vec::new(), env).unwrap();
+    w.finish(FinalizationInfo::default()).unwrap()
+}
+
+#[test]
+fn inspect_shows_static_dependencies() {
+    let bytes = static_deps_trace_bytes();
+    let (out, err, code) = run_cli_bytes(&bytes, &["inspect", "sample.trace"]);
+    assert_eq!(code, Some(0), "stderr: {err}");
+    assert!(out.contains("static_dependencies:"), "{out}");
+    assert!(out.contains("kernel32.dll: 2 imports"), "{out}");
+    assert!(out.contains("CreateFileW"), "{out}");
+    assert!(out.contains("#42"), "{out}");
+    assert!(out.contains("user32.dll: 1 import"), "{out}");
+}
+
+#[test]
+fn inspect_json_includes_static_dependencies() {
+    let bytes = static_deps_trace_bytes();
+    let (out, err, code) = run_cli_bytes(&bytes, &["inspect", "sample.trace", "--json"]);
+    assert_eq!(code, Some(0), "stderr: {err}");
+    assert!(out.contains("\"static_dependencies\""), "{out}");
+    assert!(out.contains("kernel32.dll"), "{out}");
+    assert!(out.contains("CreateFileW"), "{out}");
+}
+
 #[test]
 fn usage_lists_capture_and_attach() {
     let (out, _err, code) = run_in(&fresh_dir(), &["help"]);

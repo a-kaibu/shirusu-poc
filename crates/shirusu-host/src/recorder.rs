@@ -21,6 +21,8 @@
 use crate::trace_convert::{ArgsConversionStats, RecordMode, TraceBatchContext, TraceRecorder};
 use crate::{DrainWorker, IntegrityLevel, IntegrityReport, RingIdentity};
 use shirusu_hook::api as hook_api;
+use shirusu_hook::com as hook_com;
+use shirusu_hook::winrt as hook_winrt;
 use shirusu_trace::proto::{CaptureEnvironment, ProfileSummary};
 use shirusu_trace::writer::{Durability, WriterOptions};
 use shirusu_transport::layout;
@@ -121,6 +123,13 @@ pub struct CaptureSessionConfig {
     /// ここにあり、CLI の `--record-runtime-apis` から渡す。フック時の
     /// 呼び出し元分類による強制は Windows 側の残作業（L23）。
     pub record_runtime_apis: bool,
+    /// 診断用の追加 QueryInterface を有効にするか（L02、overview
+    /// COM 節）。有効にすると Interceptor は新規発見のインターフェイスに
+    /// 対して自身で `QueryInterface(IID_IUnknown)` を呼んで同一性を
+    /// 確認する（参照カウントを一時的に増やすため、実行に影響し得る）。
+    /// 既定は false（標準では呼ばない）。CLI の
+    /// `--diagnostic-query-interface` から渡す。
+    pub diagnostic_query_interface: bool,
     /// 記録モード（L09、overview「記録モードと性能目標」節）。既定は
     /// `RecordMode::Full`。CLI の `--mode` / `--api` から渡す。
     pub record_mode: RecordMode,
@@ -185,6 +194,17 @@ struct RingEndpoint {
     /// space_available 通知（Host → Agent）。回収で空きができたら鳴らす。
     space_notify: Option<std::sync::Arc<shirusu_transport_win::RingNotify>>,
     worker: Option<DrainWorker>,
+    /// 現在の Worker が対象としている Slot 世代 (レビュー #6 P1-4)。
+    /// 初めは `spec.expected_generation`。Agent が Slot を回収して
+    /// 別のスレッドが同じ Mapping を再初期化すると Control の世代が
+    /// 進むため、poll のたびに照合し、進んでいれば Worker を張り替える。
+    generation: u64,
+    /// Trace 上のスレッド ID (レビュー #6 P1-4)。初代は
+    /// `spec.thread_id`、世代交代のたびにセッションが新しい合成 ID
+    /// を割り当てる。Trace の Sequence はスレッド単位で単調でなけ
+    /// ればならず、新しい incarnation (別の OS スレッド) の Sequence
+    /// は 1 から再開するため、スレッドとしても別に扱うのが正しい。
+    trace_thread_id: u64,
     /// 完全性喪失で停止したか（worker.is_stopped と同期させる）。
     stopped: bool,
     events: u64,
@@ -213,6 +233,12 @@ pub struct SessionSummary {
     /// プロセス間記録で DLL から読み戻せた場合のみ Some
     /// (レビュー #4 の #8)。
     pub hook_coverage: Option<(usize, usize)>,
+    /// Agent DLL が報告した COM Factory 関数の設置数（L02。0〜2）。
+    /// プロセス間記録で DLL から読み戻せた場合のみ Some。
+    pub com_factory_count: Option<usize>,
+    /// Agent DLL が報告した WinRT アクティベーション関数の設置数
+    /// （L14。0〜2）。プロセス間記録で DLL から読み戻せた場合のみ Some。
+    pub winrt_activation_count: Option<usize>,
     /// 注入できなかった子プロセス (pid, 理由)。L05: 保護されたプロセス
     /// や注入前に終了した子はここに残り、Capture Coverage の劣化として
     /// Finalization の注記にも写る。
@@ -318,6 +344,37 @@ fn combine_reports(reports: &[IntegrityReport]) -> IntegrityReport {
     out
 }
 
+/// 世代交代した Ring の旧 Worker を確定させる (レビュー #6
+/// P1-4)。`stop` での確定と同じ手順: スレッド表を閉じ、完全性
+/// 報告を保持し、Loss を記録する。`ring.generation` は共有
+/// Control の現在値へ進める。
+fn retire_ring_worker(
+    recorder: &mut TraceRecorder<File>,
+    retired_reports: &mut Vec<IntegrityReport>,
+    retired_loss_records: &mut u64,
+    coverage_missing_calls: u64,
+    ring: &mut RingEndpoint,
+) -> Result<(), SessionError> {
+    let Some(mut worker) = ring.worker.take() else {
+        return Ok(());
+    };
+    let _ = worker.finalize_thread();
+    retired_reports
+        .push(worker.integrity_report(coverage_missing_calls, ring.stopped || worker.is_stopped()));
+    let losses = std::mem::take(&mut worker.loss_events);
+    if !losses.is_empty() {
+        *retired_loss_records += losses.len() as u64;
+        recorder.record_losses(&losses, ring.spec.process_id, ring.trace_thread_id)?;
+    }
+    ring.stopped = false;
+    ring.generation = layout::load(
+        ring.mapping.base(),
+        layout::OFF_GENERATION,
+        Ordering::Acquire,
+    );
+    Ok(())
+}
+
 pub struct CaptureSession {
     config: CaptureSessionConfig,
     recorder: TraceRecorder<File>,
@@ -332,9 +389,24 @@ pub struct CaptureSession {
     /// Agent DLL が Bootstrap 経由で報告したフック設置結果
     /// (設置数, 欠落数)。プロセス間記録でのみ設定される。
     hook_coverage: Option<(usize, usize)>,
+    /// Agent DLL が Bootstrap 経由で報告した COM Factory 関数の設置数
+    /// （L02。0〜2）。プロセス間記録でのみ設定される。
+    com_factory_count: Option<usize>,
+    /// Agent DLL が Bootstrap 経由で報告した WinRT アクティベーション
+    /// 関数の設置数（L14。0〜2）。プロセス間記録でのみ設定される。
+    winrt_activation_count: Option<usize>,
     /// Agent 終了手順の結果（レビュー第5回 #6）。プロセス間記録で
     /// 対象を生かしたまま閉じる場合のみ設定される。
     shutdown_outcome: Option<ShutdownOutcome>,
+    /// 世代交代で張り替えた旧 Worker の完全性報告 (レビュー #6
+    /// P1-4)。`stop` の集計へ合算する。
+    retired_reports: Vec<IntegrityReport>,
+    /// 世代交代で張り替えた旧 Worker の Loss 件数。`stop` の
+    /// `total_loss_records` へ合算する。
+    retired_loss_records: u64,
+    /// 世代交代した Ring へ割り当てる次の合成 Trace スレッド ID。
+    /// `add_ring` で全 spec の最大値 + 1 へ追随させる。
+    next_trace_thread_id: u64,
     /// 注入できなかった子プロセス (pid, 理由)。L05。TreeCapture が
     /// 注入の失敗時に知らせる。`stop` で Capture Coverage の劣化と
     /// 注記に写す。
@@ -367,6 +439,16 @@ impl CaptureSession {
         for def in hook_api::all_schemas() {
             recorder.register_schema(def)?;
         }
+        // L02: COM メソッドイベントの Schema も登録する（未登録だと
+        // Payload が Blob へ逃げ、args として読めなくなる）。
+        for def in hook_com::com_schemas() {
+            recorder.register_schema(def)?;
+        }
+        // L14: WinRT アクティベーションイベントの Schema も登録する
+        // （COM と同じ理由）。
+        for def in hook_winrt::winrt_schemas() {
+            recorder.register_schema(def)?;
+        }
         Ok(Self {
             config,
             recorder,
@@ -376,7 +458,12 @@ impl CaptureSession {
             args_stats: ArgsConversionStats::default(),
             coverage_missing_calls: 0,
             hook_coverage: None,
+            com_factory_count: None,
+            winrt_activation_count: None,
             shutdown_outcome: None,
+            retired_reports: Vec::new(),
+            retired_loss_records: 0,
+            next_trace_thread_id: 0,
             uninjectable_children: Vec::new(),
         })
     }
@@ -402,6 +489,17 @@ impl CaptureSession {
     /// 正常なアプリは「0 件設置・全件欠落」としてここへ届く。
     pub fn set_hook_coverage(&mut self, hooked: usize, missing: usize) {
         self.hook_coverage = Some((hooked, missing));
+    }
+
+    /// Agent DLL が報告した COM Factory 関数の設置数を知らせる (L02)。
+    pub fn set_com_factory_count(&mut self, count: usize) {
+        self.com_factory_count = Some(count);
+    }
+
+    /// Agent DLL が報告した WinRT アクティベーション関数の設置数を
+    /// 知らせる (L14)。
+    pub fn set_winrt_activation_count(&mut self, count: usize) {
+        self.winrt_activation_count = Some(count);
     }
 
     /// Agent 終了手順の結果を知らせる (レビュー第5回 #6)。
@@ -482,8 +580,11 @@ impl CaptureSession {
                 self.config.ring_config.required_len()
             )));
         }
+        self.next_trace_thread_id = self.next_trace_thread_id.max(spec.thread_id + 1);
         let index = self.rings.len();
         self.rings.push(RingEndpoint {
+            generation: spec.expected_generation,
+            trace_thread_id: spec.thread_id,
             spec,
             mapping,
             space_notify,
@@ -506,6 +607,34 @@ impl CaptureSession {
         self.ensure_state(SessionState::Recording, "poll_once")?;
         let mut stats = PollStats::default();
         for ring in &mut self.rings {
+            // 世代交代の検出 (レビュー #6 P1-4): Agent が Slot を
+            // 回収して別のスレッドが同じ Mapping を再初期化すると
+            // Control の世代が進む。Worker を張り替えないと世代
+            // 不一致で Ring が止まってしまうため、旧 Worker を
+            // ここで確定させる。なお、再初期化が進行中の drain と
+            // 競合した場合は従来どおり当該 Ring の完全性喪失として
+            // 閉じる (fail-closed)。張り替えは世代が安定してから
+            // 次の poll で効く。
+            if ring.worker.is_some() && ring.mapping.agent_initialized() {
+                let found = layout::load(
+                    ring.mapping.base(),
+                    layout::OFF_GENERATION,
+                    Ordering::Acquire,
+                );
+                if found != ring.generation {
+                    retire_ring_worker(
+                        &mut self.recorder,
+                        &mut self.retired_reports,
+                        &mut self.retired_loss_records,
+                        self.coverage_missing_calls,
+                        ring,
+                    )?;
+                    // 新しい incarnation は Trace 上の別スレッドとして
+                    // 記録する (Sequence が 1 から再開するため)。
+                    ring.trace_thread_id = self.next_trace_thread_id;
+                    self.next_trace_thread_id += 1;
+                }
+            }
             if ring.worker.is_none() {
                 if !ring.mapping.agent_initialized() {
                     stats.pending_rings += 1;
@@ -517,7 +646,7 @@ impl CaptureSession {
                     DrainWorker::new(
                         ring.mapping.base(),
                         self.config.ring_config,
-                        ring.spec.expected_generation,
+                        ring.generation,
                     )
                 };
                 // L11: セッション設定で Descriptor の global_order 検証を決める。
@@ -525,7 +654,7 @@ impl CaptureSession {
                 worker.set_identity(RingIdentity::new(
                     crate::ProcessInstanceId(ring.spec.process_id),
                     crate::RingId(ring.spec.thread_id),
-                    ring.spec.expected_generation,
+                    ring.generation,
                 ));
                 ring.worker = Some(worker);
             }
@@ -553,7 +682,7 @@ impl CaptureSession {
                     session_id: self.config.session_id,
                     process_id: ring.spec.process_id,
                     raw_pid: ring.spec.raw_pid,
-                    thread_id: ring.spec.thread_id,
+                    thread_id: ring.trace_thread_id,
                     qpc_frequency: self.config.qpc_frequency,
                 };
                 let s = self.recorder.record_batch_with_args(&ctx, &batch.events)?;
@@ -586,7 +715,8 @@ impl CaptureSession {
             });
         }
         let mut reports = Vec::new();
-        let mut total_loss_records = 0u64;
+        // 世代交代で確定済みの旧 Worker 分も集計へ含める (P1-4)。
+        let mut total_loss_records = self.retired_loss_records;
         let mut rings_active = 0usize;
         let mut rings_never = 0usize;
         let mut rings_stopped = 0usize;
@@ -610,9 +740,10 @@ impl CaptureSession {
             total_loss_records += losses.len() as u64;
             if !losses.is_empty() {
                 self.recorder
-                    .record_losses(&losses, ring.spec.process_id, ring.spec.thread_id)?;
+                    .record_losses(&losses, ring.spec.process_id, ring.trace_thread_id)?;
             }
         }
+        reports.append(&mut self.retired_reports);
         let mut report = combine_reports(&reports);
         if self.args_stats.args_fallback_blob > 0 {
             report.semantic_completeness =
@@ -682,6 +813,8 @@ impl CaptureSession {
             args_attached: self.args_stats.args_attached,
             args_fallback_blob: self.args_stats.args_fallback_blob,
             hook_coverage: self.hook_coverage,
+            com_factory_count: self.com_factory_count,
+            winrt_activation_count: self.winrt_activation_count,
             uninjectable_children: std::mem::take(&mut self.uninjectable_children),
             profile_summary,
             integrity: report,

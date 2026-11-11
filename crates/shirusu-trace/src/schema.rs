@@ -203,6 +203,18 @@ pub enum LastErrorMeaning {
     /// 戻り値が INVALID_HANDLE_VALUE の場合にだけ意味を持つ
     /// （HANDLE 戻り値の API。CreateFileW）。
     WhenReturnIsInvalidHandle,
+    /// 戻り値が NULL (0) の場合にだけ意味を持つ（HANDLE / ポインタ
+    /// 戻り値の API。L03 の生成 API 用。CreateMutexW / VirtualAlloc 等）。
+    WhenReturnIsNull,
+    /// GetLastError に意味がない（戻り値がエラーコードそのものである
+    /// API (Reg* 等) や、失敗しない・失敗を戻り値で表さない API。
+    /// L03 の生成 API 用）。取得側は生値を常に Stale として記録する。
+    Never,
+    /// 戻り値が -1 (全ビット 1) の場合にだけ意味を持つ（WAIT_FAILED /
+    /// SOCKET_ERROR 等の -1 返し。L03 の生成 API 用）。
+    /// 32bit 形 (下位 32 ビットのみ 1) も失敗とみなす
+    /// （WhenReturnIsInvalidHandle と同じ幅の扱い）。
+    WhenReturnIsMinusOne,
 }
 
 /// LastErrorMeaning を格納するフラグビット範囲 (bit8..=10)。
@@ -215,6 +227,9 @@ impl LastErrorMeaning {
             1 => Self::Always,
             2 => Self::WhenReturnIsFalse,
             3 => Self::WhenReturnIsInvalidHandle,
+            4 => Self::WhenReturnIsNull,
+            5 => Self::Never,
+            6 => Self::WhenReturnIsMinusOne,
             _ => Self::Unspecified,
         }
     }
@@ -225,6 +240,9 @@ impl LastErrorMeaning {
             Self::Always => 1,
             Self::WhenReturnIsFalse => 2,
             Self::WhenReturnIsInvalidHandle => 3,
+            Self::WhenReturnIsNull => 4,
+            Self::Never => 5,
+            Self::WhenReturnIsMinusOne => 6,
         };
         v << LAST_ERROR_MEANING_SHIFT
     }
@@ -239,6 +257,11 @@ impl LastErrorMeaning {
             Self::WhenReturnIsInvalidHandle => {
                 // INVALID_HANDLE_VALUE はポインタ幅依存（64bit: 全ビット 1、
                 // 32bit: 下位 32 ビットのみ 1。レビュー第5回 #5）。
+                return_value == u64::MAX || return_value == 0x0000_0000_ffff_ffff
+            }
+            Self::WhenReturnIsNull => return_value == 0,
+            Self::Never => false,
+            Self::WhenReturnIsMinusOne => {
                 return_value == u64::MAX || return_value == 0x0000_0000_ffff_ffff
             }
         }
@@ -583,6 +606,9 @@ mod tests {
             LastErrorMeaning::Always,
             LastErrorMeaning::WhenReturnIsFalse,
             LastErrorMeaning::WhenReturnIsInvalidHandle,
+            LastErrorMeaning::WhenReturnIsNull,
+            LastErrorMeaning::Never,
+            LastErrorMeaning::WhenReturnIsMinusOne,
         ] {
             assert_eq!(LastErrorMeaning::from_flags(meaning.flags()), meaning);
             // 意味条件は bit0..=7 (inout/省略可能・ValueKind・
@@ -655,6 +681,17 @@ mod tests {
         assert!(WhenReturnIsInvalidHandle.is_meaningful(0x0000_0000_ffff_ffff));
         assert!(!WhenReturnIsInvalidHandle.is_meaningful(0x1234));
         assert!(!WhenReturnIsInvalidHandle.is_meaningful(0));
+        // L03: 生成 API 用の追加条件。NULL 返し (HANDLE/ポインタ)、
+        // 戻り値がエラーコードそのもの (Reg* 等)、-1 返し (WAIT_FAILED 等)。
+        assert!(WhenReturnIsNull.is_meaningful(0));
+        assert!(!WhenReturnIsNull.is_meaningful(1));
+        assert!(!Never.is_meaningful(0));
+        assert!(!Never.is_meaningful(1));
+        assert!(WhenReturnIsMinusOne.is_meaningful(u64::MAX));
+        // 32bit 形の -1 (WAIT_FAILED 等。レビュー第5回 #5 と同じ幅の扱い)
+        assert!(WhenReturnIsMinusOne.is_meaningful(0x0000_0000_ffff_ffff));
+        assert!(!WhenReturnIsMinusOne.is_meaningful(0));
+        assert!(!WhenReturnIsMinusOne.is_meaningful(0x1234));
     }
 
     #[test]

@@ -100,6 +100,13 @@ pub fn is_pe64(b: &[u8]) -> Option<bool> {
 
 /// インポートディレクトリを歩き、全インポートを列挙する。
 /// 不正なイメージでは空 Vec を返す（部分的に読めた分は返す）。
+///
+/// 対象は通常のインポートディレクトリ（data directory 1）のみ。
+/// 遅延ロードインポート（delay-load、directory 13）は扱わない
+/// （レビュー #6 M07）。遅延ロード経由の API は IAT フックの対象に
+/// ならず、その呼び出しは Capture Coverage の欠落として数える側に
+/// 倒す。L13 の静的依存記録も同じ境界である（理由と合わせて
+/// `shirusu_trace::static_dep` のモジュールドキュメントに明記）。
 pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
     let mut out = Vec::new();
     let Some(h) = nt_headers(image) else {

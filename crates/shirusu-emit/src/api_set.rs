@@ -179,7 +179,7 @@ impl ApiSet {
     }
 }
 
-/// shirusu 本体のフック表（shirusu-hook `API_TABLE`）と同一の
+/// shirusu 本体のフック表（shirusu-hook `HANDWRITTEN_API_TABLE`）と同一の
 /// ファイル I/O 4 API と完了観測 2 API（GetOverlappedResult /
 /// GetQueuedCompletionStatus）の 6 API セット。本体が記録した Trace と外部レコーダの
 /// Trace を compare で突き合わせる場合の、共有セットの基準形。
@@ -247,7 +247,7 @@ pub fn file_io_api_set() -> ApiSet {
                 ("last_error", DWORD, ValueKind::Scalar, CaptureTiming::After),
             ],
         )
-        .with_annotation("L2 (file_io_api_set: shirusu-hook API_TABLE と同一定義)")
+        .with_annotation("L2 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
         .with_last_error_meaning(LastErrorMeaning::WhenReturnIsInvalidHandle),
         ApiSpec::new(
             "kernel32!ReadFile",
@@ -278,7 +278,7 @@ pub fn file_io_api_set() -> ApiSet {
                 ("last_error", DWORD, ValueKind::Scalar, CaptureTiming::After),
             ],
         )
-        .with_annotation("L2 (file_io_api_set: shirusu-hook API_TABLE と同一定義)")
+        .with_annotation("L2 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
         .with_last_error_meaning(LastErrorMeaning::WhenReturnIsFalse),
         ApiSpec::new(
             "kernel32!WriteFile",
@@ -303,7 +303,7 @@ pub fn file_io_api_set() -> ApiSet {
                 ("last_error", DWORD, ValueKind::Scalar, CaptureTiming::After),
             ],
         )
-        .with_annotation("L2 (file_io_api_set: shirusu-hook API_TABLE と同一定義)")
+        .with_annotation("L2 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
         .with_last_error_meaning(LastErrorMeaning::WhenReturnIsFalse),
         ApiSpec::new(
             "kernel32!CloseHandle",
@@ -313,7 +313,7 @@ pub fn file_io_api_set() -> ApiSet {
                 ("last_error", DWORD, ValueKind::Scalar, CaptureTiming::After),
             ],
         )
-        .with_annotation("L1 (file_io_api_set: shirusu-hook API_TABLE と同一定義)")
+        .with_annotation("L1 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
         .with_last_error_meaning(LastErrorMeaning::WhenReturnIsFalse),
         ApiSpec::new(
             "kernel32!GetOverlappedResult",
@@ -338,7 +338,7 @@ pub fn file_io_api_set() -> ApiSet {
                 ("last_error", DWORD, ValueKind::Scalar, CaptureTiming::After),
             ],
         )
-        .with_annotation("L1 (file_io_api_set: shirusu-hook API_TABLE と同一定義)")
+        .with_annotation("L1 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
         .with_last_error_meaning(LastErrorMeaning::WhenReturnIsFalse),
         ApiSpec::new(
             "kernel32!GetQueuedCompletionStatus",
@@ -385,7 +385,7 @@ pub fn file_io_api_set() -> ApiSet {
                 ("last_error", DWORD, ValueKind::Scalar, CaptureTiming::After),
             ],
         )
-        .with_annotation("L1 (file_io_api_set: shirusu-hook API_TABLE と同一定義)")
+        .with_annotation("L1 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
         .with_last_error_meaning(LastErrorMeaning::WhenReturnIsFalse),
     ];
     for def in defs {
@@ -438,7 +438,8 @@ mod tests {
     #[test]
     fn file_io_schemas_match_hook_table_hashes() {
         let mine = file_io_api_set().schemas();
-        let hook = shirusu_hook::api::all_schemas();
+        // file_io セットは手書きの 6 API に対応する（生成 API は別物）。
+        let hook = shirusu_hook::api::handwritten_schemas();
         assert_eq!(mine.len(), hook.len());
         for (a, b) in mine.iter().zip(hook.iter()) {
             assert_eq!(a.schema_id, b.schema_id);
@@ -458,7 +459,8 @@ mod tests {
         // API ごとの意味を明示して固定する。
         use shirusu_trace::schema::LastErrorMeaning;
         let set = file_io_api_set();
-        let hook = shirusu_hook::api::API_TABLE;
+        // file_io セットは手書きの 6 API に対応する（生成 API は別物）。
+        let hook = shirusu_hook::api::HANDWRITTEN_API_TABLE;
         assert_eq!(set.len(), hook.len());
         for (spec, def) in set.specs.iter().zip(hook.iter()) {
             assert_eq!(

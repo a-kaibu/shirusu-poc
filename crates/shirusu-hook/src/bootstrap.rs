@@ -32,7 +32,18 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v4: 末尾に order_global を追加した (L11 `--order=global`)。
 /// 0 = 無効、0 以外 = 有効。Agent は有効な場合のみ観測点で
 /// 全スレッド共通の番号を採番する。
-pub const BOOTSTRAP_VERSION: u32 = 4;
+/// v5: 末尾に record_runtime_apis を追加した (L23)。0 = Runtime 独自の
+/// API を記録しない（既定）、0 以外 = 記録する。Host が
+/// `CaptureSessionConfig::record_runtime_apis` から設定する。
+/// v6: 末尾に com_options と result_com_factory_count を追加した (L02)。
+/// com_options は bit0 = 診断用の追加 QueryInterface を有効にするか
+/// （既定は 0 = 無効）。result_com_factory_count は DLL が設置した
+/// COM Factory 関数の Detour の数（0〜2。CoCreateInstance /
+/// CoGetClassObject）。
+/// v7: 末尾に result_winrt_activation_count を追加した (L14)。
+/// DLL が設置した WinRT アクティベーション関数の Detour の数
+/// （0〜2。RoActivateInstance / RoGetActivationFactory）。
+pub const BOOTSTRAP_VERSION: u32 = 7;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -71,6 +82,21 @@ pub struct AgentBootstrap {
     /// `--order=global` (v4, L11): 0 = 無効、0 以外 = 有効。
     /// Host が `CaptureSessionConfig::order_global` から設定する。
     pub order_global: u32,
+    /// Runtime 独自の API も記録するか (v5, L23): 0 = 記録しない
+    /// （既定）、0 以外 = 記録する。Host が
+    /// `CaptureSessionConfig::record_runtime_apis` から設定する。
+    pub record_runtime_apis: u32,
+    /// COM オプション (v6, L02): bit0 = 診断用の追加 QueryInterface
+    /// を有効にするか（既定は 0 = 無効。標準では Interceptor 自身は
+    /// QueryInterface を呼ばない）。Host が
+    /// `CaptureSessionConfig::diagnostic_query_interface` から設定する。
+    pub com_options: u32,
+    /// 初期化結果 (v6, L02): DLL が設置した COM Factory 関数の
+    /// Detour の数（0〜2）。Host は読み戻して Coverage へ写す。
+    pub result_com_factory_count: u32,
+    /// 初期化結果 (v7, L14): DLL が設置した WinRT アクティベーション
+    /// 関数の Detour の数（0〜2）。Host は読み戻して Coverage へ写す。
+    pub result_winrt_activation_count: u32,
 }
 
 impl Default for AgentBootstrap {
@@ -90,6 +116,10 @@ impl Default for AgentBootstrap {
             result_missing_count: 0,
             result_unrestored_count: 0,
             order_global: 0,
+            record_runtime_apis: 0,
+            com_options: 0,
+            result_com_factory_count: 0,
+            result_winrt_activation_count: 0,
         }
     }
 }
@@ -180,6 +210,35 @@ impl AgentBootstrap {
     pub fn unrestored_count(&self) -> u32 {
         self.result_unrestored_count
     }
+    /// DLL 側が COM Factory 関数の設置数を書き戻すためのポインタ経由の記録。
+    ///
+    /// # Safety
+    /// [`AgentBootstrap::write_hook_outcome`] と同じ前提。
+    pub unsafe fn write_com_factory_count(bootstrap: *mut AgentBootstrap, count: u32) {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe {
+            (*bootstrap).result_com_factory_count = count;
+        }
+    }
+    /// Host 側: 読み戻した COM Factory 関数の設置数。
+    pub fn com_factory_count(&self) -> u32 {
+        self.result_com_factory_count
+    }
+    /// DLL 側が WinRT アクティベーション関数の設置数を書き戻すための
+    /// ポインタ経由の記録。
+    ///
+    /// # Safety
+    /// [`AgentBootstrap::write_hook_outcome`] と同じ前提。
+    pub unsafe fn write_winrt_activation_count(bootstrap: *mut AgentBootstrap, count: u32) {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe {
+            (*bootstrap).result_winrt_activation_count = count;
+        }
+    }
+    /// Host 側: 読み戻した WinRT アクティベーション関数の設置数。
+    pub fn winrt_activation_count(&self) -> u32 {
+        self.result_winrt_activation_count
+    }
 }
 
 #[cfg(test)]
@@ -222,10 +281,14 @@ mod tests {
         // repr(C) の固定レイアウトであること（プロセス間受け渡しの前提）
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            // フィールド合計 584 (8 バイト整列のため末尾パディング 0)。
-            // v4 で末尾に order_global (u32) を追加し、v3 の末尾パディング
-            // 4 バイトを埋めたため総サイズは v3 と同じ 584 のまま。
-            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4 + 4 + 4
+            // フィールド合計 600 (8 バイト整列)。
+            // v5 で末尾に record_runtime_apis (u32) を追加したため、
+            // v4 の 584 から 592 になった。v6 で末尾に com_options (u32)
+            // と result_com_factory_count (u32) を追加したため 600。
+            // v7 で末尾に result_winrt_activation_count (u32) を追加したが、
+            // 8 個目の u32 が v6 の末尾パディング 4 バイト分に収まるため、
+            // サイズは 600 のまま。
+            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4
         );
     }
 
@@ -240,6 +303,51 @@ mod tests {
         let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
         b.order_global = 1;
         assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn record_runtime_apis_defaults_to_disabled() {
+        // L23: v5 の record_runtime_apis は既定 0（記録しない）で、
+        // validate は通る。
+        let cfg = RingConfig::new(64, 4096);
+        let b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        assert_eq!(b.version, BOOTSTRAP_VERSION);
+        assert_eq!(b.record_runtime_apis, 0);
+        assert!(b.validate().is_ok());
+        let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        b.record_runtime_apis = 1;
+        assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn com_options_default_to_disabled_and_factory_count_roundtrip() {
+        // L02: v6 の com_options は既定 0（診断用 QI は無効）で、
+        // validate は通る。Factory 設置数の書き戻しと読み戻し。
+        let cfg = RingConfig::new(64, 4096);
+        let b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        assert_eq!(b.version, BOOTSTRAP_VERSION);
+        assert_eq!(b.com_options, 0);
+        assert_eq!(b.com_factory_count(), 0);
+        assert!(b.validate().is_ok());
+        let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        b.com_options = 1;
+        assert!(b.validate().is_ok());
+        unsafe { AgentBootstrap::write_com_factory_count(&mut b, 2) };
+        assert_eq!(b.com_factory_count(), 2);
+    }
+
+    #[test]
+    fn winrt_activation_count_roundtrip() {
+        // L14: v7 の result_winrt_activation_count は既定 0 で、
+        // 書き戻しと読み戻しができる。
+        let cfg = RingConfig::new(64, 4096);
+        let b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        assert_eq!(b.version, BOOTSTRAP_VERSION);
+        assert_eq!(b.winrt_activation_count(), 0);
+        assert!(b.validate().is_ok());
+        let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        unsafe { AgentBootstrap::write_winrt_activation_count(&mut b, 2) };
+        assert_eq!(b.winrt_activation_count(), 2);
     }
 
     #[test]

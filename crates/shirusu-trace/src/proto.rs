@@ -7,6 +7,7 @@
 
 use crate::error::ProtoError;
 use crate::module::ModuleClassification;
+use crate::static_dep::StaticDependency;
 
 // ---------------------------------------------------------------------------
 // ワイヤ形式の基礎
@@ -215,6 +216,9 @@ pub struct CaptureEnvironment {
     /// モジュール分類（L07）。空のときは field 9 を書かないので旧ファイル
     /// と同じバイト列になる。
     pub modules: Vec<ModuleClassification>,
+    /// 静的依存情報（L13）。空のときは field 10 を書かないので旧ファイル
+    /// と同じバイト列になる。
+    pub static_dependencies: Vec<StaticDependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -360,6 +364,9 @@ impl CaptureEnvironment {
         for m in &self.modules {
             w.message_field(9, &m.encode());
         }
+        for d in &self.static_dependencies {
+            w.message_field(10, &d.encode());
+        }
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, ProtoError> {
@@ -378,6 +385,9 @@ impl CaptureEnvironment {
                 (9, WIRE_LEN) => m
                     .modules
                     .push(ModuleClassification::decode(r.value_bytes()?)?),
+                (10, WIRE_LEN) => m
+                    .static_dependencies
+                    .push(StaticDependency::decode(r.value_bytes()?)?),
                 _ => r.skip(wire)?,
             }
         }

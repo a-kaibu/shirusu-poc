@@ -90,6 +90,8 @@ fn env(session_id: u64) -> CaptureEnvironment {
         feature_flags: 3,
         target_description: "bench.exe".into(),
         modules: Vec::new(),
+        // L13: ベンチは静的依存も記録しない（空）。
+        static_dependencies: Vec::new(),
     }
 }
 

@@ -3,9 +3,11 @@
 
 pub mod child_tree;
 pub mod expansion;
+pub mod modules;
 pub mod recorder;
 #[cfg(windows)]
 pub mod recorder_launch;
+pub mod static_dep;
 pub mod trace_convert;
 
 use shirusu_transport::descriptor::EventKind;
@@ -196,6 +198,152 @@ pub unsafe fn wait_for_ring_generation(
     }
 }
 
+/// 共有メモリから Host 側の像へ、確定済み範囲だけを写す
+/// (レビュー #6 P0-1)。
+///
+/// 手順:
+/// 1. `write_cursor` を Acquire で読み、次に `payload_write_position`
+///    を Acquire で読む。公開側は Payload コピー → Descriptor 書込 →
+///    `write_cursor` の Release 公開の順 (A09) であり、この順で読めば
+///    `write_cursor` 未満の Descriptor が指す Payload は必ず
+///    `payload_write_position` の範囲内にある。
+/// 2. Control 領域は 8 バイト語ごとに Acquire で読み、像の
+///    `write_cursor` / `payload_write_position` は手順 1 の値で固定
+///    する (コピー範囲と検証範囲を一致させるため。以後の公開分は
+///    次回の回収で見る)。
+/// 3. Descriptor は `from_cursor` から `write_cursor` まで、Payload は
+///    `from_payload_pos` から `payload_write_position` までだけを
+///    写す。範囲が容量以上なら領域全体を写す (書き手に一周された
+///    場合であり、検証側が Sequence の矛盾で弾く)。
+/// 4. `include_prev_descriptor` の場合は直前に読み終えた Descriptor
+///    (`from_cursor - 1`) も写す (`ValidatingReader::resume_from_image`
+///    が継続確認に使う)。
+///
+/// 旧実装は File Mapping 全体 (本番構成で 1.25MiB/ring) を毎回
+/// コピーしていた。未公開の Descriptor / Payload まで Host のメモリへ
+/// 取り込む (読み捨てるとしてもコピー自体がデータレースになる) 上に、
+/// 帯域も浪費していた (32 Ring × 2ms 周期で約 20GiB/s)。この関数は
+/// その全体コピーの置き換えである。戻り値は写したバイト数 (観測用)。
+///
+/// # Safety
+/// `base` は `cfg` 分の共有領域を指し、呼び出し中有効であること。
+/// `image` の長さは `cfg.required_len()` 以上であること。
+unsafe fn snapshot_committed_range(
+    base: *const u8,
+    image: &mut [u8],
+    cfg: RingConfig,
+    from_cursor: u64,
+    from_payload_pos: u64,
+    include_prev_descriptor: bool,
+) -> u64 {
+    debug_assert!(image.len() >= cfg.required_len());
+    // 1. 確定境界 (この順序が公開契約と対になる)
+    let write_cursor = layout::load(base, layout::OFF_WRITE_CURSOR, Ordering::Acquire);
+    let payload_end = layout::load(base, layout::OFF_PAYLOAD_WRITE_POSITION, Ordering::Acquire);
+    // 2. Control のスナップショット (語ごとにアトミックに読む)
+    for off in (0..layout::CONTROL_SIZE).step_by(8) {
+        let v = layout::load(base, off, Ordering::Acquire);
+        image[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut copied = layout::CONTROL_SIZE as u64;
+    // 像の境界は手順 1 の値で固定する (スナップショット中に進んだ
+    // 公開分は含めない。含めると、写していない範囲を検証が読む)。
+    image[layout::OFF_WRITE_CURSOR..layout::OFF_WRITE_CURSOR + 8]
+        .copy_from_slice(&write_cursor.to_le_bytes());
+    image[layout::OFF_PAYLOAD_WRITE_POSITION..layout::OFF_PAYLOAD_WRITE_POSITION + 8]
+        .copy_from_slice(&payload_end.to_le_bytes());
+    // 3a. Descriptor の確定範囲
+    let desc_from = if include_prev_descriptor {
+        from_cursor.saturating_sub(1)
+    } else {
+        from_cursor
+    };
+    if write_cursor > desc_from {
+        let capacity = cfg.descriptor_capacity as u64;
+        let start = ((desc_from % capacity) * 64) as usize;
+        let span = (write_cursor - desc_from).saturating_mul(64);
+        // SAFETY: 呼び出し側の契約 (base / image は cfg 分有効) に従う。
+        copied += unsafe {
+            copy_logical_range(
+                base,
+                image,
+                cfg.descriptors_offset(),
+                capacity as usize * 64,
+                start,
+                span,
+            )
+        };
+    }
+    // 3b. Payload の確定範囲
+    if payload_end > from_payload_pos {
+        let start = (from_payload_pos % cfg.payload_capacity as u64) as usize;
+        // SAFETY: 同上。
+        copied += unsafe {
+            copy_logical_range(
+                base,
+                image,
+                cfg.payload_offset(),
+                cfg.payload_capacity,
+                start,
+                payload_end - from_payload_pos,
+            )
+        };
+    }
+    copied
+}
+
+/// 論理範囲を、リング領域内の開始位置 `start` から `span` バイトだけ
+/// 写す (終端またぎは 2 分割する)。`span` が領域以上なら領域全体を
+/// 写す。写したバイト数を返す。
+///
+/// # Safety
+/// `base` / `image` の契約は `snapshot_committed_range` と同じ。
+/// `region_off + region_len` は両方とも有効範囲内であること。
+unsafe fn copy_logical_range(
+    base: *const u8,
+    image: &mut [u8],
+    region_off: usize,
+    region_len: usize,
+    start: usize,
+    span: u64,
+) -> u64 {
+    if span == 0 || region_len == 0 {
+        return 0;
+    }
+    if span >= region_len as u64 {
+        // SAFETY: 呼び出し側の契約 (領域全体が有効範囲内) に従う。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base.add(region_off),
+                image.as_mut_ptr().add(region_off),
+                region_len,
+            );
+        }
+        return region_len as u64;
+    }
+    let span = span as usize;
+    let first = (region_len - start).min(span);
+    // SAFETY: 同上。start + first は領域内である。
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            base.add(region_off + start),
+            image.as_mut_ptr().add(region_off + start),
+            first,
+        );
+    }
+    if span > first {
+        // SAFETY: 同上。残りは領域の先頭から写す。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base.add(region_off),
+                image.as_mut_ptr().add(region_off),
+                span - first,
+            );
+        }
+    }
+    span as u64
+}
+
 /// Ring 1 本分の Drain Worker。単一読み手を前提とし、複数 Worker で同じ Ring を扱わない。
 ///
 /// 回収は必ず検証付き経路を通る (R2): 共有領域を Host 側バッファへコピーし
@@ -207,10 +355,13 @@ pub unsafe fn wait_for_ring_generation(
 /// として transport 側に残してある)。
 pub struct DrainWorker {
     base: *mut u8,
+    cfg: RingConfig,
     reader: ValidatingReader,
     /// Host 側のコピー先バッファ。検証はこの像に対してだけ行い、共有メモリを
-    /// 読み直さない。
+    /// 読み直さない。写すのは確定済み範囲だけである (P0-1)。
     image: Vec<u8>,
+    /// これまでに共有メモリから像へ写した累積バイト数 (P0-1 の観測用)。
+    total_bytes_copied: u64,
     prev_loss: LossCounters,
     open_calls: HashMap<u64, u64>, // call_id -> enter sequence
     closed_calls: HashSet<u64>,
@@ -244,8 +395,10 @@ impl DrainWorker {
         let known = KnownConfig::new(cfg, cfg.required_len());
         Self {
             base,
+            cfg,
             reader: ValidatingReader::new(known, expected_generation),
             image: vec![0u8; cfg.required_len()],
+            total_bytes_copied: 0,
             prev_loss: LossCounters::default(),
             open_calls: HashMap::new(),
             closed_calls: HashSet::new(),
@@ -264,19 +417,38 @@ impl DrainWorker {
     pub fn is_stopped(&self) -> bool {
         self.reader.is_stopped()
     }
+    /// これまでに共有メモリから像へ写した累積バイト数 (レビュー #6
+    /// P0-1 の観測用)。旧実装は回収のたびに像全体 (本番構成で
+    /// 1.25MiB) を写していた。
+    pub fn total_bytes_copied(&self) -> u64 {
+        self.total_bytes_copied
+    }
     /// Host 再起動後の引き継ぎ: 共有側の読み位置を正として検証状態を同期
     /// する (`ValidatingReader::resume_from_image`)。同期に失敗したら Ring
     /// は止まった状態になり、`integrity_lost` が立つ。以後は
     /// `drain_*` は空のバッチを返す。
     pub fn resume_from_shared(&mut self) {
+        // 引き継ぎも確定済み範囲だけを写す (P0-1)。継続確認のため、
+        // 共有側の読み位置と、その直前の Descriptor も含める
+        // (`resume_from_image` が直前 Descriptor の格納終端を読む)。
+        let shared_read = layout::load(self.base, layout::OFF_READ_CURSOR, Ordering::Acquire);
+        let shared_pos = layout::load(
+            self.base,
+            layout::OFF_PAYLOAD_READ_POSITION,
+            Ordering::Acquire,
+        );
         // SAFETY: base はコンストラクタの契約で有効。image は同じ長さ。
-        unsafe {
-            std::ptr::copy_nonoverlapping(
+        let copied = unsafe {
+            snapshot_committed_range(
                 self.base as *const u8,
-                self.image.as_mut_ptr(),
-                self.image.len(),
-            );
-        }
+                &mut self.image,
+                self.cfg,
+                shared_read,
+                shared_pos,
+                true,
+            )
+        };
+        self.total_bytes_copied += copied;
         if let Err(e) = self.reader.resume_from_image(&self.image) {
             self.integrity_lost = true;
             self.loss_events.push(LossEvent::IntegrityLost {
@@ -333,15 +505,22 @@ impl DrainWorker {
         if self.reader.is_stopped() {
             return DrainBatch::default();
         }
-        // 1. copy: 共有領域を Host 側バッファへ写す。以後はこの像だけを見る。
+        // 1. copy: 確定済み範囲だけを Host 側バッファへ写す (P0-1)。
+        //    以後はこの像だけを見る。未公開の Descriptor / Payload は
+        //    像へ取り込まない (公開境界は Acquire で読んだ write_cursor /
+        //    payload_write_position で固定する)。
         // SAFETY: base はコンストラクタの契約で有効。image は同じ長さで確保した。
-        unsafe {
-            std::ptr::copy_nonoverlapping(
+        let copied = unsafe {
+            snapshot_committed_range(
                 self.base as *const u8,
-                self.image.as_mut_ptr(),
-                self.image.len(),
-            );
-        }
+                &mut self.image,
+                self.cfg,
+                self.reader.read_cursor(),
+                self.reader.payload_read_position(),
+                false,
+            )
+        };
+        self.total_bytes_copied += copied;
         // 2. validate + take: 検証済みの範囲だけを取り出す。矛盾したら
         // Ring を止め、完全性喪失として記録する (バッチは返さない)。
         let events = match self.reader.drain_image_up_to(&self.image, max) {
@@ -634,6 +813,9 @@ impl<'r> NotifyingDrainWorker<'r> {
 /// 検証付きで共有メモリ像を読む Host 経路。矛盾したら Ring 停止 + IntegrityLost を記録する。
 pub struct ValidatingHost {
     reader: ValidatingReader,
+    known: KnownConfig,
+    /// これまでに共有メモリから像へ写した累積バイト数 (P0-1 の観測用)。
+    total_bytes_copied: u64,
     identity: Option<RingIdentity>,
     /// 回収した格納済み Payload の一時キー（A72）。`set_identity` で識別情報を
     /// 設定した場合にだけ生成する。identity の generation は
@@ -646,6 +828,8 @@ impl ValidatingHost {
     pub fn new(known: KnownConfig, expected_generation: u64) -> Self {
         Self {
             reader: ValidatingReader::new(known, expected_generation),
+            known,
+            total_bytes_copied: 0,
             identity: None,
             payload_keys: Vec::new(),
             loss_events: Vec::new(),
@@ -695,8 +879,29 @@ impl ValidatingHost {
         base: *mut u8,
         len: usize,
     ) -> Result<Vec<ReceivedEvent>, IntegrityError> {
+        let cfg = RingConfig::new(
+            self.known.descriptor_capacity as usize,
+            self.known.payload_capacity as usize,
+        );
+        if len < cfg.required_len() {
+            return Err(IntegrityError::ImageTooSmall);
+        }
+        // 確定済み範囲だけを像へ写す (レビュー #6 P0-1)。旧実装は
+        // Mapping 全体をコピーしていた (DrainWorker と同型の問題で、
+        // こちらは e2e の実消費経路である)。
+        let mut image = vec![0u8; len];
         // SAFETY: 呼び出し側の契約 (base は len バイト有効) に従う。
-        let image = unsafe { std::slice::from_raw_parts(base as *const u8, len) }.to_vec();
+        let copied = unsafe {
+            snapshot_committed_range(
+                base as *const u8,
+                &mut image,
+                cfg,
+                self.reader.read_cursor(),
+                self.reader.payload_read_position(),
+                false,
+            )
+        };
+        self.total_bytes_copied += copied;
         let events = self.drain_image(&image)?;
         if !events.is_empty() {
             // 前進は検証済み範囲に限る (base の契約は呼び出し側が保証する)。
@@ -718,6 +923,10 @@ impl ValidatingHost {
     }
     pub fn is_stopped(&self) -> bool {
         self.reader.is_stopped()
+    }
+    /// これまでに共有メモリから像へ写した累積バイト数 (P0-1 の観測用)。
+    pub fn total_bytes_copied(&self) -> u64 {
+        self.total_bytes_copied
     }
 }
 
@@ -845,6 +1054,104 @@ mod tests {
             .iter()
             .any(|l| matches!(l, LossEvent::UnknownTermination { call_id: 1 })));
     }
+    #[test]
+    fn drain_copies_only_committed_range() {
+        // レビュー #6 P0-1: 回収は Control と確定済み範囲 (write_cursor /
+        // payload_write_position まで) だけを像へ写す。旧実装は File
+        // Mapping 全体を毎回コピーしていた。
+        let (region, mut w, mut host) = setup();
+        let cfg = RingConfig::new(16, 512);
+        w.write(ev(EventKind::CallEnter, 1, b"a"));
+        w.write(ev(EventKind::CallLeave, 1, b"bb"));
+        let batch = host.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        // Control 256 + Descriptor 2 件 × 64 + Payload 3B (1 + 2)
+        assert_eq!(host.total_bytes_copied(), 256 + 2 * 64 + 3);
+        assert!(host.total_bytes_copied() < cfg.required_len() as u64);
+        // 新規イベントが無ければ Control 分 (256B) だけを写す
+        let before = host.total_bytes_copied();
+        let batch = host.drain_all();
+        assert!(batch.events.is_empty());
+        assert_eq!(host.total_bytes_copied() - before, 256);
+        drop(region);
+    }
+
+    #[test]
+    fn drain_bandwidth_at_production_size_is_bounded() {
+        // 本番 Ring (4096 件 / 1MiB = 1,310,976B) でも、回収 1 回の
+        // コピーは確定分だけ。旧実装は 1 回ごとに 1.25MiB を写し、
+        // 32 Ring × 2ms 周期では約 20GiB/s になっていた。
+        let cfg = RingConfig::PRODUCTION;
+        let region = SharedRegion::new(cfg, 1, 1);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        let mut host = unsafe { DrainWorker::new(region.base(), cfg, 1) };
+        w.write(ev(EventKind::CallEnter, 1, b"hello"));
+        let batch = host.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(host.total_bytes_copied(), 256 + 64 + 5);
+        assert!(host.total_bytes_copied() * 100 < cfg.required_len() as u64);
+    }
+
+    #[test]
+    fn drain_never_surfaces_uncommitted_poison() {
+        // レビュー #6 P0-1: 未公開領域 (write_cursor の先の Descriptor
+        // スロット、payload_write_position の先の Payload) に毒データを
+        // 置いても、回収結果へ混入せず、完全性も失われない。本番の
+        // 回収処理そのもの (DrainWorker) を対象にする。
+        let (region, mut w, mut host) = setup();
+        let cfg = RingConfig::new(16, 512);
+        w.write(ev(EventKind::CallEnter, 1, b"real"));
+        // 未公開の Descriptor スロット (cursor 1 以降) と Payload の
+        // 未書き込み範囲 (位置 4 以降) を 0xEE で埋める。
+        // SAFETY: region はこのテストが保持する。書き手はもう書かない。
+        unsafe {
+            let desc_off = cfg.descriptors_offset() + 64; // cursor 1 のスロット
+            std::ptr::write_bytes(region.base().add(desc_off), 0xEE, 64 * 15);
+            let pay_off = cfg.payload_offset() + 4; // "real" の直後
+            std::ptr::write_bytes(region.base().add(pay_off), 0xEE, 512 - 4);
+        }
+        let batch = host.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].payload, b"real");
+        assert!(!host.integrity_lost);
+        assert!(!host.is_stopped());
+    }
+
+    #[test]
+    fn validating_host_drain_shared_copies_only_committed_range() {
+        // ValidatingHost::drain_shared (e2e の実消費経路) も同型に
+        // 確定範囲だけを写す (P0-1)。
+        let cfg = RingConfig::new(16, 512);
+        let region = SharedRegion::new(cfg, 3, 9);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        w.write(ev(EventKind::CallEnter, 1, b"xy"));
+        let known = KnownConfig::new(cfg, cfg.required_len());
+        let mut host = ValidatingHost::new(known, 3);
+        let events = unsafe { host.drain_shared(region.base(), cfg.required_len()) }.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload, b"xy");
+        // Control 256 + Descriptor 64 + Payload 2B
+        assert_eq!(host.total_bytes_copied(), 256 + 64 + 2);
+    }
+
     #[test]
     fn loss_counters_become_loss_events() {
         let (_rg, mut w, mut host) = setup();

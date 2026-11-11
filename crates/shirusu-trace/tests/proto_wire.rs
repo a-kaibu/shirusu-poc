@@ -19,6 +19,7 @@ fn sample_env() -> CaptureEnvironment {
         feature_flags: 0b101,
         target_description: "game.exe".into(),
         modules: Vec::new(),
+        static_dependencies: Vec::new(),
     }
 }
 

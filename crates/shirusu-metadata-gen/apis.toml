@@ -1,0 +1,364 @@
+# Win32 Metadata Generator (L03) の対象 API 一覧。
+#
+# 記載順に api_id を割り当てる（first_api_id から連番）。ID の安定性の
+# ため、新しい API は末尾への追加のみとし、既存の行の並べ替え・削除は
+# しないこと。生成 API を手書き表へ昇格させる場合は、ここから外して
+# 手書きの ApiDef + 専用 Detour へ置き換える（その場合も ID は再利用
+# しない。欠番は欠番のまま残す）。
+#
+# last_error の省略時は戻り値の種類から既定を決める:
+# BOOL -> false、HANDLE/ポインタ -> null、WIN32_ERROR/HRESULT/NTSTATUS/
+# その他の整数/void -> never。失敗条件が分かる API は明示する。
+# 値: false / null / invalid-handle / minus-one / never / always /
+# unspecified。
+
+first_api_id = 7
+max_params = 12
+winmd_version = "71.0.45-preview"
+
+# ---- レジストリ (advapi32.dll) ----
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegCloseKey"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegOpenKeyExW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegCreateKeyExW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegQueryValueExW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegSetValueExW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegDeleteValueW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegDeleteKeyW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegEnumKeyExW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegEnumValueW"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegQueryInfoKeyW"
+
+# ---- スレッド・プロセス (kernel32.dll) ----
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "Sleep"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "SleepEx"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "WaitForSingleObject"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "WaitForMultipleObjects"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateMutexW"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateMutexExW"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateEventW"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateEventExW"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "SetEvent"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "ResetEvent"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "ReleaseMutex"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateSemaphoreW"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "ReleaseSemaphore"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "InitializeCriticalSection"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "EnterCriticalSection"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "LeaveCriticalSection"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "DeleteCriticalSection"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "TryEnterCriticalSection"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "OpenProcess"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "TerminateProcess"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetExitCodeProcess"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetCurrentProcessId"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetCurrentThreadId"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetCurrentProcess"
+last_error = "never"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "OpenThread"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "ResumeThread"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "SuspendThread"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetProcessId"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetThreadId"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateProcessW"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateThread"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "CreateRemoteThread"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "ExitThread"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "SetThreadPriority"
+[[api]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "GetThreadPriority"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "ReadProcessMemory"
+[[api]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "WriteProcessMemory"
+
+# ---- ファイル (kernel32.dll) ----
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileSizeEx"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileSize"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "SetFilePointerEx"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "FlushFileBuffers"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "DeleteFileW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "MoveFileW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "CreateDirectoryW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "RemoveDirectoryW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileAttributesW"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "SetFileAttributesW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileType"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "SetEndOfFile"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "CopyFileW"
+[[api]]
+namespace = "Windows.Win32.System.Environment"
+module = "kernel32.dll"
+function = "GetCurrentDirectoryW"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.System.Environment"
+module = "kernel32.dll"
+function = "SetCurrentDirectoryW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetTempPathW"
+last_error = "false"
+
+# ---- メモリ (kernel32.dll) ----
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "VirtualAlloc"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "VirtualFree"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "GetProcessHeap"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "HeapAlloc"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "HeapFree"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "HeapSize"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "GlobalAlloc"
+[[api]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "VirtualQuery"
+last_error = "false"
+
+# ---- システム情報 (kernel32.dll) ----
+[[api]]
+namespace = "Windows.Win32.System.SystemInformation"
+module = "kernel32.dll"
+function = "GetSystemTime"
+[[api]]
+namespace = "Windows.Win32.System.SystemInformation"
+module = "kernel32.dll"
+function = "GetTickCount"
+[[api]]
+namespace = "Windows.Win32.System.SystemInformation"
+module = "kernel32.dll"
+function = "GetTickCount64"
+
+# ---- 意図的な除外 ----
+# GetLastError / SetLastError: Detour 自身が LastError を読む・戻すため、
+# フックすると自己参照になる。
+[[skip]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "GetLastError"
+reason = "Detour 自身が GetLastError を読むため自己参照になる"
+[[skip]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "SetLastError"
+reason = "Detour 自身が LastError を戻すために SetLastError を使うため自己参照になる"
+# GlobalFree / LocalFree: 成功時に NULL を返す（失敗時はハンドル）。
+# NULL = 成功の反転した意味のため、WhenReturnIsNull の既定では扱えない。
+[[skip]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "GlobalFree"
+reason = "成功時に NULL を返す反転した意味のため、L1 の意味条件では扱えない"
+[[skip]]
+namespace = "Windows.Win32.System.Memory"
+module = "kernel32.dll"
+function = "LocalFree"
+reason = "成功時に NULL を返す反転した意味のため、L1 の意味条件では扱えない"

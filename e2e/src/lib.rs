@@ -947,6 +947,267 @@ pub fn compare_abi_probe_outputs(baseline: &str, hooked: &str) -> Vec<String> {
     diffs
 }
 
+/// L17: 検証用アプリ 3 種の名前一覧。対象（shirusu-verify-*.exe）と
+/// 比較器で共有する正準リスト。アプリを増やすときはここにも追加する。
+pub const VERIFY_APP_NAMES: &[&str] = &["console", "gui", "com", "winrt"];
+
+/// L17: アプリごとの期待ステップ一覧（`VERIFY <app> <step> ok` の step）。
+/// 比較器と各アプリ本体で共有する正準リスト。
+pub fn verify_expected_steps(app: &str) -> &'static [&'static str] {
+    match app {
+        "console" => &["file", "registry", "thread"],
+        "gui" => &["file", "window", "gdi", "dib"],
+        "com" => &["file", "com-init", "shelllink", "persist"],
+        "winrt" => &[
+            "file",
+            "winrt-init",
+            "activate-json",
+            "activate-factory",
+            "create-uri",
+            "absolute-uri",
+        ],
+        _ => &[],
+    }
+}
+
+/// L17: 検証用アプリの出力（Hook なし＝baseline と Hook あり）の比較。
+/// `VERIFY <app> <step> <value...>` 行だけを対象にし、アプリ・ステップ・
+/// 順序・値がすべて一致すれば空を返す。不一致は人間可読の差分行を返す。
+/// `VERIFY_DONE <app> ok` 行の有無も比べる：対象が最後まで走り切って
+/// いない（異常終了・クラッシュ）場合に DONE 行が欠けるため、
+/// LaunchedCapture が対象の終了コードを返さない代わりの成功シグナル
+/// として使う。VERIFY 行以外の stdout（TARGET_* 行など）は無視する。
+/// 値は実行ごとに変わらない定数であることが前提（pid を含む一時パスは
+/// 出さない）。さもないと Hook ありとなしの比較が pid 差で壊れる。
+pub fn compare_verify_outputs(baseline: &str, hooked: &str) -> Vec<String> {
+    fn verify_lines(out: &str) -> Vec<(&str, &str, &str)> {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("VERIFY "))
+            .filter_map(|rest| {
+                let (app, rest) = rest.split_once(' ')?;
+                let (step, value) = rest.split_once(' ')?;
+                Some((app, step, value))
+            })
+            .collect()
+    }
+    let base = verify_lines(baseline);
+    let hook = verify_lines(hooked);
+    let mut diffs = Vec::new();
+    let base_done = baseline.lines().any(|l| l.starts_with("VERIFY_DONE "));
+    let hook_done = hooked.lines().any(|l| l.starts_with("VERIFY_DONE "));
+    if base_done != hook_done {
+        diffs.push(format!(
+            "VERIFY_DONE differs: baseline={base_done} hooked={hook_done} (target did not run to completion in one of the runs)"
+        ));
+    }
+    // アプリ・ステップ・順序・値を位置ごとに比べる。長さが違えば余りも報告する。
+    for (i, ((ba, bs, bv), (ha, hs, hv))) in base.iter().zip(hook.iter()).enumerate() {
+        if ba != ha || bs != hs {
+            diffs.push(format!(
+                "verify step #{i} differs: baseline={ba} {bs} hooked={ha} {hs}"
+            ));
+        } else if bv != hv {
+            diffs.push(format!(
+                "verify {ba} {bs} value differs: baseline={bv} hooked={hv}"
+            ));
+        }
+    }
+    if base.len() != hook.len() {
+        let common = base.len().min(hook.len());
+        let (longer, which) = if base.len() > hook.len() {
+            (&base[common..], "baseline")
+        } else {
+            (&hook[common..], "hooked")
+        };
+        for (a, s, _) in longer {
+            diffs.push(format!("verify {a} {s} present only in {which}"));
+        }
+    }
+    diffs
+}
+
+/// L17: 検証用アプリの VERIFY 行の収集と出力。`VERIFY <app> <step> <value>`
+/// 行を集め、最後に `VERIFY_DONE <app> ok`（全ステップ成功時）か
+/// `TARGET_FAIL ...`（失敗あり）を出す。`--verify-out` 指定時は同じ内容を
+/// ファイルにも書く（capture-e2e が Hook あり実行の出力を回収するため）。
+/// ステップの値は実行ごとに変わらない定数にすること（pid を含む一時パスは
+/// 出さない）。比較器が値をビット単位で比べるため。
+pub struct VerifyOut {
+    app: &'static str,
+    lines: Vec<String>,
+    failures: Vec<&'static str>,
+}
+
+impl VerifyOut {
+    pub fn new(app: &'static str) -> Self {
+        Self {
+            app,
+            lines: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+
+    /// 1 ステップの結果を記録する。成功なら `VERIFY <app> <step> <value>`、
+    /// 失敗なら `VERIFY <app> <step> FAIL <detail>` を出す。
+    pub fn step(&mut self, step: &'static str, result: Result<String, String>) {
+        match result {
+            Ok(v) => self.lines.push(format!("VERIFY {} {step} {v}", self.app)),
+            Err(e) => {
+                self.lines
+                    .push(format!("VERIFY {} {step} FAIL {e}", self.app));
+                self.failures.push(step);
+            }
+        }
+    }
+
+    /// 収集した行（テスト用）。
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// 失敗したステップ名（テスト用）。
+    pub fn failures(&self) -> &[&'static str] {
+        &self.failures
+    }
+
+    /// 行を stdout へ出し、DONE/FAIL 行を足して、指定時はファイルにも書く。
+    /// 全ステップ成功なら 0、1 件でも失敗があれば 11 を返す。
+    pub fn finish(self, out: Option<&str>) -> i32 {
+        for line in &self.lines {
+            println!("{line}");
+        }
+        let mut text = self.lines.join("\n");
+        text.push('\n');
+        if self.failures.is_empty() {
+            println!("VERIFY_DONE {} ok", self.app);
+            text.push_str(&format!("VERIFY_DONE {} ok\n", self.app));
+            if let Some(path) = out {
+                if let Err(e) = std::fs::write(path, text) {
+                    println!("TARGET_FAIL verify-out write error={e}");
+                    return 10;
+                }
+            }
+            0
+        } else {
+            println!("TARGET_FAIL verify failed: {}", self.failures.join(","));
+            if let Some(path) = out {
+                let _ = std::fs::write(path, text);
+            }
+            11
+        }
+    }
+}
+
+/// L17: 検証用アプリ 3 種の共通 Windows ヘルパー。ファイルの往復確認を
+/// 生 FFI（CreateFileW / WriteFile / ReadFile / CloseHandle）で行う。
+/// 3 アプリ共通の「file」ステップで、フック対象 API を通る既知の呼び出し
+/// 列（4 API × enter/leave ＝ 8 イベント）を Trace に残す。
+/// 自前の IAT に 4 API のインポートが載るよう、あえて std::fs を使わずに書く。
+#[cfg(windows)]
+pub mod verify_win {
+    use std::ffi::c_void;
+    use std::path::Path;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sa: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn WriteFile(
+            h: *mut c_void,
+            buf: *const u8,
+            n: u32,
+            written: *mut u32,
+            ovl: *mut c_void,
+        ) -> i32;
+        fn ReadFile(h: *mut c_void, buf: *mut u8, n: u32, read: *mut u32, ovl: *mut c_void) -> i32;
+        fn SetFilePointer(h: *mut c_void, dist: i32, high: *mut i32, method: u32) -> u32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// UTF-16（NUL 終端）へ変換する。
+    pub fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain([0]).collect()
+    }
+
+    pub fn is_invalid_handle(h: *mut c_void) -> bool {
+        h.is_null() || h as usize == usize::MAX
+    }
+
+    /// 一時ファイルへ書いて読み戻し、内容が一致すれば Ok("content ok")。
+    /// 値は定数（パスを含まない）。Hook ありとなしの比較が壊れないように。
+    pub fn write_and_read_back(path: &Path, data: &[u8]) -> Result<String, String> {
+        let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
+        // SAFETY: ポインタはいずれも生存期間内のローカルを指す。
+        unsafe {
+            let h = CreateFileW(
+                wide.as_ptr(),
+                0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                0,
+                std::ptr::null_mut(),
+                2,    // CREATE_ALWAYS
+                0x80, // FILE_ATTRIBUTE_NORMAL
+                std::ptr::null_mut(),
+            );
+            if is_invalid_handle(h) {
+                return Err(format!("create error={}", GetLastError()));
+            }
+            let mut written = 0u32;
+            if WriteFile(
+                h,
+                data.as_ptr(),
+                data.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            ) == 0
+                || written as usize != data.len()
+            {
+                let e = GetLastError();
+                CloseHandle(h);
+                return Err(format!("write error={e}"));
+            }
+            if SetFilePointer(h, 0, std::ptr::null_mut(), 0) == u32::MAX {
+                let e = GetLastError();
+                CloseHandle(h);
+                return Err(format!("seek error={e}"));
+            }
+            let mut buf = vec![0u8; data.len()];
+            let mut read = 0u32;
+            if ReadFile(
+                h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                let e = GetLastError();
+                CloseHandle(h);
+                return Err(format!("read error={e}"));
+            }
+            if CloseHandle(h) == 0 {
+                return Err(format!("close error={}", GetLastError()));
+            }
+            if buf != data {
+                return Err(format!("content mismatch read={read}"));
+            }
+        }
+        Ok("content ok".to_string())
+    }
+
+    /// アプリごとの一時ファイル名（アプリ名と pid で一意にする）。
+    pub fn temp_path(app: &str, pid: u32) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shirusu-verify-{app}-{pid}.tmp"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,5 +1386,132 @@ mod tests {
                 "lasterror-failure",
             ]
         );
+    }
+
+    // L17: 検証用アプリ 3 種の出力比較。`VERIFY <app> <step> <value>` 行
+    // だけを対象にし、アプリ・ステップ・順序・値が両方で一致すれば空を返す。
+    fn verify_output(app: &str, pairs: &[(&str, &str)]) -> String {
+        pairs
+            .iter()
+            .map(|(s, v)| format!("VERIFY {app} {s} {v}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn verify_compare_identical_passes() {
+        let out = verify_output(
+            "console",
+            &[
+                ("file", "content ok"),
+                ("registry", "value ok"),
+                ("thread", "exit=42"),
+            ],
+        ) + "VERIFY_DONE console ok\n";
+        assert!(compare_verify_outputs(&out, &out).is_empty());
+    }
+
+    #[test]
+    fn verify_compare_ignores_non_verify_lines() {
+        let base = format!(
+            "TARGET_PATH C:\\temp\\x.tmp\n{}VERIFY_DONE gui ok\n",
+            verify_output("gui", &[("file", "content ok")])
+        );
+        let hooked = format!(
+            "{}VERIFY_DONE gui ok\nTARGET_DONE ok",
+            verify_output("gui", &[("file", "content ok")])
+        );
+        assert!(compare_verify_outputs(&base, &hooked).is_empty());
+    }
+
+    #[test]
+    fn verify_compare_changed_value_fails() {
+        let base = verify_output(
+            "console",
+            &[("file", "content ok"), ("registry", "value ok")],
+        );
+        let hooked = verify_output(
+            "console",
+            &[("file", "content ok"), ("registry", "value BAD")],
+        );
+        let diffs = compare_verify_outputs(&base, &hooked);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert!(diffs[0].contains("registry"), "{}", diffs[0]);
+    }
+
+    #[test]
+    fn verify_compare_missing_step_fails() {
+        let base = verify_output("console", &[("file", "content ok"), ("thread", "exit=42")]);
+        let hooked = verify_output("console", &[("file", "content ok")]);
+        let diffs = compare_verify_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("thread")), "{diffs:?}");
+    }
+
+    #[test]
+    fn verify_compare_extra_step_fails() {
+        let base = verify_output("com", &[("file", "content ok")]);
+        let hooked = verify_output("com", &[("file", "content ok"), ("persist", "qi ok")]);
+        let diffs = compare_verify_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("persist")), "{diffs:?}");
+    }
+
+    #[test]
+    fn verify_compare_reordered_fails() {
+        let base = verify_output("gui", &[("file", "content ok"), ("gdi", "blit ok")]);
+        let hooked = verify_output("gui", &[("gdi", "blit ok"), ("file", "content ok")]);
+        assert!(!compare_verify_outputs(&base, &hooked).is_empty());
+    }
+
+    #[test]
+    fn verify_compare_wrong_app_fails() {
+        let base = verify_output("console", &[("file", "content ok")]);
+        let hooked = verify_output("gui", &[("file", "content ok")]);
+        let diffs = compare_verify_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("console")), "{diffs:?}");
+    }
+
+    #[test]
+    fn verify_compare_missing_done_line_fails() {
+        // DONE 行が無い＝対象が最後まで走り切っていない（異常終了）。
+        let base = verify_output("com", &[("file", "content ok")]) + "VERIFY_DONE com ok\n";
+        let hooked = verify_output("com", &[("file", "content ok")]);
+        let diffs = compare_verify_outputs(&base, &hooked);
+        assert!(diffs.iter().any(|d| d.contains("DONE")), "{diffs:?}");
+    }
+
+    #[test]
+    fn verify_app_names_cover_all_apps() {
+        assert_eq!(VERIFY_APP_NAMES, ["console", "gui", "com", "winrt"]);
+    }
+
+    #[test]
+    fn verify_expected_steps_cover_all_apps() {
+        assert_eq!(
+            verify_expected_steps("console"),
+            ["file", "registry", "thread"]
+        );
+        assert_eq!(
+            verify_expected_steps("gui"),
+            ["file", "window", "gdi", "dib"]
+        );
+        assert_eq!(
+            verify_expected_steps("com"),
+            ["file", "com-init", "shelllink", "persist"]
+        );
+        assert!(verify_expected_steps("unknown").is_empty());
+    }
+
+    #[test]
+    fn verify_out_records_steps_and_failures() {
+        let mut v = VerifyOut::new("console");
+        v.step("file", Ok("content ok".to_string()));
+        v.step("registry", Err("reg error=5".to_string()));
+        assert_eq!(
+            v.lines(),
+            [
+                "VERIFY console file content ok",
+                "VERIFY console registry FAIL reg error=5",
+            ]
+        );
+        assert_eq!(v.failures(), ["registry"]);
     }
 }
