@@ -5,7 +5,7 @@
 //! - `shirusu dump <trace> [フィルタ]`: イベントを 1 行ずつ表示する。
 //!   `--json` で JSON 配列。フィルタは CLI オプションの組であり、
 //!   独自のクエリ言語は作らない（overview の方針）。
-//! - `shirusu export <trace> --format jsonl`: JSON Lines で書き出す。
+//! - `shirusu export <trace> --format jsonl|parquet`: JSON Lines / Parquet へ書き出す。
 //! - `shirusu repair <trace> [--output <path>] [--json]`: 回復読みで
 //!   読めたイベントだけを新しい Trace に書き出す（L12）。失われた
 //!   イベントを推測で作らない（overview「完全性と復旧」）。
@@ -23,6 +23,8 @@
 //! repair の失敗（入力が読めない・出力が書けない・入出力が同一）も 1。
 //! Windows 以外での capture / attach も 1（引数の検証まで済ませてから
 //! プラットフォーム制限を明言する）。
+
+mod parquet_export;
 
 use shirusu_analysis::{
     api_name_of_schema, integrity_level_name, loss_kind_name, EventFilter, JsonValue, TraceView,
@@ -76,7 +78,8 @@ fn usage() -> &'static str {
      \x20 capabilities [--json]           supported APIs and capture limits\n\
      \x20 inspect <trace> [--json]          metadata, integrity, per-API counts\n\
      \x20 dump <trace> [filters] [--json]   one line per event\n\
-     \x20 export <trace> --format jsonl [--output <path>]\n\
+     \x20 export <trace> --format jsonl|parquet [--output <path>]\n\
+     \x20 \x20 Parquet requires --output; see docs/parquet-export.md\n\
      \x20 repair <trace> [--output <path>] [--json]\n\
      \x20 \x20 recover readable events into a new trace (default: <trace>.repaired)\n\
      \x20 capture [options] -- <exe> [args...]\n\
@@ -825,13 +828,47 @@ fn cmd_export(args: &[String]) -> Result<(), ToolError> {
     let format = parsed
         .opt("format")
         .ok_or_else(|| ToolError::Usage("export needs --format".into()))?;
-    if format != "jsonl" {
+    if !matches!(format, "jsonl" | "parquet") {
         return Err(ToolError::Usage(format!(
-            "unsupported format: {format} (only jsonl is implemented)"
+            "unsupported format: {format} (expected jsonl or parquet)"
         )));
     }
-    let (_path, trace) = load_trace(&parsed)?;
+    if format == "parquet" && parsed.opt("output").is_none() {
+        return Err(ToolError::Usage(
+            "Parquet export requires --output <path>".into(),
+        ));
+    }
+    let (path, trace) = load_trace(&parsed)?;
     let view = TraceView::build(&trace);
+    if format == "parquet" {
+        let output = parsed.opt("output").expect("validated output path");
+        if std::fs::canonicalize(output)
+            .ok()
+            .zip(std::fs::canonicalize(&path).ok())
+            .is_some_and(|(a, b)| a == b)
+        {
+            return Err(ToolError::Runtime(
+                "refusing to overwrite the input trace".into(),
+            ));
+        }
+        let parent = Path::new(output)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+            ToolError::Runtime(format!("cannot create temporary output for {output}: {e}"))
+        })?;
+        parquet_export::write(
+            file.as_file_mut(),
+            &view,
+            inspect_json(&path, &view).render(),
+        )
+        .map_err(|e| ToolError::Runtime(format!("Parquet export failed: {e}")))?;
+        file.persist(output).map_err(|e| {
+            ToolError::Runtime(format!("cannot publish Parquet output {output}: {e}"))
+        })?;
+        return Ok(());
+    }
     let mut sink: Box<dyn std::io::Write> = match parsed.opt("output") {
         Some(path) => Box::new(
             std::fs::File::create(path)

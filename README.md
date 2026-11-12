@@ -1,7 +1,11 @@
 # shirusu-poc
 
+Trace は `shirusu export capture.trace --format parquet --output events.parquet` で
+Parquet に出力できる。DuckDB からの検索とデータの扱いは
+[Parquet 出力仕様](docs/parquet-export.md) を参照。
+
 現在の対応範囲は `shirusu capabilities`（機械可読出力は `--json`）で確認できる。
-Win32／内部 API は 149 件（生成 L1: 136、手書き: 6、内部: 7）。
+Win32／内部 API は 197 件（生成 L1: 184、手書き: 6、内部: 7）。
 32/64bit 整数・短整数・浮動小数点の元の ABI を保って中継する。
 COM は Factory の観測と 7,797 IID の名前解決に対応するが、共有オブジェクトの
 メソッドを安全に追跡する通常経路は未完成。全 Windows API・COM 対応が完成した

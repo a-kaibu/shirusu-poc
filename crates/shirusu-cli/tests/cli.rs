@@ -1182,3 +1182,210 @@ fn capabilities_reports_api_support_separately_from_com_identification() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
 }
+
+#[test]
+fn parquet_export_matches_jsonl_and_preserves_integrity_metadata() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+    let dir = fresh_dir();
+    let input = trace_bytes_with(FinalizationInfo::default(), true);
+    std::fs::write(dir.join("sample.trace"), input).unwrap();
+    let (jsonl, _, code) = run_in(&dir, &["export", "sample.trace", "--format", "jsonl"]);
+    assert_eq!(code, Some(0));
+    let (_, err, code) = run_in(
+        &dir,
+        &[
+            "export",
+            "sample.trace",
+            "--format",
+            "parquet",
+            "--output",
+            "events.parquet",
+        ],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let file = SerializedFileReader::new(std::fs::File::open(dir.join("events.parquet")).unwrap())
+        .unwrap();
+    let rows: Vec<_> = file
+        .get_row_iter(None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let lines: Vec<_> = jsonl.lines().collect();
+    assert_eq!(rows.len(), lines.len());
+    for (index, (row, line)) in rows.iter().zip(lines).enumerate() {
+        assert_eq!(row.get_ulong(0).unwrap(), index as u64);
+        assert_eq!(row.get_ulong(1).unwrap(), 42);
+        assert_eq!(row.get_ulong(8).unwrap(), 10_000_000);
+        assert_eq!(row.get_string(19).unwrap(), line);
+    }
+    let metadata = file
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap();
+    let summary = metadata
+        .iter()
+        .find(|v| v.key == "shirusu.trace_summary")
+        .unwrap()
+        .value
+        .as_ref()
+        .unwrap();
+    assert!(summary.contains("\"status\":\"incomplete\""), "{summary}");
+    assert!(metadata
+        .iter()
+        .any(|v| v.key == "shirusu.parquet_export_version" && v.value.as_deref() == Some("1")));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn parquet_boundary_trace(count: usize) -> Vec<u8> {
+    let env = CaptureEnvironment {
+        session: SessionMetadata {
+            session_id: u64::MAX,
+            qpc_frequency: u64::MAX,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut writer = TraceWriter::new(Vec::new(), env).unwrap();
+    let events: Vec<_> = (0..count)
+        .map(|i| TraceEvent {
+            kind: 1,
+            sequence: i as u64 + 1,
+            timestamp_qpc: i as u64 + 1,
+            call_id: u64::MAX,
+            parent_call_id: u64::MAX,
+            api_id: 9999,
+            schema_id: 0,
+            capture: EventCapture::Captured,
+            payload: PayloadRef::None,
+            args: None,
+            global_order: match i {
+                0 => None,
+                i if i == count - 1 => Some(u64::MAX),
+                _ => Some(i as u64),
+            },
+        })
+        .collect();
+    // Global order may be absent for one batch and present in another, but a
+    // single batch must not mix those encodings.
+    for batch_events in [events.get(..1), events.get(1..)].into_iter().flatten() {
+        if batch_events.is_empty() {
+            continue;
+        }
+        writer
+            .write_batch(&EventBatch {
+                session_id: u64::MAX,
+                process_id: u64::MAX,
+                raw_pid: u32::MAX,
+                thread_id: u64::MAX,
+                qpc_frequency: u64::MAX,
+                events: batch_events.to_vec(),
+            })
+            .unwrap();
+    }
+    writer.finish(FinalizationInfo::default()).unwrap()
+}
+
+#[test]
+fn parquet_export_keeps_unsigned_ids_nulls_and_row_group_boundaries() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::{Field, RowAccessor};
+    let dir = fresh_dir();
+    std::fs::write(dir.join("sample.trace"), parquet_boundary_trace(4100)).unwrap();
+    let (_, err, code) = run_in(
+        &dir,
+        &[
+            "export",
+            "sample.trace",
+            "--format",
+            "parquet",
+            "--output",
+            "events.parquet",
+        ],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let file = SerializedFileReader::new(std::fs::File::open(dir.join("events.parquet")).unwrap())
+        .unwrap();
+    assert_eq!(file.num_row_groups(), 2);
+    assert_eq!(file.metadata().file_metadata().num_rows(), 4100);
+    let rows: Vec<_> = file
+        .get_row_iter(None)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.get_ulong(1).unwrap(), u64::MAX);
+        assert_eq!(row.get_ulong(2).unwrap(), u64::MAX);
+        assert_eq!(row.get_ulong(8).unwrap(), u64::MAX);
+        assert_eq!(row.get_ulong(12).unwrap(), u64::MAX);
+        assert_eq!(row.get_ulong(5).unwrap(), i as u64 + 1);
+        assert!(matches!(
+            row.get_column_iter().nth(14).unwrap().1,
+            Field::Null
+        ));
+    }
+    assert!(matches!(
+        rows[0].get_column_iter().nth(6).unwrap().1,
+        Field::Null
+    ));
+    assert_eq!(rows[1].get_ulong(6).unwrap(), 1);
+    assert_eq!(rows[4099].get_ulong(6).unwrap(), u64::MAX);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn parquet_export_empty_trace_still_has_schema_and_finalization_metadata() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let dir = fresh_dir();
+    std::fs::write(dir.join("sample.trace"), parquet_boundary_trace(0)).unwrap();
+    let (_, err, code) = run_in(
+        &dir,
+        &[
+            "export",
+            "sample.trace",
+            "--format",
+            "parquet",
+            "--output",
+            "events.parquet",
+        ],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let file = SerializedFileReader::new(std::fs::File::open(dir.join("events.parquet")).unwrap())
+        .unwrap();
+    assert_eq!(file.metadata().file_metadata().num_rows(), 0);
+    assert_eq!(
+        file.metadata().file_metadata().schema_descr().num_columns(),
+        20
+    );
+    assert!(file
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .iter()
+        .any(|v| v.key == "shirusu.trace_summary"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn parquet_export_refuses_to_replace_its_input() {
+    let dir = fresh_dir();
+    let bytes = sample_trace_bytes();
+    std::fs::write(dir.join("sample.trace"), &bytes).unwrap();
+    let (_, err, code) = run_in(
+        &dir,
+        &[
+            "export",
+            "sample.trace",
+            "--format",
+            "parquet",
+            "--output",
+            "./sample.trace",
+        ],
+    );
+    assert_eq!(code, Some(1));
+    assert!(err.contains("overwrite the input"), "{err}");
+    assert_eq!(std::fs::read(dir.join("sample.trace")).unwrap(), bytes);
+    std::fs::remove_dir_all(dir).unwrap();
+}
