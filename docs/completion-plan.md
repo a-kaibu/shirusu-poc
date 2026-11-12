@@ -5,7 +5,7 @@
 
 | 要件 | 現状と残件 | 合格に必要な証拠 |
 | --- | --- | --- |
-| Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
+| Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
 | 全 Win32 の L0/L1 | 現在149件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
@@ -16,7 +16,7 @@
 | 公開 Trace、解析、修復 | Writer/Reader/CLI、復旧と不正入力検査を実装 | 形式適合性・破損復旧・Linux/macOS の解析 CI |
 | 比較と再実行可能な Probe | オブジェクト相関と同期ファイル I/O 再生を実装。一般 API、非同期、コールバックは未対応 | Windows Capture → 差分 → Probe 実行の E2E、不足条件を拒否するテスト |
 | 性能と完全性 | ベンチマーク・損失通知を実装 | GUI 3倍／高負荷5倍を同一条件で測定し、未達時は数値と原因を記録 |
-| Windows x86/x64 の検証 | ローカル compile と CI を分離。Windows x86 と基本 Capture + Verifier は 7d4ca21 で通過 | Windows 実行・Application Verifier・ABI・SEH・replay の通過 |
+| Windows x86/x64 の検証 | ローカル compile と CI を分離。`e7e2fc2` で x86 Capture / ABI と x64 2 環境の全 CI シナリオ通過 | Windows 実行・Application Verifier・ABI・SEH・replay の通過 |
 
 優先順は観測境界と透明性、Windows 実走の失敗解消、Metadata 全体の
 対応拡大、安全な COM Adapter、再生可能範囲の拡大。並行する CI を待つだけで
@@ -24,6 +24,14 @@
 項目として別に残し、x86/x64 の未完成をそれらで覆い隠さない。
 
 ## Windows 実行の追跡
+
+最新の検証は `e7e2fc2` の [run `43281728421`](https://github.com/a-kaibu/shirusu-poc/actions/runs/43281728421)。
+Windows latest / Server 2022 の x64 で基本 Capture + Application Verifier、
+child-tree、ABI、GUI / COM / WinRT、詳細 Nt、Inline、CRT、native SEH、
+Capture → 差分 → Probe 再実行が通過した。x86 の実注入 Capture / ABI、
+native SEH の所有権回収、debug / release の TLS 回帰テストも通過。
+これは上表の全 Win32 対応、共有 COM メソッド追跡、実アプリ性能目標の完成を
+意味しない。以下は原因と修正を追えるよう残した過去の検証記録。
 
 `d8b6e11` の CI run `43260941181` は Windows x86 が通過。
 Windows Server 2022 は Verifier 有効時に対象が `0xC0000005` で終了。
