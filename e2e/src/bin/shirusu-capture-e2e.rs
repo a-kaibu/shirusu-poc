@@ -38,6 +38,20 @@ mod win {
         failures: Vec<String>,
     }
     impl Checker {
+        fn check_target_exit(
+            &mut self,
+            summary: &shirusu_host::recorder::SessionSummary,
+            label: &str,
+        ) {
+            self.check(
+                summary.target_exit_code == Some(0),
+                &format!(
+                    "{label} target exits 0 (got {:?})",
+                    summary.target_exit_code
+                ),
+            );
+        }
+
         fn check(&mut self, cond: bool, what: &str) {
             if cond {
                 println!("  ok: {what}");
@@ -353,6 +367,7 @@ mod win {
             }
         };
         let mut c = Checker { failures: vec![] };
+        c.check_target_exit(&summary.root, "root");
         c.check(
             summary.root.total_events >= 8,
             "root has at least the 8 file-io events",
@@ -367,6 +382,7 @@ mod win {
         let root_trace = shirusu_trace::read_trace(&root_bytes).expect("root trace parses");
         c.check(root_trace.finalization.is_some(), "root trace finalized");
         if let Some((pid, child)) = summary.children.first() {
+            c.check_target_exit(child, "child");
             c.check(
                 child.total_events >= 8,
                 "child has at least the 8 file-io events",
@@ -476,6 +492,7 @@ mod win {
             summary.total_events, summary.total_loss_records, summary.integrity.event_integrity
         );
 
+        c.check_target_exit(&summary, "ABI");
         // 3. Probe 出力の比較（Hook ありとなしで結果が同じこと）。
         let base_text = std::fs::read_to_string(&base_out).unwrap_or_default();
         let hooked_text = std::fs::read_to_string(&hooked_out).unwrap_or_default();
@@ -593,9 +610,7 @@ mod win {
                 }
             };
 
-            // 2. Hook あり：Agent DLL 付きで起動する。対象の終了コードは
-            // LaunchedCapture から取れないため、Hook あり実行の成否は
-            // --verify-out の VERIFY_DONE 行で見る（比較器が判定する）。
+            // 2. Hook あり：終了コードと VERIFY 出力の両方を比較する。
             let cfg = LaunchConfig::new(session_config(), dll.clone());
             let cmdline = format!(
                 "\"{}\" --verify-out \"{}\"",
@@ -624,6 +639,7 @@ mod win {
                 summary.total_events, summary.total_loss_records, summary.integrity.event_integrity
             );
 
+            c.check_target_exit(&summary, app);
             // 3. VERIFY 出力の比較（Hook ありとなしで結果が同じこと）。
             let base_text = std::fs::read_to_string(&base_out).unwrap_or_default();
             let hooked_text = std::fs::read_to_string(&hooked_out).unwrap_or_default();
@@ -949,6 +965,7 @@ mod win {
                     Ok(capture) => {
                         match capture.run_to_completion(Duration::from_millis(2)) {
                             Ok(dsummary) => {
+                                c.check_target_exit(&dsummary, "detailed");
                                 c.check(
                                     dsummary.internal_hook_count.unwrap_or(0) >= 1,
                                     &format!(
@@ -1240,6 +1257,7 @@ mod win {
                     continue;
                 }
             };
+            c.check_target_exit(&summary, tag);
             println!(
                 "{tag} summary: events={} losses={} integrity={:?}",
                 summary.total_events, summary.total_loss_records, summary.integrity.event_integrity
@@ -1442,6 +1460,7 @@ mod win {
             .expect("RegCloseKey in table");
 
         let mut c = Checker { failures: vec![] };
+        c.check_target_exit(&summary, "inline");
         c.check(trace.finalization.is_some(), "trace finalized");
         c.check(
             summary.integrity.event_integrity != IntegrityLevel::Lost,
