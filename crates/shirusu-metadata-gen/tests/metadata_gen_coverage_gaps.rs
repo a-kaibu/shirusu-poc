@@ -433,6 +433,31 @@ fn map_type_rejects_generic_named_type() {
 }
 
 #[test]
+fn single_field_aggregate_is_not_a_scalar_typedef() {
+    require_winmd!();
+    let index = read_index();
+    let named = |namespace: &str, name: &str| {
+        Type::Name(TypeName {
+            namespace: namespace.into(),
+            name: name.into(),
+            generics: vec![],
+        })
+    };
+    // FXECHO_INITDATA contains just a float. Flattening it would select the
+    // wrong register class on Windows x64.
+    let error = map_type(
+        &index,
+        &named("Windows.Win32.Media.Audio.XAudio2", "FXECHO_INITDATA"),
+    )
+    .unwrap_err();
+    assert!(error.contains("NativeTypedef"), "{error}");
+    // A native HANDLE typedef remains a pointer, not a C aggregate.
+    let handle = map_type(&index, &named("Windows.Win32.Foundation", "HANDLE")).unwrap();
+    assert_eq!(handle.abi, "*mut core::ffi::c_void");
+    assert_eq!(handle.kind, ValueKind::Handle);
+}
+
+#[test]
 fn emit_api_inc_escapes_quotes_and_backslashes() {
     // lib.rs 535-536: rust_str の `"` と `\` のエスケープ。
     let api = MappedApi {

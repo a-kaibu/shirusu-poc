@@ -48,10 +48,14 @@ cargo run -p shirusu-metadata-gen -- --inventory target/api-inventory.tsv
 手書き API も生成表の対象外なので `generatable` に含まれる場合がある。
 これはネイティブで記録できた API 数ではない。
 
-現在の 18,364 メソッドは selected 136、generatable 17,814、unsupported 414。
+現在の 18,364 メソッドは selected 136、generatable 17,492、unsupported 736。
 C 呼び出し規約の Wrapper は元関数にも `C-unwind` を使い、x86 でのスタックの
 後始末を保持する。LDAP 3 API と LastError 2 API の追加は ABI 回帰テスト付き。
 可変長引数と複合構造体などの残件を、この一覧で追跡する。
 
 GlobalFree / LocalFree も生成対象へ追加。NULL が成功となる解放 API の
 LastError 条件を Schema に追加し、成功時の残留値をエラーとして扱わない。
+
+単一フィールドの構造体を無条件にスカラーへ変換しない。NativeTypedef 属性で
+別名型だと確認できるものだけを変換し、実構造体／未確認の別名型は未対応理由を残す。
+この保守的な判定で、生成可能と分類していた 322 メソッドを未対応へ修正した。

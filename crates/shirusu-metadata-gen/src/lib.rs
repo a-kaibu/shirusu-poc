@@ -20,7 +20,7 @@
 //! 型対応の要点:
 //! - WinMD のプリミティブは `Ty` へ写す（8/16bit 整数は 32bit へ拡大）。
 //! - 名前付き型は解決する：enum は基底整数型、デリゲート（コールバック）
-//!   はポインタ値、単一フィールド構造体はそのフィールドの型
+//!   はポインタ値、NativeTypedef 属性付きの単一フィールド型はそのフィールドの型
 //!   （`HANDLE` / `HKEY` 等の `*mut c_void` 1 個だけの構造体はハンドル、
 //!   `PWSTR` 等の `*mut u16` はポインタ、`BOOL` は I32）。
 //! - COM インターフェイス型はネイティブのポインタとして記録する。
@@ -28,7 +28,7 @@
 
 use serde::Deserialize;
 use shirusu_trace::schema::{LastErrorMeaning, Ty, ValueKind};
-use windows_metadata::reader::{TypeCategory, TypeIndex};
+use windows_metadata::reader::{HasAttributes, TypeCategory, TypeIndex};
 use windows_metadata::{MethodCallAttributes, Type};
 
 /// 生成の設定ファイル (`apis.toml`)。
@@ -521,6 +521,15 @@ fn map_named_type(index: &TypeIndex, tn: &windows_metadata::TypeName) -> Result<
                     tn.namespace,
                     tn.name,
                     fields.len()
+                ));
+            }
+            if !def.has_attribute("NativeTypedefAttribute") {
+                // A one-field C aggregate is not a scalar typedef. In
+                // particular, struct { float x; } uses an integer register on
+                // Windows x64, whereas float uses an XMM register.
+                return Err(format!(
+                    "値渡し構造体 {}::{} は NativeTypedef ではなく、フィールドの ABI に置換できない",
+                    tn.namespace, tn.name
                 ));
             }
             let field = &fields[0];
