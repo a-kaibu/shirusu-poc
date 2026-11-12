@@ -17,7 +17,7 @@ mod win {
     use shirusu_e2e::VerifyOut;
     use std::ffi::c_void;
 
-    #[link(name = "combase")]
+    #[link(name = "RuntimeObject")]
     extern "system" {
         fn RoInitialize(init_type: u32) -> i32;
         fn RoUninitialize();

@@ -74,17 +74,6 @@ mod win {
         }
     }
 
-    /// COM メソッドイベントの enter から object ポインタを読む。
-    fn com_enter_object(trace: &shirusu_trace::reader::ReadTrace, e: &TraceEvent) -> Option<u64> {
-        let types = trace.registry.types(e.schema_id)?;
-        let args = e.args.as_ref()?;
-        let values = decode_values(&types, args).ok()?;
-        match &values.first()?.value {
-            TypedValue::U64(v) => Some(*v),
-            _ => None,
-        }
-    }
-
     /// WinRT アクティベーションイベントの enter から method_name を読む。
     /// COM メソッドイベントとはフィールド位置が違う（method_name は 2 番目）。
     fn winrt_activation_method_name(
@@ -127,30 +116,6 @@ mod win {
             TypedValue::U32(v) => Some(*v),
             _ => None,
         }
-    }
-
-    /// COM メソッドイベントの leave から (hresult, returned_object,
-    /// refcount) を読む。
-    fn com_leave_values(
-        trace: &shirusu_trace::reader::ReadTrace,
-        e: &TraceEvent,
-    ) -> Option<(i32, u64, u32)> {
-        let types = trace.registry.types(e.schema_id)?;
-        let args = e.args.as_ref()?;
-        let values = decode_values(&types, args).ok()?;
-        let hresult = match &values.first()?.value {
-            TypedValue::I32(v) => *v,
-            _ => return None,
-        };
-        let returned = match &values.get(1)?.value {
-            TypedValue::U64(v) => *v,
-            _ => return None,
-        };
-        let refcount = match &values.get(2)?.value {
-            TypedValue::U32(v) => *v,
-            _ => return None,
-        };
-        Some((hresult, returned, refcount))
     }
 
     fn session_config() -> CaptureSessionConfig {
@@ -747,83 +712,21 @@ mod win {
                                 ),
                             );
                             c.check(
-                                count("IShellLinkW::SetPath") >= 1,
-                                &format!("{app} IShellLinkW::SetPath recorded"),
+                                names.iter().all(|name| !name.contains("::")),
+                                "shared COM object methods are not patched",
                             );
                             c.check(
-                                count("IShellLinkW::GetPath") >= 1,
-                                &format!("{app} IShellLinkW::GetPath recorded"),
+                                com_enters.len() == com_leaves.len(),
+                                "COM factory enter/leave pairs",
                             );
                             c.check(
-                                count("IShellLinkW::QueryInterface") >= 1,
-                                &format!("{app} IShellLinkW::QueryInterface recorded"),
+                                summary
+                                    .integrity
+                                    .notes
+                                    .iter()
+                                    .any(|n| n.contains("shared-object-safety-unproven")),
+                                "COM method Coverage explains the safety skip",
                             );
-                            let releases =
-                                names.iter().filter(|n| n.ends_with("::Release")).count();
-                            c.check(
-                                releases >= 2,
-                                &format!(
-                                    "{app} at least 2 Release calls recorded (got {releases})"
-                                ),
-                            );
-                            c.check(
-                                com_enters.len() >= 6,
-                                &format!(
-                                    "{app} at least 6 COM method enters (got {})",
-                                    com_enters.len()
-                                ),
-                            );
-                            c.check(
-                                com_leaves.len() == com_enters.len(),
-                                &format!(
-                                    "{app} COM enters/leaves pair up ({} enters, {} leaves)",
-                                    com_enters.len(),
-                                    com_leaves.len()
-                                ),
-                            );
-                            // 同一性：QueryInterface の leave が返す別ポインタ
-                            // が、IPersistFile として追跡され、その Release が
-                            // 返されたポインタで記録されていること（L02 の
-                            // 同一性・寿命の実動確認）。
-                            let mut qi_returned: Option<u64> = None;
-                            for enter in &com_enters {
-                                if com_method_name(&trace, enter).as_deref()
-                                    != Some("IShellLinkW::QueryInterface")
-                                {
-                                    continue;
-                                }
-                                let Some(leave) =
-                                    com_leaves.iter().find(|l| l.call_id == enter.call_id)
-                                else {
-                                    continue;
-                                };
-                                if let Some((hr, returned, _)) = com_leave_values(&trace, leave) {
-                                    if hr == 0 && returned != 0 {
-                                        if let Some(obj) = com_enter_object(&trace, enter) {
-                                            if returned != obj {
-                                                qi_returned = Some(returned);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            c.check(
-                                qi_returned.is_some(),
-                                &format!(
-                                    "{app} QueryInterface returns a different interface pointer"
-                                ),
-                            );
-                            if let Some(returned) = qi_returned {
-                                let released = com_enters.iter().any(|e| {
-                                    com_method_name(&trace, e)
-                                        .is_some_and(|n| n.ends_with("::Release"))
-                                        && com_enter_object(&trace, e) == Some(returned)
-                                });
-                                c.check(
-                                    released,
-                                    &format!("{app} Release recorded on the QueryInterface-returned pointer"),
-                                );
-                            }
                         }
                         // WinRT (L14): winrt アプリは RoActivateInstance、
                         // RoGetActivationFactory、IInspectable の
@@ -914,57 +817,17 @@ mod win {
                                     e.schema_id == shirusu_hook::com::COM_METHOD_LEAVE_SCHEMA_ID
                                 })
                                 .collect();
-                            let names: Vec<String> = com_enters
-                                .iter()
-                                .filter_map(|e| com_method_name(&trace, e))
-                                .collect();
-                            let ccount =
-                                |name: &str| names.iter().filter(|n| n.as_str() == name).count();
                             c.check(
-                                ccount("IInspectable::GetRuntimeClassName") >= 2,
-                                &format!(
-                                    "{app} GetRuntimeClassName recorded (got {})",
-                                    ccount("IInspectable::GetRuntimeClassName")
-                                ),
+                                com_enters.is_empty() && com_leaves.is_empty(),
+                                "shared WinRT interfaces are not patched",
                             );
                             c.check(
-                                ccount("IActivationFactory::ActivateInstance") >= 1,
-                                &format!("{app} IActivationFactory::ActivateInstance recorded"),
-                            );
-                            c.check(
-                                ccount("IActivationFactory::QueryInterface") >= 1,
-                                &format!("{app} IActivationFactory::QueryInterface recorded"),
-                            );
-                            c.check(
-                                ccount("IUriRuntimeClassFactory::CreateUri") >= 1,
-                                &format!("{app} IUriRuntimeClassFactory::CreateUri recorded"),
-                            );
-                            c.check(
-                                ccount("IUriRuntimeClass::AbsoluteUri") >= 1,
-                                &format!("{app} IUriRuntimeClass::AbsoluteUri recorded"),
-                            );
-                            let releases =
-                                names.iter().filter(|n| n.ends_with("::Release")).count();
-                            c.check(
-                                releases >= 2,
-                                &format!(
-                                    "{app} at least 2 Release calls recorded (got {releases})"
-                                ),
-                            );
-                            c.check(
-                                com_enters.len() >= 10,
-                                &format!(
-                                    "{app} at least 10 COM method enters (got {})",
-                                    com_enters.len()
-                                ),
-                            );
-                            c.check(
-                                com_leaves.len() == com_enters.len(),
-                                &format!(
-                                    "{app} COM enters/leaves pair up ({} enters, {} leaves)",
-                                    com_enters.len(),
-                                    com_leaves.len()
-                                ),
+                                summary
+                                    .integrity
+                                    .notes
+                                    .iter()
+                                    .any(|n| n.contains("shared-object-safety-unproven")),
+                                "WinRT method Coverage explains the safety skip",
                             );
                         }
                         // コールバック (L16): gui アプリはメッセージ専用
@@ -1207,7 +1070,7 @@ mod win {
         // WinRT は L14 でアクティベーション関数（Inline Hook）と vtable メソッドを記録する。
         println!("coverage evaluation (L17):");
         println!("  recorded: file I/O (CreateFileW/WriteFile/ReadFile/CloseHandle)");
-        println!("  recorded: COM (CoCreateInstance factory + IShellLinkW/IPersistFile vtable methods, L02)");
+        println!("  recorded: COM factory results; method interception skipped (shared-object-safety-unproven)");
         println!("  recorded: WinRT (RoActivateInstance/RoGetActivationFactory + IInspectable/IUriRuntimeClass vtable methods, L14)");
         for (group, names, note) in [
             (

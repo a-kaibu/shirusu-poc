@@ -25,6 +25,8 @@ use crate::api::{
 use crate::callback::{
     callback_procs, resolve_prev_proc, should_wrap_set_window_long, wrap_wndproc_in_class,
     CallbackKind, CALLBACK_API_ID, CALLBACK_HOOKS, CALLBACK_HOOK_COUNT,
+    CALLBACK_HOOK_GET_CLASS_LONG_PTR_A, CALLBACK_HOOK_GET_CLASS_LONG_PTR_W,
+    CALLBACK_HOOK_GET_WINDOW_LONG_PTR_A, CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W,
     CALLBACK_HOOK_REGISTER_CLASS_EX_A, CALLBACK_HOOK_REGISTER_CLASS_EX_W,
     CALLBACK_HOOK_REPORT_ID_BASE, CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A,
     CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W, CALLBACK_LEAVE_SCHEMA_ID, CALLBACK_PROC_SLOTS,
@@ -298,7 +300,7 @@ pub unsafe fn uninstall_hooks(installed: &InstalledHooks) -> Vec<u32> {
 //   トランポリンだけ解放する（P1-6 と同じ「残存は正直に報告」の扱い）。
 
 /// Inline Hook 1 件分。解除時にプロローグを元へ戻し、トランポリンを
-/// 解放するために保持する。
+/// 復元するために保持する。トランポリンはプロセス終了まで保持する。
 #[derive(Debug)]
 pub struct InlineHook {
     pub api_id: u32,
@@ -528,6 +530,20 @@ fn install_one_inline(
     bitness: u32,
 ) -> Result<InlineHook, &'static str> {
     const TRAMPOLINE_SIZE: usize = 0x1000;
+    // Retired trampolines remain executable until process exit (P0-1).
+    // Bound cumulative allocation attempts across reattachments. Failed attempts
+    // also consume budget so no error path can permit unbounded retained memory.
+    static ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if ALLOCATIONS
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| (n < 4096).then_some(n + 1),
+        )
+        .is_err()
+    {
+        return Err("retained-trampoline-limit");
+    }
     let trampoline = match alloc_near(p.target, TRAMPOLINE_SIZE) {
         Some(t) => t,
         None => {
@@ -692,15 +708,11 @@ unsafe fn install_inline_hooks_for(
     outcome
 }
 
-/// Inline Hook を解除する（L01）。プロローグを元のバイトへ戻し、
-/// 復元できたトランポリンだけ解放する。復元できなかった api_id を返す
-/// (P1-6 と同じ扱い。戻り値が空でなければ Detour が残存する)。
-///
-/// 解除は IAT 復元より先に行うこと。トランポリン内に停止中のスレッドが
-/// あれば、その API のプロローグは復元してもトランポリンは解放しない
-/// （実行中のスレッドが解放済み領域へ戻ると落ちる）。プロローグ復元
-/// 自体は安全：トランポリンの戻りジャンプは `target + stolen_len` を
-/// 指し、復元後の元命令へ続くためである。
+/// Inline Hook を解除する（L01）。復元できなかった api_id を返す。
+/// トランポリンはプロセス終了まで保持する。停止時の IP が領域外でも、
+/// Detour / Passthrough が取得済みのアドレスを後から呼ぶ可能性がある。
+/// 全利用者の終了を証明する寿命管理が導入されるまでは解放できない。
+/// 解除は IAT 復元より先に行うこと。
 ///
 /// # Safety
 /// `installed` は install_inline_hooks が返したものであり、対象モジュール
@@ -714,26 +726,13 @@ pub unsafe fn uninstall_inline_hooks(installed: &[InlineHook]) -> Vec<u32> {
         return installed.iter().map(|h| h.api_id).collect();
     };
     let mut unrestored = Vec::new();
-    let mut to_free: Vec<usize> = Vec::new();
     for h in installed {
-        let in_trampoline =
-            suspender.any_ip_in_range(h.trampoline, h.trampoline + h.trampoline_size);
         match patch_target(h.target, &h.original_bytes) {
-            Ok(()) => {
-                if !in_trampoline {
-                    to_free.push(h.trampoline);
-                }
-                // トランポリン内にスレッドがいれば解放しない（リークするが
-                // 安全。プロセス終了時に OS が回収する）。
-            }
+            Ok(()) => {}
             Err(()) => unrestored.push(h.api_id),
         }
     }
     suspender.resume();
-    for t in to_free {
-        // SAFETY: 復元済みで、停止中のスレッドが中にいないトランポリン。
-        unsafe { VirtualFree(t as *mut c_void, 0, MEM_RELEASE) };
-    }
     unrestored
 }
 
@@ -769,6 +768,8 @@ pub enum ComInterceptOutcome {
     /// 未知のインターフェイス（追跡対象としては記録するが、メソッドの
     /// Detour は設置しない。カスタムインターフェイスは未対応）。
     UnknownInterface,
+    /// Factory / QI does not prove exclusive access to the returned object.
+    SharedObjectSafetyUnproven,
     /// オブジェクト／元の vtable の読み取りに失敗した。
     ReadFailed,
     /// 複製 vtable の確保に失敗した。
@@ -803,13 +804,10 @@ fn winrt_activation_name(index: usize) -> &'static str {
 }
 
 fn callback_hook_name(index: usize) -> &'static str {
-    match index {
-        CALLBACK_HOOK_REGISTER_CLASS_EX_W => "RegisterClassExW",
-        CALLBACK_HOOK_REGISTER_CLASS_EX_A => "RegisterClassExA",
-        CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W => "SetWindowLongPtrW",
-        CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A => "SetWindowLongPtrA",
-        _ => "?",
-    }
+    CALLBACK_HOOKS
+        .get(index)
+        .map(|def| def.function)
+        .unwrap_or("?")
 }
 
 /// 計画済み Inline Hook の表示名（見送り理由の報告用）。
@@ -1087,6 +1085,22 @@ pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
             CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A,
             detour_set_window_long_ptr_a as SetWindowLongPtrFn as usize,
         ),
+        (
+            CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W,
+            detour_get_window_long_ptr_w as GetLongPtrFn as usize,
+        ),
+        (
+            CALLBACK_HOOK_GET_WINDOW_LONG_PTR_A,
+            detour_get_window_long_ptr_a as GetLongPtrFn as usize,
+        ),
+        (
+            CALLBACK_HOOK_GET_CLASS_LONG_PTR_W,
+            detour_get_class_long_ptr_w as GetLongPtrFn as usize,
+        ),
+        (
+            CALLBACK_HOOK_GET_CLASS_LONG_PTR_A,
+            detour_get_class_long_ptr_a as GetLongPtrFn as usize,
+        ),
     ];
     let mut planned: Vec<PlannedInline> = Vec::new();
     for (index, detour) in hooks {
@@ -1144,6 +1158,17 @@ pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
     outcome
 }
 
+/// Standard observation never patches an object whose exclusive ownership is
+/// unknown. COM factories, QI and WinRT activation may return shared objects.
+/// The skip reason is retained by the tracker and reported in host Coverage.
+pub fn intercept_object(rt: &HookRuntime, ptr: usize, iid: Guid) -> ComInterceptOutcome {
+    if interface_by_iid(&iid).is_none() {
+        return ComInterceptOutcome::UnknownInterface;
+    }
+    rt.with_com_tracker(|t| t.note_interception_skipped(ptr as u64));
+    ComInterceptOutcome::SharedObjectSafetyUnproven
+}
+
 /// 追跡対象のインターフェイスへ vtable 複製による Detour を設置する。
 ///
 /// 手順：元の vtable とメソッド列を読み、複製を作って Detour で
@@ -1154,7 +1179,11 @@ pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
 /// # Safety
 /// `ptr` は有効な COM インターフェイスのポインタであり、呼び出し元が
 /// 設置中に他スレッドがこのポインタでメソッドを呼ばないことを保証すること。
-pub unsafe fn intercept_object(rt: &HookRuntime, ptr: usize, iid: Guid) -> ComInterceptOutcome {
+pub unsafe fn intercept_exclusive_object(
+    rt: &HookRuntime,
+    ptr: usize,
+    iid: Guid,
+) -> ComInterceptOutcome {
     let Some(def) = interface_by_iid(&iid) else {
         return ComInterceptOutcome::UnknownInterface;
     };
@@ -1529,6 +1558,16 @@ unsafe fn call_original<const N: usize>(original: usize, args: &[usize; N]) -> u
 /// CreateFileW が INVALID_HANDLE_VALUE を返すのとは異なり、生成 API
 /// は全て NULL / FALSE が失敗値であるため 0 で足りる）。
 fn generic_detour<const N: usize>(api_id: u32, args: &[usize; N]) -> usize {
+    generic_detour_with(api_id, args, |original| unsafe {
+        call_original::<N>(original, args)
+    })
+}
+
+fn generic_detour_with<const N: usize>(
+    api_id: u32,
+    args: &[usize; N],
+    invoke: impl FnOnce(usize) -> usize,
+) -> usize {
     let (rt, original, tid, api, _flight, mut guard, mut le) = match prepare(api_id) {
         Prepare::Record {
             rt,
@@ -1541,7 +1580,7 @@ fn generic_detour<const N: usize>(api_id: u32, args: &[usize; N]) -> usize {
         } => (rt, original, tid, api, flight, guard, last_error),
         Prepare::Passthrough { original } => {
             // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
-            return unsafe { call_original::<N>(original, args) };
+            return invoke(original);
         }
         Prepare::Unavailable => return 0,
     };
@@ -1560,7 +1599,7 @@ fn generic_detour<const N: usize>(api_id: u32, args: &[usize; N]) -> usize {
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe { call_original::<N>(original, args) };
+    let ret = invoke(original);
     guard.resume();
     call_guard.complete();
     // 透明性: 他の処理より先に LastError を確定させる（overview）。
@@ -1669,9 +1708,8 @@ fn on_factory_result(rt: &Arc<HookRuntime>, factory: &'static str, iid: Guid, pt
         t.note_factory_result(ptr as u64, iid, factory);
     });
     if interface_by_iid(&iid).is_some() {
-        // SAFETY: ptr は Factory が返した有効なインターフェイス。
-        // Detour の中で、ポインタがアプリへ返される前に呼ぶ。
-        let _ = unsafe { intercept_object(rt, ptr, iid) };
+        // Factory results may already be shared; record the safe skip.
+        let _ = intercept_object(rt, ptr, iid);
     }
 }
 
@@ -1699,9 +1737,8 @@ fn on_activation_result(
         t.note_factory_result(ptr as u64, iid, function);
     });
     if interface_by_iid(&iid).is_some() {
-        // SAFETY: ptr はアクティベーション関数が返した有効なインターフェイス。
-        // Detour の中で、ポインタがアプリへ返される前に呼ぶ。
-        let _ = unsafe { intercept_object(rt, ptr, iid) };
+        // Activation results may already be shared; record the safe skip.
+        let _ = intercept_object(rt, ptr, iid);
     }
 }
 
@@ -2428,6 +2465,61 @@ unsafe fn detour_set_window_long_ptr(
     resolve_prev_proc(prev, original_for_wrapper)
 }
 
+type GetLongPtrFn = unsafe extern "system" fn(*mut c_void, i32) -> usize;
+
+unsafe fn detour_get_long_ptr(
+    index: usize,
+    hwnd: *mut c_void,
+    field: i32,
+    proc_field: i32,
+) -> usize {
+    let (original, state) = match prepare_callback_hook(index) {
+        CallbackPrepare::Proceed {
+            original,
+            rt,
+            tid: _,
+            flight,
+            guard,
+            last_error,
+        } => (original, Some((rt, flight, guard, last_error))),
+        CallbackPrepare::Passthrough { original } => (original, None),
+        CallbackPrepare::Unavailable => return 0,
+    };
+    let original: GetLongPtrFn = unsafe { std::mem::transmute(original) };
+    let mut state = state;
+    if let Some((_, _, guard, le)) = state.as_mut() {
+        le.restore_before_original();
+        guard.suspend();
+    }
+    let value = unsafe { original(hwnd, field) };
+    // LastError must be captured before table lookups or synchronization.
+    let saved_error = unsafe { GetLastError() };
+    if let Some((_, _, guard, _)) = state.as_mut() {
+        guard.resume();
+    }
+    let value = if field == proc_field {
+        resolve_prev_proc(value, original_for_wrapper)
+    } else {
+        value
+    };
+    unsafe {
+        SetLastError(saved_error);
+    }
+    value
+}
+unsafe extern "system" fn detour_get_window_long_ptr_w(hwnd: *mut c_void, field: i32) -> usize {
+    unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W, hwnd, field, -4) }
+}
+unsafe extern "system" fn detour_get_window_long_ptr_a(hwnd: *mut c_void, field: i32) -> usize {
+    unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_WINDOW_LONG_PTR_A, hwnd, field, -4) }
+}
+unsafe extern "system" fn detour_get_class_long_ptr_w(hwnd: *mut c_void, field: i32) -> usize {
+    unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_CLASS_LONG_PTR_W, hwnd, field, -24) }
+}
+unsafe extern "system" fn detour_get_class_long_ptr_a(hwnd: *mut c_void, field: i32) -> usize {
+    unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_CLASS_LONG_PTR_A, hwnd, field, -24) }
+}
+
 unsafe extern "system" fn detour_set_window_long_ptr_w(
     hwnd: *mut c_void,
     n_index: i32,
@@ -2499,7 +2591,7 @@ fn com_method_post_call(
             if interface_by_iid(&iid).is_some() {
                 // SAFETY: out は元の QI が返した有効なインターフェイス。
                 // Detour の中で、ポインタがアプリへ返される前に呼ぶ。
-                let _ = unsafe { intercept_object(rt, out, iid) };
+                let _ = intercept_object(rt, out, iid);
             }
             (out as u64, 0)
         }
@@ -2548,7 +2640,7 @@ fn com_method_post_call(
             if interface_by_iid(&iid).is_some() {
                 // SAFETY: ptr は元のメソッドが返した有効なインターフェイス。
                 // Detour の中で、ポインタがアプリへ返される前に呼ぶ。
-                let _ = unsafe { intercept_object(rt, ptr, iid) };
+                let _ = intercept_object(rt, ptr, iid);
             }
             (ptr as u64, 0)
         }
@@ -3439,6 +3531,124 @@ mod tests {
     use windows_sys::Win32::System::Memory::{
         VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
     };
+
+    fn test_runtime() -> HookRuntime {
+        HookRuntime::new(
+            Arc::new(Agent::new(
+                Arc::new(SlotPool::new(2)),
+                RingConfig::new(64, 4096),
+                Arc::new(HostMonitor::always_alive()),
+            )),
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn shared_com_methods_continue_without_vtable_mutation() {
+        use crate::com::IID_IUNKNOWN;
+        unsafe extern "system" fn method(_: usize) -> u32 {
+            123
+        }
+        let vtable = Arc::new([method as *const () as usize; 3]);
+        let object = Arc::new(vtable.as_ptr() as usize);
+        let rt = test_runtime();
+        let ptr = Arc::as_ptr(&object) as usize;
+        rt.with_com_tracker(|t| {
+            t.note_factory_result(ptr as u64, IID_IUNKNOWN, "fixture");
+        });
+        let other = Arc::clone(&object);
+        let reader = std::thread::spawn(move || {
+            for _ in 0..10000 {
+                let method: unsafe extern "system" fn(usize) -> u32 =
+                    unsafe { std::mem::transmute(*(*other as *const usize).add(1)) };
+                assert_eq!(unsafe { method(Arc::as_ptr(&other) as usize) }, 123);
+            }
+        });
+        for _ in 0..1000 {
+            assert_eq!(
+                intercept_object(&rt, ptr, IID_IUNKNOWN),
+                ComInterceptOutcome::SharedObjectSafetyUnproven
+            );
+        }
+        reader.join().unwrap();
+        assert_eq!(*object, vtable.as_ptr() as usize);
+        assert_eq!(
+            rt.with_com_tracker(|t| t.lookup(ptr as u64).unwrap().interception_skip_reason),
+            Some("shared-object-safety-unproven")
+        );
+    }
+
+    #[test]
+    fn trampoline_survives_uninstall_for_late_passthrough() {
+        // Isolate SuspendThread from the parallel test harness and its locks.
+        const CHILD: &str = "SHIRUSU_TRAMPOLINE_LIFETIME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::trampoline_survives_uninstall_for_late_passthrough",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("uninstall regression timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        // mov eax, 42; ret works on x86 and x64. Simulate an already acquired
+        // trampoline held outside its code while shutdown restores the target.
+        for _ in 0..2 {
+            let target = alloc_filled_page(0x90);
+            let trampoline = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                )
+            };
+            assert!(!trampoline.is_null());
+            let code = [0xB8u8, 42, 0, 0, 0, 0xC3];
+            unsafe {
+                std::ptr::copy_nonoverlapping(code.as_ptr(), trampoline as *mut u8, code.len());
+            }
+            let hook = InlineHook {
+                api_id: 17,
+                target: target as usize,
+                trampoline: trampoline as usize,
+                trampoline_size: 4096,
+                stolen_len: code.len(),
+                original_bytes: code.to_vec(),
+            };
+            let address = hook.trampoline;
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let caller = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                unsafe { call_original::<0>(address, &[]) }
+            });
+            ready_rx.recv().unwrap();
+            assert!(unsafe { uninstall_inline_hooks(&[hook]) }.is_empty());
+            go_tx.send(()).unwrap();
+            assert_eq!(caller.join().unwrap() as u32, 42);
+            unsafe {
+                VirtualFree(target, 0, MEM_RELEASE);
+            }
+        }
+    }
 
     /// テスト用に 1 ページ確保し、同じバイトで埋める。
     fn alloc_filled_page(byte: u8) -> *mut c_void {

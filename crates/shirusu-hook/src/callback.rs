@@ -27,10 +27,9 @@
 //! - 検出は WndProc のみ。DialogProc（`DialogBoxIndirectParam` 等）、
 //!   タイマープロシージャ、列挙コールバックは未対応。`CallbackKind` に
 //!   種別コードを持たせてあるため、形式を変えずに追加できる。
-//! - `RegisterClassW/A`（旧式のクラス登録）と `SetWindowLongW/A` は
-//!   フックしない。`GetWindowLongPtrW/A` もフックしないため、アプリが
-//!   現在のプロシージャを読み戻すとラッパーのアドレスが見える（その値を
-//!   そのまま `SetWindowLongPtr` へ渡した場合は再利用して二重ラップしない）。
+//! - `GetWindowLongPtrW/A` と `GetClassLongPtrW/A` は WndProc を元の
+//!   ポインタへ解決する。x86 では Ptr 名はマクロなので Long 名をフックする。
+//! - `GetClassInfoW/A` / `GetClassInfoExW/A` 経由の読み戻しは未対応。
 //! - ラップできる WndProc は最大 `CALLBACK_PROC_SLOTS` 件（32）。超えた分は
 //!   ラップせず、コールバックの記録だけが無い（アプリの動作は変わらない）。
 
@@ -52,7 +51,7 @@ pub const CALLBACK_API_ID: u32 = 1002;
 pub const CALLBACK_ENTER_SCHEMA_ID: u32 = 10_021;
 pub const CALLBACK_LEAVE_SCHEMA_ID: u32 = 10_022;
 /// コールバック検出フックの数（RegisterClassExW/A + SetWindowLongPtrW/A）。
-pub const CALLBACK_HOOK_COUNT: usize = 4;
+pub const CALLBACK_HOOK_COUNT: usize = 8;
 /// コールバック検出フックの Inline Hook を報告するときの ID 基準値
 /// （`InlineHook.api_id` 用。COM Factory / WinRT の予約値とは別の予約値）。
 pub const CALLBACK_HOOK_REPORT_ID_BASE: u32 = 0xC002_0000;
@@ -103,6 +102,10 @@ pub const CALLBACK_HOOK_REGISTER_CLASS_EX_W: usize = 0;
 pub const CALLBACK_HOOK_REGISTER_CLASS_EX_A: usize = 1;
 pub const CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W: usize = 2;
 pub const CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A: usize = 3;
+pub const CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W: usize = 4;
+pub const CALLBACK_HOOK_GET_WINDOW_LONG_PTR_A: usize = 5;
+pub const CALLBACK_HOOK_GET_CLASS_LONG_PTR_W: usize = 6;
+pub const CALLBACK_HOOK_GET_CLASS_LONG_PTR_A: usize = 7;
 
 /// コールバック検出フック 1 件の定義。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,11 +125,51 @@ pub const CALLBACK_HOOKS: &[CallbackHookDef] = &[
     },
     CallbackHookDef {
         module: "user32.dll",
-        function: "SetWindowLongPtrW",
+        function: if cfg!(target_pointer_width = "32") {
+            "SetWindowLongW"
+        } else {
+            "SetWindowLongPtrW"
+        },
     },
     CallbackHookDef {
         module: "user32.dll",
-        function: "SetWindowLongPtrA",
+        function: if cfg!(target_pointer_width = "32") {
+            "SetWindowLongA"
+        } else {
+            "SetWindowLongPtrA"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetWindowLongW"
+        } else {
+            "GetWindowLongPtrW"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetWindowLongA"
+        } else {
+            "GetWindowLongPtrA"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetClassLongW"
+        } else {
+            "GetClassLongPtrW"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetClassLongA"
+        } else {
+            "GetClassLongPtrA"
+        },
     },
 ];
 
@@ -419,13 +462,13 @@ mod tests {
             CALLBACK_LEAVE_SCHEMA_ID,
             crate::winrt::WINRT_ACTIVATION_LEAVE_SCHEMA_ID
         );
-        assert_eq!(CALLBACK_HOOK_COUNT, 4);
+        assert_eq!(CALLBACK_HOOK_COUNT, 8);
         assert_eq!(GWLP_WNDPROC, -4);
         assert_eq!(WNDPROC_FIELD_OFFSET, 8);
     }
 
     #[test]
-    fn callback_hook_table_lists_four_hooks() {
+    fn callback_hook_table_lists_hooks() {
         assert_eq!(CALLBACK_HOOKS.len(), CALLBACK_HOOK_COUNT);
         assert_eq!(
             callback_hook_by_name("user32.dll", "RegisterClassExW").map(|(i, _)| i),
@@ -436,15 +479,30 @@ mod tests {
             Some(CALLBACK_HOOK_REGISTER_CLASS_EX_A)
         );
         assert_eq!(
-            callback_hook_by_name("user32.dll", "SetWindowLongPtrW").map(|(i, _)| i),
+            callback_hook_by_name(
+                "user32.dll",
+                CALLBACK_HOOKS[CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W].function
+            )
+            .map(|(i, _)| i),
             Some(CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W)
         );
         assert_eq!(
-            callback_hook_by_name("user32.dll", "SetWindowLongPtrA").map(|(i, _)| i),
+            callback_hook_by_name(
+                "user32.dll",
+                CALLBACK_HOOKS[CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A].function
+            )
+            .map(|(i, _)| i),
             Some(CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A)
         );
         assert!(callback_hook_by_name("user32.dll", "RegisterClassW").is_none());
-        assert!(callback_hook_by_name("user32.dll", "GetWindowLongPtrW").is_none());
+        assert_eq!(
+            callback_hook_by_name(
+                "user32.dll",
+                CALLBACK_HOOKS[CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W].function
+            )
+            .map(|(i, _)| i),
+            Some(CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W)
+        );
     }
 
     #[test]

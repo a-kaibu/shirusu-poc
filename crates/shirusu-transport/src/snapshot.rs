@@ -161,10 +161,10 @@ pub fn reassemble(events: &[crate::ring::ReceivedEvent], call_id: u64) -> (Vec<u
             continue;
         }
         match e.descriptor.kind_enum() {
-            Some(EventKind::SnapshotFragment) => {
-                if e.descriptor.flags & flags::PAYLOAD_DROPPED == 0 {
-                    data.extend_from_slice(&e.payload);
-                }
+            Some(EventKind::SnapshotFragment)
+                if e.descriptor.flags & flags::PAYLOAD_DROPPED == 0 =>
+            {
+                data.extend_from_slice(&e.payload);
             }
             Some(EventKind::SnapshotComplete) => complete = true,
             _ => {}

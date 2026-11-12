@@ -361,12 +361,9 @@ pub fn map_type(index: &TypeIndex, ty: &Type) -> Result<MappedTy, String> {
     };
     Ok(match ty {
         Type::Void => return Err("void 型は引数・戻り値以外では扱えない".into()),
-        Type::Bool => scalar(Ty::U32, true),
-        Type::Char => scalar(Ty::U32, true),
-        Type::I8 => scalar(Ty::I32, true),
-        Type::U8 => scalar(Ty::U32, true),
-        Type::I16 => scalar(Ty::I32, true),
-        Type::U16 => scalar(Ty::U32, true),
+        Type::Bool | Type::Char | Type::I8 | Type::U8 | Type::I16 | Type::U16 => {
+            return Err("32bit 未満の整数 ABI は未対応".into());
+        }
         Type::I32 => scalar(Ty::I32, true),
         Type::U32 => scalar(Ty::U32, true),
         Type::I64 => scalar(Ty::I64, false),
@@ -607,32 +604,92 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
         "// Source: Windows.Win32.winmd (Microsoft.Windows.SDK.Win32Metadata {winmd_version}).\n"
     ));
     out.push_str("// Regenerate: cargo run -p shirusu-metadata-gen -- --winmd <path> --config crates/shirusu-metadata-gen/apis.toml\n");
+    // Schema の I64/U64 は one_slot 検査済みなのでポインタ幅整数。
+    // 小整数は map_type で除外し、記録用の型への拡張を ABI に持ち込まない。
+    let abi = |ty: Ty, kind: ValueKind| -> &'static str {
+        if matches!(kind, ValueKind::Pointer | ValueKind::Handle) {
+            return "*mut core::ffi::c_void";
+        }
+        match ty {
+            Ty::I32 => "i32",
+            Ty::U32 => "u32",
+            Ty::I64 => "isize",
+            Ty::U64 => "usize",
+            _ => panic!("unsupported generated ABI: {ty:?}"),
+        }
+    };
     for api in generated.emitted() {
         let fname = detour_fn_name(api);
-        let arity = api.enter_fields.len();
-        let params: Vec<String> = (0..arity).map(|i| format!("a{i}: usize")).collect();
-        let args: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
+        let types: Vec<_> = api
+            .enter_fields
+            .iter()
+            .map(|(_, ty, kind)| abi(*ty, *kind))
+            .collect();
+        let params: Vec<_> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("a{i}: {ty}"))
+            .collect();
+        let args: Vec<_> = (0..types.len()).map(|i| format!("a{i}")).collect();
+        let raw: Vec<_> = (0..types.len())
+            .map(|i| {
+                if types[i] == "usize" {
+                    format!("a{i}")
+                } else {
+                    format!("a{i} as usize")
+                }
+            })
+            .collect();
+        let ret = api
+            .return_ty
+            .map(|(ty, kind)| abi(ty, kind))
+            .unwrap_or("()");
+        let declaration_ret = if api.return_ty.is_some() {
+            format!(" -> {ret}")
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "unsafe extern \"system\" fn {fname}({}) -> usize {{\n",
+            "unsafe extern \"system\" fn {fname}({}){declaration_ret} {{\n",
             params.join(", ")
         ));
+        let binding = if ret == "usize" || api.return_ty.is_none() {
+            ""
+        } else {
+            "let result = "
+        };
         out.push_str(&format!(
-            "    generic_detour({}, &[{}])\n",
-            api.api_id,
-            args.join(", ")
+            "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"system\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
+            api.api_id, raw.join(", "), types.join(", ")
         ));
+        if api.return_ty.is_some() {
+            out.push_str(&format!(
+                "        (unsafe {{ original({}) }}) as usize\n",
+                args.join(", ")
+            ));
+        } else {
+            out.push_str(&format!(
+                "        unsafe {{ original({}) }};\n        0\n",
+                args.join(", ")
+            ));
+        }
+        if ret == "usize" {
+            out.push_str("    })\n");
+        } else {
+            out.push_str("    });\n");
+            if api.return_ty.is_some() {
+                out.push_str(&format!("    result as {ret}\n"));
+            }
+        }
         out.push_str("}\n");
     }
     out.push_str("\nfn detour_for_generated(api_id: u32) -> usize {\n");
     out.push_str("    match api_id {\n");
     for api in generated.emitted() {
         let fname = detour_fn_name(api);
-        let arity = api.enter_fields.len();
-        let params: Vec<String> = (0..arity).map(|_| "usize".to_string()).collect();
         out.push_str(&format!(
-            "        {} => {fname} as unsafe extern \"system\" fn({}) -> usize as usize,\n",
-            api.api_id,
-            params.join(", ")
+            "        {} => {fname} as *const () as usize,\n",
+            api.api_id
         ));
     }
     out.push_str("        _ => 0,\n");
@@ -715,12 +772,6 @@ mod tests {
         // L03: プリミティブの写像は Metadata の解決を要しない。
         let idx = empty_index();
         let cases = [
-            (Type::Bool, Ty::U32, true),
-            (Type::Char, Ty::U32, true),
-            (Type::I8, Ty::I32, true),
-            (Type::U8, Ty::U32, true),
-            (Type::I16, Ty::I32, true),
-            (Type::U16, Ty::U32, true),
             (Type::I32, Ty::I32, true),
             (Type::U32, Ty::U32, true),
             (Type::I64, Ty::I64, false),
@@ -747,6 +798,16 @@ mod tests {
     #[test]
     fn map_type_rejects_unsupported_types() {
         let idx = empty_index();
+        for ty in [
+            Type::Bool,
+            Type::Char,
+            Type::I8,
+            Type::U8,
+            Type::I16,
+            Type::U16,
+        ] {
+            assert!(map_type(&idx, &ty).is_err(), "{ty:?}");
+        }
         assert!(map_type(&idx, &Type::F32).is_err());
         assert!(map_type(&idx, &Type::F64).is_err());
         assert!(map_type(&idx, &Type::String).is_err());
@@ -837,16 +898,16 @@ mod tests {
         };
         let text = emit_engine_inc(&generated, "71.0.45-preview");
         assert!(text.contains(
-            "unsafe extern \"system\" fn detour_generated_advapi32_reg_close_key(a0: usize) -> usize"
+            "unsafe extern \"system\" fn detour_generated_advapi32_reg_close_key(a0: *mut core::ffi::c_void) -> u32"
         ));
-        assert!(text.contains("generic_detour(7, &[a0])"));
+        assert!(text.contains("generic_detour_with(7, &[a0 as usize]"));
         assert!(text.contains(
-            "unsafe extern \"system\" fn detour_generated_kernel32_get_current_process_id() -> usize"
+            "unsafe extern \"system\" fn detour_generated_kernel32_get_current_process_id() -> u32"
         ));
-        assert!(text.contains("generic_detour(8, &[])"));
-        assert!(text.contains(
-            "7 => detour_generated_advapi32_reg_close_key as unsafe extern \"system\" fn(usize) -> usize as usize,"
-        ));
+        assert!(text.contains("generic_detour_with(8, &[]"));
+        assert!(
+            text.contains("7 => detour_generated_advapi32_reg_close_key as *const () as usize,")
+        );
         assert!(text.contains("fn detour_for_generated(api_id: u32) -> usize"));
     }
 

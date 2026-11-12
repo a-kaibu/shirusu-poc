@@ -432,7 +432,7 @@ mod win {
         let Some(state) = state else {
             return shutdown_status(false, false, 0);
         };
-        let mut drained = true;
+        let drained;
         let mut unrestored: Vec<u32> = Vec::new();
         match engine::runtime() {
             Some(rt) => {

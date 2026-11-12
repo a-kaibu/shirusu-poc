@@ -350,3 +350,25 @@ fn generation_change_retires_worker_and_records_loss() {
     assert_eq!(summary.rings_active, 1);
     assert_eq!(summary.rings_stopped, 0);
 }
+
+#[test]
+fn com_methods_missing_for_safety_degrade_coverage_with_reason() {
+    let path = temp_trace("com-safe-skip");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.set_com_factory_count(2);
+    session.start().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Degraded);
+    assert!(summary
+        .integrity
+        .notes
+        .iter()
+        .any(|n| n.contains("shared-object-safety-unproven")));
+    let trace = shirusu_trace::reader::read_trace(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(trace
+        .finalization
+        .unwrap()
+        .notes
+        .iter()
+        .any(|n| n.contains("shared-object-safety-unproven")));
+}

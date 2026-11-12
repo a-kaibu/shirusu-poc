@@ -620,6 +620,8 @@ pub struct ComObject {
     pub discovered: ComDiscovery,
     /// vtable 複製による Detour が設置済みか。
     pub intercepted: bool,
+    /// Why standard observation did not install method interception.
+    pub interception_skip_reason: Option<&'static str>,
     /// Release が 0 を返して寿命が終わったか（記録は残す）。
     pub destroyed: bool,
     /// 設置前に読んだ元の vtable アドレス（0 = 未読）。
@@ -665,6 +667,12 @@ impl ComTracker {
         self.diagnostic_query_interface
     }
 
+    pub fn note_interception_skipped(&mut self, ptr: u64) {
+        if let Some(object) = self.objects.get_mut(&ptr) {
+            object.interception_skip_reason = Some("shared-object-safety-unproven");
+        }
+    }
+
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
@@ -704,6 +712,7 @@ impl ComTracker {
             refcount: None,
             discovered: ComDiscovery::Factory { factory },
             intercepted: false,
+            interception_skip_reason: None,
             destroyed: false,
             original_vtable: 0,
             cloned_vtable: None,
@@ -764,6 +773,7 @@ impl ComTracker {
                     refcount: None,
                     discovered: ComDiscovery::QueryInterface { from: this },
                     intercepted: false,
+                    interception_skip_reason: None,
                     destroyed: false,
                     original_vtable: 0,
                     cloned_vtable: None,
@@ -792,6 +802,7 @@ impl ComTracker {
             refcount: None,
             discovered: ComDiscovery::QueryInterface { from: this },
             intercepted: false,
+            interception_skip_reason: None,
             destroyed: false,
             original_vtable: 0,
             cloned_vtable: None,
@@ -824,6 +835,7 @@ impl ComTracker {
             refcount: None,
             discovered: ComDiscovery::MethodReturn { from, method },
             intercepted: false,
+            interception_skip_reason: None,
             destroyed: false,
             original_vtable: 0,
             cloned_vtable: None,
@@ -847,6 +859,7 @@ impl ComTracker {
             refcount: None,
             discovered: ComDiscovery::Discovered,
             intercepted: false,
+            interception_skip_reason: None,
             destroyed: false,
             original_vtable: 0,
             cloned_vtable: None,

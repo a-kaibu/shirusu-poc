@@ -21,6 +21,15 @@ mod win {
 
     #[link(name = "user32")]
     extern "system" {
+        #[cfg_attr(target_pointer_width = "32", link_name = "GetWindowLongW")]
+        #[cfg_attr(target_pointer_width = "64", link_name = "GetWindowLongPtrW")]
+        fn get_window_long(hwnd: *mut c_void, field: i32) -> usize;
+        #[cfg_attr(target_pointer_width = "32", link_name = "GetClassLongW")]
+        #[cfg_attr(target_pointer_width = "64", link_name = "GetClassLongPtrW")]
+        fn get_class_long(hwnd: *mut c_void, field: i32) -> usize;
+        #[cfg_attr(target_pointer_width = "32", link_name = "SetWindowLongW")]
+        #[cfg_attr(target_pointer_width = "64", link_name = "SetWindowLongPtrW")]
+        fn set_window_long(hwnd: *mut c_void, field: i32, value: usize) -> usize;
         fn RegisterClassExW(wc: *const WndClassExW) -> u16;
         fn CreateWindowExW(
             exstyle: u32,
@@ -182,6 +191,15 @@ mod win {
             );
             if hwnd.is_null() {
                 return Err(format!("create window error={}", GetLastError()));
+            }
+            let expected = wnd_proc as *const () as usize;
+            if get_window_long(hwnd, -4) != expected || get_class_long(hwnd, -24) != expected {
+                return Err("WndProc readback changed by capture".into());
+            }
+            if set_window_long(hwnd, -4, expected) != expected
+                || get_window_long(hwnd, -4) != expected
+            {
+                return Err("WndProc subclass roundtrip changed by capture".into());
             }
             if PostMessageW(hwnd, WM_CLOSE, 0, 0) == 0 {
                 return Err(format!("post close error={}", GetLastError()));

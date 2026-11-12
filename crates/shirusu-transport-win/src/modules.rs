@@ -158,123 +158,203 @@ pub fn enumerate_modules(_pid: u32) -> Result<Vec<LoadedModule>> {
 /// 失敗理由の区別はここではしない（呼び出し側が区別する必要は無い）。
 #[cfg(windows)]
 pub fn verify_microsoft_signature(path: &str) -> bool {
-    use windows_sys::core::GUID;
-    use windows_sys::Win32::Security::Cryptography::{
-        CertCloseStore, CertFreeCertificateContext, CertGetNameStringW,
-        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-        CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE,
-    };
-    use windows_sys::Win32::Security::Cryptography::{CryptQueryObject, HCERTSTORE};
-    use windows_sys::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-        WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
-        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-    };
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::Cryptography::Catalog::*;
+    use windows_sys::Win32::Security::Cryptography::{CertGetNameStringW, CERT_NAME_ATTR_TYPE};
+    use windows_sys::Win32::Security::WinTrust::*;
 
+    // Reject embedded NULs rather than verifying a different, truncated path.
+    if path.encode_utf16().any(|c| c == 0) {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
     let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
-    // 1. WinVerifyTrust で署名の有効性を確認する。UI は出さず、失効
-    // 確認はしない（前掲の理由）。
-    let mut file_info = WINTRUST_FILE_INFO {
+
+    // Inspect the signer belonging to the successful trust operation BEFORE CLOSE.
+    // The provider owns the certificate; neither free it nor query a second PKCS#7.
+    unsafe fn verify(data: &mut WINTRUST_DATA) -> bool {
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        let status =
+            unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, data as *mut _ as *mut _) };
+        let microsoft = if status == 0 {
+            let provider = unsafe { WTHelperProvDataFromStateData(data.hWVTStateData) };
+            let signer = if provider.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { WTHelperGetProvSignerFromChain(provider, 0, 0, 0) }
+            };
+            if signer.is_null()
+                || unsafe {
+                    (*signer).dwError != 0
+                        || (*signer).csCertChain == 0
+                        || (*signer).pasCertChain.is_null()
+                }
+            {
+                false
+            } else {
+                let cert = unsafe { &*(*signer).pasCertChain };
+                if cert.pCert.is_null() || cert.dwError != 0 {
+                    false
+                } else {
+                    // Compare the complete organization attribute, not a substring
+                    // of a display name (which could name an unrelated publisher).
+                    let oid = b"2.5.4.10\0";
+                    let n = unsafe {
+                        CertGetNameStringW(
+                            cert.pCert,
+                            CERT_NAME_ATTR_TYPE,
+                            0,
+                            oid.as_ptr() as *const _,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    };
+                    if n <= 1 || n > 4096 {
+                        false
+                    } else {
+                        let mut name = vec![0u16; n as usize];
+                        let actual = unsafe {
+                            CertGetNameStringW(
+                                cert.pCert,
+                                CERT_NAME_ATTR_TYPE,
+                                0,
+                                oid.as_ptr() as *const _,
+                                name.as_mut_ptr(),
+                                n,
+                            )
+                        };
+                        actual == n
+                            && String::from_utf16_lossy(&name[..n as usize - 1])
+                                .eq_ignore_ascii_case("Microsoft Corporation")
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        unsafe {
+            WinVerifyTrust(std::ptr::null_mut(), &mut action, data as *mut _ as *mut _);
+        }
+        microsoft
+    }
+    fn trust_data() -> WINTRUST_DATA {
+        // SAFETY: all optional pointers/flags start at zero; required fields follow.
+        let mut data: WINTRUST_DATA = unsafe { std::mem::zeroed() };
+        data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
+        data.dwUIChoice = WTD_UI_NONE;
+        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.dwStateAction = WTD_STATEACTION_VERIFY;
+        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+        data
+    }
+    let mut info = WINTRUST_FILE_INFO {
         cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
         pcwszFilePath: wide.as_ptr(),
-        hFile: std::ptr::null_mut(),
+        hFile: file.as_raw_handle(),
         pgKnownSubject: std::ptr::null_mut(),
     };
-    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    let mut data = WINTRUST_DATA {
-        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
-        pPolicyCallbackData: std::ptr::null_mut(),
-        pSIPClientData: std::ptr::null_mut(),
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_NONE,
-        dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: WINTRUST_DATA_0 {
-            pFile: &mut file_info as *mut WINTRUST_FILE_INFO,
-        },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        hWVTStateData: std::ptr::null_mut(),
-        pwszURLReference: std::ptr::null_mut(),
-        dwProvFlags: 0,
-        dwUIContext: 0,
-        pSignatureSettings: std::ptr::null_mut(),
-    };
-    // SAFETY: file_info/data は生存期間内のローカル。WinVerifyTrust は
-    // wintrust の公開 API。
-    let status = unsafe {
-        WinVerifyTrust(
-            std::ptr::null_mut(),
-            &mut action as *mut GUID,
-            &mut data as *mut WINTRUST_DATA as *mut core::ffi::c_void,
-        )
-    };
-    // 状態を閉じる（2 回目の呼び出しで VERIFY 時の状態を破棄する）。
-    // SAFETY: data は VERIFY で使ったものと同じ構造体。
-    unsafe {
-        data.dwStateAction = WTD_STATEACTION_CLOSE;
-        WinVerifyTrust(
-            std::ptr::null_mut(),
-            &mut action as *mut GUID,
-            &mut data as *mut WINTRUST_DATA as *mut core::ffi::c_void,
-        );
+    let mut data = trust_data();
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.Anonymous.pFile = &mut info;
+    if unsafe { verify(&mut data) } {
+        return true;
     }
-    if status != 0 {
-        return false;
-    }
-    // 2. 署名者証明書の表示名を取り、Microsoft 製かを確認する。
-    // CryptQueryObject は埋め込み署名（PKCS#7）から署名者を取り出す。
-    let mut store: HCERTSTORE = std::ptr::null_mut();
-    let mut cert: *mut core::ffi::c_void = std::ptr::null_mut();
-    let mut msg: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: 引数は CryptQueryObject の公開 API の契約どおり。
-    let ok = unsafe {
-        CryptQueryObject(
-            CERT_QUERY_OBJECT_FILE,
-            wide.as_ptr() as *const core::ffi::c_void,
-            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-            CERT_QUERY_FORMAT_FLAG_BINARY,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut store,
-            &mut msg,
-            &mut cert,
-        )
-    };
-    if ok == 0 || cert.is_null() {
-        if !store.is_null() {
-            // SAFETY: CryptQueryObject が返した有効なストア。
-            unsafe { CertCloseStore(store, 0) };
+
+    // System DLLs can be catalog-signed. Verify membership of this file's hash,
+    // not merely the signature on a catalog with a matching publisher.
+    for algorithm in ["SHA256", "SHA1"] {
+        let algorithm: Vec<u16> = algorithm.encode_utf16().chain([0]).collect();
+        let mut admin = 0;
+        if unsafe {
+            CryptCATAdminAcquireContext2(
+                &mut admin,
+                std::ptr::null(),
+                algorithm.as_ptr(),
+                std::ptr::null(),
+                0,
+            )
+        } == 0
+        {
+            continue;
         }
-        return false;
-    }
-    let mut name_buf = vec![0u16; 256];
-    // SAFETY: cert は CryptQueryObject が返した署名者証明書。
-    let n = unsafe {
-        CertGetNameStringW(
-            cert as *const _,
-            CERT_NAME_SIMPLE_DISPLAY_TYPE,
-            0,
-            std::ptr::null(),
-            name_buf.as_mut_ptr(),
-            name_buf.len() as u32,
-        )
-    };
-    let signer = if n > 0 {
-        String::from_utf16_lossy(&name_buf[..(n as usize - 1).min(name_buf.len())])
-    } else {
-        String::new()
-    };
-    // SAFETY: cert/store は CryptQueryObject が返したもの。
-    unsafe {
-        CertFreeCertificateContext(cert as *const _);
-        if !store.is_null() {
-            CertCloseStore(store, 0);
+        let mut len = 0;
+        unsafe {
+            CryptCATAdminCalcHashFromFileHandle2(
+                admin,
+                file.as_raw_handle(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+        let mut matched = false;
+        if len > 0 && len <= 4096 {
+            let mut hash = vec![0u8; len as usize];
+            if unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(
+                    admin,
+                    file.as_raw_handle(),
+                    &mut len,
+                    hash.as_mut_ptr(),
+                    0,
+                )
+            } != 0
+            {
+                hash.truncate(len as usize);
+                let tag: String = hash.iter().map(|b| format!("{b:02X}")).collect();
+                let tag: Vec<u16> = tag.encode_utf16().chain([0]).collect();
+                let mut catalog = unsafe {
+                    CryptCATAdminEnumCatalogFromHash(
+                        admin,
+                        hash.as_ptr(),
+                        len,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                while catalog != 0 {
+                    let mut catalog_info: CATALOG_INFO = unsafe { std::mem::zeroed() };
+                    catalog_info.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
+                    if unsafe { CryptCATCatalogInfoFromContext(catalog, &mut catalog_info, 0) } != 0
+                    {
+                        let mut info: WINTRUST_CATALOG_INFO = unsafe { std::mem::zeroed() };
+                        info.cbStruct = std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32;
+                        info.pcwszCatalogFilePath = catalog_info.wszCatalogFile.as_ptr();
+                        info.pcwszMemberTag = tag.as_ptr();
+                        info.pcwszMemberFilePath = wide.as_ptr();
+                        info.hMemberFile = file.as_raw_handle();
+                        info.pbCalculatedFileHash = hash.as_mut_ptr();
+                        info.cbCalculatedFileHash = len;
+                        info.hCatAdmin = admin;
+                        let mut data = trust_data();
+                        data.dwUnionChoice = WTD_CHOICE_CATALOG;
+                        data.Anonymous.pCatalog = &mut info;
+                        matched = unsafe { verify(&mut data) };
+                    }
+                    if matched {
+                        unsafe {
+                            CryptCATAdminReleaseCatalogContext(admin, catalog, 0);
+                        }
+                        break;
+                    }
+                    // Enumeration consumes the previous context, including at end.
+                    catalog = unsafe {
+                        CryptCATAdminEnumCatalogFromHash(admin, hash.as_ptr(), len, 0, &mut catalog)
+                    };
+                }
+            }
+        }
+        unsafe {
+            CryptCATAdminReleaseContext(admin, 0);
+        }
+        if matched {
+            return true;
         }
     }
-    signer
-        .to_ascii_lowercase()
-        .contains("microsoft corporation")
+    false
 }
 
 /// Windows 以外のスタブ：署名は確認できない。

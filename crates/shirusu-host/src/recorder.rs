@@ -814,6 +814,14 @@ impl CaptureSession {
                 }
             }
         }
+        if self.com_factory_count.is_some() || self.winrt_activation_count.is_some() {
+            report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
+            report.notes.push(
+                "COM/WinRT method interception skipped: shared-object-safety-unproven; \
+                 factory and activation results do not establish exclusive access"
+                    .into(),
+            );
+        }
         // L05: 注入できなかった子は記録の欠落として Capture Coverage を
         // 劣化させ、pid と理由を注記に残す（値は捏造しない）。
         if !self.uninjectable_children.is_empty() {
