@@ -95,18 +95,23 @@ pub struct ReentrancyGuard {
 impl ReentrancyGuard {
     /// Detour 入口で呼ぶ。再入中なら `None` を返す。
     pub fn try_enter() -> Option<Self> {
+        Self::try_enter_with(|| {
+            CALL_STACK.try_with(|_| ()).is_ok() && shirusu_agent::current_thread_capture_available()
+        })
+    }
+
+    fn try_enter_with(available: impl FnOnce() -> bool) -> Option<Self> {
         REENTRANCY_DEPTH
             .try_with(|d| {
-                if d.get() > 0
-                    || THREAD_EXITING.try_with(Cell::get).unwrap_or(true)
-                    || CALL_STACK.try_with(|_| ()).is_err()
-                    || !shirusu_agent::current_thread_capture_available()
-                {
-                    None
-                } else {
-                    d.set(1);
-                    Some(Self { suspended: false })
+                if d.get() > 0 || THREAD_EXITING.try_with(Cell::get).unwrap_or(true) {
+                    return None;
                 }
+                // Accessing destructor-bearing TLS can register a destructor
+                // and allocate. Protect that initialization too: HeapAlloc's
+                // detour must see an active guard before it touches more TLS.
+                d.set(1);
+                let guard = Self { suspended: false };
+                available().then_some(guard)
             })
             .ok()
             .flatten()
@@ -1696,6 +1701,28 @@ mod tests {
             ReentrancyGuard::try_enter().is_some(),
             "re-entry after drop"
         );
+    }
+
+    #[test]
+    fn tls_initialization_cannot_reenter_capture() {
+        let guard = ReentrancyGuard::try_enter_with(|| {
+            // Model a hooked allocator called while registering a TLS
+            // destructor. The nested detour must take its passthrough path.
+            assert!(ReentrancyGuard::try_enter().is_none());
+            true
+        })
+        .unwrap();
+        assert!(ReentrancyGuard::is_active());
+        drop(guard);
+        assert!(!ReentrancyGuard::is_active());
+
+        assert!(ReentrancyGuard::try_enter_with(|| false).is_none());
+        assert!(!ReentrancyGuard::is_active());
+        assert!(std::panic::catch_unwind(|| {
+            ReentrancyGuard::try_enter_with(|| panic!("TLS initialization failed"));
+        })
+        .is_err());
+        assert!(ReentrancyGuard::try_enter().is_some());
     }
 
     #[test]
