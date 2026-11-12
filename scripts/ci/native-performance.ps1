@@ -59,9 +59,11 @@ foreach ($workload in @("gui", "high-load")) {
                 $summary = $null
                 if ($mode -eq "capture") {
                     $raw = & $cli inspect $trace --json
-                    if ($LASTEXITCODE -notin @(0,2)) { throw "performance trace inspection failed" }
+                    $inspectExit = $LASTEXITCODE
+                    if ($inspectExit -notin @(0,1)) { throw "performance trace inspection failed" }
                     $raw | Set-Content "trace-summary.json"
                     $summary = ($raw -join "`n") | ConvertFrom-Json
+                    if ($null -eq $summary.integrity -or ($inspectExit -eq 1 -and $summary.integrity.status -ne "incomplete")) { throw "invalid performance inspection result" }
                     $requiredApi = if ($workload -eq "gui") { "user32!BeginPaint" } else { "kernel32!HeapAlloc" }
                     if (-not ($summary.api_stats | Where-Object { $_.api -eq $requiredApi -and $_.enter -gt 0 })) {
                         throw "performance run did not capture $requiredApi"
