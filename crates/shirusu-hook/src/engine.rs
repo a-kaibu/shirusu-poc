@@ -1602,10 +1602,16 @@ fn generic_detour_with<const N: usize>(
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
     let ret = invoke(original);
-    guard.resume();
-    call_guard.complete();
-    // 透明性: 他の処理より先に LastError を確定させる（overview）。
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    // Loader heap operations may have destroyed the TLS vector in the original
+    // call. Leave the call open for integrity reporting rather than touching
+    // Rust TLS after teardown or inventing a normal completion.
+    if !crate::runtime::native_tls_available() {
+        le.restore_for_return();
+        return ret;
+    }
+    guard.resume();
     pop_call(call_id);
     let values = capture::generic_leave(api, ret, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
