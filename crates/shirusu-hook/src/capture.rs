@@ -258,10 +258,13 @@ pub fn read_file_enter(
 /// ReadFile の leave。`bytes_read_addr` は lpNumberOfBytesRead の
 /// アドレス（0 なら NULL が渡された）。OVERLAPPED 指定時は完了が
 /// 非同期のため、読取バイト数とバッファ内容は Unsupported。
+/// `requested_len` は API 入口の nNumberOfBytesToRead。戻り値の長さが
+/// これを超える場合、隣接メモリを取得せず data を Unsupported とする。
 pub fn read_file_leave(
     mem: &dyn MemoryReader,
     success: i32,
     buffer: u64,
+    requested_len: u32,
     bytes_read_addr: u64,
     overlapped: bool,
     last_error: u32,
@@ -289,7 +292,7 @@ pub fn read_file_leave(
                 // 失敗時は出力バッファに有効なデータが無い
                 CapturedValue::captured(TypedValue::Bytes(Vec::new()))
             } else {
-                read_buffer(mem, buffer, n as usize)
+                read_output_buffer(mem, buffer, requested_len, n)
             };
             (u32v(n), data)
         }
@@ -375,7 +378,8 @@ pub fn read_overlapped_transferred_with_width(
             return Some(n);
         }
     }
-    read_overlapped_internal_high_with_width(mem, overlapped_addr, pointer_width).map(|n| n as u32)
+    read_overlapped_internal_high_with_width(mem, overlapped_addr, pointer_width)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 pub fn get_overlapped_result_enter(file: u64, overlapped: u64, wait: i32) -> Vec<CapturedValue> {
@@ -599,6 +603,22 @@ pub fn read_overlapped_internal_high_with_width(
     }
 }
 
+/// The completion count is observed memory, not authority to read beyond the
+/// application's original buffer. Preserve the raw count separately and refuse
+/// data capture when its relationship to the requested capacity is invalid.
+fn read_output_buffer(
+    mem: &dyn MemoryReader,
+    buffer: u64,
+    requested: u32,
+    transferred: u32,
+) -> CapturedValue {
+    if transferred > requested {
+        unsupported_bytes()
+    } else {
+        read_buffer(mem, buffer, transferred as usize)
+    }
+}
+
 /// 完了時の ReadFile leave 値列（F27）。leave Schema と同じフィールド順
 /// （return / lpNumberOfBytesRead / data / last_error）で、完了時点の
 /// 転送バイト数とバッファ内容を取る。失敗時は同期 leave と同じく
@@ -606,6 +626,7 @@ pub fn read_overlapped_internal_high_with_width(
 pub fn complete_read_file_leave(
     mem: &dyn MemoryReader,
     buffer: u64,
+    requested_len: u32,
     transferred: u32,
     success: bool,
     last_error: u32,
@@ -615,7 +636,7 @@ pub fn complete_read_file_leave(
         vec![
             i32v(success_i32),
             u32v(transferred),
-            read_buffer(mem, buffer, transferred as usize),
+            read_output_buffer(mem, buffer, requested_len, transferred),
             last_error_value(
                 LastErrorMeaning::WhenReturnIsFalse,
                 success_i32 as u64,
@@ -986,12 +1007,71 @@ mod tests {
     }
 
     #[test]
+    fn read_results_outside_requested_capacity_never_read_the_buffer() {
+        struct CountOnly(u32);
+        impl MemoryReader for CountOnly {
+            fn read_exact(&self, addr: u64, buf: &mut [u8]) -> bool {
+                assert_eq!(addr, 0x5000, "must not attempt any output-buffer read");
+                assert_eq!(buf.len(), 4);
+                buf.copy_from_slice(&self.0.to_le_bytes());
+                true
+            }
+        }
+        for requested in [0, 1, 4096, u32::MAX - 1] {
+            let transferred = requested + 1;
+            let mem = CountOnly(transferred);
+            let sync = read_file_leave(&mem, 1, 0x4000, requested, 0x5000, false, 0);
+            let completion =
+                complete_read_file_leave(&mem, 0x4000, requested, transferred, true, 0);
+            for values in [sync, completion] {
+                assert_eq!(
+                    values[1],
+                    u32v(transferred),
+                    "retain observed count, not a clamped count"
+                );
+                assert_eq!(values[2], unsupported_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn read_result_at_requested_capacity_preserves_valid_data() {
+        let mut mem = MapMemory::new();
+        mem.write(0x4000, b"data-neighbor");
+        mem.write_u32(0x5000, 4);
+        let sync = read_file_leave(&mem, 1, 0x4000, 4, 0x5000, false, 0);
+        let completion = complete_read_file_leave(&mem, 0x4000, 4, 4, true, 0);
+        assert_eq!(sync, completion);
+        assert_eq!(
+            sync[2],
+            CapturedValue::captured(TypedValue::Bytes(b"data".to_vec()))
+        );
+    }
+
+    #[test]
+    fn overlapped_count_cannot_truncate_into_a_small_valid_length() {
+        let mut mem = MapMemory::new();
+        for oversized in [u32::MAX as u64 + 1, u64::MAX] {
+            mem.write(0x1008, &oversized.to_le_bytes());
+            assert_eq!(
+                read_overlapped_transferred_with_width(&mem, 0, 0x1000, 8),
+                None
+            );
+        }
+        mem.write(0x1008, &(u32::MAX as u64).to_le_bytes());
+        assert_eq!(
+            read_overlapped_transferred_with_width(&mem, 0, 0x1000, 8),
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
     fn read_file_leave_captures_written_data() {
         let api = api_by_id(API_READ_FILE).unwrap();
         let mut m = MapMemory::new();
         m.write(0x4000, b"save-data-1234");
         m.write_u32(0x5000, 14);
-        let values = read_file_leave(&m, 1, 0x4000, 0x5000, false, 0);
+        let values = read_file_leave(&m, 1, 0x4000, 32, 0x5000, false, 0);
         assert_eq!(values[1], u32v(14));
         assert_eq!(
             values[2],
@@ -1001,14 +1081,14 @@ mod tests {
         let types = schema_types(&api.leave_schema()).unwrap();
         assert_eq!(decode_values(&types, &bytes).unwrap(), values);
         // 失敗時はデータ空、last_error が残る
-        let failed = read_file_leave(&m, 0, 0x4000, 0x5000, false, 5);
+        let failed = read_file_leave(&m, 0, 0x4000, 32, 0x5000, false, 5);
         assert_eq!(
             failed[2],
             CapturedValue::captured(TypedValue::Bytes(Vec::new()))
         );
         assert_eq!(failed[3], u32v(5));
         // OVERLAPPED は Unsupported
-        let ov = read_file_leave(&m, 0, 0x4000, 0x5000, true, 997);
+        let ov = read_file_leave(&m, 0, 0x4000, 32, 0x5000, true, 997);
         assert_eq!(ov[1].capture, ValueCapture::Unsupported);
         assert_eq!(ov[2].capture, ValueCapture::Unsupported);
         assert_eq!(ov[3], u32v(997));
@@ -1048,7 +1128,7 @@ mod tests {
         // ReadFile の data は After: leave で API が書き込んだ後の内容を取る。
         m.write(0x4000, b"after-call");
         m.write_u32(0x5000, 10);
-        let leave = read_file_leave(&m, 1, 0x4000, 0x5000, false, 0);
+        let leave = read_file_leave(&m, 1, 0x4000, 32, 0x5000, false, 0);
         assert_eq!(
             CaptureTiming::from_flags(read.leave_schema().fields[2].flags),
             CaptureTiming::After
@@ -1060,7 +1140,7 @@ mod tests {
         // OVERLAPPED (非同期) の data は完了時に取得するものだが、leave
         // 時点では完了していないため Unsupported として記録する。完了時
         // の取得そのものは F27 の対象。
-        let ov = read_file_leave(&m, 1, 0x4000, 0x5000, true, 0);
+        let ov = read_file_leave(&m, 1, 0x4000, 32, 0x5000, true, 0);
         assert_eq!(ov[2].capture, ValueCapture::Unsupported);
     }
 
@@ -1174,7 +1254,7 @@ mod tests {
         let api = api_by_id(API_READ_FILE).unwrap();
         let mut m = MapMemory::new();
         m.write(0x4000, b"async-data-99");
-        let values = complete_read_file_leave(&m, 0x4000, 13, true, 0);
+        let values = complete_read_file_leave(&m, 0x4000, 32, 13, true, 0);
         assert_eq!(values[0], i32v(1));
         assert_eq!(values[1], u32v(13));
         assert_eq!(
@@ -1187,7 +1267,7 @@ mod tests {
         let types = schema_types(&api.leave_schema()).unwrap();
         assert_eq!(decode_values(&types, &bytes).unwrap(), values);
         // 失敗時はバイト数 Unsupported・データ空・last_error は意味あり
-        let failed = complete_read_file_leave(&m, 0x4000, 0, false, 5);
+        let failed = complete_read_file_leave(&m, 0x4000, 32, 0, false, 5);
         assert_eq!(failed[0], i32v(0));
         assert_eq!(failed[1].capture, ValueCapture::Unsupported);
         assert_eq!(
@@ -1293,9 +1373,9 @@ mod tests {
         );
         // ReadFile: FALSE なら意味あり、TRUE なら Stale
         let m = MapMemory::new();
-        let failed = read_file_leave(&m, 0, 0x4000, 0, false, 5);
+        let failed = read_file_leave(&m, 0, 0x4000, 32, 0, false, 5);
         assert_eq!(failed[3], u32v(5));
-        let ok = read_file_leave(&m, 1, 0x4000, 0, false, 5);
+        let ok = read_file_leave(&m, 1, 0x4000, 32, 0, false, 5);
         assert_eq!(ok[3].capture, ValueCapture::Stale);
         assert_eq!(ok[3].value, TypedValue::U32(5));
         // WriteFile / CloseHandle も同様

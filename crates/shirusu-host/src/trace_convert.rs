@@ -19,7 +19,7 @@
 
 use crate::{IntegrityLevel, IntegrityReport, LossEvent};
 use shirusu_hook::api as hook_api;
-use shirusu_trace::compact::validate_values;
+use shirusu_trace::compact::validate_values_completeness;
 use shirusu_trace::error::Result as TraceResult;
 use shirusu_trace::model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};
 use shirusu_trace::proto::{
@@ -128,6 +128,8 @@ pub fn finalization_info(report: &IntegrityReport) -> FinalizationInfo {
 pub struct ArgsConversionStats {
     /// Payload を引数値列として args へ写した件数。
     pub args_attached: usize,
+    /// Valid payloads containing unavailable or partial field values.
+    pub args_incomplete: usize,
     /// 引数値列として復号できず Blob として保持した件数。
     pub args_fallback_blob: usize,
 }
@@ -401,8 +403,13 @@ impl<W: DurableWrite> TraceRecorder<W> {
             } else if event.payload.is_empty() {
                 PayloadRef::None
             } else if args_mode && d.schema_id != 0 {
-                match self.writer.schema_types_ref(d.schema_id) {
-                    Some(types) if validate_values(types, &event.payload).is_ok() => {
+                match self
+                    .writer
+                    .schema_types_ref(d.schema_id)
+                    .and_then(|types| validate_values_completeness(types, &event.payload).ok())
+                {
+                    Some(complete) => {
+                        stats.args_incomplete += usize::from(!complete);
                         args = Some(match event {
                             Cow::Borrowed(event) => event.payload.clone(),
                             Cow::Owned(event) => event.payload,

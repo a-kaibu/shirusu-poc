@@ -224,10 +224,19 @@ pub fn decode_values(types: &[Ty], data: &[u8]) -> Result<Vec<CapturedValue>, Co
 /// Validate an encoded value sequence without retaining decoded values or
 /// allocating string/buffer storage. Acceptance matches `decode_values`.
 pub fn validate_values(types: &[Ty], data: &[u8]) -> Result<(), CompactError> {
+    validate_values_completeness(types, data).map(|_| ())
+}
+
+/// Validate without allocating and report whether every field was captured.
+/// Stale last-error values are intentionally not meaningful for successful calls
+/// and do not represent missing capture data.
+pub fn validate_values_completeness(types: &[Ty], data: &[u8]) -> Result<bool, CompactError> {
+    let mut complete = true;
     let mut cur = Cursor::new(data);
     for ty in types {
         let code = cur.read_u8()?;
-        ValueCapture::from_code(code).ok_or(CompactError::InvalidCapture(code))?;
+        let capture = ValueCapture::from_code(code).ok_or(CompactError::InvalidCapture(code))?;
+        complete &= matches!(capture, ValueCapture::Captured | ValueCapture::Stale);
         match ty {
             Ty::Str => {
                 std::str::from_utf8(cur.read_len_bytes()?)
@@ -250,7 +259,7 @@ pub fn validate_values(types: &[Ty], data: &[u8]) -> Result<(), CompactError> {
     if !cur.is_done() {
         return Err(CompactError::TrailingBytes(cur.remaining()));
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// fuzz ターゲット `decode_compact` の入口：SchemaSet の Protobuf

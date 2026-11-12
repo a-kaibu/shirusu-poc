@@ -3180,6 +3180,7 @@ fn record_overlapped_completion(
         capture::OverlappedDirection::Read => capture::complete_read_file_leave(
             &ProcessMemory,
             pending.buffer,
+            pending.requested_len,
             transferred,
             success,
             last_error,
@@ -3469,6 +3470,7 @@ unsafe extern "system-unwind" fn detour_read_file(
             Some(n) => capture::complete_read_file_leave(
                 &ProcessMemory,
                 buffer as u64,
+                bytes_to_read,
                 n,
                 true,
                 last_error,
@@ -3477,6 +3479,7 @@ unsafe extern "system-unwind" fn detour_read_file(
                 &ProcessMemory,
                 ret,
                 buffer as u64,
+                bytes_to_read,
                 bytes_read as u64,
                 true,
                 last_error,
@@ -3487,6 +3490,7 @@ unsafe extern "system-unwind" fn detour_read_file(
             &ProcessMemory,
             ret,
             buffer as u64,
+            bytes_to_read,
             bytes_read as u64,
             is_overlapped,
             last_error,

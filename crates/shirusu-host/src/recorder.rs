@@ -776,6 +776,7 @@ impl CaptureSession {
                     .recorder
                     .record_owned_batch_with_args(&ctx, batch.events)?;
                 self.args_stats.args_attached += s.args_attached;
+                self.args_stats.args_incomplete += s.args_incomplete;
                 self.args_stats.args_fallback_blob += s.args_fallback_blob;
                 ring.events += event_count as u64;
                 stats.events += event_count;
@@ -834,6 +835,14 @@ impl CaptureSession {
         }
         reports.append(&mut self.retired_reports);
         let mut report = combine_reports(&reports);
+        if self.args_stats.args_incomplete > 0 {
+            report.semantic_completeness =
+                worst(report.semantic_completeness, IntegrityLevel::Degraded);
+            report.notes.push(format!(
+                "args payloads with incomplete field capture: {}",
+                self.args_stats.args_incomplete
+            ));
+        }
         if self.args_stats.args_fallback_blob > 0 {
             report.semantic_completeness =
                 worst(report.semantic_completeness, IntegrityLevel::Degraded);

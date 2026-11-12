@@ -586,3 +586,55 @@ fn late_module_scan_preserves_initial_metadata_when_unavailable() {
     assert!(trace.issues.is_empty(), "{:?}", trace.issues);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn field_capture_quality_reaches_finalization_without_event_loss() {
+    use shirusu_trace::schema::ValueCapture;
+    for state in [
+        ValueCapture::Captured,
+        ValueCapture::Stale,
+        ValueCapture::Unreadable,
+        ValueCapture::Unsupported,
+        ValueCapture::Truncated,
+        ValueCapture::LimitExceeded,
+    ] {
+        let path = temp_trace("field-quality");
+        let (agent, generation, base) = agent_and_region(11);
+        let mut session = CaptureSession::create_file(&path, config()).unwrap();
+        unsafe {
+            session
+                .add_borrowed_ring(
+                    base,
+                    RingConfig::new(64, 4096).required_len(),
+                    spec(generation),
+                )
+                .unwrap();
+        }
+        session.start().unwrap();
+        let api = api_by_id(API_CLOSE_HANDLE).unwrap();
+        let enter = capture::encode_enter(api, &capture::close_handle_enter(42)).unwrap();
+        agent.record_enter(11, api.api_id, api.enter_schema_id(), 1, 0, &enter);
+        let mut values = capture::close_handle_leave(1, 0);
+        values[1].capture = state;
+        let leave = capture::encode_leave(api, &values).unwrap();
+        agent.record_leave(11, api.api_id, api.leave_schema_id(), 1, 0, &leave);
+        session.poll_once().unwrap();
+        let summary = session.stop().unwrap();
+        let expected = if matches!(state, ValueCapture::Captured | ValueCapture::Stale) {
+            IntegrityLevel::Complete
+        } else {
+            IntegrityLevel::Degraded
+        };
+        assert_eq!(
+            summary.integrity.semantic_completeness, expected,
+            "{state:?}"
+        );
+        assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
+        let trace = shirusu_trace::read_trace(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            trace.finalization.unwrap().semantic_completeness,
+            shirusu_host::trace_convert::integrity_level_code(expected)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+}
