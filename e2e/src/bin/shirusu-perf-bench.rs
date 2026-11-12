@@ -45,10 +45,9 @@ const N_BURST_CALLS: u64 = 20_000;
 /// 遅延測定用の Ring: 回収しないため、測定件数が収まる大きさにする。
 const LATENCY_DESC_CAP: usize = 65_536;
 const LATENCY_PAYLOAD_CAP: usize = 64 * 1024 * 1024;
-/// 比率測定用の Ring: 本番既定 (4096 件 / 1MiB)。Host は drain のたびに
-/// リージョン全体像をコピーするため、Ring サイズがそのまま drain コストに
-/// なる。実運用相当の数値を得るには本番サイズで測る（大きめの Ring では
-/// 全像コピーが 50 倍になり、比率が水増しされる）。
+/// 比率測定用の Ring: 本番既定 (4096 件 / 1MiB)。Host がコピーするのは
+/// 公開済みの範囲だけだが、容量変更はバースト耐性や待機頻度を変えるため、
+/// 比較には本番と同じサイズを使う。
 const RATIO_DESC_CAP: usize = 4096;
 const RATIO_PAYLOAD_CAP: usize = 1024 * 1024;
 /// バースト測定用の Ring: 本番既定 (4096 件 / 1MiB)。
@@ -56,9 +55,8 @@ const BURST_DESC_CAP: usize = 4096;
 const BURST_PAYLOAD_CAP: usize = 1024 * 1024;
 /// Host の再確認周期にならった回収ポーリング間隔。実 Host は data_ready
 /// 通知＋2ms 再確認で回収する。ベンチのプロセス内では通知が結線されない
-/// ためポーリングで代用するが、間隔は実運用と同じ 2ms にする。
-/// 200µs のような短い間隔では drain ごとの全像コピーが CPU を食い、
-/// 比率を水増しする。
+/// ため 2ms ポーリングで代用する。実 Host は空のときだけ通知を待つため、
+/// このモデルの固定待機とはスケジューリングが異なる。
 const DRAIN_POLL: Duration = Duration::from_millis(2);
 const BURST_DRAIN_POLL: Duration = Duration::from_millis(2);
 /// TraceRecorder へ渡す 1 回の Batch の目標イベント数。drain のたびに
