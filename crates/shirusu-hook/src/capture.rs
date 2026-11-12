@@ -21,10 +21,8 @@
 //!   生値を保持する。F20）。
 
 use crate::api::ApiDef;
-use shirusu_trace::compact::encode_values;
-use shirusu_trace::schema::{
-    schema_types, CapturedValue, LastErrorMeaning, Ty, TypedValue, ValueCapture,
-};
+use shirusu_trace::compact::encode_values_iter;
+use shirusu_trace::schema::{CapturedValue, LastErrorMeaning, Ty, TypedValue, ValueCapture};
 use shirusu_trace::CompactError;
 
 /// UTF-16 文字列の取得上限（終端 NUL を除く単位数）。
@@ -664,12 +662,10 @@ pub fn complete_write_file_leave(
 /// 取得した値列を、その API の Schema で Compact Binary へ符号化する。
 /// 転送 Payload として運び、Host 変換で TraceEvent.args へ写す。
 pub fn encode_enter(api: &ApiDef, values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types = schema_types(&api.enter_schema()).expect("hook schemas use known tags only");
-    encode_values(&types, values)
+    encode_values_iter(api.enter_fields.iter().map(|field| field.1), values)
 }
 pub fn encode_leave(api: &ApiDef, values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types = schema_types(&api.leave_schema()).expect("hook schemas use known tags only");
-    encode_values(&types, values)
+    encode_values_iter(api.leave_fields.iter().map(|field| field.1), values)
 }
 
 /// L1 生成 API（L03）の汎用取得。生の引数値（usize を u64 へ写した
@@ -737,8 +733,39 @@ fn raw_to_value(function: &str, name: &str, ty: Ty, raw: u64) -> CapturedValue {
 mod tests {
     use super::*;
     use crate::api::*;
-    use shirusu_trace::compact::decode_values;
+    use shirusu_trace::compact::{decode_values, encode_values};
+    use shirusu_trace::schema::schema_types;
     use shirusu_trace::schema::Ty;
+
+    #[test]
+    fn direct_field_encoding_matches_published_schemas_for_all_generated_apis() {
+        for api in GENERATED_API_TABLE {
+            for raw in [
+                0,
+                1,
+                u32::MAX as u64,
+                u64::MAX,
+                i64::MIN as u64,
+                0x7ff8_0000_0000_1234,
+            ] {
+                let args = vec![raw; api.enter_fields.len()];
+                let enter = generic_enter(api, &args);
+                let leave = generic_leave(api, raw, u32::MAX);
+                assert_eq!(
+                    encode_enter(api, &enter).unwrap(),
+                    encode_values(&schema_types(&api.enter_schema()).unwrap(), &enter).unwrap(),
+                    "{} enter",
+                    api.function
+                );
+                assert_eq!(
+                    encode_leave(api, &leave).unwrap(),
+                    encode_values(&schema_types(&api.leave_schema()).unwrap(), &leave).unwrap(),
+                    "{} leave",
+                    api.function
+                );
+            }
+        }
+    }
 
     fn mem_with_str(addr: u64, s: &str) -> MapMemory {
         let mut m = MapMemory::new();

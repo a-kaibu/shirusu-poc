@@ -103,6 +103,14 @@ jobs:
         # Windows 向けスクリプトは matrix 側のコマンドで pwsh を起動して実行する。
         shell: bash
         run: ${{ matrix.run }}
+      - name: Preserve native performance measurements
+        if: ${{ always() && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-performance-${{ matrix.name }}
+          path: target/ci-diagnostics/native-performance-*.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Preserve Windows capture diagnostics
         if: ${{ failure() && runner.os == 'Windows' }}
         uses: actions/upload-artifact@v4

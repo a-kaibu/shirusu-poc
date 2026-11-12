@@ -179,6 +179,15 @@ fn read_value(cur: &mut Cursor, ty: Ty) -> Result<TypedValue, CompactError> {
 /// Schema の型列に従って値列を符号化する。値の個数と型は Schema と
 /// 一致していなければならない。
 pub fn encode_values(types: &[Ty], values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
+    encode_values_iter(types.iter().copied(), values)
+}
+
+/// Encode using an existing field table without constructing a Schema or
+/// allocating a separate type vector on the recorder's hot path.
+pub fn encode_values_iter(
+    types: impl ExactSizeIterator<Item = Ty>,
+    values: &[CapturedValue],
+) -> Result<Vec<u8>, CompactError> {
     if types.len() != values.len() {
         return Err(CompactError::FieldCountMismatch {
             expected: types.len(),
@@ -186,8 +195,8 @@ pub fn encode_values(types: &[Ty], values: &[CapturedValue]) -> Result<Vec<u8>, 
         });
     }
     let mut out = Vec::new();
-    for (i, (ty, v)) in types.iter().zip(values.iter()).enumerate() {
-        if v.value.ty() != *ty {
+    for (i, (ty, v)) in types.zip(values.iter()).enumerate() {
+        if v.value.ty() != ty {
             return Err(CompactError::TypeMismatch { field: i });
         }
         out.push(v.capture.code());

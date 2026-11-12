@@ -64,6 +64,9 @@ foreach ($workload in @("gui", "high-load")) {
                     $raw | Set-Content "trace-summary.json"
                     $summary = ($raw -join "`n") | ConvertFrom-Json
                     if ($null -eq $summary.integrity -or ($inspectExit -eq 1 -and $summary.integrity.status -ne "incomplete")) { throw "invalid performance inspection result" }
+                    $unpaired = @($summary.api_stats | Where-Object { $_.enter -ne $_.leave } | ForEach-Object { "$($_.api):$($_.enter)/$($_.leave)" }) -join ","
+                    $lossKinds = @($summary.integrity.loss_records | ForEach-Object { "$($_.kind):$($_.records)" }) -join ","
+                    Write-Host ("Native sample {0}/{1}: {2:N3}ms events={3} losses={4} kinds=[{5}] unpaired=[{6}]" -f $workload, $round, (1000.0 * $measurement.ticks / $measurement.qpc_frequency), $summary.events, $summary.integrity.total_loss_count, $lossKinds, $unpaired)
                     $requiredApi = if ($workload -eq "gui") { "user32!BeginPaint" } else { "kernel32!HeapAlloc" }
                     if (-not ($summary.api_stats | Where-Object { $_.api -eq $requiredApi -and $_.enter -gt 0 })) {
                         throw "performance run did not capture $requiredApi"

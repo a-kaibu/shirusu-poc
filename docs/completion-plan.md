@@ -6,6 +6,7 @@
 | 要件 | 現状と残件 | 合格に必要な証拠 |
 | --- | --- | --- |
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
+| 標準の呼び出し境界 | Nt は詳細モードに分離。公開 Windows API 同士の内部呼び出しは caller address による境界判定が未実装 | Application / Runtime 起点の記録と Windows 内部起点の除外、callback 内の再開を実走で比較 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
 | 全 Win32 の L0/L1 | 現在197件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
@@ -121,7 +122,17 @@ GetStockObject も L1 に追加した（計197 API）。
 使い、欠落時も数値を残す。3倍／5倍は評価目標なので未達だけでは CI を失敗に
 しないが、実行失敗・対象 API 未観測は失敗にする。対象 API 全体の Coverage と
 全アプリの性能保証は別であり、モデルベンチのバッファ占有率とも区別する。
-初回実測値は Windows CI の結果から追記する。
+`c0e21a9` の run `43286917384` で x86 の測定が完走。GUI 3.061倍、
+高負荷387.312倍で、両方 Event Integrity は不完全。Server 2022 x64 は
+GUI 5.189倍、高負荷474.833倍、latest x64 は GUI 2.438倍、高負荷384.163倍。
+すべての環境で Event Integrity は不完全なため、目標達成とは扱わない。
+成功した CI でも測定 JSON を artifact に保存するよう追加する。
+
+記録ごとに Schema 構築・ハッシュ計算・型 Vec 確保を繰り返していたため、
+既存の静的フィールド表から直接符号化するよう変更。184 生成 API の境界値で
+旧経路と同じバイト列を検査する。`encoding-cost` example の Linux release
+測定では HeapAlloc enter の符号化部分が約570〜700nsから約33〜40nsになった。
+これは局所的な比較値であり、Windows 全体の倍率改善は次の CI で測る。
 
 ## Parquet の実装検証
 
@@ -130,3 +141,13 @@ Rust 1.87、x86/x64 のクロスチェックで検証する。1075 イベント�
 変換し、DuckDB で件数一致、API 別集計、UBIGINT 列、JSON の取得状態を確認した。
 新しい境界値テストで Writer が global_order=0 を許して Reader が拒否する不一致も
 見つかったため、書き込み前に拒否するよう修正し、拒否後の正常書き込みも検証した。
+
+通常経路の共通ロックをなくす要件も残る。`RuntimeSlot::for_detour` は現在
+セッション参照に RwLock を使っている。セッション差し替え・終了後の素通し・
+ネイティブ TLS がない経路を壊さずに、読み手の所有権を保護する方式が必要。
+性能値だけを理由に既存の寿命保護を外さない。
+
+`c0e21a9` の [CI run `43286917384`](https://github.com/a-kaibu/shirusu-poc/actions/runs/43286917384)
+は全ジョブ通過（Windows x86/x64、Server 2022、Linux、macOS、MSRV、Kani、TLA、fuzz）。
+Parquet の Windows 統合テストも通過。性能ベンチが完走したことと、数値目標や
+Event Integrity が合格したことは区別する。上記の符号化改善は後続コミットで測定する。
