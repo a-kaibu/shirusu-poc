@@ -23,6 +23,7 @@
 
 pub mod brief;
 pub mod bundle;
+pub mod reduce;
 pub mod replay;
 pub mod rules;
 pub mod select;

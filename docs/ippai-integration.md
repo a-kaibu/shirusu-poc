@@ -248,3 +248,20 @@ Capture Coverage の警告だけでは再実行生成を禁止しない。例え
 `replay_source_capture_coverage` に残す。記録されなかった操作の再現を
 保証するものではない。Event Integrity と Semantic Completeness の劣化、
 Reader の回復 issue、欠落したイベントや入力は生成を禁止する。
+
+### 再現確認を伴う削減のライブラリ API
+
+`shirusu_probe::reduce::reduce_file_io` は `ReplaySlice` と実行側の oracle を受け取り、
+対象以外の ReadFile / WriteFile を 1 件ずつ除去する。作成・クローズ・対象呼び出しと
+結果を変数に保存する呼び出しは保持する。元の Probe と採用する候補は、同じ対象差分が
+2 回連続で確認できた場合だけ採用する。タイムアウト、前提条件不足、Capture 欠落などは
+`Inconclusive` として返し、削減を採用しない。実行回数の予算も必須。
+
+oracle は各試行を **両環境の新しい隔離ディレクトリ** で実行し、基準側の期待値成立と
+同じ対象差分の維持を判定する必要がある。単なる非ゼロ終了や別の API の失敗では
+`SameTargetDifference` を返してはいけない。`Trial` は元の呼び出し位置と、削減後の
+対象位置を渡す。証拠となる結果と環境情報の保存は実行側の責務。
+
+この API は実行器を起動せず、CLI と Windows／互換実装の実行器の接続は未実装。
+`single_deletion_fixed_point` は追加の単一削除が採用されなかったという意味で、
+大域的な最小性やフレーク不在の証明ではない。後の削除で依存が変化した場合は再走査する。

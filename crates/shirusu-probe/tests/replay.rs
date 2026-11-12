@@ -282,3 +282,99 @@ fn candidate_slice_retains_reopened_file_history_and_excludes_reused_handles() {
     )
     .is_err());
 }
+
+fn reduction_fixture() -> shirusu_probe::replay::ReplaySlice {
+    let mut spec = generate_replay(&record(1, 42)).unwrap();
+    spec.steps.insert(2, spec.steps[1].clone());
+    shirusu_probe::replay::ReplaySlice {
+        spec,
+        source_steps: 7,
+        kept_steps: (0..7).collect(),
+        target_source_step: 5,
+        target_replay_step: 5,
+    }
+}
+
+#[test]
+fn reduction_preserves_target_creation_cleanup_and_required_write() {
+    use shirusu_probe::reduce::{reduce_file_io, TrialOutcome::*};
+    let reduced = reduce_file_io(reduction_fixture(), 30, |trial| {
+        assert_eq!(trial.source_steps[trial.target_replay_step], 5);
+        assert_eq!(
+            trial.spec.steps[trial.target_replay_step].call,
+            "kernel32!ReadFile"
+        );
+        for fixed in [0, 3, 4, 5, 6] {
+            assert!(trial.source_steps.contains(&fixed));
+        }
+        Ok::<_, ()>(if trial.source_steps.contains(&1) {
+            SameTargetDifference
+        } else {
+            DifferenceAbsent
+        })
+    })
+    .unwrap();
+    assert_eq!(reduced.replay.kept_steps, [0, 1, 3, 4, 5, 6]);
+    assert_eq!(reduced.replay.target_replay_step, 4);
+    assert!(reduced.single_deletion_fixed_point);
+    assert!(reduced.trials <= 30);
+}
+
+#[test]
+fn reduction_refuses_unconfirmed_baselines_and_inconclusive_or_flaky_deletions() {
+    use shirusu_probe::reduce::{reduce_file_io, ReductionError, TrialOutcome::*};
+    let error = reduce_file_io(reduction_fixture(), 20, |_| Ok::<_, ()>(Inconclusive)).unwrap_err();
+    assert_eq!(error, ReductionError::BaselineNotReproduced);
+    let mut calls = 0;
+    let unchanged = reduce_file_io(reduction_fixture(), 20, |_| {
+        calls += 1;
+        // Original twice, then a flaky deletion once, never twice.
+        Ok::<_, ()>(if calls <= 3 {
+            SameTargetDifference
+        } else {
+            Inconclusive
+        })
+    })
+    .unwrap();
+    assert_eq!(unchanged.replay.kept_steps, [0, 1, 2, 3, 4, 5, 6]);
+    let limited = reduce_file_io(reduction_fixture(), 2, |_| {
+        Ok::<_, ()>(SameTargetDifference)
+    })
+    .unwrap();
+    assert_eq!(limited.trials, 2);
+    assert!(!limited.single_deletion_fixed_point);
+    assert_eq!(limited.replay.kept_steps.len(), 7);
+    let error = reduce_file_io(reduction_fixture(), 20, |_| Err("runner crashed")).unwrap_err();
+    assert_eq!(error, ReductionError::Oracle("runner crashed"));
+}
+
+#[test]
+fn reduction_checks_provenance_before_running_an_oracle() {
+    let mut input = reduction_fixture();
+    input.target_source_step = 99;
+    assert!(
+        shirusu_probe::reduce::reduce_file_io(input, 10, |_| -> Result<_, ()> {
+            panic!("invalid input must not execute")
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn reduction_revisits_rejected_deletions_after_dependencies_change() {
+    use shirusu_probe::reduce::{reduce_file_io, TrialOutcome::*};
+    let result = reduce_file_io(reduction_fixture(), 30, |trial| {
+        // Removing step 2 alone changes the target, but after step 1 is removed
+        // it becomes redundant. A single pass cannot discover that reduction.
+        Ok::<_, ()>(
+            if trial.source_steps.contains(&1) && !trial.source_steps.contains(&2) {
+                DifferenceAbsent
+            } else {
+                SameTargetDifference
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(result.replay.kept_steps, [0, 3, 4, 5, 6]);
+    assert!(result.single_deletion_fixed_point);
+}
