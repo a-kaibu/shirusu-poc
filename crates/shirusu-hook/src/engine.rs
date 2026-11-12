@@ -43,9 +43,8 @@ use crate::pe;
 use crate::plan::{build_plan, HookPlan};
 use crate::runtime::{pop_call, push_call, ComCallGuard, HookRuntime, ReentrancyGuard};
 use crate::winrt::{
-    default_interface_for_class, winrt_method_return, IID_IACTIVATION_FACTORY, IID_IINSPECTABLE,
-    WINRT_ACTIVATIONS, WINRT_ACTIVATION_API_ID, WINRT_ACTIVATION_COUNT,
-    WINRT_ACTIVATION_LEAVE_SCHEMA_ID, WINRT_ACTIVATION_REPORT_ID_BASE,
+    winrt_method_return, IID_IINSPECTABLE, WINRT_ACTIVATIONS, WINRT_ACTIVATION_API_ID,
+    WINRT_ACTIVATION_COUNT, WINRT_ACTIVATION_LEAVE_SCHEMA_ID, WINRT_ACTIVATION_REPORT_ID_BASE,
     WINRT_ACTIVATION_RO_ACTIVATE_INSTANCE, WINRT_ACTIVATION_RO_GET_ACTIVATION_FACTORY,
 };
 use std::ffi::c_void;
@@ -1768,35 +1767,6 @@ fn on_factory_result(rt: &Arc<HookRuntime>, factory: &'static str, iid: Guid, pt
     }
 }
 
-/// WinRT アクティベーション呼び出しが返したインターフェイスを追跡対象に
-/// 加え、既知インターフェイスなら vtable 複製による Detour を設置する
-/// （L14）。設置の成否は呼び出しの成否に影響しない（best-effort）。
-///
-/// - `RoActivateInstance` が返すのはクラスの既定インターフェイス
-///   （表に無いクラスは `IInspectable`）。
-/// - `RoGetActivationFactory` が返すのは `IActivationFactory` そのもの。
-fn on_activation_result(
-    rt: &Arc<HookRuntime>,
-    activation_index: usize,
-    function: &'static str,
-    class_name: &str,
-    ptr: usize,
-) {
-    let iid = match activation_index {
-        WINRT_ACTIVATION_RO_GET_ACTIVATION_FACTORY => IID_IACTIVATION_FACTORY,
-        _ => default_interface_for_class(class_name)
-            .map(|d| d.iid)
-            .unwrap_or(IID_IINSPECTABLE),
-    };
-    rt.with_com_tracker(|t| {
-        t.note_factory_result(ptr as u64, iid, function);
-    });
-    if interface_by_iid(&iid).is_some() {
-        // Activation results may already be shared; record the safe skip.
-        let _ = intercept_object(rt, ptr, iid);
-    }
-}
-
 unsafe extern "system-unwind" fn detour_co_create_instance(
     clsid: *const Guid,
     unk_outer: *mut c_void,
@@ -1956,7 +1926,8 @@ unsafe extern "system-unwind" fn detour_co_get_class_object(
 }
 
 type RoActivateInstanceFn = unsafe extern "system-unwind" fn(usize, *mut *mut c_void) -> i32;
-type RoGetActivationFactoryFn = unsafe extern "system-unwind" fn(usize, *mut *mut c_void) -> i32;
+type RoGetActivationFactoryFn =
+    unsafe extern "system-unwind" fn(usize, *const Guid, *mut *mut c_void) -> i32;
 
 /// WinRT アクティベーション関数の Detour 共通の前処理。COM の
 /// `prepare_com` と同じ判定だが、元関数は WinRT 別表から引く。
@@ -2016,16 +1987,14 @@ fn prepare_winrt(activation_index: usize) -> WinRtPrepare {
     }
 }
 
-/// WinRT アクティベーション関数の Detour 本体。`RoActivateInstance` と
-/// `RoGetActivationFactory` は引数の形が同じ（HSTRING のクラス名と out
-/// ポインタ）のため、1 個の本体を共有する。HSTRING からクラス名を読み、
-/// アクティベーションイベントとして記録し、成功時は返された
-/// インターフェイスを追跡対象に加える。
-unsafe fn detour_winrt_activation(
+// Share recording mechanics, but invoke each activation API with its own ABI.
+fn detour_winrt_activation(
     activation_index: usize,
     function: &'static str,
     class_id: usize,
+    iid: Option<*const Guid>,
     out: *mut *mut c_void,
+    invoke: impl FnOnce(usize) -> i32,
 ) -> i32 {
     let (rt, original, tid, _flight, mut guard, mut le) = match prepare_winrt(activation_index) {
         WinRtPrepare::Record {
@@ -2037,14 +2006,18 @@ unsafe fn detour_winrt_activation(
             last_error,
         } => (rt, original, tid, flight, guard, last_error),
         WinRtPrepare::Passthrough { original } => {
-            // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
-            let orig: RoActivateInstanceFn = unsafe { std::mem::transmute(original) };
-            return unsafe { orig(class_id, out) };
+            return invoke(original);
         }
         WinRtPrepare::Unavailable => return COM_E_FAIL,
     };
-    // SAFETY: 設置時に保存した本物のアクティベーション関数。
-    let orig: RoActivateInstanceFn = unsafe { std::mem::transmute(original) };
+    let requested_iid = match iid {
+        Some(address) => read_guid(address as u64),
+        None => Some(IID_IINSPECTABLE),
+    };
+    let raw = match iid {
+        Some(address) => [class_id, address as usize, out as usize],
+        None => [class_id, out as usize, 0],
+    };
     let call_id = rt.alloc_call_id();
     // HSTRING からクラス名を読む。読めなければ空のまま記録する
     // （クラス名の読み取り失敗で呼び出し自体を失敗させない）。
@@ -2053,7 +2026,7 @@ unsafe fn detour_winrt_activation(
         0,
         &class_name,
         function,
-        &crate::com::raw_arg_slots(&[class_id, out as usize]),
+        &crate::com::raw_arg_slots(&raw[..if iid.is_some() { 3 } else { 2 }]),
     );
     if let Ok(bytes) = crate::winrt::encode_winrt_activation_enter(&values) {
         rt.record_winrt_activation_enter(tid, call_id, &bytes);
@@ -2071,7 +2044,7 @@ unsafe fn detour_winrt_activation(
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let hr = unsafe { orig(class_id, out) };
+    let hr = invoke(original);
     guard.resume();
     call_guard.complete();
     let last_error = le.capture_after_original();
@@ -2081,7 +2054,9 @@ unsafe fn detour_winrt_activation(
     if hr == 0 && !out.is_null() {
         if let Some(ptr) = read_usize(out as u64).filter(|p| *p != 0) {
             returned_object = ptr as u64;
-            on_activation_result(&rt, activation_index, function, &class_name, ptr);
+            if let Some(requested_iid) = requested_iid {
+                on_factory_result(&rt, function, requested_iid, ptr);
+            }
         }
     }
     let values = crate::winrt::winrt_activation_leave_values(hr, returned_object);
@@ -2097,28 +2072,35 @@ unsafe extern "system-unwind" fn detour_ro_activate_instance(
     class_id: usize,
     out: *mut *mut c_void,
 ) -> i32 {
-    unsafe {
-        detour_winrt_activation(
-            WINRT_ACTIVATION_RO_ACTIVATE_INSTANCE,
-            "RoActivateInstance",
-            class_id,
-            out,
-        )
-    }
+    detour_winrt_activation(
+        WINRT_ACTIVATION_RO_ACTIVATE_INSTANCE,
+        "RoActivateInstance",
+        class_id,
+        None,
+        out,
+        |original| {
+            let original: RoActivateInstanceFn = unsafe { std::mem::transmute(original) };
+            unsafe { original(class_id, out) }
+        },
+    )
 }
 
 unsafe extern "system-unwind" fn detour_ro_get_activation_factory(
     class_id: usize,
+    iid: *const Guid,
     out: *mut *mut c_void,
 ) -> i32 {
-    unsafe {
-        detour_winrt_activation(
-            WINRT_ACTIVATION_RO_GET_ACTIVATION_FACTORY,
-            "RoGetActivationFactory",
-            class_id,
-            out,
-        )
-    }
+    detour_winrt_activation(
+        WINRT_ACTIVATION_RO_GET_ACTIVATION_FACTORY,
+        "RoGetActivationFactory",
+        class_id,
+        Some(iid),
+        out,
+        |original| {
+            let original: RoGetActivationFactoryFn = unsafe { std::mem::transmute(original) };
+            unsafe { original(class_id, iid, out) }
+        },
+    )
 }
 
 // ---- コールバック (L16) ----
@@ -3636,6 +3618,46 @@ mod tests {
         assert_eq!(rt.in_flight(), 0);
         assert_eq!(Arc::strong_count(&rt), references);
         crate::fls::drain_pending_exits();
+        assert!(clear_runtime(&rt));
+    }
+
+    #[test]
+    fn activation_factory_preserves_iid_and_output_in_recording_and_passthrough() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        const IID: Guid = Guid { bytes: [0x77; 16] };
+        unsafe extern "system-unwind" fn factory(
+            class_id: usize,
+            iid: *const Guid,
+            out: *mut *mut c_void,
+        ) -> i32 {
+            assert_eq!(class_id, 0);
+            assert_eq!(unsafe { *iid }, IID);
+            unsafe {
+                *out = 0x1234usize as *mut c_void;
+                SetLastError(0x8000_0001);
+            }
+            0
+        }
+        let rt = Arc::new(test_runtime());
+        rt.set_winrt_original(
+            WINRT_ACTIVATION_RO_GET_ACTIVATION_FACTORY,
+            factory as *const () as usize,
+        );
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let detour: RoGetActivationFactoryFn = detour_ro_get_activation_factory;
+        for recording in [true, false] {
+            if !recording {
+                rt.shutdown_recording();
+            }
+            let mut output = std::ptr::null_mut();
+            assert_eq!(unsafe { detour(0, &IID, &mut output) }, 0);
+            assert_eq!(unsafe { GetLastError() }, 0x8000_0001);
+            assert_eq!(output as usize, 0x1234);
+        }
+        assert_eq!(
+            rt.with_com_tracker(|tracker| tracker.lookup(0x1234).unwrap().iid),
+            IID
+        );
         assert!(clear_runtime(&rt));
     }
 

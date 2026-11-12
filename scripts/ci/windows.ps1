@@ -38,6 +38,7 @@ try {
     # カナリア: 失敗するネイティブコマンドがジョブを落とすこと自体を検証する。
     Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "canary-exit-code.ps1") } "exit-code canary"
     Invoke-Native { cargo test --workspace --no-fail-fast --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
+    Invoke-Native { cargo test -p shirusu-hook --release --target x86_64-pc-windows-msvc native_tls_vector_absence_bypasses_rust_tls_access } "native TLS availability (optimized, x64)"
     Invoke-Native { cargo build --workspace --target x86_64-pc-windows-msvc } "cargo build (workspace, x64)"
     # L20: Probe exe 生成と JSON Runner の実動（サンプル仕様から x64 の
     # Probe exe を生成・実行し、Runner でも同じ仕様を実行する）。
@@ -122,8 +123,10 @@ try {
     try {
         $diagnostics = Join-Path (Get-Location) "target\ci-diagnostics"
         New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
-        Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter "shirusu-capture-e2e-*.trace" |
-            Copy-Item -Destination $diagnostics -ErrorAction Continue
+        foreach ($pattern in @("shirusu-capture-e2e-*.trace", "shirusu-verify-*.trace")) {
+            Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter $pattern |
+                Copy-Item -Destination $diagnostics -ErrorAction Continue
+        }
         if (-not $ciComplete) {
             # WER can be disabled on hosted runners. Event 1000 still often
             # identifies the faulting module and offset; retain matching

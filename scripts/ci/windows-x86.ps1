@@ -7,13 +7,25 @@
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "native-step.ps1")
 Set-Location (Join-Path $PSScriptRoot "..\..")
+if ($env:GITHUB_ACTIONS -eq "true") {
+    $env:SHIRUSU_DIAGNOSTIC_DIR = Join-Path (Get-Location) "target\ci-diagnostics"
+    New-Item -ItemType Directory -Force -Path $env:SHIRUSU_DIAGNOSTIC_DIR | Out-Null
+}
 # カナリア: 失敗するネイティブコマンドがジョブを落とすこと自体を検証する。
 Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "canary-exit-code.ps1") } "exit-code canary"
 Invoke-Native { rustup target add i686-pc-windows-msvc } "rustup target add i686"
 Invoke-Native { cargo test -p shirusu-transport -p shirusu-transport-win -p shirusu-agent --target i686-pc-windows-msvc } "cargo test (transport/transport-win/agent, i686)"
 # Phase 3: フックの単体テストと Agent DLL の x86 ビルド（同一ビットネス注入の前提）
 Invoke-Native { cargo test -p shirusu-hook --target i686-pc-windows-msvc } "cargo test (hook, i686)"
+Invoke-Native { cargo test -p shirusu-hook --release --target i686-pc-windows-msvc native_tls_vector_absence_bypasses_rust_tls_access } "native TLS availability (optimized, i686)"
 Invoke-Native { cargo build -p shirusu-agent-dll --target i686-pc-windows-msvc } "agent dll build (i686)"
+if ($env:GITHUB_ACTIONS -eq "true") {
+    Copy-Item "target\i686-pc-windows-msvc\debug\shirusu_agent_dll.dll", "target\i686-pc-windows-msvc\debug\shirusu_agent_dll.pdb" -Destination $env:SHIRUSU_DIAGNOSTIC_DIR
+}
+# WoW64 transport tests alone do not execute an x86 injected tracer.
+Invoke-Native { cargo build -p shirusu-e2e --target i686-pc-windows-msvc --bins } "capture targets build (i686)"
+Invoke-Native { .\target\i686-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "native capture (i686)"
+Invoke-Native { .\target\i686-pc-windows-msvc\debug\shirusu-capture-e2e.exe --abi } "native capture ABI (i686)"
 Invoke-Native { cargo build -p shirusu-e2e --target i686-pc-windows-msvc --bin shirusu-e2e-producer } "e2e producer build (i686)"
 Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --bin shirusu-e2e-supervisor } "e2e supervisor build (x64)"
 $env:SHIRUSU_E2E_PRODUCER = "$PWD\target\i686-pc-windows-msvc\debug\shirusu-e2e-producer.exe"

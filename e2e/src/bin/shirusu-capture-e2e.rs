@@ -901,11 +901,22 @@ mod win {
                                     cb_leaves.len()
                                 ),
                             );
-                            // コールバックイベントはトップレベル
-                            // （parent_call_id == 0。L15 の再実行規則）。
+                            // Synchronous callbacks can be nested in DispatchMessage /
+                            // SendMessage. Their parent must precede them on this thread.
                             c.check(
-                                cb_enters.iter().all(|e| e.parent_call_id == 0),
-                                &format!("{app} callback events are top-level"),
+                                cb_enters.iter().all(|event| {
+                                    event.parent_call_id == 0
+                                        || trace.batches.iter().any(|batch| {
+                                            batch.events.iter().any(|e| std::ptr::eq(e, **event))
+                                                && trace.batches.iter()
+                                                    .filter(|other| other.thread_id == batch.thread_id)
+                                                    .flat_map(|other| &other.events)
+                                                    .any(|parent| parent.kind == 1
+                                                        && parent.call_id == event.parent_call_id
+                                                        && parent.sequence < event.sequence)
+                                        })
+                                }),
+                                &format!("{app} callback parents resolve to earlier calls on the same thread"),
                             );
                         }
                     }
