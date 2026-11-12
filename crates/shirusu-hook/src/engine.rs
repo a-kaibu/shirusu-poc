@@ -1324,120 +1324,99 @@ fn detour_for(api_id: u32) -> usize {
         }
         // L15: 内部 API (Nt*) は汎用 Detour で中継する（手書きの
         // トランポリン。引数個数は Nt* のシグネチャ通り）。
-        API_NT_CREATE_FILE => (detour_nt_create_file as GenericFn11) as usize,
-        API_NT_OPEN_FILE => (detour_nt_open_file as GenericFn6) as usize,
-        API_NT_READ_FILE => (detour_nt_read_file as GenericFn9) as usize,
-        API_NT_WRITE_FILE => (detour_nt_write_file as GenericFn9) as usize,
-        API_NT_CLOSE => (detour_nt_close as GenericFn1) as usize,
-        API_NT_QUERY_INFORMATION_FILE => (detour_nt_query_information_file as GenericFn5) as usize,
-        API_NT_SET_INFORMATION_FILE => (detour_nt_set_information_file as GenericFn5) as usize,
+        API_NT_CREATE_FILE => detour_nt_create_file as *const () as usize,
+        API_NT_OPEN_FILE => detour_nt_open_file as *const () as usize,
+        API_NT_READ_FILE => detour_nt_read_file as *const () as usize,
+        API_NT_WRITE_FILE => detour_nt_write_file as *const () as usize,
+        API_NT_CLOSE => detour_nt_close as *const () as usize,
+        API_NT_QUERY_INFORMATION_FILE => detour_nt_query_information_file as *const () as usize,
+        API_NT_SET_INFORMATION_FILE => detour_nt_set_information_file as *const () as usize,
         _ => detour_for_generated(api_id),
     }
 }
 
-// ---- L15: 内部 API (Nt*) 用の汎用 Detour トランポリン ----
-//
-// 生成 API と同じく `generic_detour` へ中継する。トランポリンは API
-// ごとの正しい引数個数の `extern "system" fn` であるため、元の関数が
-// 見るレジスタ・スタック配置は手書き Detour と同じになる。引数個数は
-// Nt* の公開シグネチャ通り（NtCreateFile 11 / NtOpenFile 6 /
-// NtReadFile・NtWriteFile 9 / NtClose 1 /
-// NtQueryInformationFile・NtSetInformationFile 5）。
-unsafe extern "system" fn detour_nt_create_file(
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-    a7: usize,
-    a8: usize,
-    a9: usize,
-    a10: usize,
-) -> usize {
-    generic_detour(
-        API_NT_CREATE_FILE,
-        &[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10],
-    )
+// ---- L15: typed NT API detours ----
+// Signatures follow windows-sys 0.59 Wdk::Storage::FileSystem definitions.
+// Preserve NTSTATUS, access masks, enum widths, and nullable APC callbacks.
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE};
+
+macro_rules! nt_detour {
+    ($name:ident, $api:expr, ($($arg:ident: $ty:ty => $raw:expr),* $(,)?)) => {
+        unsafe extern "system" fn $name($($arg: $ty),*) -> i32 {
+            generic_detour_with($api, &[$($raw),*], |original| {
+                let original: unsafe extern "system" fn($($ty),*) -> i32 =
+                    unsafe { std::mem::transmute(original) };
+                (unsafe { original($($arg),*) }) as usize
+            }) as i32
+        }
+    };
 }
 
-unsafe extern "system" fn detour_nt_open_file(
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-) -> usize {
-    generic_detour(API_NT_OPEN_FILE, &[a0, a1, a2, a3, a4, a5])
-}
+nt_detour!(detour_nt_create_file, API_NT_CREATE_FILE, (
+    a0: *mut Handle => a0 as usize,
+    a1: u32 => a1 as usize,
+    a2: *const OBJECT_ATTRIBUTES => a2 as usize,
+    a3: *mut IO_STATUS_BLOCK => a3 as usize,
+    a4: *const i64 => a4 as usize,
+    a5: u32 => a5 as usize,
+    a6: u32 => a6 as usize,
+    a7: u32 => a7 as usize,
+    a8: u32 => a8 as usize,
+    a9: *const c_void => a9 as usize,
+    a10: u32 => a10 as usize,
+));
+nt_detour!(detour_nt_open_file, API_NT_OPEN_FILE, (
+    a0: *mut Handle => a0 as usize,
+    a1: u32 => a1 as usize,
+    a2: *const OBJECT_ATTRIBUTES => a2 as usize,
+    a3: *mut IO_STATUS_BLOCK => a3 as usize,
+    a4: u32 => a4 as usize,
+    a5: u32 => a5 as usize,
+));
+nt_detour!(detour_nt_read_file, API_NT_READ_FILE, (
+    a0: Handle => a0 as usize,
+    a1: Handle => a1 as usize,
+    a2: PIO_APC_ROUTINE => a2.map_or(0, |f| f as usize),
+    a3: *const c_void => a3 as usize,
+    a4: *mut IO_STATUS_BLOCK => a4 as usize,
+    a5: *mut c_void => a5 as usize,
+    a6: u32 => a6 as usize,
+    a7: *const i64 => a7 as usize,
+    a8: *const u32 => a8 as usize,
+));
+nt_detour!(detour_nt_write_file, API_NT_WRITE_FILE, (
+    a0: Handle => a0 as usize,
+    a1: Handle => a1 as usize,
+    a2: PIO_APC_ROUTINE => a2.map_or(0, |f| f as usize),
+    a3: *const c_void => a3 as usize,
+    a4: *mut IO_STATUS_BLOCK => a4 as usize,
+    a5: *const c_void => a5 as usize,
+    a6: u32 => a6 as usize,
+    a7: *const i64 => a7 as usize,
+    a8: *const u32 => a8 as usize,
+));
+nt_detour!(detour_nt_close, API_NT_CLOSE, (
+    a0: Handle => a0 as usize,
+));
+nt_detour!(detour_nt_query_information_file, API_NT_QUERY_INFORMATION_FILE, (
+    a0: Handle => a0 as usize,
+    a1: *mut IO_STATUS_BLOCK => a1 as usize,
+    a2: *mut c_void => a2 as usize,
+    a3: u32 => a3 as usize,
+    a4: i32 => a4 as usize,
+));
+nt_detour!(detour_nt_set_information_file, API_NT_SET_INFORMATION_FILE, (
+    a0: Handle => a0 as usize,
+    a1: *mut IO_STATUS_BLOCK => a1 as usize,
+    a2: *const c_void => a2 as usize,
+    a3: u32 => a3 as usize,
+    a4: i32 => a4 as usize,
+));
 
-unsafe extern "system" fn detour_nt_read_file(
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-    a7: usize,
-    a8: usize,
-) -> usize {
-    generic_detour(API_NT_READ_FILE, &[a0, a1, a2, a3, a4, a5, a6, a7, a8])
-}
-
-unsafe extern "system" fn detour_nt_write_file(
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-    a7: usize,
-    a8: usize,
-) -> usize {
-    generic_detour(API_NT_WRITE_FILE, &[a0, a1, a2, a3, a4, a5, a6, a7, a8])
-}
-
-unsafe extern "system" fn detour_nt_close(a0: usize) -> usize {
-    generic_detour(API_NT_CLOSE, &[a0])
-}
-
-unsafe extern "system" fn detour_nt_query_information_file(
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-) -> usize {
-    generic_detour(API_NT_QUERY_INFORMATION_FILE, &[a0, a1, a2, a3, a4])
-}
-
-unsafe extern "system" fn detour_nt_set_information_file(
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-) -> usize {
-    generic_detour(API_NT_SET_INFORMATION_FILE, &[a0, a1, a2, a3, a4])
-}
-
-// ---- L03: 生成 API 用の汎用 Detour ----
-//
-// 生成 API は全て整数・ポインタ引数だけを持つ（L1）。x64 / x86 の
-// 呼び出し規約では、そのような引数は 1 スロット（usize 1 個）に収まる
-// ため、引数個数ごとの汎用トランポリンで中継できる。浮動小数点引数・
-// 値渡し構造体・可変長引数を持つ API は生成対象外（生成器が弾く）。
-// 64bit 固定型（I64 / U64）は x86 で 2 スロットを占めるため同様に
-// 対象外。生成器の 1 スロット制約と api.rs のテストがこれを保証する。
-//
-// 各生成 API には `engine_generated.inc` の専用トランポリンがあり、
-// そこから `generic_detour::<N>` を呼ぶ。トランポリンは API ごとの
-// 正しい引数個数の `extern "system" fn` であるため、元の関数が見る
-// レジスタ・スタック配置は手書き Detour と同じになる。
+// ---- L03: generated APIs share recording, not their function pointer types ----
+// engine_generated.inc supplies typed invokers to generic_detour_with. The
+// legacy arity helpers below are retained for the exclusive COM prototype.
 
 type GenericFn0 = unsafe extern "system" fn() -> usize;
 type GenericFn1 = unsafe extern "system" fn(usize) -> usize;
@@ -1557,12 +1536,6 @@ unsafe fn call_original<const N: usize>(original: usize, args: &[usize; N]) -> u
 /// で行う。失敗時の戻り値は 0（FALSE / NULL 相当。手書きの
 /// CreateFileW が INVALID_HANDLE_VALUE を返すのとは異なり、生成 API
 /// は全て NULL / FALSE が失敗値であるため 0 で足りる）。
-fn generic_detour<const N: usize>(api_id: u32, args: &[usize; N]) -> usize {
-    generic_detour_with(api_id, args, |original| unsafe {
-        call_original::<N>(original, args)
-    })
-}
-
 fn generic_detour_with<const N: usize>(
     api_id: u32,
     args: &[usize; N],
@@ -3544,6 +3517,28 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[test]
+    fn ntstatus_and_native_arguments_survive_record_and_passthrough() {
+        let _global = TEST_RUNTIME_LOCK.lock().unwrap();
+        unsafe extern "system" fn close(handle: Handle) -> i32 {
+            assert_eq!(handle as usize, usize::MAX - 1);
+            -0x1234567
+        }
+        let agent = Arc::new(Agent::new(
+            Arc::new(SlotPool::new(2)),
+            RingConfig::new(64, 4096),
+            Arc::new(HostMonitor::always_alive()),
+        ));
+        let rt = Arc::new(HookRuntime::new(agent, Vec::new(), None).with_detailed_mode(true));
+        rt.set_original(API_NT_CLOSE, close as *const () as usize);
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let detour: unsafe extern "system" fn(Handle) -> i32 = detour_nt_close;
+        assert_eq!(unsafe { detour((usize::MAX - 1) as Handle) }, -0x1234567);
+        rt.shutdown_recording();
+        assert_eq!(unsafe { detour((usize::MAX - 1) as Handle) }, -0x1234567);
+        assert!(clear_runtime(&rt));
     }
 
     #[test]
