@@ -148,18 +148,21 @@ mod tests {
         let sites = vec![
             site("kernel32.dll", Some("CreateFileW"), 0x100),
             site("KERNEL32.DLL", Some("ReadFile"), 0x108),
-            site("kernel32.dll", Some("CreateFileA"), 0x110), // 対象外 (A 版)
+            site("kernel32.dll", Some("CreateFileA"), 0x110), // ANSI is now supported
             site("user32.dll", Some("CreateFileW"), 0x118),   // DLL 不一致
             site("kernel32.dll", None, 0x120),                // 序数は照合不能
             site("kernel32.dll", Some("WriteFile"), 0x128),
         ];
         let plan = build_plan(&sites);
         let got: Vec<u32> = plan.entries.iter().map(|e| e.api.api_id).collect();
-        assert_eq!(got, vec![API_CREATE_FILE_W, API_READ_FILE, API_WRITE_FILE]);
+        assert_eq!(
+            got,
+            vec![API_CREATE_FILE_W, API_READ_FILE, 150, API_WRITE_FILE]
+        );
         // CloseHandle と完了観測の 2 API はこのモジュール経由で
         // フックできない = Coverage 欠落（生成 API 72 件も同様に欠落）。
         // L15: 内部 API 7 件は欠落に数えないため分母から除く。
-        assert_eq!(plan.missing.len(), API_COUNT - INTERNAL_API_COUNT - 3);
+        assert_eq!(plan.missing.len(), API_COUNT - INTERNAL_API_COUNT - 4);
         let missing_ids: Vec<u32> = plan.missing.iter().map(|a| a.api_id).collect();
         assert!(missing_ids.contains(&API_CLOSE_HANDLE));
         assert!(missing_ids.contains(&API_GET_OVERLAPPED_RESULT));

@@ -952,6 +952,293 @@ unsafe extern "system-unwind" fn detour_generated_kernel32_local_free(a0: *mut c
     });
     result as *mut core::ffi::c_void
 }
+unsafe extern "system-unwind" fn detour_generated_kernel32_create_file_a(a0: *mut core::ffi::c_void, a1: u32, a2: u32, a3: *mut core::ffi::c_void, a4: u32, a5: u32, a6: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(150, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64, a6 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5, a6) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_delete_file_a(a0: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(151, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_move_file_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(152, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_copy_file_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: i32) -> i32 {
+    let result = generic_detour_with(153, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, i32) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_create_directory_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(154, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_remove_directory_a(a0: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(155, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_file_attributes_a(a0: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(156, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_set_file_attributes_a(a0: *mut core::ffi::c_void, a1: u32) -> i32 {
+    let result = generic_detour_with(157, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, u32) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_current_directory_a(a0: u32, a1: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(158, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(u32, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_set_current_directory_a(a0: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(159, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_temp_path_a(a0: u32, a1: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(160, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(u32, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_find_first_file_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(161, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_find_first_file_w(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(162, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_find_next_file_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(163, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_find_next_file_w(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(164, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_find_close(a0: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(165, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_file_information_by_handle(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(166, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_file_information_by_handle_ex(a0: *mut core::ffi::c_void, a1: i32, a2: *mut core::ffi::c_void, a3: u32) -> i32 {
+    let result = generic_detour_with(167, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, i32, *mut core::ffi::c_void, u32) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_set_file_information_by_handle(a0: *mut core::ffi::c_void, a1: i32, a2: *mut core::ffi::c_void, a3: u32) -> i32 {
+    let result = generic_detour_with(168, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, i32, *mut core::ffi::c_void, u32) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_full_path_name_a(a0: *mut core::ffi::c_void, a1: u32, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(169, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_full_path_name_w(a0: *mut core::ffi::c_void, a1: u32, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(170, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_long_path_name_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32) -> u32 {
+    let result = generic_detour_with(171, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_long_path_name_w(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32) -> u32 {
+    let result = generic_detour_with(172, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_short_path_name_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32) -> u32 {
+    let result = generic_detour_with(173, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_short_path_name_w(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32) -> u32 {
+    let result = generic_detour_with(174, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_disk_free_space_ex_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(175, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_disk_free_space_ex_w(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(176, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_drive_type_a(a0: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(177, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_drive_type_w(a0: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(178, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_logical_drives() -> u32 {
+    let result = generic_detour_with(179, &[], |original| {
+        let original: unsafe extern "system-unwind" fn() -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original() }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_logical_drive_strings_a(a0: u32, a1: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(180, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(u32, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_logical_drive_strings_w(a0: u32, a1: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(181, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(u32, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_open_key_ex_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32, a3: u32, a4: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(182, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_create_key_ex_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32, a3: *mut core::ffi::c_void, a4: u32, a5: u32, a6: *mut core::ffi::c_void, a7: *mut core::ffi::c_void, a8: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(183, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64, a6 as u64, a7 as u64, a8 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5, a6, a7, a8) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_query_value_ex_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void, a4: *mut core::ffi::c_void, a5: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(184, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_set_value_ex_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: u32, a3: u32, a4: *mut core::ffi::c_void, a5: u32) -> u32 {
+    let result = generic_detour_with(185, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32, u32, *mut core::ffi::c_void, u32) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_delete_value_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(186, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_delete_key_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(187, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_enum_key_ex_a(a0: *mut core::ffi::c_void, a1: u32, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void, a4: *mut core::ffi::c_void, a5: *mut core::ffi::c_void, a6: *mut core::ffi::c_void, a7: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(188, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64, a6 as u64, a7 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5, a6, a7) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_enum_value_a(a0: *mut core::ffi::c_void, a1: u32, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void, a4: *mut core::ffi::c_void, a5: *mut core::ffi::c_void, a6: *mut core::ffi::c_void, a7: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(189, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64, a6 as u64, a7 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5, a6, a7) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_advapi32_reg_query_info_key_a(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: *mut core::ffi::c_void, a3: *mut core::ffi::c_void, a4: *mut core::ffi::c_void, a5: *mut core::ffi::c_void, a6: *mut core::ffi::c_void, a7: *mut core::ffi::c_void, a8: *mut core::ffi::c_void, a9: *mut core::ffi::c_void, a10: *mut core::ffi::c_void, a11: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(190, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64, a5 as u64, a6 as u64, a7 as u64, a8 as u64, a9 as u64, a10 as u64, a11 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) }) as u64
+    });
+    result as u32
+}
 
 fn detour_for_generated(api_id: u32) -> usize {
     match api_id {
@@ -1091,6 +1378,47 @@ fn detour_for_generated(api_id: u32) -> usize {
         147 => detour_generated_kernel32_set_last_error as *const () as usize,
         148 => detour_generated_kernel32_global_free as *const () as usize,
         149 => detour_generated_kernel32_local_free as *const () as usize,
+        150 => detour_generated_kernel32_create_file_a as *const () as usize,
+        151 => detour_generated_kernel32_delete_file_a as *const () as usize,
+        152 => detour_generated_kernel32_move_file_a as *const () as usize,
+        153 => detour_generated_kernel32_copy_file_a as *const () as usize,
+        154 => detour_generated_kernel32_create_directory_a as *const () as usize,
+        155 => detour_generated_kernel32_remove_directory_a as *const () as usize,
+        156 => detour_generated_kernel32_get_file_attributes_a as *const () as usize,
+        157 => detour_generated_kernel32_set_file_attributes_a as *const () as usize,
+        158 => detour_generated_kernel32_get_current_directory_a as *const () as usize,
+        159 => detour_generated_kernel32_set_current_directory_a as *const () as usize,
+        160 => detour_generated_kernel32_get_temp_path_a as *const () as usize,
+        161 => detour_generated_kernel32_find_first_file_a as *const () as usize,
+        162 => detour_generated_kernel32_find_first_file_w as *const () as usize,
+        163 => detour_generated_kernel32_find_next_file_a as *const () as usize,
+        164 => detour_generated_kernel32_find_next_file_w as *const () as usize,
+        165 => detour_generated_kernel32_find_close as *const () as usize,
+        166 => detour_generated_kernel32_get_file_information_by_handle as *const () as usize,
+        167 => detour_generated_kernel32_get_file_information_by_handle_ex as *const () as usize,
+        168 => detour_generated_kernel32_set_file_information_by_handle as *const () as usize,
+        169 => detour_generated_kernel32_get_full_path_name_a as *const () as usize,
+        170 => detour_generated_kernel32_get_full_path_name_w as *const () as usize,
+        171 => detour_generated_kernel32_get_long_path_name_a as *const () as usize,
+        172 => detour_generated_kernel32_get_long_path_name_w as *const () as usize,
+        173 => detour_generated_kernel32_get_short_path_name_a as *const () as usize,
+        174 => detour_generated_kernel32_get_short_path_name_w as *const () as usize,
+        175 => detour_generated_kernel32_get_disk_free_space_ex_a as *const () as usize,
+        176 => detour_generated_kernel32_get_disk_free_space_ex_w as *const () as usize,
+        177 => detour_generated_kernel32_get_drive_type_a as *const () as usize,
+        178 => detour_generated_kernel32_get_drive_type_w as *const () as usize,
+        179 => detour_generated_kernel32_get_logical_drives as *const () as usize,
+        180 => detour_generated_kernel32_get_logical_drive_strings_a as *const () as usize,
+        181 => detour_generated_kernel32_get_logical_drive_strings_w as *const () as usize,
+        182 => detour_generated_advapi32_reg_open_key_ex_a as *const () as usize,
+        183 => detour_generated_advapi32_reg_create_key_ex_a as *const () as usize,
+        184 => detour_generated_advapi32_reg_query_value_ex_a as *const () as usize,
+        185 => detour_generated_advapi32_reg_set_value_ex_a as *const () as usize,
+        186 => detour_generated_advapi32_reg_delete_value_a as *const () as usize,
+        187 => detour_generated_advapi32_reg_delete_key_a as *const () as usize,
+        188 => detour_generated_advapi32_reg_enum_key_ex_a as *const () as usize,
+        189 => detour_generated_advapi32_reg_enum_value_a as *const () as usize,
+        190 => detour_generated_advapi32_reg_query_info_key_a as *const () as usize,
         _ => 0,
     }
 }

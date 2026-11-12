@@ -52,3 +52,6 @@ Invoke-Native { .\target\i686-pc-windows-msvc\release\shirusu-atomic-bench.exe }
 # ゲートではないため終了コードは常に 0。CI 時間を抑えるため --rounds 1)。
 Invoke-Native { cargo build -p shirusu-e2e --target i686-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (i686)"
 Invoke-Native { .\target\i686-pc-windows-msvc\release\shirusu-perf-bench.exe --rounds 1 } "perf bench (i686)"
+
+Invoke-Native { cargo build -p shirusu-cli --target i686-pc-windows-msvc } "CLI build (i686)"
+Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "legacy-api.ps1"), "-Target", "i686-pc-windows-msvc")

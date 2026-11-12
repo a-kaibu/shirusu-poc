@@ -650,3 +650,184 @@ namespace = "Windows.Win32.Foundation"
 module = "kernel32.dll"
 function = "LocalFree"
 last_error = "not-null"
+
+# ANSI entry points used by legacy applications, plus file discovery / metadata.
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "CreateFileA"
+last_error = "invalid-handle"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "DeleteFileA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "MoveFileA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "CopyFileA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "CreateDirectoryA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "RemoveDirectoryA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileAttributesA"
+last_error = "minus-one"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "SetFileAttributesA"
+[[api]]
+namespace = "Windows.Win32.System.Environment"
+module = "kernel32.dll"
+function = "GetCurrentDirectoryA"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.System.Environment"
+module = "kernel32.dll"
+function = "SetCurrentDirectoryA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetTempPathA"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "FindFirstFileA"
+last_error = "invalid-handle"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "FindFirstFileW"
+last_error = "invalid-handle"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "FindNextFileA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "FindNextFileW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "FindClose"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileInformationByHandle"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFileInformationByHandleEx"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "SetFileInformationByHandle"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFullPathNameA"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetFullPathNameW"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetLongPathNameA"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetLongPathNameW"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetShortPathNameA"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetShortPathNameW"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetDiskFreeSpaceExA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetDiskFreeSpaceExW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetDriveTypeA"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetDriveTypeW"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetLogicalDrives"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetLogicalDriveStringsA"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "GetLogicalDriveStringsW"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegOpenKeyExA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegCreateKeyExA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegQueryValueExA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegSetValueExA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegDeleteValueA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegDeleteKeyA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegEnumKeyExA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegEnumValueA"
+[[api]]
+namespace = "Windows.Win32.System.Registry"
+module = "advapi32.dll"
+function = "RegQueryInfoKeyA"

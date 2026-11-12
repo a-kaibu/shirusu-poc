@@ -604,7 +604,7 @@ mod tests {
         // （last_error は無い。Nt* は GetLastError を使わない）。
         assert_eq!(INTERNAL_API_TABLE.len(), INTERNAL_API_COUNT);
         assert_eq!(INTERNAL_API_ID_BASE, 79);
-        assert_eq!(API_COUNT, 149);
+        assert_eq!(API_COUNT, 190);
         for (i, api) in INTERNAL_API_TABLE.iter().enumerate() {
             assert_eq!(api.api_id, INTERNAL_API_ID_BASE + i as u32);
             assert_eq!(api.module, "ntdll.dll");
@@ -697,7 +697,11 @@ mod tests {
         );
         // 関数名はケース敏感、未知 API / 未知 DLL は対象外
         assert!(api_by_import("kernel32.dll", "createfilew").is_none());
-        assert!(api_by_import("kernel32.dll", "CreateFileA").is_none());
+        assert_eq!(
+            api_by_import("kernel32.dll", "CreateFileA").unwrap().api_id,
+            150
+        );
+        assert!(api_by_import("kernel32.dll", "UnknownApi").is_none());
         assert!(api_by_import("user32.dll", "CreateFileW").is_none());
     }
 

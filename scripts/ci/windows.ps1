@@ -115,6 +115,8 @@ try {
     # Actual captured file I/O must produce an executable replay, not only a rule.
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "replay-e2e.ps1")) } "native capture-to-replay"
 
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "legacy-api.ps1")) } "native ANSI and file API coverage"
+
     if ($captureFailures.Count -gt 0) {
         throw ("Windows scenarios failed:`n" + ($captureFailures -join "`n"))
     }

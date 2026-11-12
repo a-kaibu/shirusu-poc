@@ -7,7 +7,7 @@
 | --- | --- | --- |
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
-| 全 Win32 の L0/L1 | 現在149件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
+| 全 Win32 の L0/L1 | 現在190件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
 | COM の L1 と寿命追跡 | Factory と IID 名識別は実装。共有オブジェクトの通常メソッド追跡は未完成 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
 | 動的 API と既存プロセス Attach | Inline Hook は実装。新規スレッド競合・停止先ロックの制約が残る | 既存プロセスとスレッド生成中の透明性テスト、失敗時の安全な復元 |
@@ -56,7 +56,7 @@ cargo run -p shirusu-metadata-gen -- --inventory target/api-inventory.tsv
 手書き API も生成表の対象外なので `generatable` に含まれる場合がある。
 これはネイティブで記録できた API 数ではない。
 
-現在の 18,364 メソッドは selected 136、generatable 17,492、unsupported 736。
+現在の 18,364 メソッドは selected 177、generatable 17,451、unsupported 736。
 C 呼び出し規約の Wrapper は元関数にも `C-unwind` を使い、x86 でのスタックの
 後始末を保持する。LDAP 3 API と LastError 2 API の追加は ABI 回帰テスト付き。
 可変長引数と複合構造体などの残件を、この一覧で追跡する。
@@ -91,3 +91,14 @@ RoGetActivationFactory の 3 引数転送、debug / release の native TLS
 欠落回帰テストが通過した。以前の WoW64 transport 検証と区別する。
 x64 は独立シナリオを最後まで実行してから失敗を集約するよう変更し、
 先行ケースの失敗で WinRT・callback・SEH・replay の問題を隠さない。
+
+## ANSI / ファイル API の拡張
+
+従来の Unicode 中心の選択表に 41 API を追加し、合計 190 API とした。
+CreateFileA、ANSI レジストリ、A/W のファイル列挙・パス変換・ディスク情報を
+含む。既存 ID は変更せず 150〜190 を追加した。これは L1 の型付きの引数・
+戻り値の記録であり、ANSI 文字列や出力構造体の L2 復元を意味しない。
+`e2e/native/legacy-api.cpp` は追加した全 41 API を実行し、出力・副作用・
+失敗時の LastError をアプリ側で検査する。`scripts/ci/legacy-api.ps1` は
+Hook 有無の成功、Trace の完全性、各 API の Enter/Leave 対応と型付きの失敗値を
+x64 / x86 の CI で検証する。追加部分の Windows 実走は次の CI で確認する。
