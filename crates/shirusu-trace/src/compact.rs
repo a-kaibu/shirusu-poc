@@ -221,6 +221,38 @@ pub fn decode_values(types: &[Ty], data: &[u8]) -> Result<Vec<CapturedValue>, Co
     Ok(out)
 }
 
+/// Validate an encoded value sequence without retaining decoded values or
+/// allocating string/buffer storage. Acceptance matches `decode_values`.
+pub fn validate_values(types: &[Ty], data: &[u8]) -> Result<(), CompactError> {
+    let mut cur = Cursor::new(data);
+    for ty in types {
+        let code = cur.read_u8()?;
+        ValueCapture::from_code(code).ok_or(CompactError::InvalidCapture(code))?;
+        match ty {
+            Ty::Str => {
+                std::str::from_utf8(cur.read_len_bytes()?)
+                    .map_err(|_| CompactError::InvalidUtf8)?;
+            }
+            Ty::Str16 => {
+                let n = usize::try_from(cur.read_uleb()?).map_err(|_| CompactError::Truncated)?;
+                let bytes = n.checked_mul(2).ok_or(CompactError::Truncated)?;
+                cur.read_exact(bytes)?;
+            }
+            Ty::Bytes => {
+                cur.read_len_bytes()?;
+            }
+            // Scalar decoding does not allocate and shares range/bool checks.
+            _ => {
+                read_value(&mut cur, *ty)?;
+            }
+        }
+    }
+    if !cur.is_done() {
+        return Err(CompactError::TrailingBytes(cur.remaining()));
+    }
+    Ok(())
+}
+
 /// fuzz ターゲット `decode_compact` の入口：SchemaSet の Protobuf
 /// バイト列と値列バイト列を受け、最初の Schema で値列を復号する。
 /// どちらの入力が壊れていても panic せず Err を返す。

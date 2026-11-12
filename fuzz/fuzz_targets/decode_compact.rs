@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use shirusu_trace::compact::{decode_compact, decode_values, encode_values};
+use shirusu_trace::compact::{decode_compact, decode_values, encode_values, validate_values};
 use shirusu_trace::proto::SchemaSet;
 use shirusu_trace::schema::schema_types;
 
@@ -18,6 +18,14 @@ fuzz_target!(|data: &[u8]| {
     }
     let schema_bytes = &data[2..2 + slen];
     let values_bytes = &data[2 + slen..];
+    if let Ok(set) = SchemaSet::decode(schema_bytes) {
+        if let Some(types) = set.schemas.first().and_then(schema_types) {
+            assert_eq!(
+                validate_values(&types, values_bytes),
+                decode_values(&types, values_bytes).map(|_| ())
+            );
+        }
+    }
     if let Ok(values) = decode_compact(schema_bytes, values_bytes) {
         let set = SchemaSet::decode(schema_bytes).expect("decode_compact accepted it");
         let types = schema_types(&set.schemas[0]).expect("types resolved");

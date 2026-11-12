@@ -437,6 +437,7 @@ pub fn schema_types(def: &SchemaDef) -> Option<Vec<Ty>> {
 pub struct SchemaRegistry {
     by_id: std::collections::HashMap<u32, SchemaDef>,
     order: Vec<u32>,
+    types_by_id: std::collections::HashMap<u32, Vec<Ty>>,
 }
 
 impl SchemaRegistry {
@@ -466,6 +467,9 @@ impl SchemaRegistry {
                 def.schema_id
             ));
         }
+        if let Some(types) = schema_types(&def) {
+            self.types_by_id.insert(def.schema_id, types);
+        }
         self.order.push(def.schema_id);
         self.by_id.insert(def.schema_id, def);
         Ok(())
@@ -474,7 +478,11 @@ impl SchemaRegistry {
         self.by_id.get(&schema_id)
     }
     pub fn types(&self, schema_id: u32) -> Option<Vec<Ty>> {
-        self.by_id.get(&schema_id).and_then(schema_types)
+        self.types_ref(schema_id).map(<[Ty]>::to_vec)
+    }
+    /// Borrow types computed once when the immutable schema was registered.
+    pub fn types_ref(&self, schema_id: u32) -> Option<&[Ty]> {
+        self.types_by_id.get(&schema_id).map(Vec::as_slice)
     }
     pub fn len(&self) -> usize {
         self.by_id.len()

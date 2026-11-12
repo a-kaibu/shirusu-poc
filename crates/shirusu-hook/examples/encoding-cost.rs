@@ -1,7 +1,10 @@
-//! Development benchmark of encoding only, not DLL injection or GUI performance.
+//! Development benchmark of encoding/validation, not DLL injection or GUI performance.
 //! cargo run -p shirusu-hook --release --example encoding-cost
 use shirusu_hook::{api::api_by_name, capture};
-use shirusu_trace::{compact::encode_values, schema::schema_types};
+use shirusu_trace::{
+    compact::{decode_values, encode_values, validate_values},
+    schema::{schema_types, SchemaRegistry},
+};
 use std::{hint::black_box, time::Instant};
 
 fn main() {
@@ -25,6 +28,32 @@ fn main() {
         }
         println!(
             "round={round} schema_per_call_ns={:.1} direct_fields_ns={:.1} ratio={:.3}",
+            times[0],
+            times[1],
+            times[1] / times[0]
+        );
+    }
+    let schema = api.enter_schema();
+    let payload = capture::encode_enter(api, &values).unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry.register(schema.clone()).unwrap();
+    for round in 0..5 {
+        let mut times = [0.0; 2];
+        for mode in [round % 2, 1 - round % 2] {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                if mode == 0 {
+                    let types = schema_types(black_box(&schema)).unwrap();
+                    black_box(decode_values(&types, black_box(&payload)).unwrap());
+                } else {
+                    let types = black_box(&registry).types_ref(schema.schema_id).unwrap();
+                    validate_values(types, black_box(&payload)).unwrap();
+                }
+            }
+            times[mode] = start.elapsed().as_nanos() as f64 / iterations as f64;
+        }
+        println!(
+            "round={round} allocating_validation_ns={:.1} borrowed_validation_ns={:.1} ratio={:.3}",
             times[0],
             times[1],
             times[1] / times[0]

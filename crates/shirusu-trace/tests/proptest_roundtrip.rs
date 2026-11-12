@@ -3,7 +3,7 @@
 
 use proptest::prelude::*;
 use shirusu_trace::blob::BlobId;
-use shirusu_trace::compact::{decode_values, encode_values};
+use shirusu_trace::compact::{decode_values, encode_values, validate_values};
 use shirusu_trace::model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};
 use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
 use shirusu_trace::schema::{CapturedValue, EventCapture, Ty, TypedValue, ValueCapture};
@@ -48,6 +48,28 @@ proptest! {
         let encoded = encode_values(&types, &values).unwrap();
         let decoded = decode_values(&types, &encoded).unwrap();
         prop_assert_eq!(decoded, values);
+        prop_assert_eq!(validate_values(&types, &encoded), Ok(()));
+        for end in 0..encoded.len() {
+            prop_assert_eq!(
+                validate_values(&types, &encoded[..end]),
+                decode_values(&types, &encoded[..end]).map(|_| ())
+            );
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        prop_assert_eq!(
+            validate_values(&types, &trailing),
+            decode_values(&types, &trailing).map(|_| ())
+        );
+    }
+
+    #[test]
+    fn validation_matches_decoding_on_arbitrary_bytes(
+        data in prop::collection::vec(any::<u8>(), 0..128),
+        tags in prop::collection::vec(1u32..14, 0..16),
+    ) {
+        let types: Vec<Ty> = tags.into_iter().map(|tag| Ty::from_tag(tag).unwrap()).collect();
+        prop_assert_eq!(validate_values(&types, &data), decode_values(&types, &data).map(|_| ()));
     }
 
     #[test]

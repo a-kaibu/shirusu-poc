@@ -157,6 +157,8 @@ fn registry_idempotent_and_redefinition() {
     assert!(reg.register(other).is_err());
     assert_eq!(reg.get(1).unwrap().name, "api");
     assert_eq!(reg.types(1).unwrap(), vec![Ty::Bool]);
+    assert_eq!(reg.types_ref(1), Some([Ty::Bool].as_slice()));
+    assert!(reg.types_ref(99).is_none());
     assert!(reg.get(99).is_none());
 }
 
@@ -173,6 +175,7 @@ fn schema_types_unknown_tag() {
     def.content_hash = schema_content_hash(&def.name, &def.fields);
     reg.register(def).unwrap();
     assert_eq!(reg.types(1), None);
+    assert_eq!(reg.types_ref(1), None);
 }
 
 // ---- F18: Blob の部分的な更新 ----

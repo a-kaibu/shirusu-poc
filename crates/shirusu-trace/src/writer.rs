@@ -260,6 +260,11 @@ impl<W: DurableWrite> TraceWriter<W> {
         self.registry.types(schema_id)
     }
 
+    /// Borrow the registered types without allocating on each event.
+    pub fn schema_types_ref(&self, schema_id: u32) -> Option<&[crate::schema::Ty]> {
+        self.registry.types_ref(schema_id)
+    }
+
     /// 登録済み Schema の複製を Schema Checkpoint Block として書く
     /// （途中から読み始める Reader がそれ以前の定義を引けるように）。
     /// `flush_schemas` からも Schema Block の直後に自動で呼ばれる

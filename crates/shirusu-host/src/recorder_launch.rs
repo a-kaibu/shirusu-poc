@@ -182,8 +182,12 @@ impl LaunchedCapture {
             if self.target_exited()? {
                 break;
             }
-            self.session().poll_once()?;
-            std::thread::sleep(poll_interval);
+            let stats = self.session().poll_once()?;
+            // Keep consuming while the producer is active. Sleeping after every
+            // nonempty batch needlessly lets a high-rate Ring fill again.
+            if stats.events == 0 {
+                std::thread::sleep(poll_interval);
+            }
         }
         // 終了直前に書かれた分を拾い切る
         for _ in 0..4 {
@@ -222,8 +226,10 @@ impl LaunchedCapture {
             .as_ref()
             .is_some_and(|scan| !scan.is_finished())
         {
-            self.session().poll_once()?;
-            std::thread::sleep(Duration::from_millis(1));
+            let stats = self.session().poll_once()?;
+            if stats.events == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         let modules = self
             .module_scan

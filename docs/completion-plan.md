@@ -151,3 +151,18 @@ Rust 1.87、x86/x64 のクロスチェックで検証する。1075 イベント�
 は全ジョブ通過（Windows x86/x64、Server 2022、Linux、macOS、MSRV、Kani、TLA、fuzz）。
 Parquet の Windows 統合テストも通過。性能ベンチが完走したことと、数値目標や
 Event Integrity が合格したことは区別する。上記の符号化改善は後続コミットで測定する。
+
+## 起動時の回収と Host 検査の改善
+
+`e9f6a03` の [run 43291349934](https://github.com/a-kaibu/shirusu-poc/actions/runs/43291349934)
+で Windows x86 / x64 latest / Server 2022 が通過。モジュール署名確認を回収開始の
+前提から外したことで、GUI は全 3 環境・各 3 試行で欠落ゼロになった。
+GUI の倍率は x86 1.949、latest x64 1.847、Server 2022 2.468 で 3 倍以内。
+高負荷ではまだ sequence gap と counter loss があり、完成とは扱わない。
+
+Host の引数検査は登録済み型列を借用し、文字列・バッファや復号結果 Vec を
+生成せず検査する。旧 decoder との正常値・全切断位置・不正入力の差分テストと
+fuzz を追加した。Linux release の HeapAlloc enter 局所測定では約82〜89nsから
+約36〜39nsとなった。Windows 全体の倍率への効果は別途 CI で測る。
+単一対象の回収ループも、イベントを回収できた間は再回収し、空の場合だけ
+指定間隔待つよう変更する。Ring の容量や欠落の判定基準は変更しない。

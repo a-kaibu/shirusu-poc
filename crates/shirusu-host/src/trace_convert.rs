@@ -19,7 +19,7 @@
 
 use crate::{IntegrityLevel, IntegrityReport, LossEvent};
 use shirusu_hook::api as hook_api;
-use shirusu_trace::compact::decode_values;
+use shirusu_trace::compact::validate_values;
 use shirusu_trace::error::Result as TraceResult;
 use shirusu_trace::model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};
 use shirusu_trace::proto::{
@@ -401,8 +401,8 @@ impl<W: DurableWrite> TraceRecorder<W> {
             } else if event.payload.is_empty() {
                 PayloadRef::None
             } else if args_mode && d.schema_id != 0 {
-                match self.writer.schema_types(d.schema_id) {
-                    Some(types) if decode_values(&types, &event.payload).is_ok() => {
+                match self.writer.schema_types_ref(d.schema_id) {
+                    Some(types) if validate_values(types, &event.payload).is_ok() => {
                         args = Some(event.payload.clone());
                         stats.args_attached += 1;
                         PayloadRef::None
