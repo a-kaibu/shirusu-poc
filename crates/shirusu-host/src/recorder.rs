@@ -222,6 +222,9 @@ pub struct PollStats {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub trace_path: PathBuf,
+    /// Target exit status, when observed by the process driver. None for a
+    /// still-running target or an in-process session; independent of integrity.
+    pub target_exit_code: Option<u32>,
     pub total_events: u64,
     pub total_loss_records: u64,
     pub rings_total: usize,
@@ -843,6 +846,7 @@ impl CaptureSession {
         self.state = SessionState::Finished;
         Ok(SessionSummary {
             trace_path,
+            target_exit_code: None,
             total_events,
             total_loss_records,
             rings_total: self.rings.len(),

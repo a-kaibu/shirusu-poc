@@ -626,6 +626,57 @@ fn completed_without_any_call_becomes_solo() {
 }
 
 #[test]
+fn completion_does_not_guess_between_reused_call_ids() {
+    for other_api in [70, 71] {
+        let mut x = X::new();
+        for api in [70, other_api] {
+            x.push(
+                1,
+                1,
+                api,
+                203,
+                &[],
+                vec![],
+                PayloadRef::None,
+                EventCapture::Captured,
+            );
+            x.push(
+                2,
+                1,
+                api,
+                203,
+                &[],
+                vec![],
+                PayloadRef::None,
+                EventCapture::Captured,
+            );
+        }
+        x.push(
+            8,
+            1,
+            70,
+            204,
+            &[Ty::U32],
+            vec![cv(TypedValue::U32(3))],
+            PayloadRef::None,
+            EventCapture::Captured,
+        );
+        let trace = x.finish(misc_schemas(), FinalizationInfo::default(), &[], &[]);
+        let nt = NormTrace::build(&trace);
+        if other_api == 70 {
+            assert_eq!(nt.calls.len(), 3);
+            assert!(nt.calls[0].completed.is_none());
+            assert!(nt.calls[1].completed.is_none());
+            assert!(nt.calls[2].solo.is_some());
+        } else {
+            assert_eq!(nt.calls.len(), 2);
+            assert!(nt.calls[0].completed.is_some());
+            assert!(nt.calls[1].completed.is_none());
+        }
+    }
+}
+
+#[test]
 fn double_enter_starts_a_new_call() {
     let mut x = X::new();
     x.push(

@@ -170,20 +170,50 @@ pub fn build_patch(target: u64, detour: u64, bitness: u32) -> Vec<u8> {
 pub fn build_trampoline(plan: &StolenPlan, trampoline: u64) -> Result<Vec<u8>, InlineRefusal> {
     // InstructionBlock の第 2 引数は配置先の RIP（元の RIP ではない）。
     // ここを間違えると再配置が起きず、元の変位のままコピーされる。
-    let block = InstructionBlock::new(&plan.instructions, trampoline);
+    // Include the continuation in the encoded block. BlockEncoder may append
+    // literal addresses for far branches; appending executable bytes after that
+    // pool makes a relocated CALL return into data.
+    let mut instructions = plan.instructions.clone();
+    let back_to = plan.target + plan.stolen_len as u64;
+    let back = Instruction::with_branch(
+        if plan.bitness == 64 {
+            Code::Jmp_rel32_64
+        } else {
+            Code::Jmp_rel32_32
+        },
+        back_to,
+    )
+    .map_err(|e| InlineRefusal::Unrelocatable(e.to_string()))?;
+    // Do not assign back_to as this instruction's original IP: a stolen CALL
+    // to the continuation must still target the original code, not this jump.
+    instructions.push(back);
+    let block = InstructionBlock::new(&instructions, trampoline);
     let encoded = BlockEncoder::encode(plan.bitness, block, BlockEncoderOptions::NONE)
         .map_err(|e| InlineRefusal::Unrelocatable(e.to_string()))?;
-    let mut out = encoded.code_buffer;
-    let back_from = trampoline + out.len() as u64;
-    let back_to = plan.target + plan.stolen_len as u64;
-    out.extend_from_slice(&jump_bytes(back_from, back_to, plan.bitness));
-    Ok(out)
+    Ok(encoded.code_buffer)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    #[test]
+    fn far_call_returns_to_jump_before_literal_pool() {
+        let target = 0x1400_0000;
+        let trampoline = 0x1_4000_0000;
+        let plan = plan_stolen(&[0xE8, 0x20, 0, 0, 0], target, target + 4096, 64).unwrap();
+        let code = build_trampoline(&plan, trampoline).unwrap();
+        let mut decoder = Decoder::with_ip(64, &code, trampoline, DecoderOptions::NONE);
+        assert_eq!(decoder.decode().flow_control(), FlowControl::IndirectCall);
+        let continuation = decoder.decode();
+        assert_eq!(continuation.flow_control(), FlowControl::IndirectBranch);
+        let slot = (continuation.ip_rel_memory_address() - trampoline) as usize;
+        assert_eq!(
+            u64::from_le_bytes(code[slot..slot + 8].try_into().unwrap()),
+            target + 5
+        );
+    }
 
     /// バイト列の先頭 1 命令を `ip` からデコードする（検証用）。
     fn decode_first(bytes: &[u8], ip: u64, bitness: u32) -> Instruction {

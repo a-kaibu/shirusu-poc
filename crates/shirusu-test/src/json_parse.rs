@@ -14,6 +14,7 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
     let mut p = Parser {
         bytes: input.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     p.skip_ws();
     let value = p.value()?;
@@ -27,6 +28,7 @@ pub fn parse_json(input: &str) -> Result<JsonValue, String> {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -45,6 +47,16 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<JsonValue, String> {
+        if self.depth >= 128 {
+            return Err(format!("JSON nesting limit exceeded at byte {}", self.pos));
+        }
+        self.depth += 1;
+        let result = self.value_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn value_inner(&mut self) -> Result<JsonValue, String> {
         match self.peek() {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
@@ -81,6 +93,9 @@ impl<'a> Parser<'a> {
         }
         if self.pos == digits_start {
             return Err(format!("invalid number at byte {start}"));
+        }
+        if self.pos - digits_start > 1 && self.bytes[digits_start] == b'0' {
+            return Err(format!("leading zero at byte {start}"));
         }
         if matches!(self.peek(), Some(b'.') | Some(b'e') | Some(b'E')) {
             return Err(format!(
@@ -129,27 +144,20 @@ impl<'a> Parser<'a> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let cp = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&cp) {
-                                // サロゲートペア。
-                                if self.peek() == Some(b'\\') {
-                                    self.pos += 1;
-                                    if self.peek() == Some(b'u') {
-                                        self.pos += 1;
-                                        let lo = self.hex4()?;
-                                        if (0xDC00..0xE000).contains(&lo) {
-                                            let c =
-                                                0x1_0000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
-                                            out.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
-                                            continue;
-                                        }
-                                    }
+                            let scalar = if (0xD800..0xDC00).contains(&cp) {
+                                if !self.bytes[self.pos..].starts_with(b"\\u") {
+                                    return Err("unpaired high surrogate".into());
                                 }
-                                out.push('\u{FFFD}');
-                            } else if (0xDC00..0xE000).contains(&cp) {
-                                out.push('\u{FFFD}');
+                                self.pos += 2;
+                                let lo = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err("invalid low surrogate".into());
+                                }
+                                0x1_0000 + (((cp - 0xD800) << 10) | (lo - 0xDC00))
                             } else {
-                                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                            }
+                                cp
+                            };
+                            out.push(char::from_u32(scalar).ok_or("unpaired surrogate")?);
                         }
                         _ => return Err(format!("invalid escape at byte {}", self.pos - 1)),
                     }
@@ -202,6 +210,9 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             self.skip_ws();
             let value = self.value()?;
+            if pairs.iter().any(|(existing, _)| existing == &key) {
+                return Err(format!("duplicate object key {key:?}"));
+            }
             pairs.push((key, value));
             self.skip_ws();
             match self.peek() {
@@ -269,6 +280,25 @@ pub fn as_u64(value: &JsonValue) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_ambiguous_or_excessively_nested_json() {
+        for invalid in [
+            "01",
+            "-01",
+            r#"{"x":1,"x":2}"#,
+            r#""\ud800""#,
+            r#""\udc00""#,
+            r#""\ud800\n""#,
+            r#""\ud800\u0041""#,
+        ] {
+            assert!(parse_json(invalid).is_err(), "{invalid}");
+        }
+        let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+        assert!(parse_json(&nested).is_err());
+        let shallow = format!("{}0{}", "[".repeat(32), "]".repeat(32));
+        assert!(parse_json(&shallow).is_ok());
+    }
 
     #[test]
     fn parses_nested_structures() {

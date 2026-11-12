@@ -121,6 +121,9 @@ fn eval_rule(rule: &Rule, trace: &ReadTrace, view: &TraceView) -> RuleResult {
             if !s.has_finalization {
                 problems.push("no finalization block (integrity cannot be confirmed)".into());
             }
+            if view.events.iter().any(|e| e.args_error.is_some()) {
+                problems.push("argument decoding is incomplete".into());
+            }
             for (aspect, level) in [
                 ("capture_coverage", s.capture_coverage),
                 ("event_integrity", s.event_integrity),
@@ -193,9 +196,15 @@ fn eval_rule(rule: &Rule, trace: &ReadTrace, view: &TraceView) -> RuleResult {
                     if call.created.as_ref() == Some(&obj.key) {
                         return false;
                     }
+                    if call.enter.is_none() || call.aborted.is_some() {
+                        return false;
+                    }
                     let Some(leave) = &call.leave else {
                         return false;
                     };
+                    if !leave.fully_captured {
+                        return false;
+                    }
                     let Some(ret) = leave.fields.iter().find(|f| f.name == "return") else {
                         return false;
                     };

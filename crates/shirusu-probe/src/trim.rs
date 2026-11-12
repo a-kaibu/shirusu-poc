@@ -148,7 +148,7 @@ pub fn trim_trace(
         writer.write_batch(batch)?;
     }
     writer.write_loss_records(&source.loss_records)?;
-    let (cc, ei, sc) = match &source.finalization {
+    let (cc, mut ei, sc) = match &source.finalization {
         Some(fin) => (
             fin.capture_coverage,
             fin.event_integrity,
@@ -160,11 +160,17 @@ pub fn trim_trace(
             integrity_level::UNKNOWN,
         ),
     };
+    if (!source.issues.is_empty() || !source.finalized_cleanly) && ei == integrity_level::COMPLETE {
+        ei = integrity_level::DEGRADED;
+    }
     let mut notes = source
         .finalization
         .as_ref()
         .map(|f| f.notes.clone())
         .unwrap_or_default();
+    for issue in &source.issues {
+        notes.push(format!("source recovery issue: {issue:?}"));
+    }
     notes.push(format!(
         "trimmed by shirusu-probe from {source_label}: {kept_events} of {} events kept; \
          this is a partial slice for diff reproduction, not a complete session record; \

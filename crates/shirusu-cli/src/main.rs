@@ -296,7 +296,7 @@ fn cmd_inspect(args: &[String]) -> Result<(), ToolError> {
     // 終了ステータスでも失敗を知らせる (overview「Traceの完全性」)。
     // 判定は shirusu-test の no-integrity-loss と同じ述語
     // (`has_event_loss`) を使う。Finalization なし (Unknown) や
-    // 回復 issue のみは「確定できない」と別扱いで incomplete にしない。
+    // Index の不一致のみは別扱いだが、破損・切断・上限超過は incomplete。
     if view.integrity.has_event_loss() {
         return Err(ToolError::Incomplete(format!(
             "{path} lost event integrity (see the loss / dropped-payload / missing-blob lines above)"
@@ -1740,6 +1740,9 @@ fn qpc_frequency() -> u64 {
 fn print_summary(trace: &Path, summary: &shirusu_host::recorder::SessionSummary) {
     use shirusu_host::trace_convert::integrity_level_code;
     println!("captured: {}", trace.display());
+    if let Some(code) = summary.target_exit_code {
+        println!("target exit code: {code} (0x{code:08X})");
+    }
     println!(
         "events: {} (loss records: {})",
         summary.total_events, summary.total_loss_records

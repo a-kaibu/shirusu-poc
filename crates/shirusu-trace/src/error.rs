@@ -47,6 +47,8 @@ pub enum CompactError {
     Leb128TooLong,
     /// bool の値が 0 / 1 以外。
     InvalidBool(u8),
+    /// Integer does not fit the declared field width.
+    IntegerOutOfRange,
     /// 取得状態の値が未知（イベント単位の Other 保持とは別に、値列では拒否する）。
     InvalidCapture(u8),
     /// Str が UTF-8 でない。
@@ -66,6 +68,7 @@ impl fmt::Display for CompactError {
         match self {
             Self::Truncated => write!(f, "compact input truncated"),
             Self::Leb128TooLong => write!(f, "LEB128 too long or unterminated"),
+            Self::IntegerOutOfRange => write!(f, "integer exceeds declared field width"),
             Self::InvalidBool(v) => write!(f, "invalid bool value {v}"),
             Self::InvalidCapture(v) => write!(f, "invalid capture state {v}"),
             Self::InvalidUtf8 => write!(f, "string is not valid UTF-8"),

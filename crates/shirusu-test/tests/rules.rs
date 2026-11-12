@@ -190,6 +190,42 @@ fn clean_trace() -> ReadTrace {
     b.finish(FinalizationInfo::default())
 }
 
+#[test]
+fn recovered_trace_cannot_pass_no_integrity_loss() {
+    let mut trace = clean_trace();
+    trace
+        .issues
+        .push(shirusu_trace::reader::RecoveryIssue::CorruptBlock {
+            offset: 100,
+            reason: "crc mismatch".into(),
+        });
+    let s = spec(r#"{"rules":[{"type":"no-integrity-loss"}]}"#);
+    assert!(!evaluate(&s, &trace).all_passed());
+    trace.issues.clear();
+    trace.finalized_cleanly = false;
+    assert!(!evaluate(&s, &trace).all_passed());
+}
+
+#[test]
+fn failed_close_is_not_a_closed_object() {
+    let mut trace = clean_trace();
+    for batch in &mut trace.batches {
+        for e in &mut batch.events {
+            if e.schema_id == 8 {
+                e.args = Some(
+                    encode_values(
+                        &[Ty::I32, Ty::U32],
+                        &[cv(TypedValue::I32(0)), cv(TypedValue::U32(6))],
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+    }
+    let s = spec(r#"{"rules":[{"type":"object-closed","created_by":"kernel32!CreateFileW"}]}"#);
+    assert!(!evaluate(&s, &trace).all_passed());
+}
+
 fn spec(json: &str) -> TestSpec {
     TestSpec::parse(json).unwrap()
 }

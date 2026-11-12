@@ -216,7 +216,8 @@ impl LaunchedCapture {
         };
         let mut session = self.session.take().expect("session present");
         session.set_shutdown_outcome(outcome);
-        let summary = session.stop()?;
+        let mut summary = session.stop()?;
+        summary.target_exit_code = win::process_exit_code(self.process)?;
         win::close_handle_value(self.process);
         self.process = 0;
         Ok(summary)
@@ -258,6 +259,9 @@ pub struct TreeCapture {
     children: Vec<LaunchedCapture>,
     child_summaries: Vec<(u32, SessionSummary)>,
     tracker: ChildTracker,
+    // Holding each process object prevents Windows from reusing its PID while
+    // it is still accepted as an ancestor, even after its capture is finalized.
+    ancestors: std::collections::HashMap<u32, AncestorProcess>,
     launch_cfg: LaunchConfig,
     root_trace: PathBuf,
     uninjectable: Vec<(u32, String)>,
@@ -265,6 +269,24 @@ pub struct TreeCapture {
     /// （CreateToolhelp32Snapshot は負荷時に失敗することがある）は
     /// 許容し、一定回数を超えたらエラーとして返す。
     scan_failures: u32,
+}
+
+struct AncestorProcess {
+    handle: win::HandleValue,
+    created: u64,
+}
+
+impl Drop for AncestorProcess {
+    fn drop(&mut self) {
+        win::close_handle_value(self.handle);
+    }
+}
+
+fn pin_process(pid: u32) -> Result<AncestorProcess, SessionError> {
+    let handle = win::open_process_for_injection(pid)?;
+    let mut pinned = AncestorProcess { handle, created: 0 };
+    pinned.created = win::process_creation_time(handle)?;
+    Ok(pinned)
 }
 
 /// プロセス一覧の取得失敗を連続で許容する回数。
@@ -293,11 +315,14 @@ impl TreeCapture {
         let root_trace = trace_path.as_ref().to_path_buf();
         let root = LaunchedCapture::launch(cmdline, &root_trace, cfg.clone())?;
         let tracker = ChildTracker::new(root.pid());
+        let pinned = pin_process(root.pid())?;
+        let ancestors = [(root.pid(), pinned)].into_iter().collect();
         Ok(Self {
             root,
             children: Vec::new(),
             child_summaries: Vec::new(),
             tracker,
+            ancestors,
             launch_cfg: cfg,
             root_trace,
             uninjectable: Vec::new(),
@@ -320,13 +345,64 @@ impl TreeCapture {
                 ppid: *ppid,
             })
             .collect();
-        for pid in self.tracker.update(&snapshot) {
-            let child_trace = child_trace_path(&self.root_trace, pid);
-            let child_cfg = child_launch_config(&self.launch_cfg, pid, self.root.pid());
-            match LaunchedCapture::attach(pid, &child_trace, child_cfg) {
-                Ok(child) => self.children.push(child),
-                Err(e) => self.uninjectable.push((pid, e.to_string())),
+        let mut pending = self.tracker.update(&snapshot);
+        while !pending.is_empty() {
+            let mut deferred = Vec::new();
+            let mut progressed = false;
+            for pid in pending {
+                let parent = snapshot
+                    .iter()
+                    .find(|e| e.pid == pid)
+                    .map(|e| e.ppid)
+                    .unwrap_or(0);
+                let Some(ancestor) = self.ancestors.get(&parent) else {
+                    deferred.push(pid);
+                    continue;
+                };
+                progressed = true;
+                let pinned = match pin_process(pid) {
+                    Ok(pinned) => pinned,
+                    Err(e) => {
+                        self.uninjectable.push((pid, e.to_string()));
+                        continue;
+                    }
+                };
+                // Recheck parentage after opening the handle: a snapshot PID
+                // can be recycled before OpenProcess. Old children of a prior
+                // owner of the parent's PID must also be excluded.
+                let current = match win::enumerate_processes() {
+                    Ok(current) => current,
+                    Err(error) => {
+                        self.uninjectable
+                            .push((pid, format!("cannot recheck process identity: {error}")));
+                        continue;
+                    }
+                };
+                let current_parent = current
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == pid)
+                    .map(|(_, ppid)| ppid);
+                if current_parent != Some(parent) || pinned.created < ancestor.created {
+                    self.uninjectable
+                        .push((pid, "process identity changed during discovery".into()));
+                    continue;
+                }
+                self.ancestors.insert(pid, pinned);
+                let child_trace = child_trace_path(&self.root_trace, pid);
+                let child_cfg = child_launch_config(&self.launch_cfg, pid, self.root.pid());
+                match LaunchedCapture::attach(pid, &child_trace, child_cfg) {
+                    Ok(child) => self.children.push(child),
+                    Err(e) => self.uninjectable.push((pid, e.to_string())),
+                }
             }
+            if !progressed {
+                for pid in deferred {
+                    self.uninjectable
+                        .push((pid, "parent identity could not be confirmed".into()));
+                }
+                break;
+            }
+            pending = deferred;
         }
         Ok(())
     }
@@ -748,7 +824,9 @@ fn inject_and_init(
     } else {
         None
     };
-    win::remote_free(process, remote);
+    if !matches!(status, Err(win::WinError::RemoteCallPending { .. })) {
+        win::remote_free(process, remote);
+    }
     let status = status?;
     if status != 0 {
         if let Some(result) = outcome.filter(|r| r.unrestored > 0) {

@@ -38,8 +38,20 @@ if ($appverif) {
     try {
         Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e (with Application Verifier)"
     } finally {
-        & $appverif -delete settings -for shirusu-hook-target.exe | Out-Host
-        & $appverif -delete logs -for shirusu-hook-target.exe | Out-Host
+        # Export before deleting settings/logs, including when capture-e2e fails.
+        # Keep diagnostic failures from replacing the original test failure.
+        try {
+            $diagnostics = Join-Path (Get-Location) "target\ci-diagnostics"
+            New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+            & $appverif -export log -for shirusu-hook-target.exe -with "To=$diagnostics\appverifier.xml" | Out-Host
+            Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter "shirusu-capture-e2e-*.trace" |
+                Copy-Item -Destination $diagnostics -ErrorAction Continue
+        } catch {
+            Write-Warning "Could not preserve capture diagnostics: $_"
+        } finally {
+            & $appverif -delete settings -for shirusu-hook-target.exe | Out-Host
+            & $appverif -delete logs -for shirusu-hook-target.exe | Out-Host
+        }
     }
 } else {
     Write-Host "D54: appverif.exe not found; running capture-e2e without Application Verifier"

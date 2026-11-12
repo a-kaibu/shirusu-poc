@@ -24,15 +24,15 @@ pub struct ImportSite {
 }
 
 fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
-    b.get(off..off + 2)
+    b.get(off..off.checked_add(2)?)
         .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
 }
 fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
-    b.get(off..off + 4)
+    b.get(off..off.checked_add(4)?)
         .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
 }
 fn rd_u64(b: &[u8], off: usize) -> Option<u64> {
-    b.get(off..off + 8)
+    b.get(off..off.checked_add(8)?)
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
 }
 
@@ -56,7 +56,7 @@ fn nt_headers(b: &[u8]) -> Option<NtHeaders> {
         return None;
     }
     let nt = rd_u32(b, 0x3C)? as usize;
-    if b.get(nt..nt + 4)? != b"PE\0\0" {
+    if b.get(nt..nt.checked_add(4)?)? != b"PE\0\0" {
         return None;
     }
     let coff = nt + 4;
@@ -84,6 +84,9 @@ fn nt_headers(b: &[u8]) -> Option<NtHeaders> {
 fn data_directory(b: &[u8], h: &NtHeaders, index: usize) -> Option<(u32, u32)> {
     let base = h.optional_off + if h.is64 { 112 } else { 96 };
     let off = base.checked_add(index.checked_mul(8)?)?;
+    if off.checked_add(8)? > h.section_off {
+        return None;
+    }
     Some((rd_u32(b, off)?, rd_u32(b, off + 4)?))
 }
 
@@ -127,6 +130,9 @@ pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
     let mut desc_off = dir_rva as usize;
     // ディスクリプタ数の暴走防止（実在のモジュールでも数百が上限）
     for _ in 0..4096 {
+        if desc_off.checked_add(20).is_none_or(|end| end > image.len()) {
+            break;
+        }
         let Some(original_first_thunk) = rd_u32(image, desc_off) else {
             break;
         };
@@ -149,7 +155,9 @@ pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
             first_thunk
         };
         for i in 0..16384usize {
-            let entry_off = lookup_rva as usize + i * thunk_size;
+            let Some(entry_off) = (lookup_rva as usize).checked_add(i * thunk_size) else {
+                break;
+            };
             let val = if h.is64 {
                 rd_u64(image, entry_off)
             } else {
@@ -159,7 +167,15 @@ pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
             if val == 0 {
                 break;
             }
-            let iat_rva = first_thunk + (i * thunk_size) as u32;
+            let Some(iat_rva) = first_thunk.checked_add((i * thunk_size) as u32) else {
+                break;
+            };
+            if (iat_rva as usize)
+                .checked_add(thunk_size)
+                .is_none_or(|end| end > image.len())
+            {
+                break;
+            }
             if val & ordinal_flag != 0 {
                 out.push(ImportSite {
                     dll_name: dll_name.clone(),
@@ -168,7 +184,10 @@ pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
                     iat_rva,
                 });
             } else {
-                let name = read_c_string(image, (val as u32) as usize + 2, 512);
+                let name = u32::try_from(val)
+                    .ok()
+                    .and_then(|rva| rva.checked_add(2))
+                    .and_then(|rva| read_c_string(image, rva as usize, 512));
                 out.push(ImportSite {
                     dll_name: dll_name.clone(),
                     func_name: name,
@@ -189,6 +208,7 @@ pub fn find_export(image: &[u8], name: &str) -> Option<u32> {
         return None;
     }
     let d = dir_rva as usize;
+    image.get(d..d.checked_add(40)?)?;
     let num_names = rd_u32(image, d + 24)? as usize;
     let names_rva = rd_u32(image, d + 32)? as usize;
     let ordinals_rva = rd_u32(image, d + 36)? as usize;
@@ -197,10 +217,18 @@ pub fn find_export(image: &[u8], name: &str) -> Option<u32> {
         return None;
     }
     for i in 0..num_names {
-        let name_rva = rd_u32(image, names_rva + i * 4)? as usize;
+        let name_rva = rd_u32(image, names_rva.checked_add(i.checked_mul(4)?)?)? as usize;
         if read_c_string(image, name_rva, 512).as_deref() == Some(name) {
-            let ordinal = rd_u16(image, ordinals_rva + i * 2)? as usize;
-            return rd_u32(image, functions_rva + ordinal * 4);
+            let ordinal = rd_u16(image, ordinals_rva.checked_add(i.checked_mul(2)?)?)? as usize;
+            let rva = rd_u32(image, functions_rva.checked_add(ordinal.checked_mul(4)?)?)?;
+            // Forwarded exports point into the export directory, not executable
+            // code. This API resolves only direct addresses.
+            let (_, export_size) = data_directory(image, &h, 0)?;
+            let export_end = dir_rva.checked_add(export_size)?;
+            if rva == 0 || rva as usize >= image.len() || (dir_rva..export_end).contains(&rva) {
+                return None;
+            }
+            return Some(rva);
         }
     }
     None
@@ -337,6 +365,10 @@ mod tests {
         assert_eq!(find_export(&img, "shirusu_agent_init"), Some(0x1111));
         assert_eq!(find_export(&img, "shirusu_agent_shutdown"), Some(0x2222));
         assert_eq!(find_export(&img, "nonexistent"), None);
+        for invalid_rva in [0, 0x2008, 0x4000, u32::MAX] {
+            w32(&mut img, 0x2100, invalid_rva);
+            assert_eq!(find_export(&img, "shirusu_agent_init"), None);
+        }
     }
 
     #[test]
@@ -347,6 +379,20 @@ mod tests {
         let mut img = synthetic_image(0x1000);
         set_dir(&mut img, 1, 0xFFFF_0000, 20); // 範囲外 RVA
         assert!(parse_imports(&img).is_empty());
+    }
+
+    #[test]
+    fn rejects_out_of_image_iat() {
+        let mut img = synthetic_image(0x4000);
+        set_dir(&mut img, 1, 0x1000, 40);
+        w32(&mut img, 0x1000, 0x1100);
+        w32(&mut img, 0x100c, 0x1300);
+        wstr(&mut img, 0x1300, "kernel32.dll");
+        w64(&mut img, 0x1100, 0x8000_0000_0000_0042);
+        for invalid_iat in [0x3ffc, 0x4000, u32::MAX] {
+            w32(&mut img, 0x1010, invalid_iat);
+            assert!(parse_imports(&img).is_empty());
+        }
     }
 
     #[test]

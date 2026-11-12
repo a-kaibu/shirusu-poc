@@ -21,6 +21,26 @@ fn serialized(trace: &ReadTrace) -> ReadTrace {
     }
     shirusu_trace::read_trace(&w.finish(FinalizationInfo::default()).unwrap()).unwrap()
 }
+
+#[test]
+fn trimming_does_not_turn_unclean_source_into_complete_evidence() {
+    let make = |path| {
+        let mut b = Builder::new(Env::default());
+        b.create_file(1, 0, path);
+        b.finish(FinalizationInfo::default(), &[])
+    };
+    let mut left = make("a");
+    let right = make("b");
+    let diff = compare_traces(&left, &right);
+    left.finalized_cleanly = false;
+    let trimmed =
+        shirusu_probe::trim::trim_trace(&left, &diff.candidates[0], "left", "unclean").unwrap();
+    let trace = shirusu_trace::read_trace(&trimmed.bytes).unwrap();
+    assert_eq!(
+        trace.finalization.unwrap().event_integrity,
+        shirusu_trace::proto::integrity_level::DEGRADED
+    );
+}
 #[test]
 fn utf16_distinct_code_units_survive_compare() {
     let make = |unit| {

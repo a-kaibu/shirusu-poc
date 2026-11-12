@@ -188,10 +188,20 @@ impl AgentBootstrap {
             }
         }
         let (d, p) = (self.descriptor_capacity, self.payload_capacity);
-        if d == 0 || p == 0 || d > (1 << 24) || p > (1 << 32) {
+        if d < 2 || p < 16 || d > (1 << 24) || p > (1 << 32) {
             return Err(BootstrapError::BadRingConfig);
         }
-        Ok(RingConfig::new(d as usize, p as usize))
+        let d = usize::try_from(d).map_err(|_| BootstrapError::BadRingConfig)?;
+        let p = usize::try_from(p).map_err(|_| BootstrapError::BadRingConfig)?;
+        let len = d
+            .checked_mul(64)
+            .and_then(|n| n.checked_add(shirusu_transport::layout::CONTROL_SIZE))
+            .and_then(|n| n.checked_add(p))
+            .ok_or(BootstrapError::BadRingConfig)?;
+        if len > isize::MAX as usize {
+            return Err(BootstrapError::BadRingConfig);
+        }
+        Ok(RingConfig::new(d, p))
     }
 
     pub fn ring_mapping_handle(&self, index: usize) -> u64 {
@@ -292,6 +302,16 @@ impl AgentBootstrap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_small_capacities_return_error_without_panicking() {
+        for (d, p) in [(1, 4096), (64, 1), (64, 15)] {
+            let mut b = AgentBootstrap::new(1, RingConfig::new(64, 4096), &[(1, 2)]);
+            b.descriptor_capacity = d;
+            b.payload_capacity = p;
+            assert_eq!(b.validate(), Err(BootstrapError::BadRingConfig));
+        }
+    }
 
     #[test]
     fn roundtrip_new_validate() {

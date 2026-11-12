@@ -256,10 +256,11 @@ impl NormTrace {
         // File chunk order is drain order, not execution order. Prefer the
         // explicit observation order; otherwise compare QPC in common units.
         let global = view.events.iter().all(|e| e.global_order.is_some());
+        let comparable_qpc = view.events.iter().all(|e| e.qpc_frequency != 0);
         view.events.sort_by(|a, b| {
             let order = if global {
                 a.global_order.cmp(&b.global_order)
-            } else if a.qpc_frequency != 0 && b.qpc_frequency != 0 {
+            } else if comparable_qpc {
                 ((a.timestamp_qpc as u128) * b.qpc_frequency as u128)
                     .cmp(&((b.timestamp_qpc as u128) * a.qpc_frequency as u128))
             } else {
@@ -341,10 +342,6 @@ impl NormTrace {
         let mut threads: Vec<Vec<usize>> = Vec::new();
         let mut calls: Vec<NormCall> = Vec::new();
         let mut pending: HashMap<(usize, u64), usize> = HashMap::new();
-        // F27: leave が済んだ呼び出しの call_id -> 呼び出し index。
-        // 完了は leave の後に来て、別スレッドで観測されることがある
-        // ためスレッドは問わず、(session, process, call_id) で引く。
-        let mut completed_lookup: HashMap<(u64, u64, u64), usize> = HashMap::new();
         let mut object_calls: HashMap<ObjectKey, Vec<usize>> = HashMap::new();
 
         let norm_event = |ev: &shirusu_analysis::EventView| -> NormEvent {
@@ -374,7 +371,8 @@ impl NormTrace {
             NormEvent {
                 source_index: ev.index,
                 sequence: ev.sequence,
-                fully_captured: ev.capture == shirusu_trace::schema::EventCapture::Captured,
+                fully_captured: ev.capture == shirusu_trace::schema::EventCapture::Captured
+                    && ev.args_error.is_none(),
                 fields,
                 payload,
             }
@@ -410,28 +408,35 @@ impl NormTrace {
                 threads[thread].push(idx);
                 continue;
             }
-            // F27: 完了は leave が済んだ呼び出しに付ける。leave は
-            // call_id で引く（完了は別スレッドで観測されることがある
-            // ため、スレッドは問わない）。leave が欠落していた場合は、
-            // call_id が一致する最新の呼び出しに付ける。どちらも無ければ
-            // 単独イベント扱い。二重の完了は最初のものを残す。
+            // 完了は同じ session/process/API/call_id の一意な呼び出しに
+            // 付ける。別スレッドで観測されるため thread は問わない。
+            // 曖昧なら単独イベントとして残す。二重の完了は最初を残す。
             if phase == Phase::Completed {
                 let nev = norm_event(ev);
-                if let Some(&idx) =
-                    completed_lookup.get(&(ev.session_id, ev.process_id, ev.call_id))
-                {
+                // call_id can be reused by external emitters on different
+                // threads. Only correlate an unambiguous call in this process
+                // with the same API; never attach to an unrelated latest call.
+                let mut candidates = calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        let origin = c.enter.as_ref().or(c.leave.as_ref());
+                        origin.is_some_and(|origin| {
+                            let original = &view.events[rank[&origin.source_index]];
+                            original.session_id == ev.session_id
+                                && original.process_id == ev.process_id
+                                && original.api_id == ev.api_id
+                                && c.raw_call_id == ev.call_id
+                                && c.aborted.is_none()
+                        })
+                    })
+                    .map(|(index, _)| index);
+                let first = candidates.next();
+                let unique = first.filter(|_| candidates.next().is_none());
+                if let Some(idx) = unique {
                     if calls[idx].completed.is_none() {
                         calls[idx].completed = Some(nev);
                     }
-                } else if let Some(idx) = calls.iter().rposition(|c| {
-                    c.raw_call_id == ev.call_id
-                        && c.enter.as_ref().or(c.leave.as_ref()).is_some_and(|e| {
-                            identity[&e.source_index] == (ev.session_id, ev.process_id)
-                        })
-                        && c.completed.is_none()
-                        && (c.leave.is_some() || c.enter.is_some())
-                }) {
-                    calls[idx].completed = Some(nev);
                 } else {
                     let idx = calls.len();
                     calls.push(NormCall {
@@ -501,7 +506,6 @@ impl NormTrace {
                         calls[idx].created = Some(key.clone());
                     }
                     calls[idx].leave = Some(nev);
-                    completed_lookup.insert((ev.session_id, ev.process_id, ev.call_id), idx);
                     pending.remove(&pkey);
                 }
                 // L08: 中断は Leave と同じく呼び出しを閉じるが、正常終了

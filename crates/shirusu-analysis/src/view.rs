@@ -520,7 +520,7 @@ impl IntegritySummary {
         let mut total_loss_count = 0u64;
         for rec in &trace.loss_records {
             *by_kind.entry(rec.kind).or_default() += 1;
-            total_loss_count += rec.count;
+            total_loss_count = total_loss_count.saturating_add(rec.count);
         }
         let mut dropped_events = 0u64;
         let mut dropped_bytes = 0u64;
@@ -530,7 +530,7 @@ impl IntegritySummary {
             for e in &batch.events {
                 if let PayloadRef::Dropped { original_len, .. } = &e.payload {
                     dropped_events += 1;
-                    dropped_bytes += original_len;
+                    dropped_bytes = dropped_bytes.saturating_add(*original_len);
                 }
                 if e.capture != EventCapture::Captured {
                     degraded += 1;
@@ -622,6 +622,10 @@ impl IntegritySummary {
     /// `no-integrity-loss` ルールの判定材料。
     pub fn has_event_loss(&self) -> bool {
         !self.loss_records_by_kind.is_empty()
+            || self
+                .recovery_issues
+                .iter()
+                .any(|issue| issue != "index_mismatch")
             || self.dropped_payload_events > 0
             || self.missing_blob_refs > 0
             || matches!(self.event_integrity, Some(level) if level != 0)

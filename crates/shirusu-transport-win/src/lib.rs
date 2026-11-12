@@ -16,7 +16,14 @@ pub mod modules;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WinError {
     Unsupported,
-    OsError { api: &'static str, code: u32 },
+    OsError {
+        api: &'static str,
+        code: u32,
+    },
+    /// The remote thread may still be using its parameter. Do not free it.
+    RemoteCallPending {
+        wait_status: u32,
+    },
     InvalidArgument(&'static str),
 }
 impl std::fmt::Display for WinError {
@@ -24,6 +31,10 @@ impl std::fmt::Display for WinError {
         match self {
             Self::Unsupported => write!(f, "not supported on this platform"),
             Self::OsError { api, code } => write!(f, "{api} failed with OS error {code}"),
+            Self::RemoteCallPending { wait_status } => write!(
+                f,
+                "remote call did not finish (wait status {wait_status}); parameter memory retained"
+            ),
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
         }
     }
@@ -556,6 +567,40 @@ mod imp {
         }
     }
 
+    /// Read an exited process's status without consuming its handle. Waiting
+    /// first distinguishes a live process from one that actually exited with 259
+    /// (STILL_ACTIVE).
+    pub fn process_exit_code(process: HandleValue) -> Result<Option<u32>> {
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+        if !process_exited(process)? {
+            return Ok(None);
+        }
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(h(process), &mut code) } == 0 {
+            return Err(last_err("GetExitCodeProcess"));
+        }
+        Ok(Some(code))
+    }
+
+    pub fn process_creation_time(process: HandleValue) -> Result<u64> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let mut times: [FILETIME; 4] = unsafe { std::mem::zeroed() };
+        if unsafe {
+            GetProcessTimes(
+                h(process),
+                &mut times[0],
+                &mut times[1],
+                &mut times[2],
+                &mut times[3],
+            )
+        } == 0
+        {
+            return Err(last_err("GetProcessTimes"));
+        }
+        Ok((u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+    }
+
     pub fn close_handle_value(v: HandleValue) {
         if v != 0 {
             unsafe { CloseHandle(h(v)) };
@@ -665,9 +710,8 @@ mod imp {
         let waited = unsafe { WaitForSingleObject(thread, 30_000) };
         if waited != 0 {
             unsafe { CloseHandle(thread) };
-            return Err(WinError::OsError {
-                api: "remote_call wait",
-                code: waited,
+            return Err(WinError::RemoteCallPending {
+                wait_status: waited,
             });
         }
         let mut code: u32 = 0;
@@ -726,7 +770,11 @@ mod imp {
             }
             Ok(())
         })();
-        unsafe { VirtualFreeEx(proc_handle, remote, 0, MEM_RELEASE) };
+        // A timeout does not stop LoadLibraryW. Its input must remain valid
+        // until the remote thread finishes (or the target process exits).
+        if !matches!(result, Err(WinError::RemoteCallPending { .. })) {
+            unsafe { VirtualFreeEx(proc_handle, remote, 0, MEM_RELEASE) };
+        }
         result
     }
 
@@ -1004,13 +1052,20 @@ mod imp {
     pub fn terminate_process(_process: HandleValue, _exit_code: u32) -> Result<()> {
         Err(WinError::Unsupported)
     }
+    pub fn process_exit_code(_process: HandleValue) -> Result<Option<u32>> {
+        Err(WinError::Unsupported)
+    }
+    pub fn process_creation_time(_process: HandleValue) -> Result<u64> {
+        Err(WinError::Unsupported)
+    }
 }
 
 pub use imp::{
     close_handle_value, duplicate_handle_to_process, enumerate_processes, module_base,
-    open_process_for_injection, process_exited, read_process_memory, remote_alloc, remote_call,
-    remote_free, remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended,
-    terminate_process, wait_process, write_process_memory, EventObject, SharedMapping,
+    open_process_for_injection, process_creation_time, process_exit_code, process_exited,
+    read_process_memory, remote_alloc, remote_call, remote_free, remote_load_library,
+    resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process, wait_process,
+    write_process_memory, EventObject, SharedMapping,
 };
 
 /// プロセス単位の通知イベント群。data_ready は auto-reset。
@@ -1216,13 +1271,34 @@ mod tests {
         resume_main_thread(child.thread).unwrap();
         assert_eq!(wait_process(child.process, Duration::from_secs(5)), Some(0));
         close_handle_value(child.thread);
-        close_handle_value(child.process);
         assert!(process_exited(handle).unwrap());
         close_handle_value(handle);
         assert!(
             process_exited(0).is_err(),
             "invalid handle must not mean alive"
         );
+    }
+
+    #[test]
+    fn exit_status_preserves_live_nonzero_and_still_active_codes() {
+        let own = open_process_for_injection(std::process::id()).unwrap();
+        assert_eq!(process_exit_code(own).unwrap(), None);
+        close_handle_value(own);
+        for code in [0, 37, 259] {
+            let child = spawn_suspended(&format!("cmd.exe /C exit {code}")).unwrap();
+            let handle = open_process_for_injection(child.pid).unwrap();
+            resume_main_thread(child.thread).unwrap();
+            assert_eq!(
+                wait_process(child.process, Duration::from_secs(5)),
+                Some(code)
+            );
+            close_handle_value(child.thread);
+            assert_eq!(process_exit_code(handle).unwrap(), Some(code));
+            // Querying the status must not close the borrowed handle.
+            assert_eq!(process_exit_code(handle).unwrap(), Some(code));
+            close_handle_value(handle);
+        }
+        assert!(process_exit_code(0).is_err());
     }
 
     #[test]

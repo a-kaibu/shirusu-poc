@@ -248,13 +248,9 @@ mod win {
         // become intercepted below. Those operations belong to the Agent and
         // must stay on the passthrough path throughout initialization.
         let _initialization_guard = shirusu_hook::runtime::ReentrancyGuard::try_enter();
-        // レビュー #6 P1-4: スレッド終了の検出を FLS デストラクタへ
-        // 結線する。DisableThreadLibraryCalls のため DLL_THREAD_DETACH
-        // は届かないが、FLS デストラクタはスレッド終了時に呼ばれる。
-        // ハンドラは現在のランタイムを引くため、セッションをまたい
-        // でも有効であり、終了済みセッションのスレッドには no-op に
-        // なる。登録に失敗しても記録自体は継続する (Slot 再利用が
-        // 効かず、短命スレッドの多い対象では不足しうるだけである)。
+        // OS-thread detach is delivered by the native TLS callback, not FLS:
+        // fiber deletion must not finalize a still-running thread's capture.
+        // Resolve the current runtime so this registration survives reattach.
         let _ = shirusu_hook::fls::install_thread_exit_handler(Arc::new(|tid| {
             if let Some(rt) = engine::runtime() {
                 rt.thread_exit(tid);

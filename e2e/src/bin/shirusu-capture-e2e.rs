@@ -210,6 +210,16 @@ mod win {
         let ch = shirusu_hook::api::api_by_id(API_CLOSE_HANDLE).unwrap();
 
         let mut c = Checker { failures: vec![] };
+        println!(
+            "target exit code: {:?}",
+            summary
+                .target_exit_code
+                .map(|code| format!("{code} (0x{code:08X})"))
+        );
+        c.check(
+            summary.target_exit_code == Some(0),
+            "target exited successfully",
+        );
         c.check(trace.finalization.is_some(), "trace finalized");
         c.check(
             summary.integrity.event_integrity != IntegrityLevel::Lost,
@@ -289,11 +299,15 @@ mod win {
         } else {
             c.check(false, "CloseHandle enter present with known handle");
         }
-        let _ = std::fs::remove_file(&trace_path);
         if c.failures.is_empty() {
+            let _ = std::fs::remove_file(&trace_path);
             println!("PASS shirusu-capture-e2e");
             0
         } else {
+            println!("failed trace retained: {}", trace_path.display());
+            for event in &events {
+                println!("  recorded event: {event:?}");
+            }
             println!(
                 "FAIL shirusu-capture-e2e: {} checks failed",
                 c.failures.len()

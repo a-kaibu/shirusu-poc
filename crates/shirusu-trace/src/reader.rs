@@ -201,6 +201,7 @@ pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadT
         blobs: HashMap::new(),
         blob_offsets: HashMap::new(),
         blob_updates: Vec::new(),
+        blob_update_offsets: Vec::new(),
         resource_versions: HashMap::new(),
         loss_records: Vec::new(),
         stored_index: None,
@@ -331,7 +332,7 @@ fn fold_blob_updates(scan: &mut Scan) {
     // リソースごとの作業中内容（初回は基底のコピー）。
     let mut current: HashMap<BlobId, Vec<u8>> = HashMap::new();
     let mut versions: HashMap<BlobId, BlobId> = HashMap::new();
-    for update in &scan.blob_updates {
+    for (update, &offset) in scan.blob_updates.iter().zip(&scan.blob_update_offsets) {
         let Some(base) = scan.blobs.get(&update.resource_id) else {
             if missing_base_reported.insert(update.resource_id) {
                 scan.issues.push(RecoveryIssue::BlobUpdateMissingBase {
@@ -340,6 +341,16 @@ fn fold_blob_updates(scan: &mut Scan) {
             }
             continue;
         };
+        let base_offset = scan
+            .blob_offsets
+            .get(&update.resource_id)
+            .copied()
+            .unwrap_or(offset);
+        if base_offset > offset {
+            scan.issues.push(RecoveryIssue::ForwardBlobReference {
+                id: update.resource_id,
+            });
+        }
         let base_len = base.len() as u64;
         if !scan.blobs.contains_key(&update.new_version_id) {
             let exceeded = if scan.blobs.len() >= scan.limits.max_blobs {
@@ -375,6 +386,9 @@ fn fold_blob_updates(scan: &mut Scan) {
                 } else {
                     *working = folded.clone();
                     versions.insert(update.resource_id, update.new_version_id);
+                    scan.blob_offsets
+                        .entry(update.new_version_id)
+                        .or_insert(offset.max(base_offset));
                     if let std::collections::hash_map::Entry::Vacant(e) =
                         scan.blobs.entry(update.new_version_id)
                     {
@@ -407,6 +421,7 @@ struct Scan<'a> {
     /// ファイル順に受理した Blob の部分的な更新（F18）。走査後に
     /// 畳み込む。復号できたものはすべて並ぶ。
     blob_updates: Vec<BlobUpdate>,
+    blob_update_offsets: Vec<u64>,
     /// F18 の畳み込み結果：リソース ID から直近の版の ID への写像。
     resource_versions: HashMap<BlobId, BlobId>,
     loss_records: Vec<LossRecord>,
@@ -723,7 +738,10 @@ impl<'a> Scan<'a> {
                 // 復号できた更新は走査後にまとめて畳み込む（F18）。
                 // 宣言サイズの不一致等は、その Block だけを破損として
                 // 隔離する（F05 の厳格さと同じ）。
-                Some(update) => self.blob_updates.push(update),
+                Some(update) => {
+                    self.blob_updates.push(update);
+                    self.blob_update_offsets.push(offset);
+                }
                 None => corrupt(
                     &mut self.issues,
                     "blob update payload malformed: declared size mismatch or truncated".into(),

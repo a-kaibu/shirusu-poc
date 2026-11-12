@@ -367,6 +367,13 @@ pub fn plan_steps(steps: &[Step]) -> Result<Vec<PlannedCall>, String> {
                 step.call
             )
         })?;
+        if sig.function == "Sleep"
+            && (step.store.is_some() || step.expect.as_ref().is_some_and(|e| e.ret.is_some()))
+        {
+            return Err(format!(
+                "step {i}: Sleep returns void; store and return expectations are invalid"
+            ));
+        }
         if let Some(name) = &step.store {
             if !valid_name(name) {
                 return Err(format!("step {i}: invalid store name {name:?}"));
@@ -778,139 +785,121 @@ extern "system" {
     fn GetLastError() -> u32;
 }
 
-/// 汎用の呼び出し。引数はすべて `usize` スロットで渡す（Win32 の
-/// `stdcall` 呼び出し規約に沿う）。表の最大引数は 7 だが、将来の
-/// 拡張に備えて 12 まで受ける。
-#[cfg(windows)]
-unsafe fn call_raw(addr: usize, args: &[usize]) -> usize {
-    match args.len() {
-        0 => {
-            let f: extern "system" fn() -> usize = std::mem::transmute(addr);
-            f()
+/// Invoke only the supported signatures, preserving pointer widths, DWORD,
+/// BOOL and void returns. None means an unsupported signature; Some(None)
+/// is a successful void call, with no invented return value.
+#[cfg(any(windows, test))]
+unsafe fn call_raw(addr: usize, function: &str, args: &[usize]) -> Option<Option<u64>> {
+    match (function, args) {
+        ("CreateFileW", [a0, a1, a2, a3, a4, a5, a6]) => {
+            let f: unsafe extern "system" fn(
+                *const u16,
+                u32,
+                u32,
+                *mut std::ffi::c_void,
+                u32,
+                u32,
+                *mut std::ffi::c_void,
+            ) -> *mut std::ffi::c_void = unsafe { std::mem::transmute(addr) };
+            let value = unsafe {
+                f(
+                    *a0 as *const u16,
+                    *a1 as u32,
+                    *a2 as u32,
+                    *a3 as *mut std::ffi::c_void,
+                    *a4 as u32,
+                    *a5 as u32,
+                    *a6 as *mut std::ffi::c_void,
+                )
+            };
+            Some(Some(value as usize as u64))
         }
-        1 => {
-            let f: extern "system" fn(usize) -> usize = std::mem::transmute(addr);
-            f(args[0])
+        ("ReadFile", [a0, a1, a2, a3, a4]) => {
+            let f: unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                u32,
+                *mut u32,
+                *mut std::ffi::c_void,
+            ) -> i32 = unsafe { std::mem::transmute(addr) };
+            let value = unsafe {
+                f(
+                    *a0 as *mut std::ffi::c_void,
+                    *a1 as *mut std::ffi::c_void,
+                    *a2 as u32,
+                    *a3 as *mut u32,
+                    *a4 as *mut std::ffi::c_void,
+                )
+            };
+            Some(Some(value as u32 as u64))
         }
-        2 => {
-            let f: extern "system" fn(usize, usize) -> usize = std::mem::transmute(addr);
-            f(args[0], args[1])
+        ("WriteFile", [a0, a1, a2, a3, a4]) => {
+            let f: unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+                u32,
+                *mut u32,
+                *mut std::ffi::c_void,
+            ) -> i32 = unsafe { std::mem::transmute(addr) };
+            let value = unsafe {
+                f(
+                    *a0 as *mut std::ffi::c_void,
+                    *a1 as *const std::ffi::c_void,
+                    *a2 as u32,
+                    *a3 as *mut u32,
+                    *a4 as *mut std::ffi::c_void,
+                )
+            };
+            Some(Some(value as u32 as u64))
         }
-        3 => {
-            let f: extern "system" fn(usize, usize, usize) -> usize = std::mem::transmute(addr);
-            f(args[0], args[1], args[2])
+        ("CloseHandle", [a0]) => {
+            let f: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *mut std::ffi::c_void) };
+            Some(Some(value as u32 as u64))
         }
-        4 => {
-            let f: extern "system" fn(usize, usize, usize, usize) -> usize =
-                std::mem::transmute(addr);
-            f(args[0], args[1], args[2], args[3])
+        ("GetFileSize", [a0, a1]) => {
+            let f: unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> u32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *mut std::ffi::c_void, *a1 as *mut u32) };
+            Some(Some(value as u64))
         }
-        5 => {
-            let f: extern "system" fn(usize, usize, usize, usize, usize) -> usize =
-                std::mem::transmute(addr);
-            f(args[0], args[1], args[2], args[3], args[4])
+        ("DeleteFileW", [a0]) => {
+            let f: unsafe extern "system" fn(*const u16) -> i32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *const u16) };
+            Some(Some(value as u32 as u64))
         }
-        6 => {
-            let f: extern "system" fn(usize, usize, usize, usize, usize, usize) -> usize =
-                std::mem::transmute(addr);
-            f(args[0], args[1], args[2], args[3], args[4], args[5])
+        ("CreateDirectoryW", [a0, a1]) => {
+            let f: unsafe extern "system" fn(*const u16, *mut std::ffi::c_void) -> i32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *const u16, *a1 as *mut std::ffi::c_void) };
+            Some(Some(value as u32 as u64))
         }
-        7 => {
-            let f: extern "system" fn(usize, usize, usize, usize, usize, usize, usize) -> usize =
-                std::mem::transmute(addr);
-            f(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-            )
+        ("RemoveDirectoryW", [a0]) => {
+            let f: unsafe extern "system" fn(*const u16) -> i32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *const u16) };
+            Some(Some(value as u32 as u64))
         }
-        8 => {
-            let f: extern "system" fn(
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-            ) -> usize = std::mem::transmute(addr);
-            f(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
-            )
+        ("Sleep", [a0]) => {
+            let f: unsafe extern "system" fn(u32) -> () = unsafe { std::mem::transmute(addr) };
+            unsafe { f(*a0 as u32) };
+            Some(None)
         }
-        9 => {
-            let f: extern "system" fn(
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-            ) -> usize = std::mem::transmute(addr);
-            f(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
-            )
+        ("FlushFileBuffers", [a0]) => {
+            let f: unsafe extern "system" fn(*mut std::ffi::c_void) -> i32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *mut std::ffi::c_void) };
+            Some(Some(value as u32 as u64))
         }
-        10 => {
-            let f: extern "system" fn(
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-            ) -> usize = std::mem::transmute(addr);
-            f(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
-                args[9],
-            )
+        ("MoveFileW", [a0, a1]) => {
+            let f: unsafe extern "system" fn(*const u16, *const u16) -> i32 =
+                unsafe { std::mem::transmute(addr) };
+            let value = unsafe { f(*a0 as *const u16, *a1 as *const u16) };
+            Some(Some(value as u32 as u64))
         }
-        11 => {
-            let f: extern "system" fn(
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-            ) -> usize = std::mem::transmute(addr);
-            f(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
-                args[9], args[10],
-            )
-        }
-        12 => {
-            let f: extern "system" fn(
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-                usize,
-            ) -> usize = std::mem::transmute(addr);
-            f(
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
-                args[9], args[10], args[11],
-            )
-        }
-        _ => 0,
+        _ => None,
     }
 }
 
@@ -1043,7 +1032,9 @@ fn execute_one(
             ArgSlot::OutU64(slot) => storage.out64.as_ptr() as usize + slot * 8,
         })
         .collect();
-    let returned = unsafe { call_raw(addr, &values) } as u64;
+    let Some(returned) = (unsafe { call_raw(addr, call.function, &values) }) else {
+        return fail(format!("unsupported call signature: {}", call.function));
+    };
     let last_error = unsafe { GetLastError() };
     let mut outputs = Vec::new();
     let mut outputs_truncated = Vec::new();
@@ -1069,21 +1060,23 @@ fn execute_one(
             None => {}
         }
     }
-    if let Some(name) = &call.store {
-        stored.insert(name.clone(), returned);
+    if let (Some(name), Some(value)) = (&call.store, returned) {
+        stored.insert(name.clone(), value);
     }
     let mut error = None;
     if let Some(expect) = &call.expect {
         if let Some(ret) = expect.ret {
             let ok = match ret {
-                RetExpect::ValidHandle => returned != 0 && returned != usize::MAX as u64,
-                RetExpect::NonZero => returned != 0,
-                RetExpect::Zero => returned == 0,
-                RetExpect::Equals(v) => returned == v,
+                RetExpect::ValidHandle => {
+                    returned.is_some_and(|v| v != 0 && v != usize::MAX as u64)
+                }
+                RetExpect::NonZero => returned.is_some_and(|v| v != 0),
+                RetExpect::Zero => returned == Some(0),
+                RetExpect::Equals(v) => returned == Some(v),
             };
             if !ok {
                 error = Some(format!(
-                    "return value {returned} does not satisfy expect {ret:?}"
+                    "return value {returned:?} does not satisfy expect {ret:?}"
                 ));
             }
         }
@@ -1111,7 +1104,7 @@ fn execute_one(
         call: call_name,
         ok: error.is_none(),
         executed: true,
-        returned: Some(returned),
+        returned,
         last_error: Some(last_error),
         outputs,
         outputs_truncated,
@@ -1282,6 +1275,26 @@ pub fn run_embedded(spec_name: &str, steps: &[Step]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_dispatch_preserves_void_and_32_bit_results() {
+        unsafe extern "system" fn sleep(_: u32) {}
+        unsafe extern "system" fn close(_: *mut std::ffi::c_void) -> i32 {
+            -1
+        }
+        unsafe {
+            assert_eq!(
+                call_raw(sleep as *const () as usize, "Sleep", &[0]),
+                Some(None)
+            );
+            assert_eq!(
+                call_raw(close as *const () as usize, "CloseHandle", &[0]),
+                Some(Some(u32::MAX as u64))
+            );
+            assert_eq!(call_raw(0, "Sleep", &[]), None);
+            assert_eq!(call_raw(0, "Unsupported", &[]), None);
+        }
+    }
 
     fn file_flow() -> Vec<Step> {
         vec![

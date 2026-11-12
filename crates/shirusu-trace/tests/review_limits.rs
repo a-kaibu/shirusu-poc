@@ -14,6 +14,46 @@ fn updates() -> Vec<u8> {
     }
     w.finish(FinalizationInfo::default()).unwrap()
 }
+
+#[test]
+fn derived_blob_cannot_hide_a_forward_base_reference() {
+    let mut w = TraceWriter::new(Vec::new(), Default::default()).unwrap();
+    let base_data = vec![0; 1024];
+    let base = w.add_payload(&base_data).unwrap();
+    let mut updated = base_data.clone();
+    updated[0] = 1;
+    w.write_blob_update(base, BlobId::of_content(&updated), 0, &[1])
+        .unwrap();
+    let bytes = w.finish(FinalizationInfo::default()).unwrap();
+    let layout = read_trace_with_limits(&bytes, ReaderLimits::default())
+        .unwrap()
+        .blocks;
+    let blob = layout
+        .iter()
+        .position(|b| b.block_type == shirusu_trace::container::BlockType::BlobChunk)
+        .unwrap();
+    let update = layout
+        .iter()
+        .position(|b| b.block_type == shirusu_trace::container::BlockType::BlobUpdate)
+        .unwrap();
+    assert_eq!(update, blob + 1);
+    let start = layout[blob].offset as usize;
+    let middle = layout[update].offset as usize;
+    let end = layout[update + 1].offset as usize;
+    // Deliberately corrupt ordering without corrupting either block's CRC.
+    let reordered = [
+        &bytes[..start],
+        &bytes[middle..end],
+        &bytes[start..middle],
+        &bytes[end..],
+    ]
+    .concat();
+    let trace = read_trace_with_limits(&reordered, ReaderLimits::default()).unwrap();
+    assert!(trace
+        .issues
+        .iter()
+        .any(|issue| matches!(issue, RecoveryIssue::ForwardBlobReference { .. })));
+}
 #[test]
 fn derived_blobs_respect_count_and_byte_budgets() {
     for (limits, what, max) in [

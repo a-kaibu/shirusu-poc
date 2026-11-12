@@ -121,9 +121,13 @@ fn write_value(out: &mut Vec<u8>, v: &TypedValue) {
 
 fn read_value(cur: &mut Cursor, ty: Ty) -> Result<TypedValue, CompactError> {
     Ok(match ty {
-        Ty::I32 => TypedValue::I32(cur.read_sleb()? as i32),
+        Ty::I32 => TypedValue::I32(
+            i32::try_from(cur.read_sleb()?).map_err(|_| CompactError::IntegerOutOfRange)?,
+        ),
         Ty::I64 => TypedValue::I64(cur.read_sleb()?),
-        Ty::U32 => TypedValue::U32(cur.read_uleb()? as u32),
+        Ty::U32 => TypedValue::U32(
+            u32::try_from(cur.read_uleb()?).map_err(|_| CompactError::IntegerOutOfRange)?,
+        ),
         Ty::U64 => TypedValue::U64(cur.read_uleb()?),
         Ty::F32 => {
             let b = cur.read_exact(4)?;
@@ -364,11 +368,14 @@ pub fn decode_event_chunk(payload: &[u8]) -> Result<EventBatch, crate::error::Tr
         let ts_delta = cur.read_sleb().map_err(|_| corrupt("event truncated"))?;
         let timestamp_qpc = prev_ts.wrapping_add(ts_delta as u64);
         prev_ts = timestamp_qpc;
-        let kind = cur.read_uleb().map_err(|_| corrupt("event truncated"))? as u16;
+        let kind = u16::try_from(cur.read_uleb().map_err(|_| corrupt("event truncated"))?)
+            .map_err(|_| corrupt("kind overflow"))?;
         let call_id = cur.read_uleb().map_err(|_| corrupt("event truncated"))?;
         let parent_call_id = cur.read_uleb().map_err(|_| corrupt("event truncated"))?;
-        let api_id = cur.read_uleb().map_err(|_| corrupt("event truncated"))? as u32;
-        let schema_id = cur.read_uleb().map_err(|_| corrupt("event truncated"))? as u32;
+        let api_id = u32::try_from(cur.read_uleb().map_err(|_| corrupt("event truncated"))?)
+            .map_err(|_| corrupt("api_id overflow"))?;
+        let schema_id = u32::try_from(cur.read_uleb().map_err(|_| corrupt("event truncated"))?)
+            .map_err(|_| corrupt("schema_id overflow"))?;
         let capture = EventCapture::from_code(cur.read_u8().map_err(|_| corrupt("truncated"))?);
         let payload_tag = cur.read_u8().map_err(|_| corrupt("event truncated"))?;
         let payload = match payload_tag {
@@ -459,4 +466,35 @@ pub fn decode_event_chunk(payload: &[u8]) -> Result<EventBatch, crate::error::Tr
         qpc_frequency: header.qpc_frequency,
         events,
     })
+}
+
+#[cfg(test)]
+mod integer_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_narrow_integer_overflow() {
+        let mut bytes = Vec::new();
+        write_uleb(&mut bytes, u32::MAX as u64 + 1);
+        assert!(matches!(
+            read_value(&mut Cursor::new(&bytes), Ty::U32),
+            Err(CompactError::IntegerOutOfRange)
+        ));
+        for value in [i32::MIN as i64 - 1, i32::MAX as i64 + 1] {
+            bytes.clear();
+            write_sleb(&mut bytes, value);
+            assert!(matches!(
+                read_value(&mut Cursor::new(&bytes), Ty::I32),
+                Err(CompactError::IntegerOutOfRange)
+            ));
+        }
+        for value in [i32::MIN, i32::MAX] {
+            bytes.clear();
+            write_sleb(&mut bytes, value as i64);
+            assert_eq!(
+                read_value(&mut Cursor::new(&bytes), Ty::I32).unwrap(),
+                TypedValue::I32(value)
+            );
+        }
+    }
 }

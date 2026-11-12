@@ -103,6 +103,14 @@ jobs:
         # Windows 向けスクリプトは matrix 側のコマンドで pwsh を起動して実行する。
         shell: bash
         run: ${{ matrix.run }}
+      - name: Preserve Windows capture diagnostics
+        if: ${{ failure() && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-diagnostics-${{ matrix.name }}
+          path: target/ci-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
 
   done:
     name: done
