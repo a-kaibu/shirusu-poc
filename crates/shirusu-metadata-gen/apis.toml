@@ -340,18 +340,6 @@ module = "kernel32.dll"
 function = "SetFilePointerEx"
 
 # ---- 意図的な除外 ----
-# GetLastError / SetLastError: Detour 自身が LastError を読む・戻すため、
-# フックすると自己参照になる。
-[[skip]]
-namespace = "Windows.Win32.Foundation"
-module = "kernel32.dll"
-function = "GetLastError"
-reason = "Detour 自身が GetLastError を読むため自己参照になる"
-[[skip]]
-namespace = "Windows.Win32.Foundation"
-module = "kernel32.dll"
-function = "SetLastError"
-reason = "Detour 自身が LastError を戻すために SetLastError を使うため自己参照になる"
 # GlobalFree / LocalFree: 成功時に NULL を返す（失敗時はハンドル）。
 # NULL = 成功の反転した意味のため、WhenReturnIsNull の既定では扱えない。
 [[skip]]
@@ -638,3 +626,29 @@ function = "glDepthRange"
 namespace = "Windows.Win32.Graphics.OpenGL"
 module = "opengl32.dll"
 function = "glClearColor"
+
+# Fixed-argument cdecl: preserve caller stack cleanup on x86.
+[[api]]
+namespace = "Windows.Win32.Networking.Ldap"
+module = "WLDAP32.dll"
+function = "ldap_initW"
+[[api]]
+namespace = "Windows.Win32.Networking.Ldap"
+module = "WLDAP32.dll"
+function = "ldap_openW"
+[[api]]
+namespace = "Windows.Win32.Networking.Ldap"
+module = "WLDAP32.dll"
+function = "ldap_unbind"
+
+# Recorder reads LastError directly from the TEB, avoiding self-interception.
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "GetLastError"
+last_error = "never"
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "SetLastError"
+last_error = "never"

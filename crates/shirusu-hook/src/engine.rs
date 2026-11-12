@@ -3723,8 +3723,21 @@ mod tests {
         rt.set_original(api.api_id, original); // The state after IAT installation.
         rt.shutdown_recording();
         assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let before = unsafe { std::slice::from_raw_parts(original as *const u8, 16) }.to_vec();
         let result = unsafe { install_inline_hooks_for(&rt, std::iter::once(api)) };
-        assert_eq!(result.installed.len(), 1, "{:?}", result.skipped);
+        if result.installed.is_empty() {
+            // Some Windows builds implement this export in fewer bytes than
+            // a jump. Refusing it must preserve both code and the IAT original.
+            assert_eq!(result.skipped, vec![(api.api_id, "too-short")]);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(original as *const u8, 16) },
+                before
+            );
+            assert_eq!(rt.original(api.api_id), original);
+        } else {
+            assert_eq!(result.installed.len(), 1);
+            assert!(result.skipped.is_empty());
+        }
         assert_eq!(unsafe { GetCurrentProcess() } as usize, usize::MAX);
         assert!(unsafe { uninstall_inline_hooks(&result.installed) }.is_empty());
         assert!(clear_runtime(&rt));

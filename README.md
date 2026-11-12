@@ -1,7 +1,7 @@
 # shirusu-poc
 
 現在の対応範囲は `shirusu capabilities`（機械可読出力は `--json`）で確認できる。
-Win32／内部 API は 142 件（生成 L1: 129、手書き: 6、内部: 7）。
+Win32／内部 API は 147 件（生成 L1: 134、手書き: 6、内部: 7）。
 32/64bit 整数・短整数・浮動小数点の元の ABI を保って中継する。
 COM は Factory の観測と 7,797 IID の名前解決に対応するが、共有オブジェクトの
 メソッドを安全に追跡する通常経路は未完成。全 Windows API・COM 対応が完成した
@@ -23,6 +23,8 @@ shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC
 「未着手 0」をトレーサー全体の完成とは扱わない。
 標準の記録境界は Runtime → Windows API も含む。`--record-runtime-apis` は
 Runtime 自身のエクスポートを追加する設定で、CRT 経由の Windows I/O を隠す設定ではない。
+全 WinMD の対応状況は `cargo run -p shirusu-metadata-gen -- --inventory target/api-inventory.tsv`
+で出力できる。生成可能な型の件数と実機で記録を検証した件数は区別する。
 
 ## 2026年11月12日のレビュー対応
 

@@ -30,6 +30,10 @@ fn generic_detour_with<const N: usize>(
         "GetCurrentProcessId" => pid as *const () as usize,
         "GetCurrentProcess" => std_handle as *const () as usize,
         "SetEvent" => set_event as *const () as usize,
+        "ldap_initW" | "ldap_openW" => ldap_init as *const () as usize,
+        "ldap_unbind" => ldap_unbind as *const () as usize,
+        "GetLastError" => get_error as *const () as usize,
+        "SetLastError" => set_error as *const () as usize,
         "GetTickCount64" => tick64 as *const () as usize,
         "SetFilePointerEx" => {
             assert_eq!(raw[1], i64::MIN as u64);
@@ -54,6 +58,52 @@ fn generic_detour_with<const N: usize>(
     invoke(original)
 }
 include!("../src/engine_generated.inc");
+
+thread_local! {
+    static ERROR_CELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+unsafe extern "system-unwind" fn get_error() -> u32 {
+    ERROR_CELL.with(std::cell::Cell::get)
+}
+unsafe extern "system-unwind" fn set_error(value: u32) {
+    ERROR_CELL.with(|cell| cell.set(value));
+}
+#[test]
+fn last_error_apis_are_generated_with_void_and_dword_signatures() {
+    for code in [0, 5, 0x8000_0001, u32::MAX] {
+        unsafe {
+            detour_generated_kernel32_set_last_error(code);
+            assert_eq!(detour_generated_kernel32_get_last_error(), code);
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn ldap_init(host: *mut c_void, port: u32) -> *mut c_void {
+    assert_eq!(host as usize, 0x1234);
+    assert_eq!(port, u32::MAX);
+    0x5678usize as *mut c_void
+}
+unsafe extern "C-unwind" fn ldap_unbind(handle: *mut c_void) -> u32 {
+    assert_eq!(handle as usize, 0x5678);
+    0x8123_4567
+}
+
+#[test]
+fn cdecl_wrappers_keep_caller_stack_cleanup_and_return_width() {
+    let init: unsafe extern "C-unwind" fn(*mut c_void, u32) -> *mut c_void =
+        detour_generated_wldap32_ldap_init_w;
+    let open: unsafe extern "C-unwind" fn(*mut c_void, u32) -> *mut c_void =
+        detour_generated_wldap32_ldap_open_w;
+    let close: unsafe extern "C-unwind" fn(*mut c_void) -> u32 =
+        detour_generated_wldap32_ldap_unbind;
+    for _ in 0..1024 {
+        unsafe {
+            let handle = init(0x1234usize as *mut c_void, u32::MAX);
+            assert_eq!(open(0x1234usize as *mut c_void, u32::MAX), handle);
+            assert_eq!(close(handle), 0x8123_4567);
+        }
+    }
+}
 #[test]
 fn void_integer_and_pointer_returns_preserve_abi() {
     let sleep: unsafe extern "system-unwind" fn(u32) = detour_generated_kernel32_sleep;

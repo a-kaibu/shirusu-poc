@@ -254,8 +254,7 @@ fn generate_skips_vararg_api() {
 }
 
 #[test]
-fn generate_skips_non_system_calling_convention() {
-    // lib.rs 257: 呼出規約が system ではない (ldap_openW は C)。
+fn generates_cdecl_with_its_native_calling_convention() {
     require_winmd!();
     let index = read_index();
     let generated = generate(
@@ -269,13 +268,12 @@ fn generate_skips_non_system_calling_convention() {
             12,
         ),
     )
-    .expect("生成できる");
-    assert_single_skip(
-        &generated,
-        "WLDAP32.dll",
-        "ldap_openW",
-        "呼出規約が system ではない",
-    );
+    .unwrap();
+    assert_eq!(generated.emitted().len(), 1);
+    assert_eq!(generated.emitted()[0].calling_convention, "C-unwind");
+    let code = shirusu_metadata_gen::emit_engine_inc(&generated, "test");
+    assert!(code.contains("extern \"C-unwind\""));
+    assert!(!code.contains("extern \"system-unwind\""));
 }
 
 #[test]
@@ -438,6 +436,7 @@ fn map_type_rejects_generic_named_type() {
 fn emit_api_inc_escapes_quotes_and_backslashes() {
     // lib.rs 535-536: rust_str の `"` と `\` のエスケープ。
     let api = MappedApi {
+        calling_convention: "system-unwind",
         api_id: 7,
         module: "we\"ird.dll".into(),
         function: "Na\\me".into(),

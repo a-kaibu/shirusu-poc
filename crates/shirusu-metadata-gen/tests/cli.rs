@@ -398,3 +398,61 @@ fn write_error_for_engine_inc_exits_1() {
     // api 側は書けていること。
     assert!(dir.path().join("api_generated.inc").exists());
 }
+
+#[test]
+fn inventory_audits_unselected_apis_without_rewriting_wrappers() {
+    require_winmd!();
+    let path = std::env::temp_dir().join(format!("shirusu-inventory-{}.tsv", std::process::id()));
+    let winmd = winmd_path();
+    let config = config_path();
+    let args = [
+        "--winmd",
+        winmd.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    let result = Command::new(bin())
+        .args(args)
+        .arg("--inventory")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let content = std::fs::read_to_string(&path).unwrap();
+    let rows: Vec<_> = content
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .collect();
+    assert!(rows.len() > 10_000);
+    assert!(rows.iter().all(|r| r.len() == 5));
+    assert!(rows
+        .iter()
+        .any(|r| r[2] == "ldap_openW" && r[3] == "selected"));
+    assert!(rows.iter().any(|r| r[3] == "generatable"));
+    assert!(rows
+        .iter()
+        .any(|r| r[3] == "unsupported" && !r[4].is_empty()));
+    let result = Command::new(bin())
+        .args(args)
+        .arg("--inventory")
+        .arg(&path)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    std::fs::write(&path, "stale").unwrap();
+    let result = Command::new(bin())
+        .args(args)
+        .arg("--inventory")
+        .arg(&path)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    std::fs::remove_file(path).unwrap();
+}

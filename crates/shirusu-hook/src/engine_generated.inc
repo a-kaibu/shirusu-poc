@@ -903,6 +903,41 @@ unsafe extern "system-unwind" fn detour_generated_opengl32_gl_clear_color(a0: f3
         0
     });
 }
+unsafe extern "C-unwind" fn detour_generated_wldap32_ldap_init_w(a0: *mut core::ffi::c_void, a1: u32) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(143, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "C-unwind" fn(*mut core::ffi::c_void, u32) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "C-unwind" fn detour_generated_wldap32_ldap_open_w(a0: *mut core::ffi::c_void, a1: u32) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(144, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "C-unwind" fn(*mut core::ffi::c_void, u32) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "C-unwind" fn detour_generated_wldap32_ldap_unbind(a0: *mut core::ffi::c_void) -> u32 {
+    let result = generic_detour_with(145, &[a0 as u64], |original| {
+        let original: unsafe extern "C-unwind" fn(*mut core::ffi::c_void) -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_get_last_error() -> u32 {
+    let result = generic_detour_with(146, &[], |original| {
+        let original: unsafe extern "system-unwind" fn() -> u32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original() }) as u64
+    });
+    result as u32
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_set_last_error(a0: u32) {
+    generic_detour_with(147, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(u32) -> () = unsafe { std::mem::transmute(original) };
+        unsafe { original(a0) };
+        0
+    });
+}
 
 fn detour_for_generated(api_id: u32) -> usize {
     match api_id {
@@ -1035,6 +1070,11 @@ fn detour_for_generated(api_id: u32) -> usize {
         140 => detour_generated_opengl32_gl_clear_depth as *const () as usize,
         141 => detour_generated_opengl32_gl_depth_range as *const () as usize,
         142 => detour_generated_opengl32_gl_clear_color as *const () as usize,
+        143 => detour_generated_wldap32_ldap_init_w as *const () as usize,
+        144 => detour_generated_wldap32_ldap_open_w as *const () as usize,
+        145 => detour_generated_wldap32_ldap_unbind as *const () as usize,
+        146 => detour_generated_kernel32_get_last_error as *const () as usize,
+        147 => detour_generated_kernel32_set_last_error as *const () as usize,
         _ => 0,
     }
 }

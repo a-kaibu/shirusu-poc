@@ -15,7 +15,7 @@
 //! `target/winmd/Windows.Win32.winmd`。
 
 use shirusu_metadata_gen::{
-    emit_api_inc, emit_com_catalog, emit_engine_inc, generate, load_config,
+    emit_api_inc, emit_api_inventory, emit_com_catalog, emit_engine_inc, generate, load_config,
 };
 use windows_metadata::reader::TypeIndex;
 
@@ -24,7 +24,7 @@ const ENGINE_INC: &str = "engine_generated.inc";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--check]"
+        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--check]"
     );
     std::process::exit(2);
 }
@@ -35,6 +35,7 @@ fn main() {
     let mut out_dir = "crates/shirusu-hook/src".to_string();
     let mut check = false;
     let mut catalog: Option<String> = None;
+    let mut inventory: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -43,15 +44,38 @@ fn main() {
             "--out-dir" => out_dir = args.next().unwrap_or_else(|| usage()),
             "--check" => check = true,
             "--com-catalog" => catalog = Some(args.next().unwrap_or_else(|| usage())),
+            "--inventory" => inventory = Some(args.next().unwrap_or_else(|| usage())),
             _ => usage(),
         }
+    }
+    if inventory.is_some() && catalog.is_some() {
+        usage();
     }
     let winmd = winmd
         .or_else(|| std::env::var("SHIRUSU_WINMD").ok())
         .unwrap_or_else(|| "target/winmd/Windows.Win32.winmd".to_string());
-    if let Err(e) = run(&winmd, &config_path, &out_dir, check, catalog.as_deref()) {
+    let result = if let Some(path) = inventory {
+        inventory_run(&winmd, &config_path, &path, check)
+    } else {
+        run(&winmd, &config_path, &out_dir, check, catalog.as_deref())
+    };
+    if let Err(e) = result {
         eprintln!("win32-metadata-gen: {e}");
         std::process::exit(1);
+    }
+}
+
+fn inventory_run(winmd: &str, config_path: &str, path: &str, check: bool) -> Result<(), String> {
+    let config = load_config(config_path)?;
+    let index = TypeIndex::read(winmd).ok_or_else(|| format!("cannot read WinMD: {winmd}"))?;
+    let content = emit_api_inventory(&index, &config);
+    if check {
+        if !matches!(std::fs::read_to_string(path), Ok(have) if have == content) {
+            return Err(format!("API inventory {path} is stale"));
+        }
+        Ok(())
+    } else {
+        std::fs::write(path, content).map_err(|e| format!("{path}: {e}"))
     }
 }
 

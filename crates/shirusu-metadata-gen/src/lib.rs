@@ -59,6 +59,76 @@ fn default_max_params() -> usize {
     12
 }
 
+/// Audit every WinMD Apis method, including entries absent from the selection
+/// file. "generatable" describes the ABI mapper, not native capture coverage.
+pub fn emit_api_inventory(index: &TypeIndex, config: &Config) -> String {
+    let mut rows = Vec::new();
+    for (namespace, name, def) in index.iter() {
+        if name != "Apis" {
+            continue;
+        }
+        for method in def.methods() {
+            let module = method
+                .impl_map()
+                .map(|m| m.import_scope().name().to_string())
+                .unwrap_or_default();
+            let function = method.name().to_string();
+            let selected = config.apis.iter().find(|a| {
+                a.namespace == namespace
+                    && a.module.eq_ignore_ascii_case(&module)
+                    && a.function == function
+            });
+            let skipped = config.skips.iter().find(|a| {
+                a.namespace == namespace
+                    && a.module.eq_ignore_ascii_case(&module)
+                    && a.function == function
+            });
+            let candidate = ApiConfig {
+                namespace: namespace.to_string(),
+                module: module.clone(),
+                function: function.clone(),
+                last_error: selected.and_then(|a| a.last_error.clone()),
+            };
+            let (status, reason) = match skipped {
+                Some(skip) => ("excluded", skip.reason.clone()),
+                None => match map_api(index, &candidate, 1, config.max_params) {
+                    Ok(EntryOutcome::Emitted(_)) => (
+                        if selected.is_some() {
+                            "selected"
+                        } else {
+                            "generatable"
+                        },
+                        String::new(),
+                    ),
+                    Ok(EntryOutcome::Skipped { reason, .. }) | Err(reason) => {
+                        ("unsupported", reason)
+                    }
+                },
+            };
+            rows.push((namespace.to_string(), module, function, status, reason));
+        }
+    }
+    rows.sort();
+    let mut out = String::from("namespace\tmodule\tfunction\tstatus\treason\n");
+    for (namespace, module, function, status, reason) in rows {
+        let fields = [namespace, module, function, status.to_string(), reason];
+        out.push_str(
+            &fields
+                .iter()
+                .map(|v| {
+                    v.replace('\\', "\\\\")
+                        .replace('\t', "\\t")
+                        .replace('\r', "\\r")
+                        .replace('\n', "\\n")
+                })
+                .collect::<Vec<_>>()
+                .join("\t"),
+        );
+        out.push('\n');
+    }
+    out
+}
+
 /// 生成対象の API 1 件。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiConfig {
@@ -122,6 +192,7 @@ pub enum Flavor {
 /// 生成した API 1 件（`ApiDef` と Detour 生成の入力）。
 #[derive(Debug, Clone)]
 pub struct MappedApi {
+    pub calling_convention: &'static str,
     pub abi_params: Vec<&'static str>,
     pub abi_return: &'static str,
     pub api_id: u32,
@@ -263,12 +334,11 @@ fn map_api(
     if sig.flags.contains(MethodCallAttributes::HASTHIS) {
         return Ok(skipped("インスタンスメソッド (HASTHIS) は対象外".into()));
     }
-    if method.calling_convention() != "system" {
-        return Ok(skipped(format!(
-            "呼出規約が system ではない: {:?}",
-            method.calling_convention()
-        )));
-    }
+    let calling_convention = match method.calling_convention() {
+        "system" => "system-unwind",
+        "C" => "C-unwind",
+        other => return Ok(skipped(format!("unsupported calling convention: {other}"))),
+    };
     let Some(map) = method.impl_map() else {
         return Ok(skipped("ImplMap が無い (P/Invoke ではない)".into()));
     };
@@ -334,6 +404,7 @@ fn map_api(
         None => default_meaning(flavor),
     };
     Ok(EntryOutcome::Emitted(MappedApi {
+        calling_convention,
         abi_params,
         abi_return,
         api_id,
@@ -622,6 +693,7 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
     out.push_str("// Regenerate: cargo run -p shirusu-metadata-gen -- --winmd <path> --config crates/shirusu-metadata-gen/apis.toml\n");
     for api in generated.emitted() {
         let fname = detour_fn_name(api);
+        let abi = api.calling_convention;
         let types = &api.abi_params;
         let params: Vec<_> = types
             .iter()
@@ -646,7 +718,7 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             String::new()
         };
         out.push_str(&format!(
-            "unsafe extern \"system-unwind\" fn {fname}({}){declaration_ret} {{\n",
+            "unsafe extern \"{abi}\" fn {fname}({}){declaration_ret} {{\n",
             params.join(", ")
         ));
         let binding = if api.return_ty.is_some() && ret != "u64" {
@@ -655,7 +727,7 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             ""
         };
         out.push_str(&format!(
-            "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"system-unwind\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
+            "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"{abi}\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
             api.api_id, raw.join(", "), types.join(", ")
         ));
         let call = format!("unsafe {{ original({}) }}", args.join(", "));
@@ -885,6 +957,7 @@ mod tests {
     #[test]
     fn emit_api_inc_renders_api_def() {
         let api = MappedApi {
+            calling_convention: "system-unwind",
             api_id: 7,
             module: "advapi32.dll".into(),
             function: "RegCloseKey".into(),
@@ -915,6 +988,7 @@ mod tests {
         assert!(text.contains("71.0.45-preview"));
         // void 戻りの API は return フィールドを持たない。
         let api = MappedApi {
+            calling_convention: "system-unwind",
             api_id: 8,
             module: "kernel32.dll".into(),
             function: "Sleep".into(),
@@ -936,6 +1010,7 @@ mod tests {
     #[test]
     fn emit_engine_inc_renders_detours_and_dispatch() {
         let api = MappedApi {
+            calling_convention: "system-unwind",
             api_id: 7,
             module: "advapi32.dll".into(),
             function: "RegCloseKey".into(),
@@ -946,6 +1021,7 @@ mod tests {
             last_error_meaning: LastErrorMeaning::Never,
         };
         let zero = MappedApi {
+            calling_convention: "system-unwind",
             api_id: 8,
             module: "kernel32.dll".into(),
             function: "GetCurrentProcessId".into(),
