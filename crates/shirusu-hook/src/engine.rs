@@ -778,6 +778,10 @@ pub unsafe fn uninstall_inline_hooks(installed: &[InlineHook]) -> Vec<u32> {
         return installed.iter().map(|h| h.api_id).collect();
     };
     for h in installed {
+        if suspender.any_ip_in_range(h.target, h.target + h.original_bytes.len()) {
+            unrestored.push(h.api_id);
+            continue;
+        }
         match patch_target(h.target, &h.original_bytes) {
             Ok(()) => {}
             Err(()) => unrestored.push(h.api_id),
@@ -3866,6 +3870,59 @@ mod tests {
                 VirtualFree(target, 0, MEM_RELEASE);
             }
         }
+    }
+
+    #[test]
+    fn uninstall_refuses_to_rewrite_a_stopped_instruction_pointer() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // Signal entry through flag[1], then spin until flag[0] is set. Keep
+        // the worker inside the restoration range without OS calls or locks.
+        #[cfg(target_arch = "x86_64")]
+        let code = [0xc6, 0x41, 1, 1, 0x80, 0x39, 0, 0x74, 0xfb, 0xc3];
+        #[cfg(target_arch = "x86")]
+        let code = [
+            0x8b, 0x4c, 0x24, 4, 0xc6, 0x41, 1, 1, 0x80, 0x39, 0, 0x74, 0xfb, 0xc2, 4, 0,
+        ];
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!page.is_null());
+        unsafe {
+            std::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+            FlushInstructionCache(GetCurrentProcess(), page, code.len());
+        }
+        let address = page as usize;
+        let flags = Arc::new([AtomicU8::new(0), AtomicU8::new(0)]);
+        let worker_flags = Arc::clone(&flags);
+        let worker = std::thread::spawn(move || {
+            let run: unsafe extern "system" fn(*const AtomicU8) =
+                unsafe { std::mem::transmute(address) };
+            unsafe { run(worker_flags.as_ptr()) };
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while flags[1].load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let entered = flags[1].load(Ordering::Acquire) != 0;
+        let hook = InlineHook {
+            api_id: 17,
+            target: address,
+            trampoline: 0,
+            trampoline_size: 0,
+            stolen_len: code.len(),
+            original_bytes: code.to_vec(),
+        };
+        let unrestored = unsafe { uninstall_inline_hooks(&[hook]) };
+        flags[0].store(1, Ordering::Release);
+        worker.join().unwrap();
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        assert!(entered, "worker did not enter its native loop");
+        assert_eq!(unrestored, vec![17]);
     }
 
     /// テスト用に 1 ページ確保し、同じバイトで埋める。
