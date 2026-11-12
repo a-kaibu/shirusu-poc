@@ -784,21 +784,47 @@ mod win {
     }
 
     fn lasterror_success_probe(pid: u32) -> Result<String, String> {
-        // 成功した呼び出しの後も、呼び出し前に設定した LastError が
-        // そのまま残ること（Detour が記録処理で汚染しないこと。G06）。
-        unsafe { SetLastError(0x1234) };
+        // Success need not preserve entry LastError: CREATE_ALWAYS explicitly
+        // sets it to zero for a new file. Capture immediately after each API;
+        // the supervisor compares these observations with the no-hook baseline.
         let path = probe_path("lasterror", pid);
-        let h = create_file_w(&path, 2 /* CREATE_ALWAYS */);
-        if is_invalid_handle(h) {
-            return Err(format!("create error={}", unsafe { GetLastError() }));
-        }
-        close(h);
-        let err = unsafe { GetLastError() };
         let _ = std::fs::remove_file(&path);
-        if err != 0x1234 {
-            return Err(format!("LastError changed: got {err:#x} want 0x1234"));
+        let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
+        let (h, created_error) = unsafe {
+            SetLastError(0x1234);
+            let h = CreateFileW(
+                wide.as_ptr(),
+                0xC000_0000,
+                0,
+                std::ptr::null_mut(),
+                2,
+                0x80,
+                std::ptr::null_mut(),
+            );
+            (h, GetLastError())
+        };
+        if is_invalid_handle(h) {
+            return Err(format!("create error={created_error}"));
         }
-        Ok(format!("{err:#x}"))
+        let mut byte = 0u8;
+        let mut read = 0u32;
+        let (read_ok, read_error) = unsafe {
+            SetLastError(0x5678);
+            let ok = ReadFile(h, &mut byte, 0, &mut read, std::ptr::null_mut());
+            (ok, GetLastError())
+        };
+        let (close_ok, close_error) = unsafe {
+            SetLastError(0x9ABC);
+            let ok = CloseHandle(h);
+            (ok, GetLastError())
+        };
+        let _ = std::fs::remove_file(&path);
+        if created_error != 0 || read_ok == 0 || read != 0 || close_ok == 0 {
+            return Err(format!("success probe failed: create={created_error} read={read_ok}/{read} close={close_ok}"));
+        }
+        Ok(format!(
+            "create={created_error:#x} read={read_error:#x} close={close_error:#x}"
+        ))
     }
 
     fn lasterror_failure_probe() -> Result<String, String> {
