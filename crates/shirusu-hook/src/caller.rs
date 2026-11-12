@@ -1,28 +1,16 @@
-//! L23: フック時の呼び出し元分類。
+//! Module-address lookup helpers and target Runtime policy.
 //!
-//! Detour の入口で、API 呼び出しの戻りアドレスから呼び出し元の
-//! モジュールを特定する。記録ポリシーは呼び出し先で判断する。
-//! Runtime から Windows API へ入る呼び出しは標準でも記録する。
+//! The standard Detour path currently suppresses Runtime targets through
+//! `should_suppress_target`; it does not call `caller_return_address` or use
+//! caller classification to suppress Windows-to-Windows calls. Runtime callers
+//! entering Windows APIs remain recorded. Source-boundary filtering is pending.
 //!
-//! 戻りアドレスは `RtlCaptureStackBackTrace` で取る（安定 Rust で使える
-//! 公開 API。`_ReturnAddress` 相当の組み込みは安定版に無い）。Detour・
-//! prepare・ヘルパ自体は Agent DLL の `.text` にあるため、歩いた
-//! フレームのうち DLL 自身の `AllocationBase` と同じものを飛ばし、最初
-//! に DLL 外へ出たアドレスを呼び出し元の戻りアドレスとする。prepare の
-//! インライン化の有無に依存しない。
-//!
-//! モジュール一覧は DLL 起動時に 1 回作り、呼び出し元が一覧に無い場合
-//! にだけ再列挙する（遅れてロードされたモジュールへの追随。再列挙は
-//! 500ms に 1 回まで）。DLL 側の分類は名前だけに依存する Runtime 判定
-//! が目的のため、署名検証はしない（System32 のモジュールは Unknown に
-//! なるが、抑制の判定は Runtime かどうかだけを見るため影響しない。
-//! 署名付きの正式な分類は Host 側の列挙が Trace へ残す）。
-//!
-//! 現行の IAT フックはメインモジュール限定のため、Detour へ到達する
-//! 呼び出し元の戻りアドレスは実質つねに exe 内（Application）になる。
-//! そのため抑制の実動はフック範囲の拡大（L01 Inline Hook）後に初めて
-//! 観測できる。ここでは強制の仕組みとその単体検証を用意し、E2E での
-//! 抑制確認は L01 待ちとして traceability に明記する。
+//! The Windows stack helper below searches for the first frame outside its own
+//! allocation. It is not a verified direct-caller boundary: a stack walk may
+//! include OS helper frames, and the current module ranges have no Microsoft
+//! signature evidence. Do not enable source suppression from these helpers
+//! without validating direct application calls, Runtime calls and callbacks.
+//! Module refresh retains the old snapshot on failure and is rate limited.
 
 use shirusu_trace::module::{classify_module, is_api_set_contract, ModuleClass, ModuleEvidence};
 use shirusu_transport_win::modules::LoadedModule;
