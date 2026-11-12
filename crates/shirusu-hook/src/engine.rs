@@ -38,7 +38,7 @@ use crate::com::{
     COM_FACTORY_CO_CREATE_INSTANCE, COM_FACTORY_CO_GET_CLASS_OBJECT, COM_FACTORY_REPORT_ID_BASE,
     IID_IUNKNOWN, KNOWN_FACTORIES,
 };
-use crate::inline::{build_patch, build_trampoline, plan_stolen, StolenPlan};
+use crate::inline::{build_patch, build_trampoline, plan_with_near_relay, StolenPlan};
 use crate::pe;
 use crate::plan::{build_plan, HookPlan};
 use crate::runtime::{pop_call, push_call, ComCallGuard, HookRuntime, ReentrancyGuard};
@@ -517,6 +517,22 @@ fn resolve_export(module: &str, function: &str) -> Option<usize> {
     proc.map(|f| f as usize)
 }
 
+fn is_existing_detour(target: usize, detour: usize, bitness: u32, bytes: &[u8]) -> bool {
+    if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
+        return true;
+    }
+    if bitness != 64 || bytes.len() < 5 || bytes[0] != 0xe9 {
+        return false;
+    }
+    let displacement = i32::from_le_bytes(bytes[1..5].try_into().unwrap());
+    let relay = (target as u64)
+        .wrapping_add(5)
+        .wrapping_add_signed(displacement as i64);
+    let mut relay_bytes = [0; 14];
+    ProcessMemory.read_exact(relay, &mut relay_bytes)
+        && relay_bytes.starts_with(&build_patch(relay, detour as u64, bitness))
+}
+
 /// `target` の近く（±2GB）に実行可能メモリを確保する。近くに空きが
 /// 無ければ None（呼び出し側は全体確保＋絶対ジャンプへ切り替える）。
 fn alloc_near(target: usize, size: usize) -> Option<usize> {
@@ -571,6 +587,7 @@ fn patch_target(target: usize, patch: &[u8]) -> Result<(), ()> {
 /// Prepare the trampoline and patch bytes before suspending any thread.
 fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8>), &'static str> {
     const TRAMPOLINE_SIZE: usize = 0x1000;
+    const RELAY_OFFSET: usize = 0xf00;
     // Retired trampolines remain executable until process exit (P0-1).
     // Bound cumulative allocation attempts across reattachments. Failed attempts
     // also consume budget so no error path can permit unbounded retained memory.
@@ -610,10 +627,34 @@ fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8
             return Err(e.reason());
         }
     };
+    let direct_patch = build_patch(p.target as u64, p.detour as u64, bitness);
+    let patch = if direct_patch.len() > p.plan.patch_len {
+        let relay = trampoline + RELAY_OFFSET;
+        let entry = build_patch(p.target as u64, relay as u64, bitness);
+        if bitness != 64 || entry.len() > p.plan.patch_len || code.len() > RELAY_OFFSET {
+            unsafe { VirtualFree(trampoline as *mut c_void, 0, MEM_RELEASE) };
+            return Err("near-relay-unavailable");
+        }
+        let relay_code = build_patch(relay as u64, p.detour as u64, bitness);
+        unsafe {
+            std::ptr::copy_nonoverlapping(relay_code.as_ptr(), relay as *mut u8, relay_code.len());
+        }
+        entry
+    } else {
+        direct_patch
+    };
+    if code.len() > RELAY_OFFSET {
+        unsafe { VirtualFree(trampoline as *mut c_void, 0, MEM_RELEASE) };
+        return Err("trampoline-too-large");
+    }
     // SAFETY: 確保したての実行可能領域へ書き込む。
     unsafe {
         std::ptr::copy_nonoverlapping(code.as_ptr(), trampoline as *mut u8, code.len());
-        FlushInstructionCache(GetCurrentProcess(), trampoline as *const c_void, code.len());
+        FlushInstructionCache(
+            GetCurrentProcess(),
+            trampoline as *const c_void,
+            TRAMPOLINE_SIZE,
+        );
     }
     Ok((
         InlineHook {
@@ -624,7 +665,7 @@ fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8
             stolen_len: p.plan.stolen_len,
             original_bytes: p.original_bytes.clone(),
         },
-        build_patch(p.target as u64, p.detour as u64, bitness),
+        patch,
     ))
 }
 
@@ -734,11 +775,11 @@ unsafe fn install_inline_hooks_for(
             continue;
         }
         // 既に Detour へ向くパッチが入っている場合は二重設置しない。
-        if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
+        if is_existing_detour(target, detour, bitness, &bytes) {
             outcome.skipped.push((api.api_id, "already-hooked"));
             continue;
         }
-        match plan_stolen(&bytes, target as u64, detour as u64, bitness) {
+        match plan_with_near_relay(&bytes, target as u64, detour as u64, bitness) {
             Ok(plan) => planned.push(PlannedInline {
                 slot: InlineOriginalSlot::Api(api.api_id),
                 target,
@@ -968,11 +1009,11 @@ pub unsafe fn install_com_factory_hooks(rt: &HookRuntime) -> ComFactoryOutcome {
             outcome.skipped.push((def.function, "read-failed"));
             continue;
         }
-        if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
+        if is_existing_detour(target, detour, bitness, &bytes) {
             outcome.skipped.push((def.function, "already-hooked"));
             continue;
         }
-        match plan_stolen(&bytes, target as u64, detour as u64, bitness) {
+        match plan_with_near_relay(&bytes, target as u64, detour as u64, bitness) {
             Ok(plan) => planned.push(PlannedInline {
                 slot: InlineOriginalSlot::ComFactory(index),
                 target,
@@ -1041,11 +1082,11 @@ pub unsafe fn install_winrt_activation_hooks(rt: &HookRuntime) -> WinRtActivatio
             outcome.skipped.push((def.function, "read-failed"));
             continue;
         }
-        if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
+        if is_existing_detour(target, detour, bitness, &bytes) {
             outcome.skipped.push((def.function, "already-hooked"));
             continue;
         }
-        match plan_stolen(&bytes, target as u64, detour as u64, bitness) {
+        match plan_with_near_relay(&bytes, target as u64, detour as u64, bitness) {
             Ok(plan) => planned.push(PlannedInline {
                 slot: InlineOriginalSlot::WinRtActivation(index),
                 target,
@@ -1138,11 +1179,11 @@ pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
             outcome.skipped.push((def.function, "read-failed"));
             continue;
         }
-        if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
+        if is_existing_detour(target, detour, bitness, &bytes) {
             outcome.skipped.push((def.function, "already-hooked"));
             continue;
         }
-        match plan_stolen(&bytes, target as u64, detour as u64, bitness) {
+        match plan_with_near_relay(&bytes, target as u64, detour as u64, bitness) {
             Ok(plan) => planned.push(PlannedInline {
                 slot: InlineOriginalSlot::Callback(index),
                 target,
@@ -3646,6 +3687,7 @@ mod tests {
 
     #[test]
     fn suspended_thread_context_has_native_alignment_and_valid_ip() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
         use std::sync::atomic::{AtomicBool, Ordering};
         assert!(std::mem::align_of::<AlignedContext>() >= 16);
         let stop = Arc::new(AtomicBool::new(false));
@@ -3880,6 +3922,7 @@ mod tests {
 
     #[test]
     fn uninstall_refuses_to_rewrite_a_stopped_instruction_pointer() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
         use std::sync::atomic::{AtomicU8, Ordering};
         // Signal entry through flag[1], then spin until flag[0] is set. Keep
         // the worker inside the restoration range without OS calls or locks.
@@ -3929,6 +3972,61 @@ mod tests {
         unsafe { VirtualFree(page, 0, MEM_RELEASE) };
         assert!(entered, "worker did not enter its native loop");
         assert_eq!(unrestored, vec![17]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn near_relay_preserves_short_function_tail_and_detects_repeat_install() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        unsafe extern "system" fn replacement() -> u32 {
+            7
+        }
+        let detour = replacement as *const () as usize;
+        let mut target = 0;
+        for hint in [0x1_0000_0000usize, 0x2_0000_0000, 0x3_0000_0000] {
+            let page = unsafe {
+                VirtualAlloc(
+                    hint as *const c_void,
+                    4096,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                )
+            };
+            if page.is_null() {
+                continue;
+            }
+            if build_patch(page as u64, detour as u64, 64).len() > 5 {
+                target = page as usize;
+                break;
+            }
+            unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        }
+        assert_ne!(target, 0, "no distant test page available");
+        let code = [0xb8u8, 42, 0, 0, 0, 0xc3, 0xcc];
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), target as *mut u8, code.len()) };
+        let plan = plan_with_near_relay(&code, target as u64, detour as u64, 64).unwrap();
+        assert_eq!(plan.patch_len, 5);
+        let planned = PlannedInline {
+            slot: InlineOriginalSlot::Api(40),
+            target,
+            detour,
+            original_bytes: code[..plan.stolen_len].to_vec(),
+            plan,
+        };
+        let rt = test_runtime();
+        let hook = install_planned(&rt, &[planned], 64).pop().unwrap().unwrap();
+        let call: unsafe extern "system" fn() -> u32 = unsafe { std::mem::transmute(target) };
+        let original: unsafe extern "system" fn() -> u32 =
+            unsafe { std::mem::transmute(hook.trampoline) };
+        assert_eq!(unsafe { call() }, 7);
+        assert_eq!(unsafe { original() }, 42);
+        let patched = unsafe { std::slice::from_raw_parts(target as *const u8, code.len()) };
+        assert_eq!(&patched[5..], &[0xc3, 0xcc]);
+        assert!(is_existing_detour(target, detour, 64, patched));
+        assert!(unsafe { uninstall_inline_hooks(&[hook]) }.is_empty());
+        assert_eq!(unsafe { call() }, 42);
+        assert_eq!(unsafe { original() }, 42);
+        unsafe { VirtualFree(target as *mut c_void, 0, MEM_RELEASE) };
     }
 
     /// テスト用に 1 ページ確保し、同じバイトで埋める。

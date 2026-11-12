@@ -156,6 +156,25 @@ pub fn plan_stolen(
     })
 }
 
+/// Plan a five-byte entry jump when a far detour cannot fit in a short x64
+/// function. In that case `detour` in the returned plan is a near placeholder;
+/// the installer must allocate a reachable relay before publishing the patch.
+pub fn plan_with_near_relay(
+    bytes: &[u8],
+    target: u64,
+    detour: u64,
+    bitness: u32,
+) -> Result<StolenPlan, InlineRefusal> {
+    match plan_stolen(bytes, target, detour, bitness) {
+        Err(InlineRefusal::TooShort { .. })
+            if bitness == 64 && patch_len_for(target, detour, bitness) > PATCH_LEN_REL32 =>
+        {
+            plan_stolen(bytes, target, target, bitness)
+        }
+        result => result,
+    }
+}
+
 /// `from` に置くジャンプ命令のバイト列。相対 32bit が届けば `E9 rel32`、
 /// 届かなければ絶対間接ジャンプ（x64: `FF 25 00000000` の直後に
 /// 8 バイトアドレス / x86: `FF 25 disp32` の直後に 4 バイトアドレス。
@@ -218,6 +237,20 @@ pub fn build_trampoline(plan: &StolenPlan, trampoline: u64) -> Result<Vec<u8>, I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_relay_can_cover_a_short_thunk_but_not_a_tiny_function() {
+        let bytes = [0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc];
+        let plan = plan_with_near_relay(&bytes, 0x1000, 0x1_0000_0000, 64).unwrap();
+        assert_eq!(plan.patch_len, 5);
+        assert_eq!(plan.stolen_len, 6);
+        assert!(plan_with_near_relay(&[0xc3; 32], 0x1000, 0x1_0000_0000, 64).is_err());
+        // The sixth byte still belongs to the thunk; bytes after it are never
+        // stolen or overwritten to make room for an absolute jump.
+        let trampoline = build_trampoline(&plan, 0x2000).unwrap();
+        let mut decoder = Decoder::with_ip(64, &trampoline, 0x2000, DecoderOptions::NONE);
+        assert_eq!(decoder.decode().ip_rel_memory_address(), 0x1006);
+    }
 
     #[test]
     fn does_not_overwrite_adjacent_code_after_a_short_function() {
