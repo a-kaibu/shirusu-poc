@@ -1,47 +1,25 @@
-//! COM Interception（L02・overview COM 節・フック実装順序 3・段階 6）。
+//! COM Factory observation, identity tracking, and interception metadata.
 //!
-//! 既知の Factory 関数（`CoCreateInstance` / `CoGetClassObject`）が
-//! 返したインターフェイスを起点に追跡し、その vtable のメソッド呼び出しを
-//! 記録する。メソッドが返すインターフェイスや `QueryInterface` の結果も
-//! 追跡対象に加えていく。同一性は対象アプリが実際に実行した
-//! `QueryInterface` の結果だけで判定し（標準では追加で呼ばない）、
-//! `AddRef` / `Release` で寿命を追う。同一性を確定できない
-//! インターフェイスは別々に保持し、関係を未確認とする。型不明のカスタム
-//! インターフェイスは未対応として明記する。
+//! Standard capture records CoCreateInstance / CoGetClassObject and the returned
+//! interface pointers. A returned pointer may refer to an existing shared
+//! object, so standard capture never replaces its vtable. The tracker retains
+//! `shared-object-safety-unproven` as the reason method capture was skipped;
+//! Host writes this limitation to Capture Coverage.
 //!
-//! Interception 方式は「オブジェクト単位の vtable 複製」である：
-//! - 追跡対象のオブジェクトごとに vtable を複製し、複製のスロットを
-//!   Detour へ向け、オブジェクトの vtable ポインタだけを複製へ向ける。
-//! - 共有 vtable そのものは書き換えないため、同じ実装を共有する別の
-//!   オブジェクトには及ばない（overview が副作用として挙げる共有
-//!   vtable 書き換えの波及は起きない）。
-//! - Proxy を使わないため、アプリへ返すポインタの同一性は壊れない
-//!   （オブジェクトのポインタ値そのものは変えない）。
-//! - 代償として、複製した vtable とその登録は解放しない（Release で
-//!   寿命が終わった後も、他スレッドが呼び出し中かもしれないため。
-//!   1 オブジェクトあたり最大で (メソッド数 + 登録) × 8 バイト程度）。
-//!   プロセス終了時に OS が回収する。
+//! The method tables and clone registry also support the experimental unsafe
+//! `engine::intercept_exclusive_object` path. Its caller must independently
+//! guarantee exclusive access and a matching ABI. Standard factory observation
+//! does not call that path. Clone storage is retained until process exit.
 //!
-//! 制限（このファイルと engine.rs の Windows 実装に共通）:
-//! - 既知インターフェイスは IUnknown / IShellLinkW / IPersistFile の
-//!   3 つに加え、WinRT の 6 つ（`crate::winrt::WINRT_INTERFACES`。
-//!   IInspectable / IActivationFactory / IUriRuntimeClass /
-//!   IUriRuntimeClassFactory / IJsonObject / IStringable。L14）。
-//!   それ以外の IID は追跡対象として記録するが、メソッドの Detour は
-//!   設置しない。
-//! - `Direct3DCreate9` は既知の Factory 関数として表に載せるが、
-//!   返す IDirect3D9 のメソッド表が未定義のため、この版ではフック
-//!   しない（Factory 呼び出しの記録もしない）。
-//! - アタッチ前に既に存在していたオブジェクトは発見できない
-//!   （Factory / QueryInterface / メソッド戻りを観測して初めて追跡
-//!   対象になる）。途中から発見したポインタは来歴不明として扱う。
-//! - COM メソッドの記録は L1（引数は生のスロット値列。型付きの
-//!   取得は将来の拡張）。`QueryInterface` の要求 IID と Factory
-//!   呼び出しの CLSID は `target_iid` に読んで記録する。
-//! - 診断用オプション（`diagnostic_query_interface`）が有効な場合
-//!   にだけ、Interceptor 自身が `QueryInterface(IID_IUnknown)` を
-//   呼んで正規の同一性を確認する。標準では呼ばない（参照カウントを
-//!   増やし、アプリがしなかった COM 操作になるため）。
+//! Known interface metadata covers IUnknown, IShellLinkW, IPersistFile and the
+//! six WinRT interfaces in `crate::winrt::WINRT_INTERFACES`. Unknown interfaces
+//! retain their identity without method interception. Objects that existed
+//! before attachment have unknown provenance until a factory result is observed.
+//!
+//! Direct3DCreate9 is listed as a known factory but is not intercepted in this
+//! version. COM method schemas describe raw argument slots (L1); they do not
+//! establish that typed capture or transparent shared-object interception is
+//! available.
 
 use shirusu_trace::compact::encode_values;
 use shirusu_trace::proto::SchemaDef;
