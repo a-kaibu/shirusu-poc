@@ -361,6 +361,26 @@ struct SuspendedThreads {
     handles: Vec<*mut c_void>,
 }
 
+// The x64 Windows SDK declares CONTEXT with DECLSPEC_ALIGN(16), but the
+// windows-sys 0.59 binding only has repr(C). Preserve the native buffer alignment
+// explicitly; otherwise GetThreadContext can fail and every hook is refused as
+// thread-in-target by the fail-safe IP check.
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
+fn thread_instruction_pointer(handle: *mut c_void) -> Result<usize, u32> {
+    let mut ctx = AlignedContext(unsafe { std::mem::zeroed() });
+    ctx.0.ContextFlags = CONTEXT_CONTROL;
+    if unsafe { GetThreadContext(handle, &mut ctx.0) } == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    #[cfg(target_arch = "x86_64")]
+    let ip = ctx.0.Rip as usize;
+    #[cfg(target_arch = "x86")]
+    let ip = ctx.0.Eip as usize;
+    Ok(ip)
+}
+
 impl SuspendedThreads {
     /// 全スレッドを停止する。1 つでも停止できなければ、既に停止した
     /// スレッドを再開して Err を返す（パッチ中の実行と競合させない）。
@@ -418,16 +438,9 @@ impl SuspendedThreads {
     /// コンテキスト取得に失敗したスレッドは「範囲内」とみなし、安全側に倒す。
     fn any_ip_in_range(&self, start: usize, end: usize) -> bool {
         for &handle in &self.handles {
-            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
-            ctx.ContextFlags = CONTEXT_CONTROL;
-            // SAFETY: 停止中の自プロセスのスレッド。
-            if unsafe { GetThreadContext(handle, &mut ctx) } == 0 {
+            let Ok(ip) = thread_instruction_pointer(handle) else {
                 return true;
-            }
-            #[cfg(target_arch = "x86_64")]
-            let ip = ctx.Rip as usize;
-            #[cfg(target_arch = "x86")]
-            let ip = ctx.Eip as usize;
+            };
             if (start..end).contains(&ip) {
                 return true;
             }
@@ -3517,6 +3530,56 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[test]
+    fn suspended_thread_context_has_native_alignment_and_valid_ip() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        assert!(std::mem::align_of::<AlignedContext>() >= 16);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            while !worker_stop.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+        let tid = rx.recv().unwrap();
+        let handle = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                0,
+                tid,
+            )
+        };
+        if handle.is_null() {
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            panic!("OpenThread failed: {}", unsafe { GetLastError() });
+        }
+        let suspended = unsafe { SuspendThread(handle) };
+        if suspended == u32::MAX {
+            unsafe {
+                CloseHandle(handle);
+            }
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            panic!("SuspendThread failed");
+        }
+        let guard = SuspendedThreads {
+            handles: vec![handle],
+        };
+        let ip = thread_instruction_pointer(handle);
+        let outside = !guard.any_ip_in_range(usize::MAX - 1, usize::MAX);
+        guard.resume();
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert_ne!(ip.expect("GetThreadContext on suspended worker"), 0);
+        assert!(
+            outside,
+            "a valid context must not refuse every target range"
+        );
     }
 
     #[test]
