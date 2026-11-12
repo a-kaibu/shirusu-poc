@@ -179,7 +179,7 @@ pub fn build_bundle(
             trim_outcome: Some(trim_outcome),
         },
     );
-    let replay = crate::replay::generate_replay(left);
+    let replay_slice = crate::replay::generate_candidate_replay(left, cand);
     let mut manifest = manifest(opts, cand, &rule_generation, Some(trim_outcome));
     if let JsonValue::Object(ref mut fields) = manifest {
         fields.push((
@@ -191,13 +191,19 @@ pub fn build_bundle(
         ));
         fields.push((
             "replay".into(),
-            match &replay {
-                Ok(_) => JsonValue::obj(vec![
+            match &replay_slice {
+                Ok(slice) => JsonValue::obj(vec![
+                    ("source_steps", JsonValue::U64(slice.source_steps as u64)),
+                    ("kept_source_steps", JsonValue::Array(slice.kept_steps.iter().map(|i| JsonValue::U64(*i as u64)).collect())),
+                    ("target_source_step", JsonValue::U64(slice.target_source_step as u64)),
+                    ("target_replay_step", JsonValue::U64(slice.target_replay_step as u64)),
+                    ("execution_verified", JsonValue::Bool(false)),
+                    ("minimal", JsonValue::Bool(false)),
                     ("file", JsonValue::Str("replay.json".into())),
                     (
                         "scope",
                         JsonValue::Str(
-                            "recorded baseline calls only, synchronous file I/O; run in a fresh scratch directory"
+                            "candidate file dependencies from recorded baseline calls only; all lifetimes retained; run in a fresh scratch directory"
                                 .into(),
                         ),
                     ),
@@ -206,6 +212,7 @@ pub fn build_bundle(
             },
         ));
     }
+    let replay = replay_slice.map(|slice| slice.spec);
     let manifest_json = manifest.render_pretty();
     Ok(ProbeBundle {
         name: opts.name.clone(),

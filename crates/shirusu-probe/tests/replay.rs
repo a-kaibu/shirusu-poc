@@ -5,6 +5,14 @@ use shirusu_trace::schema::{CapturedValue, TypedValue as V};
 use shirusu_trace::writer::FinalizationInfo;
 
 fn record(initial_disposition: u32, read_byte: u8) -> shirusu_trace::reader::ReadTrace {
+    record_with_unrelated(initial_disposition, read_byte, false)
+}
+
+fn record_with_unrelated(
+    initial_disposition: u32,
+    read_byte: u8,
+    unrelated: bool,
+) -> shirusu_trace::reader::ReadTrace {
     let mut em = Emitter::new(
         Vec::new(),
         file_io_api_set(),
@@ -43,6 +51,32 @@ fn record(initial_disposition: u32, read_byte: u8) -> shirusu_trace::reader::Rea
         (initial_disposition, 0x4000_0000, 100),
         (3, 0x8000_0000, 200),
     ] {
+        if unrelated {
+            // Reuse the same raw handle as the interesting first lifetime.
+            // These separate files must not become dependencies via handle reuse.
+            call(
+                "kernel32!CreateFileW",
+                vec![
+                    V::Str16(
+                        format!("C:\\private\\unrelated-{disposition}.bin")
+                            .encode_utf16()
+                            .collect(),
+                    ),
+                    V::U32(0x4000_0000),
+                    V::U32(0),
+                    V::U64(0),
+                    V::U32(1),
+                    V::U32(128),
+                    V::U64(0),
+                ],
+                vec![V::U64(100), V::U32(0)],
+            );
+            call(
+                "kernel32!CloseHandle",
+                vec![V::U64(100)],
+                vec![V::I32(1), V::U32(0)],
+            );
+        }
         call(
             "kernel32!CreateFileW",
             vec![
@@ -108,6 +142,11 @@ fn serialized_trace_generates_plannable_replay_without_original_paths_or_handles
     .unwrap();
     assert!(bundle.replay.is_ok());
     assert!(bundle.manifest_json.contains("replay.json"));
+    assert!(bundle
+        .manifest_json
+        .contains("\"execution_verified\": false"));
+    assert!(bundle.manifest_json.contains("\"minimal\": false"));
+    assert!(bundle.manifest_json.contains("kept_source_steps"));
 }
 
 #[test]
@@ -130,7 +169,21 @@ fn missing_initial_state_and_inconsistent_read_are_explicitly_rejected() {
 fn generated_replay_executes_and_refuses_to_overwrite() {
     let dir = std::env::temp_dir().join(format!("shirusu-replay-e2e-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    let spec = generate_replay(&record(1, 42)).unwrap();
+    let left = record_with_unrelated(1, 42, true);
+    let right = record_with_unrelated(1, 43, true);
+    let diff = shirusu_compare::compare_traces(&left, &right);
+    let candidate = diff
+        .candidates
+        .iter()
+        .find(|c| {
+            c.left_event
+                .as_ref()
+                .is_some_and(|e| e.api == "kernel32!ReadFile")
+        })
+        .unwrap();
+    let spec = shirusu_probe::replay::generate_candidate_replay(&left, candidate)
+        .unwrap()
+        .spec;
     let target = if cfg!(target_arch = "x86") {
         "i686-pc-windows-msvc"
     } else {
@@ -150,10 +203,10 @@ fn generated_replay_executes_and_refuses_to_overwrite() {
         "{}",
         String::from_utf8_lossy(&first.stdout)
     );
-    std::fs::write(dir.join("shirusu-replay-0.bin"), b"keep").unwrap();
+    std::fs::write(dir.join("shirusu-replay-1.bin"), b"keep").unwrap();
     assert!(!run().status.success());
     assert_eq!(
-        std::fs::read(dir.join("shirusu-replay-0.bin")).unwrap(),
+        std::fs::read(dir.join("shirusu-replay-1.bin")).unwrap(),
         b"keep"
     );
     std::fs::remove_dir_all(&dir).unwrap();
@@ -184,4 +237,48 @@ fn coverage_warning_is_preserved_but_recorded_event_loss_blocks_replay() {
     trace.finalization.as_mut().unwrap().event_integrity = 0;
     trace.finalization.as_mut().unwrap().semantic_completeness = 1;
     assert!(generate_replay(&trace).is_err());
+}
+
+#[test]
+fn candidate_slice_retains_reopened_file_history_and_excludes_reused_handles() {
+    let left = record_with_unrelated(1, 42, true);
+    let right = record_with_unrelated(1, 43, true);
+    let diff = shirusu_compare::compare_traces(&left, &right);
+    let candidate = diff
+        .candidates
+        .iter()
+        .find(|c| {
+            c.left_event
+                .as_ref()
+                .is_some_and(|e| e.api == "kernel32!ReadFile")
+        })
+        .unwrap();
+    let slice = shirusu_probe::replay::generate_candidate_replay(&left, candidate).unwrap();
+    assert_eq!(slice.source_steps, 10);
+    assert_eq!(slice.kept_steps, [2, 3, 4, 7, 8, 9]);
+    assert_eq!(slice.target_source_step, 8);
+    assert_eq!(slice.target_replay_step, 4);
+    assert_eq!(slice.spec.steps.len(), 6);
+    let serialized = slice.spec.to_json().render_pretty();
+    assert!(!serialized.contains("private"));
+    assert!(!serialized.contains("shirusu-replay-0.bin"));
+    assert!(!serialized.contains("shirusu-replay-2.bin"));
+    assert!(serialized.contains("shirusu-replay-1.bin"));
+    assert_eq!(
+        shirusu_test::TestSpec::parse(&serialized).unwrap(),
+        slice.spec
+    );
+    plan_steps(&slice.spec.steps).unwrap();
+    let mut no_baseline = candidate.clone();
+    no_baseline.left_event = None;
+    assert!(
+        shirusu_probe::replay::generate_candidate_replay(&left, &no_baseline)
+            .unwrap_err()
+            .contains("no baseline event")
+    );
+    assert!(shirusu_probe::replay::generate_candidate_replay(
+        &record_with_unrelated(3, 42, true),
+        candidate
+    )
+    .is_err());
 }

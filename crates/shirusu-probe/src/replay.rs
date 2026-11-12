@@ -229,6 +229,103 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
     })
 }
 
+/// A conservative file dependency slice, not an execution-verified minimum.
+#[derive(Debug)]
+pub struct ReplaySlice {
+    pub spec: TestSpec,
+    pub source_steps: usize,
+    /// Zero-based step positions in the complete supported baseline sequence.
+    pub kept_steps: Vec<usize>,
+    pub target_source_step: usize,
+    pub target_replay_step: usize,
+}
+
+/// Keep every recorded lifetime of the file touched by the candidate's baseline
+/// event. A reopened handle depends on writes through older, already closed
+/// handles; handle-only slicing would silently lose those prerequisites.
+/// Validate the entire source first: unsupported side effects cannot be discarded
+/// just because they do not carry a recognized file handle.
+pub fn generate_candidate_replay(
+    trace: &ReadTrace,
+    candidate: &shirusu_compare::Candidate,
+) -> Result<ReplaySlice, String> {
+    let full = generate_replay(trace)?;
+    let evidence = candidate
+        .left_event
+        .as_ref()
+        .ok_or("candidate has no baseline event; cannot identify a replay dependency root")?;
+    let norm = shirusu_compare::NormTrace::build(trace);
+    let call = crate::select::locate_call(&norm, evidence)
+        .and_then(|i| norm.calls[i].enter.as_ref())
+        .ok_or("candidate baseline call cannot be located")?;
+    let view = TraceView::build(trace);
+    let sequence = view
+        .events
+        .get(call.source_index)
+        .ok_or("candidate source event is missing")?
+        .sequence;
+    let mut enters: Vec<_> = view.events.iter().filter(|e| e.kind == 1).collect();
+    enters.sort_by_key(|e| e.sequence);
+    let target = enters
+        .iter()
+        .position(|e| e.sequence == sequence)
+        .ok_or("candidate baseline step is missing")?;
+    if enters.len() != full.steps.len() {
+        return Err("replay step provenance does not match source calls".into());
+    }
+    let mut variables = BTreeMap::<String, String>::new();
+    let mut paths = Vec::with_capacity(full.steps.len());
+    for step in &full.steps {
+        let path = if step.call == "kernel32!CreateFileW" {
+            let path = step
+                .args
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("lpFileName", ArgValue::Text(path)) => Some(path.clone()),
+                    _ => None,
+                })
+                .ok_or("file creation lacks a replay path")?;
+            variables.insert(
+                step.store.clone().ok_or("file creation lacks a variable")?,
+                path.clone(),
+            );
+            path
+        } else {
+            step.args
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("hFile" | "hObject", ArgValue::Ref(var)) => variables.get(var).cloned(),
+                    _ => None,
+                })
+                .ok_or("file operation lacks a linked replay path")?
+        };
+        paths.push(path);
+    }
+    let kept_steps: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, path)| (path == &paths[target]).then_some(i))
+        .collect();
+    let target_replay_step = kept_steps
+        .iter()
+        .position(|i| *i == target)
+        .ok_or("dependency slice lost its root")?;
+    let source_steps = full.steps.len();
+    let spec = TestSpec {
+        name: "candidate-file-dependencies".into(),
+        steps: kept_steps.iter().map(|i| full.steps[*i].clone()).collect(),
+        rules: vec![],
+    };
+    plan_steps(&spec.steps)?;
+    Ok(ReplaySlice {
+        spec,
+        source_steps,
+        kept_steps,
+        target_source_step: target,
+        target_replay_step,
+    })
+}
+
 fn value<'a>(event: &'a EventView, name: &str) -> Result<&'a TypedValue, String> {
     let field = event
         .field(name)
