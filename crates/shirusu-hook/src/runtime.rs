@@ -46,16 +46,25 @@ thread_local! {
 }
 
 pub fn current_parent_call() -> u64 {
+    if !native_tls_available() {
+        return 0;
+    }
     CALL_STACK
         .try_with(|s| s.borrow().last().copied().unwrap_or(0))
         .unwrap_or(0)
 }
 pub fn push_call(call_id: u64) {
+    if !native_tls_available() {
+        return;
+    }
     let _ = CALL_STACK.try_with(|s| s.borrow_mut().push(call_id));
 }
 /// スタック最上位が自分の Call ID のときにだけ取り除く（異常な
 /// 対応ずれで他人のフレームを壊さない）。
 pub fn pop_call(call_id: u64) {
+    if !native_tls_available() {
+        return;
+    }
     let _ = CALL_STACK.try_with(|s| {
         let mut s = s.borrow_mut();
         if s.last() == Some(&call_id) {
@@ -68,6 +77,39 @@ thread_local! {
     /// Detour の再入ガードの深さ (G15)。0 = 記録経路の外、1 = 記録経路の実行中。
     static REENTRANCY_DEPTH: Cell<u32> = const { Cell::new(0) };
     static THREAD_EXITING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Loader heap operations can enter an inline hook before allocation or after
+/// destruction of this thread's native TLS vector. Rust's try_with only checks
+/// a key's lifecycle *after* loading that vector, so it cannot guard this case.
+#[inline]
+pub(crate) fn native_tls_available() -> bool {
+    #[cfg(windows)]
+    {
+        extern "C" {
+            static _tls_index: u32;
+        }
+        let vector: *const *const u8;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, gs:[0x58]", out(reg) vector, options(nostack, preserves_flags, readonly))
+        };
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            core::arch::asm!("mov {}, fs:[0x2c]", out(reg) vector, options(nostack, preserves_flags, readonly))
+        };
+        if vector.is_null() {
+            return false;
+        }
+        // Windows sizes the vector for the loaded modules before filling its
+        // per-module blocks. A block may not have been allocated yet either.
+        let index = unsafe { std::ptr::read_volatile(std::ptr::addr_of!(_tls_index)) } as usize;
+        !unsafe { std::ptr::read_volatile(vector.add(index)) }.is_null()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 /// Detour の再入ガード (G15)。
@@ -101,6 +143,9 @@ impl ReentrancyGuard {
     }
 
     fn try_enter_with(available: impl FnOnce() -> bool) -> Option<Self> {
+        if !native_tls_available() {
+            return None;
+        }
         REENTRANCY_DEPTH
             .try_with(|d| {
                 if d.get() > 0 || THREAD_EXITING.try_with(Cell::get).unwrap_or(true) {
@@ -120,18 +165,23 @@ impl ReentrancyGuard {
     /// FLS callbacks can run before or after Rust TLS destructors. Never resume
     /// capture on this thread once exit cleanup has begun.
     pub fn mark_thread_exiting() {
+        if !native_tls_available() {
+            return;
+        }
         let _ = THREAD_EXITING.try_with(|exiting| exiting.set(true));
     }
 
     /// 記録経路の実行中か。
     pub fn is_active() -> bool {
-        REENTRANCY_DEPTH.with(|d| d.get() > 0)
+        native_tls_available() && REENTRANCY_DEPTH.with(|d| d.get() > 0)
     }
 
     /// 元の API 呼び出しの直前に呼ぶ: ガードを一時的に外す。
     pub fn suspend(&mut self) {
         if !self.suspended {
-            REENTRANCY_DEPTH.with(|d| d.set(0));
+            if native_tls_available() {
+                REENTRANCY_DEPTH.with(|d| d.set(0));
+            }
             self.suspended = true;
         }
     }
@@ -139,7 +189,9 @@ impl ReentrancyGuard {
     /// 元の API 呼び出しの直後に呼ぶ: ガードを戻す。
     pub fn resume(&mut self) {
         if self.suspended {
-            REENTRANCY_DEPTH.with(|d| d.set(1));
+            if native_tls_available() {
+                REENTRANCY_DEPTH.with(|d| d.set(1));
+            }
             self.suspended = false;
         }
     }
@@ -148,7 +200,7 @@ impl ReentrancyGuard {
 impl Drop for ReentrancyGuard {
     fn drop(&mut self) {
         // suspend 中は深さは既に 0。保持中の場合だけ 0 に戻す。
-        if !self.suspended {
+        if !self.suspended && native_tls_available() {
             REENTRANCY_DEPTH.with(|d| d.set(0));
         }
     }
@@ -197,7 +249,7 @@ impl CallGuard {
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || !native_tls_available() {
             return;
         }
         self.armed = false;
@@ -345,7 +397,7 @@ impl ComCallGuard {
 
 impl Drop for ComCallGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || !native_tls_available() {
             return;
         }
         self.armed = false;
@@ -1722,6 +1774,33 @@ mod tests {
             ReentrancyGuard::try_enter_with(|| panic!("TLS initialization failed"));
         })
         .is_err());
+        assert!(ReentrancyGuard::try_enter().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_tls_vector_absence_bypasses_rust_tls_access() {
+        // No OS calls, allocations, assertions or unwinding while the vector
+        // is absent. This reproduces the loader teardown state from the AV.
+        assert!(native_tls_available());
+        let saved: usize;
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("mov {}, gs:[0x58]", "mov qword ptr gs:[0x58], 0", out(reg) saved, options(nostack, preserves_flags));
+            #[cfg(target_arch = "x86")]
+            core::arch::asm!("mov {}, fs:[0x2c]", "mov dword ptr fs:[0x2c], 0", out(reg) saved, options(nostack, preserves_flags));
+        }
+        let entered = ReentrancyGuard::try_enter().is_some();
+        let active = ReentrancyGuard::is_active();
+        ReentrancyGuard::mark_thread_exiting();
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("mov gs:[0x58], {}", in(reg) saved, options(nostack, preserves_flags));
+            #[cfg(target_arch = "x86")]
+            core::arch::asm!("mov fs:[0x2c], {}", in(reg) saved, options(nostack, preserves_flags));
+        }
+        assert!(!entered);
+        assert!(!active);
         assert!(ReentrancyGuard::try_enter().is_some());
     }
 

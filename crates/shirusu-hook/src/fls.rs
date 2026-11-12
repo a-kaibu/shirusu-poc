@@ -52,6 +52,9 @@ unsafe extern "system" fn thread_callback(
 ) {
     const DLL_THREAD_DETACH: u32 = 3;
     if reason == DLL_THREAD_DETACH {
+        if !crate::runtime::native_tls_available() {
+            return;
+        }
         crate::runtime::ReentrancyGuard::mark_thread_exiting();
         let _ = THREAD_NODE.try_with(|slot| {
             let node = slot.replace(std::ptr::null_mut());
