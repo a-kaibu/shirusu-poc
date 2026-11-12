@@ -4261,6 +4261,32 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn near_relay_preserves_short_function_tail_and_detects_repeat_install() {
+        // Isolate SuspendThread from the parallel test harness and its locks.
+        const CHILD: &str = "SHIRUSU_NEAR_RELAY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::near_relay_preserves_short_function_tail_and_detects_repeat_install",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("near relay regression timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
         unsafe extern "system" fn replacement() -> u32 {
             7

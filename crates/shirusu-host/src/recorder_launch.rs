@@ -10,11 +10,9 @@
 //!    再開する（アタッチ時は再開は無い）。初期化の成否とは別に、
 //!    DLL が Bootstrap へ書き戻したフック設置/欠落件数を読み戻し、
 //!    Capture Coverage へ反映する（レビュー #4 の #8）。
-//! 5. L23: 再開後にロード済みモジュールを列挙（安定化待ち）し、注入
-//!    直後の分と合成して Environment の modules へ載せてから Trace
-//!    ファイルを作る（Environment ブロックは作成時に書き込まれるため、
-//!    列挙は作成の前に済ませる必要がある）。列挙に失敗しても capture
-//!    は失敗させない（CLI の exe 分類だけが残る）。
+//! 5. Trace と Ring 回収を対象再開前に準備する。再開後のモジュール列挙・
+//!    署名確認は別スレッドで行い、終了時に Environment を追記する。
+//!    この間もイベントを回収し、短い対象が metadata 待ちで Ring を溢れさせない。
 //! 6. 対象を生かしたまま終える場合は `shirusu_agent_shutdown` を
 //!    リモートスレッドで呼び、Agent 側の終了手順（記録無効化 →
 //!    進行中 Detour の完了待ち → IAT 復元）を済ませてから最終回収・
@@ -80,13 +78,13 @@ pub struct LaunchedCapture {
     /// 解決できなかった（旧 DLL 等）場合は None で、finish は
     /// Agent 側の終了手順を呼ばずに従来どおり閉じる。
     shutdown_addr: Option<usize>,
+    module_scan: Option<std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>>,
 }
 
 impl LaunchedCapture {
     /// CREATE_SUSPENDED で起動し、Agent を初期化してから再開する。
-    /// L23: 注入と初期化を先に行い、モジュール列挙は Trace ファイルの
-    /// 作成の前に済ませる。列挙は対象の実行開始後にしか完全にならない
-    /// ため、注入直後の分と再開後の安定化待ちの分を合成する。
+    /// Trace と Ring の接続を再開前に準備する。モジュール分類は別スレッド
+    /// で行い、注入直後の分と再開後の分を合成して終了時に追記する。
     pub fn launch(
         cmdline: &str,
         trace_path: impl AsRef<Path>,
@@ -106,28 +104,31 @@ impl LaunchedCapture {
         // Agent DLL とその依存だけが見える。失敗しても空のまま進む
         // （再開後の列挙が本命）。
         let pre_modules = crate::modules::enumerate_modules_for_process(spawned.pid);
+        // Prepare the consumer before resuming the producer. Module signature
+        // work must not leave the target filling an unconsumed Ring.
+        let (session, shutdown_addr) = match finalize_session(trace_path, injected) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = win::terminate_process(spawned.process, 1);
+                win::close_handle_value(spawned.thread);
+                win::close_handle_value(spawned.process);
+                return Err(e);
+            }
+        };
         if let Err(e) = win::resume_main_thread(spawned.thread) {
-            // 再開できない対象は止めたまま放置しない
             let _ = win::terminate_process(spawned.process, 1);
             win::close_handle_value(spawned.thread);
             win::close_handle_value(spawned.process);
             return Err(e.into());
         }
         win::close_handle_value(spawned.thread);
-        let (session, shutdown_addr) =
-            match finalize_session(trace_path, spawned.pid, injected, pre_modules) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = win::terminate_process(spawned.process, 1);
-                    win::close_handle_value(spawned.process);
-                    return Err(e);
-                }
-            };
+        let module_scan = start_module_scan(spawned.pid, pre_modules);
         Ok(Self {
             session: Some(session),
             process: spawned.process,
             pid: spawned.pid,
             shutdown_addr,
+            module_scan,
         })
     }
 
@@ -141,12 +142,13 @@ impl LaunchedCapture {
     ) -> Result<Self, SessionError> {
         let process = win::open_process_for_injection(pid)?;
         match inject_and_init(&cfg, process, pid) {
-            Ok(injected) => match finalize_session(trace_path, pid, injected, Vec::new()) {
+            Ok(injected) => match finalize_session(trace_path, injected) {
                 Ok((session, shutdown_addr)) => Ok(Self {
                     session: Some(session),
                     process,
                     pid,
                     shutdown_addr,
+                    module_scan: start_module_scan(pid, Vec::new()),
                 }),
                 Err(e) => {
                     win::close_handle_value(process);
@@ -214,7 +216,22 @@ impl LaunchedCapture {
         } else {
             ShutdownOutcome::ExportUnavailable
         };
+        // Keep draining even if signature verification outlives a short target.
+        while self
+            .module_scan
+            .as_ref()
+            .is_some_and(|scan| !scan.is_finished())
+        {
+            self.session().poll_once()?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let modules = self
+            .module_scan
+            .take()
+            .and_then(|scan| scan.join().ok())
+            .unwrap_or_default();
         let mut session = self.session.take().expect("session present");
+        session.update_modules(modules)?;
         session.set_shutdown_outcome(outcome);
         let mut summary = session.stop()?;
         summary.target_exit_code = win::process_exit_code(self.process)?;
@@ -226,6 +243,11 @@ impl LaunchedCapture {
 
 impl Drop for LaunchedCapture {
     fn drop(&mut self) {
+        // On an early error, retain the process handle until the PID-based scan
+        // ends as well. Otherwise a reused PID could classify another process.
+        if let Some(scan) = self.module_scan.take() {
+            let _ = scan.join();
+        }
         if self.process != 0 {
             win::close_handle_value(self.process);
         }
@@ -864,38 +886,26 @@ fn inject_and_init(
     })
 }
 
-/// Trace ファイルを作り、Ring を結線して記録を開始する。L23: 作成前に
-/// 対象プロセスのモジュールを列挙して Environment へ載せる（Header と
-/// Environment は作成時に書き込まれるため、列挙はこの前に済ませる）。
-/// `pre_modules` は注入直後（起動時は再開前）に取ったスナップショット
-/// で、再開後の安定化待ち列挙と合成する（起動対象が再開直後に終了して
-/// しまった場合でも、注入直後の分は残る）。列挙に失敗・空の場合は CLI
-/// が作った `environment.modules` をそのまま使う（capture を失敗させない）。
+fn start_module_scan(
+    pid: u32,
+    pre_modules: Vec<shirusu_transport_win::modules::LoadedModule>,
+) -> Option<std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>> {
+    std::thread::Builder::new()
+        .name("shirusu-module-scan".into())
+        .spawn(move || {
+            let settled = crate::modules::enumerate_modules_settled(pid);
+            let merged = crate::modules::merge_module_snapshots(pre_modules, settled);
+            crate::modules::classify_module_list(&merged)
+        })
+        .ok()
+}
+
+/// Create and connect the consumer immediately; module discovery runs separately.
 fn finalize_session(
     trace_path: impl AsRef<Path>,
-    pid: u32,
     injected: InjectedTarget,
-    pre_modules: Vec<shirusu_transport_win::modules::LoadedModule>,
 ) -> Result<(CaptureSession, Option<usize>), SessionError> {
-    let mut session_cfg = injected.session_cfg;
-    let settled = crate::modules::enumerate_modules_settled(pid);
-    let merged = crate::modules::merge_module_snapshots(pre_modules, settled);
-    if !merged.is_empty() {
-        let classified = crate::modules::classify_module_list(&merged);
-        let existing = std::mem::take(&mut session_cfg.environment.modules);
-        session_cfg.environment.modules =
-            crate::modules::merge_environment_modules(existing, classified);
-        session_cfg.environment.capture_config = format!(
-            "{}; modules={} (L23)",
-            session_cfg.environment.capture_config,
-            session_cfg.environment.modules.len()
-        );
-    } else {
-        session_cfg.environment.capture_config = format!(
-            "{}; modules=unavailable (L23 enumeration failed)",
-            session_cfg.environment.capture_config
-        );
-    }
+    let session_cfg = injected.session_cfg;
     let mut session = CaptureSession::create_file(trace_path, session_cfg)?;
     for (mapping, notify, spec) in injected.rings {
         session.add_shared_mapping(mapping, spec, Some(notify))?;

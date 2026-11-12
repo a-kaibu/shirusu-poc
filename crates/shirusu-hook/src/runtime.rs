@@ -574,8 +574,15 @@ pub fn runtime_slot() -> &'static RuntimeSlot {
 /// スタックフレーム（旧セッションの Call ID）が、次セッションの
 /// ID と衝突して親子関係を誤らせることを防ぐ。
 static NEXT_CALL_ID_SEED: AtomicU64 = AtomicU64::new(1);
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    // Copy-only native TLS: no allocation or destructor registration in a Hook.
+    static REGISTERED_THREAD: Cell<Option<(u64, u64, u64)>> = const { Cell::new(None) };
+}
 
 pub struct HookRuntime {
+    runtime_id: u64,
+    registration_epoch: AtomicU64,
     agent: Arc<Agent>,
     /// Slot index 順の space_available 通知。スレッドが Slot を取得した
     /// 時点で、そのスレッド（Ring）へ結線する（R7 の Ring 単位結線）。
@@ -627,6 +634,8 @@ impl HookRuntime {
         data_ready: Option<ProcessNotify>,
     ) -> Self {
         Self {
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
+            registration_epoch: AtomicU64::new(0),
             agent,
             space_notifies,
             data_ready,
@@ -820,10 +829,22 @@ impl HookRuntime {
     /// space_available 通知を Ring へ結線する。2 回目以降は何もしない
     /// （記録の通常経路はここを通らない）。
     pub fn ensure_thread(&self, thread_id: u64) {
+        if !native_tls_available() {
+            return;
+        }
         crate::fls::drain_pending_exits();
+        let epoch = self.registration_epoch.load(Ordering::Acquire);
+        let key = (self.runtime_id, thread_id, epoch);
+        if REGISTERED_THREAD
+            .try_with(|cache| cache.get() == Some(key))
+            .unwrap_or(false)
+        {
+            return;
+        }
         {
             let seen = self.seen_threads.lock().unwrap();
             if seen.contains(&thread_id) {
+                let _ = REGISTERED_THREAD.try_with(|cache| cache.set(Some(key)));
                 return;
             }
         }
@@ -845,6 +866,7 @@ impl HookRuntime {
         // ごとの格納域であり、ensure_thread は記録するスレッドの
         // 文脈で呼ばれる)。
         crate::fls::arm_current_thread(thread_id);
+        let _ = REGISTERED_THREAD.try_with(|cache| cache.set(Some(key)));
     }
 
     /// スレッド終了の通知 (レビュー #6 P1-4)。FLS デストラクタ
@@ -856,6 +878,9 @@ impl HookRuntime {
         self.seen_threads.lock().unwrap().remove(&thread_id);
         self.agent.thread_exit(thread_id);
         self.agent.poll_reclaims();
+        // Native detach is processed on a different thread. Invalidate cached
+        // registration only after removing the old slot, including TID reuse.
+        self.registration_epoch.fetch_add(1, Ordering::Release);
     }
 
     fn signal_if_needed(&self, result: &RecordResult) {
@@ -1696,6 +1721,29 @@ mod tests {
     }
 
     #[test]
+    fn repeated_thread_registration_does_not_acquire_the_shared_mutex() {
+        let (_agent, rt) = runtime();
+        rt.ensure_thread(771);
+        // A cached hit must not even attempt to read this poisoned mutex.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _seen = rt.seen_threads.lock().unwrap();
+            panic!("poison management lock");
+        }));
+        rt.ensure_thread(771);
+    }
+
+    #[test]
+    fn registration_cache_does_not_cross_runtime_sessions() {
+        let (first_agent, first) = runtime();
+        let (second_agent, second) = runtime();
+        first.ensure_thread(772);
+        assert!(unsafe { first_agent.thread_region_base(772) }.is_some());
+        second.ensure_thread(772);
+        assert!(unsafe { second_agent.thread_region_base(772) }.is_some());
+        assert_ne!(first.runtime_id, second.runtime_id);
+    }
+
+    #[test]
     fn thread_exit_frees_the_slot_for_a_new_incarnation() {
         // レビュー #6 P1-4: 終了したスレッドの Slot は、Host が drain
         // すれば同じ TID の新しい incarnation が使える。Pool の
@@ -1706,11 +1754,13 @@ mod tests {
         let other = 888u64;
         rt.ensure_thread(tid);
         rt.ensure_thread(other); // 2 スロット目も埋める
+        rt.ensure_thread(tid); // Keep this incarnation in the TLS cache.
         let create = api_by_id(API_CREATE_FILE_W).unwrap();
         let call_id = rt.alloc_call_id();
         rt.record_enter(tid, create, call_id, b"enter-args");
         let base = unsafe { agent.thread_region_base(tid) }.expect("region");
-        rt.thread_exit(tid);
+        // Native TLS notices are drained by another still-live thread.
+        std::thread::scope(|scope| scope.spawn(|| rt.thread_exit(tid)).join().unwrap());
         // drain されるまでは回収待ちのまま
         assert_eq!(agent.pending_reclaim_count(), 1);
         let mut reader =
@@ -1782,6 +1832,7 @@ mod tests {
     fn native_tls_vector_absence_bypasses_rust_tls_access() {
         // No OS calls, allocations, assertions or unwinding while the vector
         // is absent. This reproduces the loader teardown state from the AV.
+        let (_agent, rt) = runtime();
         assert!(native_tls_available());
         let saved: usize;
         unsafe {
@@ -1790,6 +1841,7 @@ mod tests {
             #[cfg(target_arch = "x86")]
             core::arch::asm!("mov {}, fs:[0x2c]", "mov dword ptr fs:[0x2c], 0", out(reg) saved, options(nostack, preserves_flags));
         }
+        rt.ensure_thread(123);
         let entered = ReentrancyGuard::try_enter().is_some();
         let active = ReentrancyGuard::is_active();
         ReentrancyGuard::mark_thread_exiting();
@@ -1799,6 +1851,7 @@ mod tests {
             #[cfg(target_arch = "x86")]
             core::arch::asm!("mov fs:[0x2c], {}", in(reg) saved, options(nostack, preserves_flags));
         }
+        assert!(rt.seen_threads.lock().unwrap().is_empty());
         assert!(!entered);
         assert!(!active);
         assert!(ReentrancyGuard::try_enter().is_some());

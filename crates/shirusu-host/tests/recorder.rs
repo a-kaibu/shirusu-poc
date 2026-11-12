@@ -554,3 +554,25 @@ fn session_follows_ring_reincarnation_after_slot_reuse() {
     assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn late_module_scan_preserves_initial_metadata_when_unavailable() {
+    let path = temp_trace("late-modules");
+    let mut cfg = config();
+    cfg.environment.target_description = "short-lived.exe".into();
+    let mut session = CaptureSession::create_file(&path, cfg).unwrap();
+    assert!(session.update_modules(Vec::new()).is_err());
+    session.start().unwrap();
+    session.update_modules(Vec::new()).unwrap();
+    session.stop().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let environment = trace.environment.unwrap();
+    assert_eq!(environment.target_description, "short-lived.exe");
+    assert!(environment
+        .capture_config
+        .contains("module_scan=unavailable"));
+    assert!(trace.finalization.is_some());
+    assert!(trace.issues.is_empty(), "{:?}", trace.issues);
+    std::fs::remove_file(path).unwrap();
+}

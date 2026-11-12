@@ -303,6 +303,10 @@ impl<W: DurableWrite> TraceRecorder<W> {
         })
     }
 
+    pub fn update_environment(&mut self, environment: &CaptureEnvironment) -> TraceResult<()> {
+        self.writer.update_environment(environment)
+    }
+
     /// 記録モードを指定する（L09）。`CaptureSession::create_file` が
     /// `CaptureSessionConfig::record_mode` から渡す。既定は `Full`。
     pub fn set_record_mode(&mut self, mode: RecordMode) {

@@ -492,6 +492,31 @@ impl CaptureSession {
         })
     }
 
+    /// Publish late module discovery without delaying Ring consumption.
+    pub fn update_modules(
+        &mut self,
+        modules: Vec<shirusu_trace::module::ModuleClassification>,
+    ) -> Result<(), SessionError> {
+        self.ensure_state(SessionState::Recording, "update_modules")?;
+        let environment = &mut self.config.environment;
+        if modules.is_empty() {
+            environment
+                .capture_config
+                .push_str("; module_scan=unavailable");
+        } else {
+            environment.modules = crate::modules::merge_environment_modules(
+                std::mem::take(&mut environment.modules),
+                modules,
+            );
+            environment.capture_config.push_str(&format!(
+                "; modules={} (L23 async)",
+                environment.modules.len()
+            ));
+        }
+        self.recorder.update_environment(environment)?;
+        Ok(())
+    }
+
     pub fn state(&self) -> SessionState {
         self.state
     }

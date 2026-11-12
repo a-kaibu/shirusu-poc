@@ -278,6 +278,9 @@ message ApiProfile {                // L09: API ごとの集計 1 行
 `SessionMetadata` は Header payload の session_id と一致させる。Reader は
 不一致を `SessionMismatch` として issue に記録する（回復意味論の表を参照）。
 Writer は Header・Environment・各 Batch の session_id を単一源泉で一致させる。
+Environment は後から完全なスナップショットを追記でき、Reader は最後に正常に
+復号できたスナップショットを採用する。更新時に session_id と qpc_frequency は
+変更できない。終了前に中断された Trace には初期のモジュール情報だけが残る場合がある。
 `content_hash` は、正規化した Schema 定義の BLAKE3 ハッシュ先頭
 8 バイト（LE）。正規化バイト列は「名前のバイト列＋区切り 0xFF＋
 フィールドごとに（名前のバイト列＋区切り 0x00＋ty の u32 LE＋
@@ -775,9 +778,10 @@ Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
   対象プロセスの全モジュールを列挙する（`EnumProcessModulesEx` 等）。
   起動時は注入直後（再開前）の分と、再開後の安定化待ち（10ms 間隔・
   最大 200ms・2 回連続で同じ一覧になったら確定）の分を合成する。
-  アタッチ時は対象が既に実行中のため安定化待ち列挙だけで完全な一覧が
-  得られる。列挙は Trace ファイルの作成（Environment ブロックの書き込み）
-  の前に済ませ、署名は `WinVerifyTrust`（失効確認なし）＋署名者証明書の
+  アタッチ時は安定化待ち列挙を使う（列挙の前後にロード・アンロード
+  されたモジュールは含まれないことがある）。Trace と Ring 接続は起動対象
+  の再開前に準備し、再開後の列挙・署名確認は別スレッドで行う。終了時に
+  更新した Environment を追記するまでイベント回収を続ける。署名は `WinVerifyTrust`（失効確認なし）＋署名者証明書の
   表示名が "Microsoft Corporation" であることで確認し、
   `ModuleEvidence.microsoft_signed` へ渡す。API Set 契約名はローダ経由
   （`GetModuleHandleW(契約名)` が apisets スキーマを参照して返す実装
@@ -786,8 +790,8 @@ Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
   と合成する：CLI の上書きは残し、それ以外の既存エントリは列挙の新しい
   証拠（署名確認済み）で置き換え、列挙に無かった既存エントリは末尾へ残す。
   列挙に失敗・空の場合は CLI の `modules` をそのまま使い、capture を
-  失敗させない（`capture_config` に `modules=unavailable` と残す）。
-  成功時は `capture_config` に `modules=<件数> (L23)` と残す。
+  失敗させない（`capture_config` に `module_scan=unavailable` と残す）。
+  成功時は `capture_config` に `modules=<件数> (L23 async)` と残す。
   遅れてロードされたモジュール（capture 開始後に `LoadLibrary` された
   もの）は、この一覧には載らない。DLL 側の呼び出し元分類は再列挙で
   追随するが、Trace の `modules` は capture 開始時のスナップショット

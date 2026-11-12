@@ -207,6 +207,19 @@ impl<W: DurableWrite> TraceWriter<W> {
         Ok(w)
     }
 
+    /// Append a newer environment snapshot. Readers use the last valid snapshot;
+    /// event identity and the session clock must remain unchanged.
+    pub fn update_environment(&mut self, environment: &CaptureEnvironment) -> Result<()> {
+        if environment.session.session_id != self.session_id
+            || environment.session.qpc_frequency != self.qpc_frequency
+        {
+            return Err(TraceError::WriterInvariant(
+                "environment update changes session or clock".into(),
+            ));
+        }
+        self.write_block(BlockType::Environment, &environment.encode(), false)
+    }
+
     /// この Writer の永続化設定。
     pub fn durability(&self) -> Durability {
         self.durability

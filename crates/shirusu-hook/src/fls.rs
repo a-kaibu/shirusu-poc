@@ -34,6 +34,11 @@ pub fn drain_pending_exits() {
     #[cfg(windows)]
     {
         use std::sync::atomic::Ordering;
+        // The ordinary recording path only reads the cache line. Avoid an
+        // inter-thread read/modify/write when there are no detach notices.
+        if PENDING.load(Ordering::Acquire).is_null() {
+            return;
+        }
         let mut node = PENDING.swap(std::ptr::null_mut(), Ordering::Acquire);
         while !node.is_null() {
             // The atomic swap grants sole ownership of this detached list.

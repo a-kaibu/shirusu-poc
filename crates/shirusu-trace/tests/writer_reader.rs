@@ -736,3 +736,52 @@ fn profile_summary_absent_without_block() {
     let trace = read_trace_via(&bytes).unwrap();
     assert!(trace.profile_summary.is_none());
 }
+
+#[test]
+fn late_environment_snapshot_preserves_interleaved_events() {
+    let mut writer = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    writer
+        .write_batch(&batch(3, vec![event(1, PayloadRef::None)]))
+        .unwrap();
+    let mut updated = env(42);
+    updated.capture_config = "L2; module_scan=unavailable".into();
+    writer.update_environment(&updated).unwrap();
+    writer
+        .write_batch(&batch(3, vec![event(2, PayloadRef::None)]))
+        .unwrap();
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace_via(&bytes).unwrap();
+    assert_eq!(trace.environment.as_ref(), Some(&updated));
+    assert_eq!(trace.batches.len(), 2);
+    assert_eq!(trace.batches[0].events[0].sequence, 1);
+    assert_eq!(trace.batches[1].events[0].sequence, 2);
+    assert!(trace.issues.is_empty(), "{:?}", trace.issues);
+}
+
+#[test]
+fn environment_update_rejects_identity_changes_without_writing() {
+    let buf = SharedBuf::default();
+    let mut writer = TraceWriter::new(buf.clone(), env(42)).unwrap();
+    let before = buf.bytes();
+    for invalid in [
+        env(43),
+        CaptureEnvironment {
+            session: SessionMetadata {
+                qpc_frequency: 1,
+                ..env(42).session
+            },
+            ..env(42)
+        },
+    ] {
+        assert!(matches!(
+            writer.update_environment(&invalid),
+            Err(TraceError::WriterInvariant(_))
+        ));
+        assert_eq!(buf.bytes(), before);
+    }
+    writer.update_environment(&env(42)).unwrap();
+    writer.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace_via(&buf.bytes()).unwrap();
+    assert_eq!(trace.environment.as_ref(), Some(&env(42)));
+    assert!(trace.issues.is_empty(), "{:?}", trace.issues);
+}
