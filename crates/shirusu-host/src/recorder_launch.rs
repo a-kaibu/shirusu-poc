@@ -79,6 +79,7 @@ pub struct LaunchedCapture {
     /// Agent 側の終了手順を呼ばずに従来どおり閉じる。
     shutdown_addr: Option<usize>,
     module_scan: Option<std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>>,
+    data_ready: win::ProcessNotify,
 }
 
 impl LaunchedCapture {
@@ -106,7 +107,7 @@ impl LaunchedCapture {
         let pre_modules = crate::modules::enumerate_modules_for_process(spawned.pid);
         // Prepare the consumer before resuming the producer. Module signature
         // work must not leave the target filling an unconsumed Ring.
-        let (session, shutdown_addr) = match finalize_session(trace_path, injected) {
+        let (session, shutdown_addr, data_ready) = match finalize_session(trace_path, injected) {
             Ok(v) => v,
             Err(e) => {
                 let _ = win::terminate_process(spawned.process, 1);
@@ -129,6 +130,7 @@ impl LaunchedCapture {
             pid: spawned.pid,
             shutdown_addr,
             module_scan,
+            data_ready,
         })
     }
 
@@ -143,12 +145,13 @@ impl LaunchedCapture {
         let process = win::open_process_for_injection(pid)?;
         match inject_and_init(&cfg, process, pid) {
             Ok(injected) => match finalize_session(trace_path, injected) {
-                Ok((session, shutdown_addr)) => Ok(Self {
+                Ok((session, shutdown_addr, data_ready)) => Ok(Self {
                     session: Some(session),
                     process,
                     pid,
                     shutdown_addr,
                     module_scan: start_module_scan(pid, Vec::new()),
+                    data_ready,
                 }),
                 Err(e) => {
                     win::close_handle_value(process);
@@ -174,6 +177,7 @@ impl LaunchedCapture {
 
     /// 対象の終了まで回収を続け、終了したら最終回収して Trace を閉じる。
     /// 対象が途中で死んでも、回収済み分は Trace に残る（異常系の通常経路）。
+    /// 空なら data_ready を待ち、通知が無くても poll_interval 後に再確認する。
     pub fn run_to_completion(
         mut self,
         poll_interval: Duration,
@@ -186,7 +190,7 @@ impl LaunchedCapture {
             // Keep consuming while the producer is active. Sleeping after every
             // nonempty batch needlessly lets a high-rate Ring fill again.
             if stats.events == 0 {
-                std::thread::sleep(poll_interval);
+                self.data_ready.data_ready.wait_timeout(poll_interval);
             }
         }
         // 終了直前に書かれた分を拾い切る
@@ -228,7 +232,9 @@ impl LaunchedCapture {
         {
             let stats = self.session().poll_once()?;
             if stats.events == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+                self.data_ready
+                    .data_ready
+                    .wait_timeout(Duration::from_millis(1));
             }
         }
         let modules = self
@@ -502,6 +508,52 @@ impl TreeCapture {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn prepared_session_retains_the_agent_notification_event() {
+        let path =
+            std::env::temp_dir().join(format!("shirusu-notify-{}.trace", std::process::id()));
+        let data_ready = win::ProcessNotify::new().unwrap();
+        data_ready.notify_data_ready().unwrap();
+        let config = CaptureSessionConfig {
+            session_id: 41,
+            ring_config: shirusu_transport::RingConfig::new(64, 4096),
+            environment: shirusu_trace::proto::CaptureEnvironment {
+                session: shirusu_trace::proto::SessionMetadata {
+                    session_id: 41,
+                    qpc_frequency: 10_000_000,
+                    created_by: "notification regression".into(),
+                },
+                ..Default::default()
+            },
+            qpc_frequency: 10_000_000,
+            durability: shirusu_trace::writer::Durability::Buffered,
+            order_global: false,
+            record_runtime_apis: false,
+            diagnostic_query_interface: false,
+            record_mode: crate::trace_convert::RecordMode::Full,
+        };
+        let (session, _, notification) = finalize_session(
+            &path,
+            InjectedTarget {
+                data_ready,
+                session_cfg: config,
+                rings: Vec::new(),
+                hook_coverage: None,
+                com_factory_count: None,
+                winrt_activation_count: None,
+                internal_hook_count: None,
+                callback_hook_count: None,
+                shutdown_addr: None,
+            },
+        )
+        .unwrap();
+        assert!(notification.data_ready.wait_timeout(Duration::ZERO));
+        assert!(!notification.data_ready.wait_timeout(Duration::ZERO));
+        session.stop().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// 最小の PE ヘッダー (nt_headers が読める形) を合成する。
     fn synthetic_pe(magic: u16, opt_size: u16) -> Vec<u8> {
         let mut b = vec![0u8; 0x200];
@@ -711,8 +763,9 @@ fn dll_pointer_width(image: &[u8]) -> Option<u32> {
 
 /// 注入済みの対象と、セッション確定に必要な材料。L23 の分割で
 /// `inject_and_prepare` を 2 段にした：注入・初期化（`inject_and_init`）
-/// と、モジュール列挙後のセッション作成（`finalize_session`）。
+/// と、再開前のセッション作成（`finalize_session`）。
 struct InjectedTarget {
+    data_ready: win::ProcessNotify,
     /// Trace 作成時に使うセッション設定（DLL の PE から決めた
     /// pointer_width を反映済み）。
     session_cfg: CaptureSessionConfig,
@@ -739,8 +792,7 @@ struct InjectedTarget {
 
 /// Mapping とイベントを用意し、DLL を注入して初期化を確認する。
 /// 起動（suspended）とアタッチで共通の手順。Trace ファイルはまだ作ら
-/// ない（L23：Environment へ載せるモジュール列挙は、対象の実行開始
-/// 後にしか完全にならないため、作成は `finalize_session` へ遅らせる）。
+/// ない。Ring を準備した後、再開前に `finalize_session` で作成する。
 fn inject_and_init(
     cfg: &LaunchConfig,
     process: win::HandleValue,
@@ -881,6 +933,7 @@ fn inject_and_init(
     let internal_hook_count = outcome.as_ref().map(|result| result.internal_hooks);
     let callback_hook_count = outcome.as_ref().map(|result| result.callback_hooks);
     Ok(InjectedTarget {
+        data_ready: notify,
         session_cfg,
         rings,
         hook_coverage,
@@ -910,7 +963,7 @@ fn start_module_scan(
 fn finalize_session(
     trace_path: impl AsRef<Path>,
     injected: InjectedTarget,
-) -> Result<(CaptureSession, Option<usize>), SessionError> {
+) -> Result<(CaptureSession, Option<usize>, win::ProcessNotify), SessionError> {
     let session_cfg = injected.session_cfg;
     let mut session = CaptureSession::create_file(trace_path, session_cfg)?;
     for (mapping, notify, spec) in injected.rings {
@@ -932,5 +985,5 @@ fn finalize_session(
         session.set_callback_hook_count(count);
     }
     session.start()?;
-    Ok((session, injected.shutdown_addr))
+    Ok((session, injected.shutdown_addr, injected.data_ready))
 }
