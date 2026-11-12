@@ -4,7 +4,7 @@
 #include <windows.h>
 static void require(bool ok, UINT code) { if (!ok) ExitProcess(code); }
 extern "C" void __cdecl entry() {
-    char path[1024]; wchar_t wide[1024];
+    static char path[1024]; static wchar_t wide[1024];
     require(GetTempPathA(1024, path) != 0, 10);
     require(GetCurrentDirectoryA(1024, path) != 0, 11);
     require(SetCurrentDirectoryA(".") != 0, 12);
@@ -27,7 +27,7 @@ extern "C" void __cdecl entry() {
     require(MoveFileA("files\\two.bin", "files\\three.bin") != 0, 21);
     require(GetFileAttributesA("files\\three.bin") != INVALID_FILE_ATTRIBUTES, 22);
     require(SetFileAttributesA("files\\three.bin", FILE_ATTRIBUTE_NORMAL) != 0, 23);
-    WIN32_FIND_DATAA found; WIN32_FIND_DATAW found_w;
+    static WIN32_FIND_DATAA found; static WIN32_FIND_DATAW found_w;
     HANDLE a = FindFirstFileA("files\\*.bin", &found);
     require(a != INVALID_HANDLE_VALUE && FindNextFileA(a, &found), 24);
     require(FindClose(a) != 0, 25);

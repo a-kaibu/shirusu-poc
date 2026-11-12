@@ -14,7 +14,7 @@ if (-not $vs) { throw "MSVC compiler not found" }
 $dev = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
 $source = Join-Path $repo "e2e\native\legacy-api.cpp"
 $exe = Join-Path $work "legacy-api.exe"
-$compile = "`"$dev`" -arch=$arch && cl /nologo /W4 /WX /O2 /GS- /Gs16384 /Fe:`"$exe`" /Fo:`"$work\fixture.obj`" `"$source`" /link /ENTRY:entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib advapi32.lib"
+$compile = "`"$dev`" -arch=$arch && cl /nologo /W4 /WX /O2 /GS- /Fe:`"$exe`" /Fo:`"$work\fixture.obj`" `"$source`" /link /ENTRY:entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib advapi32.lib"
 $buildScript = Join-Path $work "build.cmd"
 @("@echo off", "call $compile") | Set-Content -Encoding ascii $buildScript
 Invoke-Native { cmd /d /c $buildScript } "legacy API fixture ($arch)"
@@ -72,8 +72,9 @@ try {
                 $trace = Join-Path $work "legacy.trace"
                 $selection = @("capture", "--dll", $dll, "--mode", "filtered", "--output", $trace)
                 foreach ($name in $expected) { $selection += @("--api", $name) }
-                & $cli @selection -- $exe
+                & $cli @selection -- $exe | Tee-Object -Variable captureOutput
                 if ($LASTEXITCODE -notin @(0,2)) { throw "legacy capture failed: $LASTEXITCODE" }
+                if (-not ($captureOutput -match '^target exit code: 0 \(0x00000000\)$')) { throw "legacy target did not exit successfully" }
             }
             $bytes = [System.IO.File]::ReadAllBytes((Join-Path $dir "result.bin"))
             if (($bytes -join ",") -ne "205,171,52,18") { throw "legacy application did not finish correctly ($mode)" }

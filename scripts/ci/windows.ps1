@@ -105,7 +105,7 @@ try {
     # A74: 64bit アトミック操作のコスト測定 (x64 側の対照値。判断は i686 側の実測で行う)
     Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (x64)"
     Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe } "atomic bench (x64)"
-    # L10: 性能目標の測定 (GUI ワークロード 3 倍・高負荷 5 倍・API 追加遅延・
+    # L10: モデル性能の測定 (実注入の測定は native-performance.ps1)。API 追加遅延・
     # スループット・バッファ使用率)。測定器でありゲートではないため終了コードは
     # 常に 0。判定の読み取りはログで行う。CI 時間を抑えるため --rounds 1。
     Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (x64)"
@@ -116,6 +116,8 @@ try {
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "replay-e2e.ps1")) } "native capture-to-replay"
 
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "legacy-api.ps1")) } "native ANSI and file API coverage"
+
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1")) } "native injected performance"
 
     if ($captureFailures.Count -gt 0) {
         throw ("Windows scenarios failed:`n" + ($captureFailures -join "`n"))

@@ -1239,6 +1239,55 @@ unsafe extern "system-unwind" fn detour_generated_advapi32_reg_query_info_key_a(
     });
     result as u32
 }
+unsafe extern "system-unwind" fn detour_generated_user32_begin_paint(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(191, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "system-unwind" fn detour_generated_user32_end_paint(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(192, &[a0 as u64, a1 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_user32_invalidate_rect(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: i32) -> i32 {
+    let result = generic_detour_with(193, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, i32) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_user32_update_window(a0: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(194, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_user32_fill_rect(a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void, a2: *mut core::ffi::c_void) -> i32 {
+    let result = generic_detour_with(195, &[a0 as u64, a1 as u64, a2 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, *mut core::ffi::c_void) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_gdi32_text_out_w(a0: *mut core::ffi::c_void, a1: i32, a2: i32, a3: *mut core::ffi::c_void, a4: i32) -> i32 {
+    let result = generic_detour_with(196, &[a0 as u64, a1 as u64, a2 as u64, a3 as u64, a4 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void, i32, i32, *mut core::ffi::c_void, i32) -> i32 = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0, a1, a2, a3, a4) }) as u64
+    });
+    result as i32
+}
+unsafe extern "system-unwind" fn detour_generated_gdi32_get_stock_object(a0: i32) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(197, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(i32) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
 
 fn detour_for_generated(api_id: u32) -> usize {
     match api_id {
@@ -1419,6 +1468,13 @@ fn detour_for_generated(api_id: u32) -> usize {
         188 => detour_generated_advapi32_reg_enum_key_ex_a as *const () as usize,
         189 => detour_generated_advapi32_reg_enum_value_a as *const () as usize,
         190 => detour_generated_advapi32_reg_query_info_key_a as *const () as usize,
+        191 => detour_generated_user32_begin_paint as *const () as usize,
+        192 => detour_generated_user32_end_paint as *const () as usize,
+        193 => detour_generated_user32_invalidate_rect as *const () as usize,
+        194 => detour_generated_user32_update_window as *const () as usize,
+        195 => detour_generated_user32_fill_rect as *const () as usize,
+        196 => detour_generated_gdi32_text_out_w as *const () as usize,
+        197 => detour_generated_gdi32_get_stock_object as *const () as usize,
         _ => 0,
     }
 }

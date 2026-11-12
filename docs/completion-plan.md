@@ -7,7 +7,7 @@
 | --- | --- | --- |
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
-| 全 Win32 の L0/L1 | 現在190件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
+| 全 Win32 の L0/L1 | 現在197件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
 | COM の L1 と寿命追跡 | Factory と IID 名識別は実装。共有オブジェクトの通常メソッド追跡は未完成 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
 | 動的 API と既存プロセス Attach | Inline Hook は実装。新規スレッド競合・停止先ロックの制約が残る | 既存プロセスとスレッド生成中の透明性テスト、失敗時の安全な復元 |
@@ -56,7 +56,7 @@ cargo run -p shirusu-metadata-gen -- --inventory target/api-inventory.tsv
 手書き API も生成表の対象外なので `generatable` に含まれる場合がある。
 これはネイティブで記録できた API 数ではない。
 
-現在の 18,364 メソッドは selected 177、generatable 17,451、unsupported 736。
+現在の 18,364 メソッドは selected 184、generatable 17,444、unsupported 736。
 C 呼び出し規約の Wrapper は元関数にも `C-unwind` を使い、x86 でのスタックの
 後始末を保持する。LDAP 3 API と LastError 2 API の追加は ABI 回帰テスト付き。
 可変長引数と複合構造体などの残件を、この一覧で追跡する。
@@ -101,4 +101,21 @@ CreateFileA、ANSI レジストリ、A/W のファイル列挙・パス変換・
 `e2e/native/legacy-api.cpp` は追加した全 41 API を実行し、出力・副作用・
 失敗時の LastError をアプリ側で検査する。`scripts/ci/legacy-api.ps1` は
 Hook 有無の成功、Trace の完全性、各 API の Enter/Leave 対応と型付きの失敗値を
-x64 / x86 の CI で検証する。追加部分の Windows 実走は次の CI で確認する。
+x64 / x86 の CI で検証する。`54b1bde` の run `43284387895` で x64 の全 41 API 検証が通過した。
+x86 と後続変更は次の CI で追跡する。
+
+## 実注入の性能測定
+
+`scripts/ci/native-performance.ps1` は release の Agent DLL / Host を使い、
+300 フレームの GDI 再描画・メッセージ処理と 50,000 回の
+GetCurrentProcessId / HeapAlloc / HeapFree を実際に実行する。GUI の
+BeginPaint / EndPaint / InvalidateRect / UpdateWindow / FillRect / TextOutW /
+GetStockObject も L1 に追加した（計197 API）。
+
+3 回ずつ Hook 無し／full の順序を交互に変え、アプリ内 QPC 区間の中央値と
+倍率、反復当たり追加時間、出力の一致、Trace サイズ・件数・完全性を JSON に
+保存する。起動・注入・終了まで含む wall time は別列とする。Ring は本番既定値を
+使い、欠落時も数値を残す。3倍／5倍は評価目標なので未達だけでは CI を失敗に
+しないが、実行失敗・対象 API 未観測は失敗にする。対象 API 全体の Coverage と
+全アプリの性能保証は別であり、モデルベンチのバッファ占有率とも区別する。
+初回実測値は Windows CI の結果から追記する。

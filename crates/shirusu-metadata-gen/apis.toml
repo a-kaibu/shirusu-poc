@@ -831,3 +831,40 @@ function = "RegEnumValueA"
 namespace = "Windows.Win32.System.Registry"
 module = "advapi32.dll"
 function = "RegQueryInfoKeyA"
+
+# Native GUI paint / message workload boundaries.
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "BeginPaint"
+last_error = "null"
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "EndPaint"
+last_error = "never"
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "InvalidateRect"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "UpdateWindow"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "FillRect"
+last_error = "never"
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "TextOutW"
+last_error = "false"
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "GetStockObject"
+last_error = "never"
