@@ -182,8 +182,13 @@ impl AgentBootstrap {
         if self.ring_count as usize > MAX_BOOTSTRAP_RINGS {
             return Err(BootstrapError::TooManyRings(self.ring_count));
         }
-        for i in 0..self.ring_count as usize {
-            if self.mapping_handles[i] == 0 {
+        for (i, handle) in self
+            .mapping_handles
+            .iter()
+            .take(self.ring_count as usize)
+            .enumerate()
+        {
+            if *handle == 0 {
                 return Err(BootstrapError::MissingMappingHandle(i as u32));
             }
         }

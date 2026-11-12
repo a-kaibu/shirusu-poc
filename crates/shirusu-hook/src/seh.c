@@ -9,11 +9,13 @@ typedef void (__cdecl *cleanup_fn)(void *);
 uint64_t __cdecl shirusu_invoke_with_finally(
     invoke_fn invoke, void *context, cleanup_fn cleanup)
 {
+    uint64_t result;
     __try {
-        return invoke(context);
+        result = invoke(context);
     } __finally {
         if (AbnormalTermination()) cleanup(context);
     }
+    return result;
 }
 
 // Native regression harness. Unreferenced helpers are discarded from the DLL.
