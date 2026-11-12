@@ -57,6 +57,8 @@ foreach ($workload in @("gui", "high-load")) {
                     throw "invalid native timing result"
                 }
                 $summary = $null
+                $requiredApi = $null
+                $requiredApiObserved = $null
                 if ($mode -eq "capture") {
                     $raw = & $cli inspect $trace --json
                     $inspectExit = $LASTEXITCODE
@@ -68,9 +70,7 @@ foreach ($workload in @("gui", "high-load")) {
                     $lossKinds = @($summary.integrity.loss_records | ForEach-Object { "$($_.kind):$($_.records)" }) -join ","
                     Write-Host ("Native sample {0}/{1}: {2:N3}ms events={3} losses={4} kinds=[{5}] unpaired=[{6}]" -f $workload, $round, (1000.0 * $measurement.ticks / $measurement.qpc_frequency), $summary.events, $summary.integrity.total_loss_count, $lossKinds, $unpaired)
                     $requiredApi = if ($workload -eq "gui") { "user32!BeginPaint" } else { "kernel32!HeapAlloc" }
-                    if (-not ($summary.api_stats | Where-Object { $_.api -eq $requiredApi -and $_.enter -gt 0 })) {
-                        throw "performance run did not capture $requiredApi"
-                    }
+                    $requiredApiObserved = @($summary.api_stats | Where-Object { $_.api -eq $requiredApi -and $_.enter -gt 0 }).Count -gt 0
                 }
                 $samples += [ordered]@{
                     workload = $workload; round = $round; mode = $mode
@@ -82,6 +82,11 @@ foreach ($workload in @("gui", "high-load")) {
                     trace_events = $(if ($summary) { $summary.events } else { $null })
                     integrity = $(if ($summary) { $summary.integrity } else { $null })
                     apis = $(if ($summary) { $summary.api_stats } else { $null })
+                    required_api = $requiredApi; required_api_observed = $requiredApiObserved
+                }
+                # Preserve the failing sample before rejecting an unobserved workload.
+                if ($mode -eq "capture" -and -not $requiredApiObserved) {
+                    throw "performance run did not capture $requiredApi"
                 }
             } finally { Pop-Location }
         }
