@@ -191,13 +191,17 @@ pub fn is_api_set_contract(name: &str) -> bool {
 /// 既知の実行基盤モジュールか。実行基盤であることはモジュール固有の
 /// 性質のため、ファイル名の一覧で識別する（overview の「VC++ Runtime、
 /// CLRなどの実行基盤」に対応する実務的な識別規則）。
-fn is_runtime_module(file_name: &str) -> bool {
-    let lower = file_name.to_ascii_lowercase();
+pub fn is_runtime_module(file_name: &str) -> bool {
+    let lower = if file_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(file_name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(file_name)
+    };
     if !lower.ends_with(".dll") {
         return false;
     }
     matches!(
-        lower.as_str(),
+        lower.as_ref(),
         "clr.dll"
             | "coreclr.dll"
             | "clrjit.dll"

@@ -1654,11 +1654,7 @@ fn prepare_com(factory_index: usize) -> ComPrepare {
     if original == 0 {
         return ComPrepare::Unavailable;
     }
-    // L23: 呼び出し元が Runtime なら記録しない（元の呼び出しだけ素通し）。
-    if rt.should_suppress_caller() {
-        le.restore_before_original();
-        return ComPrepare::Passthrough { original };
-    }
+    // COM methods are observable even when called through a runtime.
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
             let tid = unsafe { GetCurrentThreadId() } as u64;
@@ -1934,11 +1930,7 @@ fn prepare_winrt(activation_index: usize) -> WinRtPrepare {
     if original == 0 {
         return WinRtPrepare::Unavailable;
     }
-    // L23: 呼び出し元が Runtime なら記録しない（元の呼び出しだけ素通し）。
-    if rt.should_suppress_caller() {
-        le.restore_before_original();
-        return WinRtPrepare::Passthrough { original };
-    }
+    // COM methods are observable even when called through a runtime.
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
             let tid = unsafe { GetCurrentThreadId() } as u64;
@@ -2112,11 +2104,7 @@ fn prepare_callback_hook(hook_index: usize) -> CallbackPrepare {
     if original == 0 {
         return CallbackPrepare::Unavailable;
     }
-    // L23: 呼び出し元が Runtime なら記録しない（元の呼び出しだけ素通し）。
-    if rt.should_suppress_caller() {
-        le.restore_before_original();
-        return CallbackPrepare::Passthrough { original };
-    }
+    // COM methods are observable even when called through a runtime.
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
             let tid = unsafe { GetCurrentThreadId() } as u64;
@@ -2152,10 +2140,6 @@ fn prepare_callback_dispatch(original: usize) -> CallbackPrepare {
     };
     // L23: 呼び出し元は user32.dll の DispatchMessageW（Windows 分類）の
     // ため通常は抑制されない。Runtime 分類の場合は記録しない。
-    if rt.should_suppress_caller() {
-        le.restore_before_original();
-        return CallbackPrepare::Passthrough { original };
-    }
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
             let tid = unsafe { GetCurrentThreadId() } as u64;
@@ -2676,12 +2660,7 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
         // SAFETY: 同上。
         return unsafe { call_com_original(original, this, args) };
     };
-    // L23: 呼び出し元が Runtime なら記録しない（元の呼び出しだけ素通し）。
-    if rt.should_suppress_caller() {
-        le.restore_before_original();
-        // SAFETY: 同上。
-        return unsafe { call_com_original(original, this, args) };
-    }
+    // COM methods are observable even when called through a runtime.
     let Some(flight) = crate::runtime::DetourFlight::begin(&rt) else {
         le.restore_before_original();
         // SAFETY: 同上。
@@ -2922,12 +2901,10 @@ fn record_overlapped_completion(
 struct WinLastError;
 impl crate::runtime::LastErrorCell for WinLastError {
     fn get(&self) -> u32 {
-        // SAFETY: スレッドローカルな値の読み取り。
-        unsafe { GetLastError() }
+        crate::last_error::get()
     }
     fn set(&self, code: u32) {
-        // SAFETY: 同上。
-        unsafe { SetLastError(code) }
+        crate::last_error::set(code)
     }
 }
 
@@ -2992,11 +2969,9 @@ fn prepare(api_id: u32) -> Prepare {
     let Some(api) = api_by_id(api_id) else {
         return Prepare::Unavailable;
     };
-    // L23: 呼び出し元が Runtime で record_runtime_apis が無効なら記録
-    // しない（元の API だけ素通しで呼ぶ）。呼び出し元が特定できない
-    // 場合は記録する（fail-open）。再入ゲートや終了ゲートの後に判定
-    // することで、Agent 自身の呼び出しはそちらで素通しになる。
-    if rt.should_suppress_caller() {
+    // The option controls Runtime's own exported APIs, not Windows API calls
+    // made by Runtime. Agent-originated calls are excluded by reentrancy above.
+    if rt.should_suppress_api(api.module) {
         le.restore_before_original();
         return Prepare::Passthrough { original };
     }

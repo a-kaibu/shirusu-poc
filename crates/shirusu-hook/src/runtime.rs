@@ -693,44 +693,12 @@ impl HookRuntime {
         }
     }
 
-    /// 今回の Detour 呼び出しを記録しない（素通しにする）か。呼び出し元が
-    /// Runtime で `record_runtime_apis` が無効な場合に真。呼び出し元が
-    /// 特定できない場合は偽（記録する）。再入ガードや終了ゲートより
-    /// 後に判定すること（Agent 自身の呼び出しはそちらで素通しになる）。
-    pub fn should_suppress_caller(&self) -> bool {
-        if self.record_runtime_apis {
-            return false;
-        }
-        let Some(addr) = crate::caller::caller_return_address() else {
-            return false;
-        };
-        let class = self
-            .caller_modules
-            .read()
-            .ok()
-            .and_then(|guard| guard.classify(addr));
-        let class = match class {
-            Some(c) => Some(c),
-            None => {
-                // 一覧に無い呼び出し元：遅れてロードされたモジュールの
-                // 可能性があるため、間隔を空けて再列挙してからもう一度見る。
-                let needs_retry = self
-                    .caller_modules
-                    .read()
-                    .map(|guard| guard.needs_refresh())
-                    .unwrap_or(false);
-                if needs_retry {
-                    self.refresh_caller_modules();
-                    self.caller_modules
-                        .read()
-                        .ok()
-                        .and_then(|guard| guard.classify(addr))
-                } else {
-                    None
-                }
-            }
-        };
-        crate::caller::should_suppress(class, self.record_runtime_apis)
+    /// Runtime 独自の API の除外は呼び出し先で決める。
+    /// Runtime から Windows 公開 API への呼び出しは標準でも記録する。
+    pub fn should_suppress_api(&self, module: &str) -> bool {
+        let target = shirusu_trace::module::is_runtime_module(module)
+            .then_some(shirusu_trace::module::ModuleClass::Runtime);
+        crate::caller::should_suppress_target(target, self.record_runtime_apis)
     }
 
     /// 記録が有効か。終了手順 (shutdown_recording) が始まると false。
@@ -1904,14 +1872,15 @@ mod tests {
     }
 
     #[test]
-    fn should_suppress_caller_is_false_without_caller() {
-        // Linux では呼び出し元アドレスは取れないため、常に記録する
-        //（fail-open）。record_runtime_apis が有効でも同じく false。
+    fn runtime_api_policy_does_not_exclude_windows_targets() {
         let (agent, rt) = runtime();
-        assert!(!rt.should_suppress_caller());
+        assert!(!rt.should_suppress_api("kernel32.dll"));
+        assert!(!rt.should_suppress_api("user32.dll"));
+        assert!(rt.should_suppress_api("ucrtbase.dll"));
         let rt =
             HookRuntime::new(Arc::clone(&agent), Vec::new(), None).with_record_runtime_apis(true);
-        assert!(!rt.should_suppress_caller());
+        assert!(!rt.should_suppress_api("ucrtbase.dll"));
+        assert!(!rt.should_suppress_api("kernel32.dll"));
     }
 
     #[test]

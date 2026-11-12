@@ -3,13 +3,13 @@
 //! 構成:
 //! - `api`: フック対象 API の定義表と Schema（プラットフォーム非依存）
 //! - `caller` (L23): フック時の呼び出し元分類（戻りアドレスから
-//!   モジュールを特定し、Runtime からの呼び出しを記録しない）
+//!   モジュールを特定する。除外設定は Runtime 自身の API が対象）
 //! - `capture`: 型付き引数取得（メモリ読み取りを抽象化、非依存）
 //! - `pe`: PE イメージのインポート/エクスポート解析（非依存）
 //! - `plan`: IAT フック計画（非依存）
 //! - `bootstrap`: Host → Agent DLL の初期化受け渡し構造（共有定義）
 //! - `runtime`: Detour が共有する記録ランタイム
-//! - `fls`: スレッド終了の検出 (FLS デストラクタ。Slot 再利用の契機)
+//! - `fls`: OS スレッド終了の通知と、Loader Lock 外での遅延回収
 //! - `com` (L02): COM Interception の追跡表・既知インターフェイス・
 //!   COM メソッドイベントの Schema（プラットフォーム非依存）
 //! - `winrt` (L14): WinRT の定義表（既知インターフェイス・ランタイム
@@ -29,6 +29,8 @@ pub mod capture;
 pub mod com;
 pub mod fls;
 pub mod inline;
+#[cfg(windows)]
+pub mod last_error;
 pub mod pe;
 pub mod plan;
 pub mod runtime;

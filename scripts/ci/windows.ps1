@@ -33,6 +33,18 @@ if (-not $appverif) {
     if ($cmd) { $appverif = $cmd.Source }
 }
 if ($appverif) {
+    # A native AV may have no Application Verifier stop entry. On disposable
+    # GHA runners preserve its exception context and module/stack information.
+    $dumpKey = $null
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        $diagnostics = Join-Path (Get-Location) "target\ci-diagnostics"
+        New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+        $dumpKey = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\shirusu-hook-target.exe"
+        New-Item -Path $dumpKey -Force | Out-Null
+        New-ItemProperty -Path $dumpKey -Name DumpFolder -PropertyType ExpandString -Value $diagnostics -Force | Out-Null
+        New-ItemProperty -Path $dumpKey -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
+        New-ItemProperty -Path $dumpKey -Name DumpCount -PropertyType DWord -Value 2 -Force | Out-Null
+    }
     Write-Host "D54: enabling Application Verifier for shirusu-hook-target.exe ($appverif)"
     & $appverif -enable Heaps Handles Locks -for shirusu-hook-target.exe | Out-Host
     try {
@@ -51,6 +63,7 @@ if ($appverif) {
         } finally {
             & $appverif -delete settings -for shirusu-hook-target.exe | Out-Host
             & $appverif -delete logs -for shirusu-hook-target.exe | Out-Host
+            if ($dumpKey) { Remove-Item $dumpKey -Force -ErrorAction Continue }
         }
     }
 } else {
@@ -74,7 +87,7 @@ Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --
 # Trace の Environment.modules に列挙・分類されたモジュールが載ることと、
 # 直接呼び出しのファイル I/O が記録されることを検証する（record_runtime_apis の
 # on/off 両方）。CRT 経由の呼び出しは L01 の Inline Hook で Detour に届き、
-# 既定では L23 の呼び出し元分類で抑制されること（on では記録されること）を検証する。
+# 既定でも Windows API 呼び出しが記録されることを検証する。
 Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --modules } "capture-e2e --modules"
 # A74: 64bit アトミック操作のコスト測定 (x64 側の対照値。判断は i686 側の実測で行う)
 Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (x64)"

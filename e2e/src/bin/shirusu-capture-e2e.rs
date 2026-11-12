@@ -1358,19 +1358,12 @@ mod win {
             &format!("{tag} direct CreateFileW recorded"),
         );
         // L01: CRT 経由の呼び出しも Inline Hook で Detour に届く。
-        // record_runtime_apis が無効（default）の場合は L23 の呼び出し元
-        // 分類で抑制され、Trace に現れない。有効（runtime-on）の場合は記録される。
-        if tag == "default" {
-            c.check(
-                crt_events == 0,
-                &format!("{tag} crt-mediated CreateFileW suppressed (got {crt_events})"),
-            );
-        } else {
-            c.check(
-                crt_events >= 1,
-                &format!("{tag} crt-mediated CreateFileW recorded (got {crt_events})"),
-            );
-        }
+        // Runtime -> Windows is part of the default boundary. The option only
+        // adds Runtime's own API exports; it must not hide CRT-mediated I/O.
+        c.check(
+            crt_events >= 1,
+            &format!("{tag} crt-mediated CreateFileW recorded (got {crt_events})"),
+        );
     }
     /// L01: Inline Hook の E2E。hook-target `--getprocaddress` は
     /// ファイル 4 API と RegCreateKeyExW / RegCloseKey を

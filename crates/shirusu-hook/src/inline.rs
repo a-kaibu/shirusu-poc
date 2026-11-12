@@ -18,8 +18,8 @@
 //!   後方ジャンプ等）は検出できない。先頭命令の直後にそのような
 //!   分岐を持つ関数は稀だが、存在すれば誤動作し得る。パッチ長は
 //!   最小（5 バイト、遠方時のみ 14/10 バイト）に留め、範囲を狭くする。
-//! - 盗んだ命令に `ret` が含まれても、トランポリン内の `ret` は
-//!   Detour へ戻る（呼び出し側への復帰と等価）ため正しい。
+//! - 必要なパッチ長より前に ret / 無条件分岐等が現れたら拒否する。
+//!   続く領域は他の関数やデータかもしれず、上書きしてはならない。
 
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, Instruction, InstructionBlock,
@@ -122,6 +122,28 @@ pub fn plan_stolen(
         if instr.code() == Code::INVALID {
             return Err(InlineRefusal::DecodeFailed);
         }
+        let forward_inside_patch = instr.flow_control()
+            == iced_x86::FlowControl::UnconditionalBranch
+            && instr.near_branch_target() >= instr.next_ip()
+            && instr.near_branch_target() < target + patch_len as u64;
+        if decoder.position() < patch_len
+            && !forward_inside_patch
+            && matches!(
+                instr.flow_control(),
+                iced_x86::FlowControl::Return
+                    | iced_x86::FlowControl::UnconditionalBranch
+                    | iced_x86::FlowControl::IndirectBranch
+                    | iced_x86::FlowControl::Exception
+                    | iced_x86::FlowControl::Interrupt
+            )
+        {
+            // Bytes after a terminal instruction may belong to another export
+            // or hold data. Relocating them does not make overwriting them safe.
+            return Err(InlineRefusal::TooShort {
+                available: decoder.position(),
+                needed: patch_len,
+            });
+        }
         instructions.push(instr);
     }
     Ok(StolenPlan {
@@ -196,6 +218,20 @@ pub fn build_trampoline(plan: &StolenPlan, trampoline: u64) -> Result<Vec<u8>, I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn does_not_overwrite_adjacent_code_after_a_short_function() {
+        for prefix in [&[0xc3][..], &[0xeb, 0x20], &[0xff, 0x25, 0, 0, 0, 0]] {
+            let mut bytes = prefix.to_vec();
+            bytes.resize(32, 0x90);
+            assert!(matches!(
+                plan_stolen(&bytes, 0x1000, 0x1_0000_0000, 64),
+                Err(InlineRefusal::TooShort { .. })
+            ));
+        }
+        // A complete five-byte thunk can still be patched with a near jump.
+        assert!(plan_stolen(&[0xe9, 0x20, 0, 0, 0], 0x1000, 0x2000, 64).is_ok());
+    }
     use iced_x86::{Decoder, DecoderOptions, FlowControl};
 
     #[test]

@@ -1,8 +1,8 @@
 //! L23: フック時の呼び出し元分類。
 //!
 //! Detour の入口で、API 呼び出しの戻りアドレスから呼び出し元の
-//! モジュールを特定し、分類が Runtime で `record_runtime_apis` が無効
-//! なら記録しない。呼び出し元が特定できない場合は記録する（fail-open）。
+//! モジュールを特定する。記録ポリシーは呼び出し先で判断する。
+//! Runtime から Windows API へ入る呼び出しは標準でも記録する。
 //!
 //! 戻りアドレスは `RtlCaptureStackBackTrace` で取る（安定 Rust で使える
 //! 公開 API。`_ReturnAddress` 相当の組み込みは安定版に無い）。Detour・
@@ -53,10 +53,10 @@ pub fn classify_address(ranges: &[ModuleRange], addr: usize) -> Option<ModuleCla
     }
 }
 
-/// 呼び出し元の分類から、今回の呼び出しを記録しないかを決める。
-/// Runtime で `record_runtime_apis` が無効な場合にだけ真。不明
+/// 呼び出し先の分類から、今回の呼び出しを記録しないかを決める。
+/// 呼び出し先が Runtime で `record_runtime_apis` が無効な場合にだけ真。不明
 /// （`None`）の場合は記録する（fail-open）。
-pub fn should_suppress(class: Option<ModuleClass>, record_runtime_apis: bool) -> bool {
+pub fn should_suppress_target(class: Option<ModuleClass>, record_runtime_apis: bool) -> bool {
     !record_runtime_apis && class == Some(ModuleClass::Runtime)
 }
 
@@ -263,15 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn should_suppress_only_runtime_when_disabled() {
-        assert!(should_suppress(Some(ModuleClass::Runtime), false));
-        assert!(!should_suppress(Some(ModuleClass::Runtime), true));
-        assert!(!should_suppress(Some(ModuleClass::Windows), false));
-        assert!(!should_suppress(Some(ModuleClass::Application), false));
-        assert!(!should_suppress(Some(ModuleClass::Unknown), false));
+    fn should_suppress_only_runtime_targets_when_disabled() {
+        assert!(should_suppress_target(Some(ModuleClass::Runtime), false));
+        assert!(!should_suppress_target(Some(ModuleClass::Runtime), true));
+        assert!(!should_suppress_target(Some(ModuleClass::Windows), false));
+        assert!(!should_suppress_target(
+            Some(ModuleClass::Application),
+            false
+        ));
+        assert!(!should_suppress_target(Some(ModuleClass::Unknown), false));
         // 呼び出し元不明は記録する（fail-open）。
-        assert!(!should_suppress(None, false));
-        assert!(!should_suppress(None, true));
+        assert!(!should_suppress_target(None, false));
+        assert!(!should_suppress_target(None, true));
     }
 
     #[test]

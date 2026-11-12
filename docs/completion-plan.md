@@ -1,0 +1,33 @@
+# 当初構想に対する完成条件
+
+要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
+過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
+
+| 要件 | 現状と残件 | 合格に必要な証拠 |
+| --- | --- | --- |
+| Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
+| LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
+| 全 Win32 の L0/L1 | 現在142件。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
+| 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError 等の意図的除外が残る | 再入なしの記録、短い関数への Inline Hook の透過性 |
+| COM の L1 と寿命追跡 | Factory と IID 名識別は実装。共有オブジェクトの通常メソッド追跡は未完成 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
+| 動的 API と既存プロセス Attach | Inline Hook は実装。新規スレッド競合・停止先ロックの制約が残る | 既存プロセスとスレッド生成中の透明性テスト、失敗時の安全な復元 |
+| 子プロセス／スレッド寿命 | PID の同一性検証と thread-exit queue を追加 | 再利用、短命スレッド、ファイバー削除、再 Attach の実機テスト |
+| L2/L3 の意味情報 | ファイル等の手書き対応。全 API の出力・資源意味は未対応 | SAL と手書き意味定義、引数／出力／資源の対応検査 |
+| 公開 Trace、解析、修復 | Writer/Reader/CLI、復旧と不正入力検査を実装 | 形式適合性・破損復旧・Linux/macOS の解析 CI |
+| 比較と再実行可能な Probe | オブジェクト相関と同期ファイル I/O 再生を実装。一般 API、非同期、コールバックは未対応 | Windows Capture → 差分 → Probe 実行の E2E、不足条件を拒否するテスト |
+| 性能と完全性 | ベンチマーク・損失通知を実装 | GUI 3倍／高負荷5倍を同一条件で測定し、未達時は数値と原因を記録 |
+| Windows x86/x64 の検証 | ローカル compile と CI を分離。前回レビュー修正の最新 CI は d8b6e11 | Windows 実行・Application Verifier・ABI・SEH・replay の通過 |
+
+優先順は観測境界と透明性、Windows 実走の失敗解消、Metadata 全体の
+対応拡大、安全な COM Adapter、再生可能範囲の拡大。並行する CI を待つだけで
+開発を止めない。ARM64、値のすり替え、ETW 等は overview で次段階／未決とされた
+項目として別に残し、x86/x64 の未完成をそれらで覆い隠さない。
+
+## Windows 実行の追跡
+
+`d8b6e11` の CI run `43260941181` は Windows x86 が通過。
+Windows Server 2022 は Verifier 有効時に対象が `0xC0000005` で終了。
+保存 Trace は注入用スレッドの ExitThread と HeapSize までで、Verifier XML に
+違反の記録はない。短い関数の後ろまでパッチする危険を独立した回帰テストで
+修正し、次回は WER ミニダンプも保存する。これをクラッシュ解消の証拠とは扱わず、
+新しい CI と例外位置で確認する。
