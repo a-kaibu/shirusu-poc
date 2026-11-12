@@ -6,7 +6,8 @@ shirusu coverage capture.trace --json
 ```
 
 静的依存、Hook 設置、観測、意味情報を別々の証拠として表示する。記録する Agent と
-Host は Bootstrap v10 の同じ版を使う。新しい Agent は旧版の小さい Bootstrap を
+Host は Bootstrap v11 の同じビルドを使う。結果欄は固定 256 スロットで、API を追加しても
+構造体サイズを暗黙に変えない。新しい Agent は旧版の小さい Bootstrap を
 全体コピーする前に version を検査して拒否する。
 
 - 静的依存：現在は起動対象 EXE の通常 import table のみ。source と名前／序数を残す。

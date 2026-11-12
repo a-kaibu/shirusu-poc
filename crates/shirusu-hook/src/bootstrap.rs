@@ -51,8 +51,12 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// DLL が設置したコールバック検出フックの数（0〜4。RegisterClassExW/A /
 /// SetWindowLongPtrW/A）。
 /// v10: bounded per-API IAT and Inline installation evidence.
-pub const BOOTSTRAP_VERSION: u32 = 10;
-pub const HOOK_EVIDENCE_COUNT: usize = crate::api::API_COUNT + 1;
+/// v11: freeze evidence capacity independently of API_COUNT.
+pub const BOOTSTRAP_VERSION: u32 = 11;
+// Fixed protocol capacity: adding an API must not silently enlarge the native
+// structure while keeping the same Bootstrap version.
+pub const HOOK_EVIDENCE_COUNT: usize = 256;
+const _: () = assert!(crate::api::API_COUNT < HOOK_EVIDENCE_COUNT);
 pub const HOOK_REASON_BYTES: usize = 48;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 

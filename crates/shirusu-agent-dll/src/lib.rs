@@ -558,11 +558,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn old_bootstrap_is_rejected_before_reading_new_fields() {
-        let version = 9u32;
-        assert_eq!(
-            super::win::init((&version as *const u32).cast()),
-            STATUS_BAD_BOOTSTRAP
-        );
+        for version in [9u32, 10] {
+            assert_eq!(
+                super::win::init((&version as *const u32).cast()),
+                STATUS_BAD_BOOTSTRAP
+            );
+        }
     }
 
     #[test]
