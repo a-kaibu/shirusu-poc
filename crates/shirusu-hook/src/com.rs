@@ -41,6 +41,8 @@ pub const COM_METHOD_API_ID: u32 = 1000;
 /// 同一 ID の異内容登録を拒否してセッション開始時に失敗する。
 pub const COM_METHOD_ENTER_SCHEMA_ID: u32 = 10_001;
 pub const COM_METHOD_LEAVE_SCHEMA_ID: u32 = 10_002;
+pub const COM_FACTORY_ENTER_SCHEMA_ID: u32 = 10_007;
+pub const COM_FACTORY_LEAVE_SCHEMA_ID: u32 = 10_008;
 /// Factory 呼び出しを COM メソッドイベントとして記録するときの
 /// `method_index`。vtable の実インデックスとは区別する番兵。
 pub const FACTORY_METHOD_INDEX: u32 = u32::MAX;
@@ -521,7 +523,87 @@ pub fn com_method_leave_schema() -> SchemaDef {
 
 /// Host がセッション開始時に登録する COM 用 Schema（enter / leave）。
 pub fn com_schemas() -> Vec<SchemaDef> {
-    vec![com_method_enter_schema(), com_method_leave_schema()]
+    vec![
+        com_method_enter_schema(),
+        com_method_leave_schema(),
+        com_factory_enter_schema(),
+        com_factory_leave_schema(),
+    ]
+}
+
+/// Factory arguments separate GUID contents/scalars from process-local addresses.
+pub struct ComFactoryArgs {
+    pub method: &'static str,
+    pub clsid: Option<Guid>,
+    pub iid: Option<Guid>,
+    pub context: u32,
+    pub outer: u64,
+    pub server_info: u64,
+    pub output_address: u64,
+    pub clsid_address: u64,
+    pub iid_address: u64,
+}
+pub fn com_factory_enter_schema() -> SchemaDef {
+    let fields = [
+        ("clsid", Ty::Bytes, ValueKind::Scalar),
+        ("iid", Ty::Bytes, ValueKind::Scalar),
+        ("context", Ty::U32, ValueKind::Scalar),
+        ("method_name", Ty::Str, ValueKind::Scalar),
+        ("outer", Ty::U64, ValueKind::Handle),
+        ("server_info", Ty::U64, ValueKind::Pointer),
+        ("output_address", Ty::U64, ValueKind::Pointer),
+        ("clsid_address", Ty::U64, ValueKind::Pointer),
+        ("iid_address", Ty::U64, ValueKind::Pointer),
+    ];
+    let mut schema = make_schema(
+        COM_FACTORY_ENTER_SCHEMA_ID,
+        "com!factory/enter",
+        fields
+            .into_iter()
+            .map(|(n, t, k)| (n.into(), t, k.flags() | before()))
+            .collect(),
+    );
+    schema.annotation =
+        "COM factory: GUID contents and context captured; server_info pointee is not expanded"
+            .into();
+    schema
+}
+pub fn com_factory_leave_schema() -> SchemaDef {
+    let mut schema = com_method_leave_schema();
+    schema.schema_id = COM_FACTORY_LEAVE_SCHEMA_ID;
+    schema.name = "com!factory/leave".into();
+    // Schema identity includes its name and fields, not its numeric ID.
+    schema.content_hash = shirusu_trace::schema::schema_content_hash(&schema.name, &schema.fields);
+    schema
+}
+pub fn com_factory_enter_values(args: &ComFactoryArgs) -> Vec<CapturedValue> {
+    use shirusu_trace::schema::ValueCapture;
+    let guid = |g: Option<Guid>| CapturedValue {
+        capture: if g.is_some() {
+            ValueCapture::Captured
+        } else {
+            ValueCapture::Unreadable
+        },
+        value: TypedValue::Bytes(g.map(|g| g.bytes.to_vec()).unwrap_or_default()),
+    };
+    let cv = CapturedValue::captured;
+    vec![
+        guid(args.clsid),
+        guid(args.iid),
+        cv(TypedValue::U32(args.context)),
+        cv(TypedValue::Str(args.method.into())),
+        cv(TypedValue::U64(args.outer)),
+        cv(TypedValue::U64(args.server_info)),
+        cv(TypedValue::U64(args.output_address)),
+        cv(TypedValue::U64(args.clsid_address)),
+        cv(TypedValue::U64(args.iid_address)),
+    ]
+}
+pub fn encode_com_factory_enter(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
+    encode_values(&schema_types(&com_factory_enter_schema()).unwrap(), values)
+}
+pub fn encode_com_factory_leave(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
+    encode_values(&schema_types(&com_factory_leave_schema()).unwrap(), values)
 }
 
 /// enter 値列を作る。`args` は `this` を除く引数の生スロット値列。
@@ -1099,7 +1181,7 @@ mod tests {
         for def in com_schemas() {
             reg.register(def).expect("com schemas must register");
         }
-        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.len(), 4);
         // 再登録は冪等。
         for def in com_schemas() {
             reg.register(def).expect("re-register is idempotent");

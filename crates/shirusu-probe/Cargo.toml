@@ -13,6 +13,7 @@ shirusu-test = { path = "../shirusu-test" }
 shirusu-trace = { path = "../shirusu-trace" }
 
 [dev-dependencies]
+shirusu-hook = { path = "../shirusu-hook" }
 shirusu-conformance = { path = "../shirusu-conformance" }
 shirusu-emit = { path = "../shirusu-emit" }
 

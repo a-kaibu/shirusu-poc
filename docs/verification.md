@@ -247,3 +247,9 @@ IID カタログは Win32 Metadata 71.0.45-preview の全インターフェイ�
 `shirusu capabilities --json` でも明示的に false として返す。
 再生成・検査には metadata-gen の
 `--com-catalog crates/shirusu-trace/src/com_catalog_generated.inc` を付ける。
+
+### COM Factoryの比較回帰検証
+
+`com_factory`統合テストは実際のCapture SchemaからTraceを直列化し、32/64bitとアドレス配置を変えた同一操作が一致することを確かめる。CLSID・実行コンテキストの変化は差分になり、その差分から生成したルールが元のTraceで成功し変更後に失敗する。読めないGUIDは空の識別子として扱わない。ポインタをScalarに戻すmutationでアドレス差の回帰検出力を確認する。
+
+新しいFactory SchemaはCoCreateInstanceとCoGetClassObjectで使用する。旧Schemaの生バイト列は復元できる型情報が不足するため、自動変換しない。COSERVERINFOの参照先は未展開であり、リモート認証設定の同一性までは比較できない。

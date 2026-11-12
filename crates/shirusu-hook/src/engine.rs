@@ -36,7 +36,7 @@ use crate::capture::{self, MemoryReader};
 use crate::com::{
     build_cloned_vtable, interface_by_iid, ComCloneRegistry, Guid, COM_FACTORY_COUNT,
     COM_FACTORY_CO_CREATE_INSTANCE, COM_FACTORY_CO_GET_CLASS_OBJECT, COM_FACTORY_REPORT_ID_BASE,
-    FACTORY_METHOD_INDEX, IID_IUNKNOWN, KNOWN_FACTORIES,
+    IID_IUNKNOWN, KNOWN_FACTORIES,
 };
 use crate::inline::{build_patch, build_trampoline, plan_stolen, StolenPlan};
 use crate::pe;
@@ -1764,31 +1764,30 @@ unsafe extern "system-unwind" fn detour_co_create_instance(
     let orig: CoCreateInstanceFn = unsafe { std::mem::transmute(original) };
     let call_id = rt.alloc_call_id();
     let requested = read_guid(iid as u64);
-    let iid_bytes: Vec<u8> = requested.map(|g| g.bytes.to_vec()).unwrap_or_default();
-    let clsid_bytes: Vec<u8> = read_guid(clsid as u64)
-        .map(|g| g.bytes.to_vec())
-        .unwrap_or_default();
-    let values = crate::com::com_method_enter_values(
-        0,
-        &iid_bytes,
-        FACTORY_METHOD_INDEX,
-        "CoCreateInstance",
-        &crate::com::raw_arg_slots(&[
-            clsid as usize,
-            unk_outer as usize,
-            cls_context as usize,
-            iid as usize,
-            ppv as usize,
-        ]),
-        &clsid_bytes,
-    );
-    if let Ok(bytes) = crate::com::encode_com_enter(&values) {
-        rt.record_com_enter(tid, call_id, &bytes);
+    let values = crate::com::com_factory_enter_values(&crate::com::ComFactoryArgs {
+        method: "CoCreateInstance",
+        clsid: read_guid(clsid as u64),
+        iid: requested,
+        context: cls_context,
+        outer: unk_outer as u64,
+        server_info: 0,
+        output_address: ppv as u64,
+        clsid_address: clsid as u64,
+        iid_address: iid as u64,
+    });
+    if let Ok(bytes) = crate::com::encode_com_factory_enter(&values) {
+        rt.record_com_factory_enter(tid, call_id, &bytes);
     }
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = ComCallGuard::new(&rt, tid, call_id);
+    let mut call_guard = ComCallGuard::new_for(
+        &rt,
+        tid,
+        call_id,
+        crate::com::COM_METHOD_API_ID,
+        crate::com::COM_FACTORY_LEAVE_SCHEMA_ID,
+    );
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
@@ -1808,8 +1807,8 @@ unsafe extern "system-unwind" fn detour_co_create_instance(
         }
     }
     let values = crate::com::com_method_leave_values(hr, returned_object, 0);
-    if let Ok(bytes) = crate::com::encode_com_leave(&values) {
-        rt.record_com_leave(tid, call_id, &bytes);
+    if let Ok(bytes) = crate::com::encode_com_factory_leave(&values) {
+        rt.record_com_factory_leave(tid, call_id, &bytes);
     }
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();
@@ -1844,31 +1843,30 @@ unsafe extern "system-unwind" fn detour_co_get_class_object(
     let orig: CoGetClassObjectFn = unsafe { std::mem::transmute(original) };
     let call_id = rt.alloc_call_id();
     let requested = read_guid(iid as u64);
-    let iid_bytes: Vec<u8> = requested.map(|g| g.bytes.to_vec()).unwrap_or_default();
-    let clsid_bytes: Vec<u8> = read_guid(clsid as u64)
-        .map(|g| g.bytes.to_vec())
-        .unwrap_or_default();
-    let values = crate::com::com_method_enter_values(
-        0,
-        &iid_bytes,
-        FACTORY_METHOD_INDEX,
-        "CoGetClassObject",
-        &crate::com::raw_arg_slots(&[
-            clsid as usize,
-            cls_context as usize,
-            server_info as usize,
-            iid as usize,
-            ppv as usize,
-        ]),
-        &clsid_bytes,
-    );
-    if let Ok(bytes) = crate::com::encode_com_enter(&values) {
-        rt.record_com_enter(tid, call_id, &bytes);
+    let values = crate::com::com_factory_enter_values(&crate::com::ComFactoryArgs {
+        method: "CoGetClassObject",
+        clsid: read_guid(clsid as u64),
+        iid: requested,
+        context: cls_context,
+        outer: 0,
+        server_info: server_info as u64,
+        output_address: ppv as u64,
+        clsid_address: clsid as u64,
+        iid_address: iid as u64,
+    });
+    if let Ok(bytes) = crate::com::encode_com_factory_enter(&values) {
+        rt.record_com_factory_enter(tid, call_id, &bytes);
     }
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = ComCallGuard::new(&rt, tid, call_id);
+    let mut call_guard = ComCallGuard::new_for(
+        &rt,
+        tid,
+        call_id,
+        crate::com::COM_METHOD_API_ID,
+        crate::com::COM_FACTORY_LEAVE_SCHEMA_ID,
+    );
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
@@ -1888,8 +1886,8 @@ unsafe extern "system-unwind" fn detour_co_get_class_object(
         }
     }
     let values = crate::com::com_method_leave_values(hr, returned_object, 0);
-    if let Ok(bytes) = crate::com::encode_com_leave(&values) {
-        rt.record_com_leave(tid, call_id, &bytes);
+    if let Ok(bytes) = crate::com::encode_com_factory_leave(&values) {
+        rt.record_com_factory_leave(tid, call_id, &bytes);
     }
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();

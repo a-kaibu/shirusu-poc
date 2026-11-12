@@ -689,13 +689,13 @@ mod win {
                             let com_enters: Vec<&&TraceEvent> = events
                                 .iter()
                                 .filter(|e| {
-                                    e.schema_id == shirusu_hook::com::COM_METHOD_ENTER_SCHEMA_ID
+                                    e.schema_id == shirusu_hook::com::COM_FACTORY_ENTER_SCHEMA_ID
                                 })
                                 .collect();
                             let com_leaves: Vec<&&TraceEvent> = events
                                 .iter()
                                 .filter(|e| {
-                                    e.schema_id == shirusu_hook::com::COM_METHOD_LEAVE_SCHEMA_ID
+                                    e.schema_id == shirusu_hook::com::COM_FACTORY_LEAVE_SCHEMA_ID
                                 })
                                 .collect();
                             let names: Vec<String> = com_enters

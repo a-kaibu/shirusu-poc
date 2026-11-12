@@ -927,6 +927,41 @@ impl HookRuntime {
         result
     }
 
+    pub fn record_com_factory_enter(
+        &self,
+        thread_id: u64,
+        call_id: u64,
+        payload: &[u8],
+    ) -> RecordResult {
+        let result = self.agent.record_enter(
+            thread_id,
+            COM_METHOD_API_ID,
+            crate::com::COM_FACTORY_ENTER_SCHEMA_ID,
+            call_id,
+            current_parent_call(),
+            payload,
+        );
+        self.signal_if_needed(&result);
+        result
+    }
+    pub fn record_com_factory_leave(
+        &self,
+        thread_id: u64,
+        call_id: u64,
+        payload: &[u8],
+    ) -> RecordResult {
+        let result = self.agent.record_leave(
+            thread_id,
+            COM_METHOD_API_ID,
+            crate::com::COM_FACTORY_LEAVE_SCHEMA_ID,
+            call_id,
+            current_parent_call(),
+            payload,
+        );
+        self.signal_if_needed(&result);
+        result
+    }
+
     /// 中断した COM メソッド呼び出しを記録する（L08・L02）。
     /// `ComCallGuard` の Drop から呼ぶ。
     pub fn record_com_aborted(&self, thread_id: u64, call_id: u64) {

@@ -7,6 +7,9 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[2]
 cases = [
+    ('com_factory_address', 'crates/shirusu-hook/src/com.rs',
+     [('("output_address", Ty::U64, ValueKind::Pointer)', '("output_address", Ty::U64, ValueKind::Scalar)')],
+     'shirusu-probe', 'com_factory', 'relocated_com_factories'),
     ('wide_abi', 'crates/shirusu-hook/src/engine_generated.inc',
      [('unsafe { original() }\n    })\n', '(unsafe { original() }) as u32 as u64\n    })\n')],
      'shirusu-hook', 'generated_abi', 'generated_abi_preserves_wide'),

@@ -949,7 +949,7 @@ mod tests {
         for def in crate::com::com_schemas() {
             reg.register(def).expect("com schemas must register");
         }
-        assert_eq!(reg.len(), 4);
+        assert_eq!(reg.len(), 6);
         // 再登録は冪等。
         for def in winrt_schemas() {
             reg.register(def).expect("re-register is idempotent");

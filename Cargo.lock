@@ -605,6 +605,7 @@ dependencies = [
  "shirusu-compare",
  "shirusu-conformance",
  "shirusu-emit",
+ "shirusu-hook",
  "shirusu-test",
  "shirusu-trace",
 ]

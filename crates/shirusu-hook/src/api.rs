@@ -526,6 +526,8 @@ pub fn is_hook_schema(schema_id: u32) -> bool {
     (schema_id >= 1 && schema_id <= (API_COUNT * 2) as u32)
         || schema_id == crate::com::COM_METHOD_ENTER_SCHEMA_ID
         || schema_id == crate::com::COM_METHOD_LEAVE_SCHEMA_ID
+        || schema_id == crate::com::COM_FACTORY_ENTER_SCHEMA_ID
+        || schema_id == crate::com::COM_FACTORY_LEAVE_SCHEMA_ID
 }
 
 #[cfg(test)]

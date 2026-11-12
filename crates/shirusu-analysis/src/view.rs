@@ -238,7 +238,7 @@ impl EventView {
 
     /// IID identification is descriptive; it says nothing about intercepted methods.
     pub fn com_interface_names(&self) -> Option<&'static [&'static str]> {
-        if self.api_name.as_deref() != Some("com!method") {
+        if !matches!(self.api_name.as_deref(), Some("com!method" | "com!factory")) {
             return None;
         }
         let field = self.field("iid")?;
