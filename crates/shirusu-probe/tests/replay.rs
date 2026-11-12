@@ -203,6 +203,11 @@ fn generated_replay_executes_and_refuses_to_overwrite() {
         "{}",
         String::from_utf8_lossy(&first.stdout)
     );
+    let report =
+        shirusu_test::parse_runner_report_json(std::str::from_utf8(&first.stdout).unwrap())
+            .unwrap();
+    assert!(report.executed && report.all_ok);
+    assert_eq!(report.spec_name, spec.name);
     std::fs::write(dir.join("shirusu-replay-1.bin"), b"keep").unwrap();
     assert!(!run().status.success());
     assert_eq!(
@@ -567,7 +572,9 @@ fn native_runner_pair_does_not_invent_a_difference_between_windows_runs() {
                 }
             }
         }
-        execute_planned(&isolated.name, &plan_steps(&isolated.steps).unwrap())
+        let report = execute_planned(&isolated.name, &plan_steps(&isolated.steps).unwrap());
+        shirusu_test::parse_runner_report_json(&shirusu_test::runner_exec::report_to_json(&report))
+            .unwrap()
     };
     let left = execute("left");
     let right = execute("right");

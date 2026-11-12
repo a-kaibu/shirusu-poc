@@ -24,6 +24,7 @@ pub mod prereq;
 pub mod probe_exe;
 pub mod runner;
 pub mod runner_exec;
+pub mod runner_report;
 pub mod spec;
 pub mod steps;
 
@@ -38,4 +39,5 @@ pub use runner_exec::{
     plan_steps, ArgValue, Expect, ExpectedOutput, ParamKind, RetExpect, RunReportData, Step,
     StepOutcome,
 };
+pub use runner_report::parse_runner_report_json;
 pub use spec::{Rule, TestSpec};
