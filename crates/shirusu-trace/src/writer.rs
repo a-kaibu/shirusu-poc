@@ -475,6 +475,11 @@ impl<W: DurableWrite> TraceWriter<W> {
         for e in &batch.events {
             match e.global_order {
                 Some(g) => {
+                    if g == 0 {
+                        return Err(TraceError::WriterInvariant(
+                            "global_order must be nonzero".into(),
+                        ));
+                    }
                     any_global = true;
                     if let Some(p) = prev_global {
                         if g <= p {

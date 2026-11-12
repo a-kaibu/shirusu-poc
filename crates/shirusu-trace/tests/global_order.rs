@@ -173,3 +173,19 @@ fn writer_roundtrip_preserves_global_order() {
         vec![Some(11), Some(12), Some(20)]
     );
 }
+
+#[test]
+fn writer_rejects_zero_global_order_before_writing_and_can_continue() {
+    let sink = SharedBuf::default();
+    let mut writer = TraceWriter::new(sink.clone(), env(42)).unwrap();
+    let before = sink.bytes();
+    let error = writer
+        .write_batch(&batch(vec![event(1, Some(0))]))
+        .unwrap_err();
+    assert!(error.to_string().contains("global_order must be nonzero"));
+    assert_eq!(sink.bytes(), before);
+    writer.write_batch(&batch(vec![event(1, Some(1))])).unwrap();
+    writer.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace(&sink.bytes()).unwrap();
+    assert_eq!(orders(&trace.batches[0]), vec![Some(1)]);
+}
