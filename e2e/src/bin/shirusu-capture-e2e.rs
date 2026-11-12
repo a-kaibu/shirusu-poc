@@ -611,7 +611,14 @@ mod win {
             };
 
             // 2. Hook あり：終了コードと VERIFY 出力の両方を比較する。
-            let cfg = LaunchConfig::new(session_config(), dll.clone());
+            let mut cfg = LaunchConfig::new(session_config(), dll.clone());
+            // COM activation can burst beyond the production ring before the
+            // first drain. This fixture checks transparency/pairing; pressure
+            // and loss accounting are tested separately with production sizes.
+            cfg.session.ring_config = RingConfig {
+                descriptor_capacity: 32768,
+                payload_capacity: 4 * 1024 * 1024,
+            };
             let cmdline = format!(
                 "\"{}\" --verify-out \"{}\"",
                 target.display(),

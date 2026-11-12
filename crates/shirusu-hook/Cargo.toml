@@ -21,6 +21,9 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 # L01: スレッド停止に ToolHelp（スレッド列挙）と Kernel（CONTEXT）を追加。
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Wdk_Foundation", "Win32_System_IO"] }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 proptest = "1"
 

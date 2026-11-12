@@ -513,7 +513,55 @@ fn resolve_export(module: &str, function: &str) -> Option<usize> {
     let name = std::ffi::CString::new(function).ok()?;
     // SAFETY: handle はロード済みモジュール、name はヌル終端済み。
     let proc = unsafe { GetProcAddress(handle, name.as_ptr() as *const u8) };
-    proc.map(|f| f as usize)
+    follow_import_thunks(proc? as usize)
+}
+
+// kernel32 exports may be six-byte import thunks while CRT/API-set callers
+// address kernelbase directly. Patch their common implementation. Never follow
+// our own published detour (or an allocation-backed relay) on reattachment.
+fn follow_import_thunks(mut address: usize) -> Option<usize> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    let module_at = |address: usize| {
+        let mut module = std::ptr::null_mut();
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                address as *const u16,
+                &mut module,
+            );
+        }
+        module
+    };
+    let agent = module_at(follow_import_thunks as *const () as usize);
+    for _ in 0..8 {
+        let mut bytes = [0u8; 6];
+        if !ProcessMemory.read_exact(address as u64, &mut bytes) || bytes[..2] != [0xff, 0x25] {
+            return Some(address);
+        }
+        let displacement = u32::from_le_bytes(bytes[2..6].try_into().unwrap());
+        #[cfg(target_pointer_width = "64")]
+        let slot = (address as u64)
+            .checked_add(6)?
+            .checked_add_signed(displacement as i32 as i64)?;
+        #[cfg(target_pointer_width = "32")]
+        let slot = displacement as u64;
+        let Some(next) = read_usize(slot).filter(|next| *next != 0) else {
+            return Some(address);
+        };
+        let module = module_at(next);
+        if module.is_null() || module == agent {
+            return Some(address);
+        }
+        if next == address {
+            return None;
+        }
+        address = next;
+    }
+    None
 }
 
 fn is_existing_detour(target: usize, detour: usize, bitness: u32, bytes: &[u8]) -> bool {
@@ -1600,7 +1648,7 @@ unsafe fn call_original<const N: usize>(original: usize, args: &[usize; N]) -> u
 fn generic_detour_with<const N: usize>(
     api_id: u32,
     args: &[u64; N],
-    invoke: impl FnOnce(usize) -> u64,
+    invoke: impl FnOnce(usize) -> u64 + Copy,
 ) -> u64 {
     let (rt, original, tid, api, _flight, mut guard, mut le) = match prepare(api_id) {
         Prepare::Record {
@@ -1637,16 +1685,21 @@ fn generic_detour_with<const N: usize>(
         le.restore_before_original();
         return invoke(original);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す。元の呼び出しの中で
     // アプリ由来の入れ子呼び出しが起きた場合は記録される (A43)。
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = invoke(original);
+    // Tuple field order drops CallGuard before the reentrancy/flight guards.
+    // Option::take in the native finally prevents a second cleanup if Rust
+    // also runs destructors (for example, a Rust panic through C-unwind).
+    let (ret, (mut call_guard, rt, _flight, mut guard)) =
+        crate::seh::invoke(original, invoke, (call_guard, rt, _flight, guard));
     let last_error = le.capture_after_original();
     call_guard.complete();
     // Loader heap operations may have destroyed the TLS vector in the original
@@ -3638,6 +3691,45 @@ mod tests {
         assert_eq!(Arc::strong_count(&rt), references);
         crate::fls::drain_pending_exits();
         assert!(clear_runtime(&rt));
+    }
+
+    #[test]
+    fn seh_releases_detour_state_and_clears_parent_stack() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        extern "C-unwind" {
+            fn shirusu_test_raise_seh() -> u64;
+            fn shirusu_test_catch_seh(
+                invoke: unsafe extern "C-unwind" fn(*mut c_void) -> u64,
+                context: *mut c_void,
+            ) -> u32;
+        }
+        unsafe extern "C-unwind" fn invoke(_: *mut c_void) -> u64 {
+            generic_detour_with(72, &[0, 4, u64::MAX], |_| unsafe {
+                shirusu_test_raise_seh()
+            })
+        }
+        let rt = Arc::new(test_runtime());
+        rt.set_original(72, 1); // callback raises directly; no fabricated pointer is invoked
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let references = Arc::strong_count(&rt);
+        assert_eq!(
+            unsafe { shirusu_test_catch_seh(invoke, std::ptr::null_mut()) },
+            0xe0424242
+        );
+        assert_eq!(rt.in_flight(), 0);
+        assert_eq!(Arc::strong_count(&rt), references);
+        assert_eq!(crate::runtime::current_parent_call(), 0);
+        assert!(!ReentrancyGuard::is_active());
+        assert!(clear_runtime(&rt));
+    }
+
+    #[test]
+    fn kernel32_import_thunks_resolve_to_kernelbase_implementations() {
+        for name in ["CreateFileW", "WriteFile", "CloseHandle"] {
+            let kernel32 = resolve_export("kernel32.dll", name).unwrap();
+            let kernelbase = resolve_export("kernelbase.dll", name).unwrap();
+            assert_eq!(kernel32, kernelbase, "{name}");
+        }
     }
 
     #[test]

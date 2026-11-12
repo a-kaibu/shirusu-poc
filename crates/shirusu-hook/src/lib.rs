@@ -38,6 +38,8 @@ pub mod winrt;
 
 #[cfg(windows)]
 pub mod engine;
+#[cfg(windows)]
+mod seh;
 
 // Windows native tests count allocator activity in the actual suspended interval.
 // No panic/assertion runs until every suspended thread has been resumed.

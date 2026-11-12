@@ -26,7 +26,7 @@ foreach ($side in @("left", "right")) {
     Invoke-Native { cmd /d /c $buildScript } "native replay fixture ($side)"
     Push-Location $dir
     try {
-        & $cli capture --dll $dll --output (Join-Path $work "$side.trace") -- $exe
+        & $cli capture --dll $dll --mode filtered --api CreateFileW --api WriteFile --api ReadFile --api CloseHandle --output (Join-Path $work "$side.trace") -- $exe
         if ($LASTEXITCODE -notin @(0,2)) { throw "capture $side failed: $LASTEXITCODE" }
         $bytes = [System.IO.File]::ReadAllBytes((Join-Path $dir "captured-file.bin"))
         if ($bytes.Length -ne 1 -or $bytes[0] -ne $value) { throw "fixture $side did not finish I/O" }

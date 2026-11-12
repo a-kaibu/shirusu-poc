@@ -127,7 +127,8 @@ try {
             Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter $pattern |
                 Copy-Item -Destination $diagnostics -ErrorAction Continue
         }
-        Get-ChildItem "target/native-exception", "target/native-replay-*" -Recurse -File -ErrorAction SilentlyContinue |
+        Get-ChildItem target -Directory | Where-Object { $_.Name -eq "native-exception" -or $_.Name -like "native-replay-*" } |
+            Get-ChildItem -Recurse -File |
             Where-Object { $_.Extension -in @(".trace", ".json", ".txt") } |
             ForEach-Object { Copy-Item $_.FullName (Join-Path $diagnostics ($_.Directory.Name + "-" + $_.Name)) -ErrorAction Continue }
         if (-not $ciComplete) {
