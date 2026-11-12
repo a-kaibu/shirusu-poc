@@ -803,6 +803,48 @@ Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
   追加コストは無い。L10 の性能測定は API 本体のモデルで行っており、
   Detour のコストは含まない。
 
+## 詳細調査モード（L15）
+
+overview「記録境界とモジュール分類」節に対応する。詳細調査モードでは、
+Windows 内部の呼び出し（`CreateFileW` → `NtCreateFile` など）も記録する。
+
+- 有効化：記録モード `detailed`（`RecordMode::Detailed`）。CLI は
+  `shirusu capture --mode detailed`。`capture_config` には
+  `mode=detailed` と残る。Host は Bootstrap v8 の `detailed_mode` で
+  Agent DLL へ伝える。詳細調査モードでは Runtime 起源の呼び出しも
+  記録するため、CLI は `--record-runtime-apis` を強制的に有効にする。
+- 内部 API の表：ntdll の Nt* 7 件（api_id 79〜85。`NtCreateFile` /
+  `NtOpenFile` / `NtReadFile` / `NtWriteFile` / `NtClose` /
+  `NtQueryInformationFile` / `NtSetInformationFile`）。手書きの厳選表で
+  あり、WinMD の生成対象ではない（Win32 公開 API ではないため）。L1
+  （型付き引数・戻り値のみ。NTSTATUS を返す。Nt* は GetLastError を
+  使わないため leave に `last_error` は無い）。Schema ID は表の順に
+  enter = 2n-1、leave = 2n（157〜170）。設置は Inline Hook のみ
+  （IAT は使わない）。詳細調査モードが無効な場合、Agent DLL は内部
+  API の Inline Hook 自体を設置しない。
+- 親子関係：内部呼び出しは、実際に起きた別の呼び出しとして
+  `parent_call_id` に親（呼び出し元の Win32 API）の call_id を持って
+  保存される。親子関係の記録自体は通常の入れ子呼び出しと同じ仕組み
+  （Detour のスレッドローカルな呼び出しスタック）で、詳細調査モード
+  以外の入れ子呼び出し（A43 / C18）にも同じ `parent_call_id` が付く。
+- 再実行の規則：再実行・Probe 生成では、トップレベルの呼び出し
+  （`parent_call_id == 0` のイベント）だけを実行し、下位呼び出し
+  （`parent_call_id != 0`）を重ねて実行しない。下位呼び出しは親の操作
+  の一部として既に実行されるためである。`shirusu-trace` の
+  `TraceEvent::is_top_level` / `top_level_events` がこの抽出を提供する。
+  親子関係が壊れた Trace（子の親が列に無い等）の扱いは、再実行側の
+  判断に委ねる（ここでは決めない）。
+- Coverage：内部 API は通常モードの Coverage 欠落には数えない
+  （`HookPlan.missing` と Agent DLL の `missing` の両方で除外）。
+  詳細調査モードでの設置数は Bootstrap の
+  `result_internal_hook_count`（0〜7）で別に報告し、Host は
+  `CaptureSummary.internal_hook_count` へ写す。
+- 制限：対象は上記 7 件のファイル系 Nt* のみ。レジストリ・同期・
+  メモリ等の内部呼び出し（`NtCreateKey` 等）は未対象。Nt* の引数は
+  生値のみで、OBJECT_ATTRIBUTES 等の構造体の中身は取得しない。
+  アタッチ前に存在した呼び出しの内部呼び出しは、親の Detour に
+  届かないため記録されない。
+
 ## 静的依存情報（L13）
 
 overview「観測レベル L0〜L4」節に対応する。インポートテーブル等から
@@ -1232,6 +1274,89 @@ Host はセッション開始時にこの 2 Schema を登録する（未登録�
   いないため、その副作用の実測は対象外とする。同じ実装の別オブジェクト
   を並べて vtable ポインタの不変を直接確認する E2E は、まだ無い（将来の
   拡張。verify-com アプリは ShellLink を 1 個しか作らない）。
+
+## コールバック（L16）
+
+overview「記録境界とモジュール分類」節：Windows からアプリへ入る
+コールバック（WndProc など）を、API 呼び出しとは別種のイベントとして
+記録する。コールバック中の API 呼び出しの入れ子記録自体は A43 / C18
+の範囲（呼出スタックによる親子関係）であり、ここはコールバック自体の
+別種イベント化が対象。
+
+- 検出は WndProc のラップで行う。`RegisterClassExW/A`（user32.dll）で
+  登録されるクラスプロシージャと、`SetWindowLongPtrW/A (GWLP_WNDPROC)`
+  で差し替えられるプロシージャを Inline Hook で捕捉し、shirusu の
+  ラッパーへすり替える（4 関数。`CallbackHookDef` 表）。
+  `RegisterClassEx` にはアプリが渡した構造体のコピーを渡す（アプリの
+  構造体自体は書き換えない）。コピー内の `lpfnWndProc`（オフセット 8）
+  だけをラッパーへすり替える。`SetWindowLongPtr` は以前のプロシージャを
+  返すが、以前の値が shirusu のラッパーだった場合は元のプロシージャへ
+  解決して返す（アプリはラッパーの存在を観測しない）。
+- ラッパーはスロット表（`CallbackProcTable`、最大 32 件）で元の
+  プロシージャと 1 対 1 に対応づける。ラッパー関数自体はスロット番号を
+  固定で持ち、ディスパッチ時の引数だけでは判別できない「どの元の
+  プロシージャを呼ぶか」がスロット番号で決まる。同じ元のプロシージャは
+  同じスロットを再利用し（重複登録・二重ラップを防ぐ）、スロットが尽きた
+  場合はラップせず素通しにする（fail-open。アプリの動作は変わらない）。
+- ラッパーはコールバック enter を記録し、呼出スタックへ積んでから元の
+  プロシージャを呼ぶ。コールバック中の API 呼び出しは、このイベントを
+  親（`parent_call_id`）として入れ子に記録される。元のプロシージャが
+  例外で中断したら、ComCallGuard が `CallAborted` を記録する（L08。
+  例外は捕捉しない）。元のプロシージャを呼ばずに失敗値を返す経路は
+  作らない（WndProc が 0 を返すとウィンドウ作成の失敗など、アプリの
+  挙動が変わるため。ランタイムが無い場合も素通しで呼ぶ）。
+- コールバックイベントはトップレベル（`parent_call_id == 0`）であり、
+  L15 の再実行規則（トップレベルの呼び出しだけを実行する）にそのまま
+  従う。
+- Bootstrap は v9 になり、`result_callback_hook_count`（0〜4）が増えた。
+  Host は読み戻して Coverage へ写す（SessionSummary の
+  `callback_hook_count`）。
+
+### コールバックイベントの Schema
+
+コールバックは COM メソッドイベント・WinRT アクティベーションイベントとは
+別の予約 ID で記録する（api_id = 1002、enter Schema = 10021、
+leave Schema = 10022）。Host はセッション開始時にこの 2 Schema を登録する
+（未登録だと Payload が Blob へ逃げる）。
+
+- enter `callback!enter`：`hwnd` (U64, Pointer。メッセージを受け取る
+  ウィンドウ)、`kind` (U32。コールバック種別コード。WndProc = 1)、
+  `message` (U32。WM_* メッセージ番号)、`wparam` (U64。WndProc の
+  wParam の生値)、`lparam` (I64。WndProc の lParam の生値)、`proc`
+  (U64, Pointer。元の WndProc のアドレス。ラッパーではない)。
+- leave `callback!leave`：`result` (I64。WndProc の戻り値 LRESULT)。
+- コールバックの leave も GetLastError の意味条件を持たない（F20 の対象は
+  Win32 API のみ）。Detour は LastError の保存・復元（P1-5）も行い、
+  透明性を保つ。
+- 比較（shirusu-compare）の正規化は未対応：コールバックイベントの
+  `hwnd` / `proc` には実行ごとの生ポインタ値が載るため、別実行の Trace
+  との比較では差分が出る。コールバックイベントの正規化は将来の拡張。
+
+### 制限（L16）
+
+- 検出は WndProc のみ。DialogProc（`DialogBoxIndirectParam` 等）、
+  タイマープロシージャ、列挙コールバックは未対応。`CallbackKind` に
+  種別コードを持たせてあるため、形式を変えずに追加できる。
+- `RegisterClassW/A`（旧式のクラス登録）と `SetWindowLongW/A` は
+  フックしない。`GetWindowLongPtrW/A` もフックしないため、アプリが
+  現在のプロシージャを読み戻すとラッパーのアドレスが見える（その値を
+  そのまま `SetWindowLongPtr` へ渡した場合は再利用して二重ラップしない）。
+- ラップできる WndProc は最大 32 件。超えた分はラップせず、コールバックの
+  記録だけが無い（アプリの動作は変わらない）。
+- アタッチ前に登録されたクラスは、登録時のラップを観測できないため
+  WndProc がラップされない（L02 と同じ）。そのウィンドウへのコールバックは
+  記録されない。
+
+### 検証（L16）
+
+- `shirusu-capture-e2e --verify-apps` の gui アプリで、コールバック検出
+  フックの設置数（SessionSummary の `callback_hook_count`、1 以上）、
+  WM_CREATE（0x0001）・WM_DESTROY（0x0002）のコールバック enter、
+  コールバック enter（2 件以上）と enter/leave の対応、コールバック
+  イベントがトップレベル（`parent_call_id == 0`）であることを確認する。
+  gui アプリはメッセージ専用ウィンドウを作り、WM_CLOSE を送って
+  メッセージループを回す（WM_CREATE は CreateWindowExW の中で、
+  WM_CLOSE / WM_DESTROY はメッセージループの中で届く）。
 
 ## テストベクター
 

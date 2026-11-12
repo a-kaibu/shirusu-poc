@@ -114,6 +114,21 @@ mod win {
         }
     }
 
+    /// コールバックイベントの enter から message (WM_*) を読む。
+    /// フィールド位置は hwnd(0)・kind(1)・message(2)。
+    fn callback_enter_message(
+        trace: &shirusu_trace::reader::ReadTrace,
+        e: &TraceEvent,
+    ) -> Option<u32> {
+        let types = trace.registry.types(e.schema_id)?;
+        let args = e.args.as_ref()?;
+        let values = decode_values(&types, args).ok()?;
+        match &values.get(2)?.value {
+            TypedValue::U32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// COM メソッドイベントの leave から (hresult, returned_object,
     /// refcount) を読む。
     fn com_leave_values(
@@ -163,6 +178,17 @@ mod win {
             // L09: E2E は既定の `full`（間引きなし）。
             record_mode: shirusu_host::trace_convert::RecordMode::Full,
         }
+    }
+
+    /// L15: 詳細調査モード用のセッション設定。`session_config()` と
+    /// 同じ土台で、記録モードだけ `Detailed` にし、Runtime 起源の
+    /// 呼び出しの記録も有効にする（CLI の `--mode detailed` と同じ
+    /// 組み合わせ）。
+    fn detailed_session_config() -> CaptureSessionConfig {
+        let mut cfg = session_config();
+        cfg.record_mode = shirusu_host::trace_convert::RecordMode::Detailed;
+        cfg.record_runtime_apis = true;
+        cfg
     }
 
     pub fn run() -> i32 {
@@ -941,10 +967,233 @@ mod win {
                                 ),
                             );
                         }
+                        // コールバック (L16): gui アプリはメッセージ専用
+                        // ウィンドウを作り、WM_CLOSE を送ってメッセージ
+                        // ループを回す。RegisterClassExW でラップされた
+                        // WndProc が WM_CREATE / WM_CLOSE / WM_DESTROY を
+                        // コールバックイベントとして記録する。検出フックが
+                        // 1 つも設置できていなければ、コールバックの記録は
+                        // そもそも始まらない。
+                        if *app == "gui" {
+                            c.check(
+                                summary.callback_hook_count.unwrap_or(0) >= 1,
+                                &format!(
+                                    "{app} at least 1 callback hook installed (got {:?})",
+                                    summary.callback_hook_count
+                                ),
+                            );
+                            let cb_enters: Vec<&&TraceEvent> = events
+                                .iter()
+                                .filter(|e| {
+                                    e.schema_id == shirusu_hook::callback::CALLBACK_ENTER_SCHEMA_ID
+                                })
+                                .collect();
+                            let cb_leaves: Vec<&&TraceEvent> = events
+                                .iter()
+                                .filter(|e| {
+                                    e.schema_id == shirusu_hook::callback::CALLBACK_LEAVE_SCHEMA_ID
+                                })
+                                .collect();
+                            let messages: Vec<u32> = cb_enters
+                                .iter()
+                                .filter_map(|e| callback_enter_message(&trace, e))
+                                .collect();
+                            // WM_CREATE (0x0001) は CreateWindowExW の中で、
+                            // WM_CLOSE (0x0010) と WM_DESTROY (0x0002) は
+                            // メッセージループの中で届く。
+                            c.check(
+                                messages.iter().any(|m| *m == 0x0001),
+                                &format!("{app} WM_CREATE callback recorded"),
+                            );
+                            c.check(
+                                messages.iter().any(|m| *m == 0x0002),
+                                &format!("{app} WM_DESTROY callback recorded"),
+                            );
+                            c.check(
+                                cb_enters.len() >= 2,
+                                &format!(
+                                    "{app} at least 2 callback enters (got {})",
+                                    cb_enters.len()
+                                ),
+                            );
+                            c.check(
+                                cb_leaves.len() == cb_enters.len(),
+                                &format!(
+                                    "{app} callback enters/leaves pair up ({} enters, {} leaves)",
+                                    cb_enters.len(),
+                                    cb_leaves.len()
+                                ),
+                            );
+                            // コールバックイベントはトップレベル
+                            // （parent_call_id == 0。L15 の再実行規則）。
+                            c.check(
+                                cb_enters.iter().all(|e| e.parent_call_id == 0),
+                                &format!("{app} callback events are top-level"),
+                            );
+                        }
                     }
                     Err(e) => c.check(false, &format!("{app} trace parses ({e})")),
                 },
                 Err(e) => c.check(false, &format!("{app} trace readable ({e})")),
+            }
+            // L15: 詳細調査モード（console アプリのみ）。同じアプリを
+            // `--mode detailed` 相当で記録し直し、Windows 内部の呼び出し
+            // (NtCreateFile / NtClose) が親子関係付きで記録されることを
+            // 検証する。詳細調査モードでも VERIFY 出力は変わらないこと
+            // （Hook の透明性）もあわせて確認する。
+            if *app == "console" {
+                let detailed_out =
+                    std::env::temp_dir().join(format!("shirusu-verify-{app}-detailed-{pid}.txt"));
+                let detailed_trace_path =
+                    std::env::temp_dir().join(format!("shirusu-verify-{app}-detailed-{pid}.trace"));
+                let _ = std::fs::remove_file(&detailed_out);
+                let _ = std::fs::remove_file(&detailed_trace_path);
+                let cfg = LaunchConfig::new(detailed_session_config(), dll.clone());
+                let cmdline = format!(
+                    "\"{}\" --verify-out \"{}\"",
+                    target.display(),
+                    detailed_out.display()
+                );
+                println!("launching (detailed) {cmdline}");
+                match LaunchedCapture::launch(&cmdline, &detailed_trace_path, cfg) {
+                    Ok(capture) => {
+                        match capture.run_to_completion(Duration::from_millis(2)) {
+                            Ok(dsummary) => {
+                                c.check(
+                                    dsummary.internal_hook_count.unwrap_or(0) >= 1,
+                                    &format!(
+                                        "{app} (detailed) at least 1 internal hook installed (got {:?})",
+                                        dsummary.internal_hook_count
+                                    ),
+                                );
+                                let detailed_text =
+                                    std::fs::read_to_string(&detailed_out).unwrap_or_default();
+                                if base_ok && !base_text.is_empty() && !detailed_text.is_empty() {
+                                    let diffs = shirusu_e2e::compare_verify_outputs(
+                                        &base_text,
+                                        &detailed_text,
+                                    );
+                                    for d in &diffs {
+                                        println!("  FAIL: {app} (detailed) verify diff: {d}");
+                                        c.failures
+                                            .push(format!("{app} (detailed) verify diff: {d}"));
+                                    }
+                                }
+                                match std::fs::read(&detailed_trace_path) {
+                                    Ok(bytes) => match shirusu_trace::read_trace(&bytes) {
+                                        Ok(dtrace) => {
+                                            let devents: Vec<&TraceEvent> = dtrace
+                                                .batches
+                                                .iter()
+                                                .flat_map(|b| &b.events)
+                                                .collect();
+                                            // NtCreateFile / NtClose の enter は
+                                            // 親 (CreateFileW / CloseHandle)
+                                            // の call_id を parent_call_id に持つ。
+                                            let mut check_internal =
+                                                |internal: &str, parent: &str, label: &str| {
+                                                    let Some(idef) =
+                                                        shirusu_hook::api::api_by_name(internal)
+                                                    else {
+                                                        c.check(
+                                                            false,
+                                                            &format!(
+                                                        "{app} (detailed) {internal} in hook table"
+                                                    ),
+                                                        );
+                                                        return;
+                                                    };
+                                                    let Some(pdef) =
+                                                        shirusu_hook::api::api_by_name(parent)
+                                                    else {
+                                                        c.check(
+                                                            false,
+                                                            &format!(
+                                                        "{app} (detailed) {parent} in hook table"
+                                                    ),
+                                                        );
+                                                        return;
+                                                    };
+                                                    let enters: Vec<&&TraceEvent> = devents
+                                                        .iter()
+                                                        .filter(|e| {
+                                                            e.api_id == idef.api_id
+                                                                && e.schema_id
+                                                                    == idef.enter_schema_id()
+                                                        })
+                                                        .collect();
+                                                    let leaves: Vec<&&TraceEvent> = devents
+                                                        .iter()
+                                                        .filter(|e| {
+                                                            e.api_id == idef.api_id
+                                                                && e.schema_id
+                                                                    == idef.leave_schema_id()
+                                                        })
+                                                        .collect();
+                                                    c.check(
+                                                    !enters.is_empty(),
+                                                    &format!(
+                                                        "{app} (detailed) {internal} recorded (got {})",
+                                                        enters.len()
+                                                    ),
+                                                );
+                                                    c.check(
+                                                    leaves.len() == enters.len(),
+                                                    &format!(
+                                                        "{app} (detailed) {internal} enters/leaves pair up ({} enters, {} leaves)",
+                                                        enters.len(),
+                                                        leaves.len()
+                                                    ),
+                                                );
+                                                    let with_parent = enters.iter().any(|e| {
+                                                        e.parent_call_id != 0
+                                                            && devents.iter().any(|p| {
+                                                                p.call_id == e.parent_call_id
+                                                                    && p.api_id == pdef.api_id
+                                                            })
+                                                    });
+                                                    c.check(
+                                                    with_parent,
+                                                    &format!(
+                                                        "{app} (detailed) {internal} has a {parent} parent ({label})"
+                                                    ),
+                                                );
+                                                };
+                                            check_internal(
+                                                "NtCreateFile",
+                                                "CreateFileW",
+                                                "CreateFileW -> NtCreateFile",
+                                            );
+                                            check_internal(
+                                                "NtClose",
+                                                "CloseHandle",
+                                                "CloseHandle -> NtClose",
+                                            );
+                                        }
+                                        Err(e) => c.check(
+                                            false,
+                                            &format!("{app} (detailed) trace parses ({e})"),
+                                        ),
+                                    },
+                                    Err(e) => c.check(
+                                        false,
+                                        &format!("{app} (detailed) trace readable ({e})"),
+                                    ),
+                                }
+                            }
+                            Err(e) => {
+                                println!("FAIL: {app} (detailed) run: {e}");
+                                c.failures.push(format!("{app} (detailed) run: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("FAIL: {app} (detailed) launch: {e}");
+                        c.failures.push(format!("{app} (detailed) launch: {e}"));
+                    }
+                }
+                let _ = std::fs::remove_file(&detailed_out);
+                let _ = std::fs::remove_file(&detailed_trace_path);
             }
             let _ = std::fs::remove_file(&base_out);
             let _ = std::fs::remove_file(&hooked_out);

@@ -517,6 +517,11 @@ struct BootstrapResult {
     /// DLL が設置した WinRT アクティベーション関数の Detour の数
     /// (L14)。通常は 2。
     winrt_activations: usize,
+    /// DLL が設置した内部 API (Nt*) の Inline Hook の数 (L15)。
+    /// 詳細調査モードでのみ 0 より大きくなる。通常は 7。
+    internal_hooks: usize,
+    /// DLL が設置したコールバック検出フックの数 (L16)。通常は 4。
+    callback_hooks: usize,
 }
 
 /// Bootstrap の初期化結果を対象メモリから読み戻す。
@@ -538,6 +543,8 @@ fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<Boo
     let unrestored = buf.unrestored_count();
     let com_factories = buf.com_factory_count();
     let winrt_activations = buf.winrt_activation_count();
+    let internal_hooks = buf.internal_hook_count();
+    let callback_hooks = buf.callback_hook_count();
     // 対象 API の総数を超える報告は信用しない（書かれていない
     // 領域の読み違い等を Coverage として採用しない）。上限は表の
     // API 数（API_COUNT）に連動させる。旧値は 64 の固定値で、L03 で
@@ -554,12 +561,22 @@ fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<Boo
     if winrt_activations as usize > shirusu_hook::winrt::WINRT_ACTIVATION_COUNT {
         return None;
     }
+    // L15: 内部 API (Nt*) の設置数は内部 API の数（7）を超えない。
+    if internal_hooks as usize > shirusu_hook::api::INTERNAL_API_COUNT {
+        return None;
+    }
+    // L16: コールバック検出フックの設置数はフック関数の数（4）を超えない。
+    if callback_hooks as usize > shirusu_hook::callback::CALLBACK_HOOK_COUNT {
+        return None;
+    }
     Some(BootstrapResult {
         hooked: hooked as usize,
         missing: missing as usize,
         unrestored: unrestored as usize,
         com_factories: com_factories as usize,
         winrt_activations: winrt_activations as usize,
+        internal_hooks: internal_hooks as usize,
+        callback_hooks: callback_hooks as usize,
     })
 }
 
@@ -608,6 +625,10 @@ struct InjectedTarget {
     /// DLL が Bootstrap へ書き戻した WinRT アクティベーション関数の
     /// 設置数 (L14)。
     winrt_activation_count: Option<usize>,
+    /// DLL が Bootstrap へ書き戻した内部 API (Nt*) の設置数 (L15)。
+    internal_hook_count: Option<usize>,
+    /// DLL が Bootstrap へ書き戻したコールバック検出フックの設置数 (L16)。
+    callback_hook_count: Option<usize>,
     /// Agent 終了エントリのアドレス（解決できた場合）。
     shutdown_addr: Option<usize>,
 }
@@ -675,6 +696,12 @@ fn inject_and_init(
     // L02: 診断用の追加 QueryInterface の可否を Agent DLL へ伝える
     // (Bootstrap v6, bit0)。
     bootstrap.com_options = u32::from(cfg.session.diagnostic_query_interface);
+    // L15: 詳細調査モードを Agent DLL へ伝える (Bootstrap v8)。
+    // `RecordMode::Detailed` のときだけ有効にする。
+    bootstrap.detailed_mode = u32::from(matches!(
+        cfg.session.record_mode,
+        crate::trace_convert::RecordMode::Detailed
+    ));
 
     let dll_path_str = cfg.dll_path.to_string_lossy().into_owned();
     win::remote_load_library(process, &dll_path_str)?;
@@ -745,12 +772,16 @@ fn inject_and_init(
         .map(|result| (result.hooked, result.missing));
     let com_factory_count = outcome.as_ref().map(|result| result.com_factories);
     let winrt_activation_count = outcome.as_ref().map(|result| result.winrt_activations);
+    let internal_hook_count = outcome.as_ref().map(|result| result.internal_hooks);
+    let callback_hook_count = outcome.as_ref().map(|result| result.callback_hooks);
     Ok(InjectedTarget {
         session_cfg,
         rings,
         hook_coverage,
         com_factory_count,
         winrt_activation_count,
+        internal_hook_count,
+        callback_hook_count,
         shutdown_addr,
     })
 }
@@ -799,6 +830,12 @@ fn finalize_session(
     }
     if let Some(count) = injected.winrt_activation_count {
         session.set_winrt_activation_count(count);
+    }
+    if let Some(count) = injected.internal_hook_count {
+        session.set_internal_hook_count(count);
+    }
+    if let Some(count) = injected.callback_hook_count {
+        session.set_callback_hook_count(count);
     }
     session.start()?;
     Ok((session, injected.shutdown_addr))

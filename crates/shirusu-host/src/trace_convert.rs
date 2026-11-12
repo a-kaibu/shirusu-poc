@@ -147,6 +147,15 @@ pub enum RecordMode {
     /// Schema は API によらず残る。Agent 側での間引きはしない
     ///（Host 側で落とす。Agent 側の間引きは将来の最適化）。
     Filtered { apis: BTreeSet<u32> },
+    /// 詳細調査モード（L15、overview「記録境界とモジュール分類」節）。
+    /// `Full` と同じく個別イベントを全て保存するが、Agent 側で
+    /// Windows 内部の呼び出し（Nt*。CreateFileW → NtCreateFile など）
+    /// も記録する（Bootstrap の detailed_mode 経由）。内部呼び出しは
+    /// 親子関係付きの別の呼び出しとして保存される（parent_call_id）。
+    /// 再実行では下位呼び出しを重ねて実行しない（trace-format.md 参照）。
+    /// 詳細調査モードでは Runtime 起源の呼び出しも記録する（CLI が
+    /// `--record-runtime-apis` を強制する）。
+    Detailed,
 }
 
 impl RecordMode {
@@ -157,6 +166,7 @@ impl RecordMode {
         match self {
             RecordMode::Full => "mode=full".to_string(),
             RecordMode::Profile => "mode=profile".to_string(),
+            RecordMode::Detailed => "mode=detailed".to_string(),
             RecordMode::Filtered { .. } => {
                 format!("mode=filtered apis={}", api_names.join(","))
             }
@@ -356,7 +366,8 @@ impl<W: DurableWrite> TraceRecorder<W> {
         // - `Filtered`: 指定 API 以外のイベントをここで落とす（Blob 化
         //   の前に落とすため、不要な Blob は書かれない）。落とした後
         //   空になれば書かない（`write_batch` は空を拒否する）。
-        // - `Full`: 全て保存する。
+        // - `Full` / `Detailed`: 全て保存する。`Detailed` は Agent 側で
+        //   内部呼び出しも記録する点だけが異なり、Host 側の扱いは同じ。
         let kept: Vec<&ReceivedEvent> = match &self.mode {
             RecordMode::Profile => {
                 for event in events {
@@ -368,7 +379,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
                 .iter()
                 .filter(|e| apis.contains(&e.descriptor.api_id))
                 .collect(),
-            RecordMode::Full => events.iter().collect(),
+            RecordMode::Full | RecordMode::Detailed => events.iter().collect(),
         };
         if kept.is_empty() {
             return Ok(stats);

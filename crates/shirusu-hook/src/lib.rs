@@ -23,6 +23,7 @@
 
 pub mod api;
 pub mod bootstrap;
+pub mod callback;
 pub mod caller;
 pub mod capture;
 pub mod com;

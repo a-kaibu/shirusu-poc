@@ -43,7 +43,14 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v7: 末尾に result_winrt_activation_count を追加した (L14)。
 /// DLL が設置した WinRT アクティベーション関数の Detour の数
 /// （0〜2。RoActivateInstance / RoGetActivationFactory）。
-pub const BOOTSTRAP_VERSION: u32 = 7;
+/// v8: 末尾に detailed_mode と result_internal_hook_count を追加した
+/// (L15)。detailed_mode は 0 = 無効（既定。内部 API を記録しない）、
+/// 0 以外 = 有効（詳細調査モード）。result_internal_hook_count は DLL
+/// が設置した内部 API (Nt*) の Inline Hook の数（0〜7）。
+/// v9: 末尾に result_callback_hook_count を追加した (L16)。
+/// DLL が設置したコールバック検出フックの数（0〜4。RegisterClassExW/A /
+/// SetWindowLongPtrW/A）。
+pub const BOOTSTRAP_VERSION: u32 = 9;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -97,6 +104,16 @@ pub struct AgentBootstrap {
     /// 初期化結果 (v7, L14): DLL が設置した WinRT アクティベーション
     /// 関数の Detour の数（0〜2）。Host は読み戻して Coverage へ写す。
     pub result_winrt_activation_count: u32,
+    /// 詳細調査モード (v8, L15): 0 = 無効（既定。内部 API を記録しない）、
+    /// 0 以外 = 有効。Host が `CaptureSessionConfig::record_mode` の
+    /// `Detailed` から設定する。
+    pub detailed_mode: u32,
+    /// 初期化結果 (v8, L15): DLL が設置した内部 API (Nt*) の Inline
+    /// Hook の数（0〜7）。Host は読み戻して Coverage へ写す。
+    pub result_internal_hook_count: u32,
+    /// 初期化結果 (v9, L16): DLL が設置したコールバック検出フックの
+    /// 数（0〜4）。Host は読み戻して Coverage へ写す。
+    pub result_callback_hook_count: u32,
 }
 
 impl Default for AgentBootstrap {
@@ -120,6 +137,9 @@ impl Default for AgentBootstrap {
             com_options: 0,
             result_com_factory_count: 0,
             result_winrt_activation_count: 0,
+            detailed_mode: 0,
+            result_internal_hook_count: 0,
+            result_callback_hook_count: 0,
         }
     }
 }
@@ -239,6 +259,34 @@ impl AgentBootstrap {
     pub fn winrt_activation_count(&self) -> u32 {
         self.result_winrt_activation_count
     }
+    /// DLL 側が内部 API (Nt*) の設置数を書き戻すためのポインタ経由の記録。
+    ///
+    /// # Safety
+    /// [`AgentBootstrap::write_hook_outcome`] と同じ前提。
+    pub unsafe fn write_internal_hook_count(bootstrap: *mut AgentBootstrap, count: u32) {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe {
+            (*bootstrap).result_internal_hook_count = count;
+        }
+    }
+    /// Host 側: 読み戻した内部 API (Nt*) の設置数。
+    pub fn internal_hook_count(&self) -> u32 {
+        self.result_internal_hook_count
+    }
+    /// DLL 側がコールバック検出フックの設置数を書き戻すためのポインタ経由の記録。
+    ///
+    /// # Safety
+    /// [`AgentBootstrap::write_hook_outcome`] と同じ前提。
+    pub unsafe fn write_callback_hook_count(bootstrap: *mut AgentBootstrap, count: u32) {
+        // SAFETY: 呼び出し側の契約に従う。
+        unsafe {
+            (*bootstrap).result_callback_hook_count = count;
+        }
+    }
+    /// Host 側: 読み戻したコールバック検出フックの設置数。
+    pub fn callback_hook_count(&self) -> u32 {
+        self.result_callback_hook_count
+    }
 }
 
 #[cfg(test)]
@@ -281,15 +329,44 @@ mod tests {
         // repr(C) の固定レイアウトであること（プロセス間受け渡しの前提）
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            // フィールド合計 600 (8 バイト整列)。
+            // フィールド合計 616 (8 バイト整列)。
             // v5 で末尾に record_runtime_apis (u32) を追加したため、
             // v4 の 584 から 592 になった。v6 で末尾に com_options (u32)
             // と result_com_factory_count (u32) を追加したため 600。
             // v7 で末尾に result_winrt_activation_count (u32) を追加したが、
             // 8 個目の u32 が v6 の末尾パディング 4 バイト分に収まるため、
-            // サイズは 600 のまま。
-            4 + 4 + 8 * 6 + 8 * (MAX_BOOTSTRAP_RINGS * 2) + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4
+            // サイズは 600 のまま。v8 で末尾に detailed_mode (u32) と
+            // result_internal_hook_count (u32) を追加したため 608。
+            // v9 で末尾に result_callback_hook_count (u32) を追加したため
+            // 612 になるが、8 バイト整列のパディングでサイズは 616。
+            4 + 4
+                + 8 * 6
+                + 8 * (MAX_BOOTSTRAP_RINGS * 2)
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
+                + 4
         );
+    }
+
+    #[test]
+    fn detailed_mode_defaults_to_disabled() {
+        // L15: v8 の detailed_mode は既定 0（無効）で、validate は通る。
+        // 内部フックの設置数も既定 0。
+        let cfg = RingConfig::new(64, 4096);
+        let b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        assert_eq!(b.version, BOOTSTRAP_VERSION);
+        assert_eq!(b.detailed_mode, 0);
+        assert_eq!(b.internal_hook_count(), 0);
+        b.validate().expect("default bootstrap validates");
     }
 
     #[test]
@@ -348,6 +425,20 @@ mod tests {
         let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
         unsafe { AgentBootstrap::write_winrt_activation_count(&mut b, 2) };
         assert_eq!(b.winrt_activation_count(), 2);
+    }
+
+    #[test]
+    fn callback_hook_count_roundtrip() {
+        // L16: v9 の result_callback_hook_count は既定 0 で、
+        // 書き戻しと読み戻しができる。
+        let cfg = RingConfig::new(64, 4096);
+        let b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        assert_eq!(b.version, BOOTSTRAP_VERSION);
+        assert_eq!(b.callback_hook_count(), 0);
+        assert!(b.validate().is_ok());
+        let mut b = AgentBootstrap::new(1, cfg, &[(1, 2)]);
+        unsafe { AgentBootstrap::write_callback_hook_count(&mut b, 4) };
+        assert_eq!(b.callback_hook_count(), 4);
     }
 
     #[test]

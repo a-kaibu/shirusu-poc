@@ -1040,8 +1040,13 @@ mod tests {
     fn last_error_meaning_matches_declaration() {
         // F20: Schema の宣言と実際の取得が一致する。失敗時は生値を
         // Captured、成功時は残留値として Stale（生値は保持）。
+        // L15: 内部 API (Nt*) は last_error フィールドを持たないため
+        // 対象外（意味条件は Never として表に宣言済み）。
         use shirusu_trace::schema::LastErrorMeaning;
         for api in api_table() {
+            if crate::api::is_internal_api(api.api_id) {
+                continue;
+            }
             let declared =
                 LastErrorMeaning::from_flags(api.leave_schema().fields.last().unwrap().flags);
             assert_eq!(declared, api.last_error_meaning, "{}", api.function);

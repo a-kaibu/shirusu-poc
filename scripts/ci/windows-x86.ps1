@@ -27,6 +27,11 @@ Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe
 # i686 Producer で実行する。x64 同士の組み合わせは windows-x64 ジョブの
 # --all に含まれる。
 Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --memory-order-stress } "e2e supervisor --memory-order-stress"
+# L20: Probe exe 生成と JSON Runner の実動（i686）。x86 の Probe exe
+# を生成・実行し、Runner でも同じ仕様を実行する。shirusu-test 本体は
+# x64 でビルドしたものを使う（生成器自体はホストで動くため）。
+Invoke-Native { cargo build -p shirusu-test --target x86_64-pc-windows-msvc } "shirusu-test build (x64, for L20)"
+Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "probe-l20.ps1") -Target i686-pc-windows-msvc } "probe-exe + runner (L20, i686)"
 # A74: i686 (WoW64) での 64bit アトミック操作のコスト測定。32bit
 # 折り返しカウンタへの切替判断はこの実測で行う (bench 内に基準を明記)。
 Invoke-Native { cargo build -p shirusu-e2e --target i686-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (i686)"

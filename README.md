@@ -22,7 +22,7 @@ shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC
 | `crates/shirusu-analysis` | 公開 Trace の解析ビュー（共有基盤）。イベント復号・表示・完全性サマリ・JSON 出力（Phase 4） | なし |
 | `crates/shirusu-cli` | 解析・記録 CLI。inspect / dump / export / repair / capture・attach（Phase 4） | なし |
 | `crates/shirusu-compare` | 正規化つき差分エンジン。非決定値の正規化とオブジェクト相関による Trace 間比較（Phase 4） | なし |
-| `crates/shirusu-test` | shirusu-test 基礎。言語非依存 JSON 仕様による Trace 期待ルールの評価（Phase 4） | なし |
+| `crates/shirusu-test` | shirusu-test 基礎。言語非依存 JSON 仕様による Trace 期待ルールの評価（Phase 4）。JSON Runner と Probe exe 生成（L20）もここ | なし |
 | `crates/shirusu-emit` | 外部レコーダ向けエミッタキット（Phase 5）。shirusu 本体以外の実装（sake 等）が公開 Trace 仕様に適合した Trace を出すための高水準 API：セッション管理、共有 API セットの Schema 登録、sequence / call_id の自動採番、Enter/Leave 対応の保証 | なし |
 | `crates/shirusu-conformance` | 外部生成 Trace の適合性チェッカ（Phase 5）。形式仕様＋compare/test が依存する規約を 10 項目で検査する lib + CLI | なし |
 | `crates/shirusu-probe` | 差分→Probe 最小化（Phase 5）。compare の候補から回帰バンドル（ブリーフ＋shirusu-test ルール＋トリム済み Trace ペア）を生成する lib + CLI。契約は `docs/ippai-integration.md` | なし |
@@ -81,7 +81,7 @@ CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1`
 | Kani (14 harness: Cursor 演算 / 占有量 / Slot 割当 / Snapshot 分割 / Descriptor 解釈 / Payload 範囲 / 損失差分) | **全 14 harness が VERIFICATION SUCCESSFUL、0 failures**（`cargo kani -p shirusu-transport`）。証明の入力範囲は CBMC の実力に合わせて絞った箇所があり、理由と代替カバーは各 harness のコメントに明記 | CI ジョブあり (continue-on-error) |
 | Miri (UB 検査) | **実施済み・UB 検出なし**（transport lib 38 件 + boundary 61 件、純粋演算テスト 1 件のみ解釈コストで除外。開始時に SharedRegion の provenance 違反など 3 種の UB を検出して修正済み——所感参照）。spec_table からは c03/c14/c15/c17 が Miri で通過（約 2 秒）。c01/c08 も小規模で通過（c01 は OPS=200 で 1.86 秒、c08 は OPS=20 で 0.52 秒）。注意: Miri は既定でホストの環境変数を転送しないため、繰り返し回数の指定には `MIRIFLAGS="-Zmiri-env-forward=SHIRUSU_SPEC_TABLE_C01_OPS"` が要る（指定なしでは既定の 100,000 件で回る。D59 の罠だった——所感参照） | CI ジョブなし（nightly 前提、ローカルで回すもの） |
 | cargo-mutants (shirusu-transport 全件) | **実施済み**: 554 件中 caught 431 / missed 75 / unviable 41 / timeout 7。missed のうち 50 件は `#[cfg(kani)]` 証明本体内で cargo test からは原理的に倒せず (Kani が担当)、数件は等価 mutant と判断 (理由を所感に明記)。倒せる中核 mutant はテスト追加で kill 済み (追試で確認) | CI ジョブなし（長時間のためローカルで回すもの） |
-| コードカバレッジ (cargo-llvm-cov) | **測定済み**: 中核モジュールは全て行 96% 以上 (clock/context/crc32c/descriptor/layout/notify/slot は 100%、ring 99.6%、validate 98.9%、snapshot 96.1%)。e2e 除き全体 98.5%。未達行は到達不能な防御分岐・スタブの失敗経路等で、内訳は所感に明記。e2e は supervisor 実行のため本測定では 0% になる (別途 16 シナリオ通過で確認) | CI ジョブなし（ローカルで回すもの） |
+| コードカバレッジ (cargo-llvm-cov) | **測定済み (2026-11-12 17:29)**: `cargo llvm-cov --workspace`（`--tests`、doctest 除外）でワークスペース全体 **行 86.26%（22,900 / 26,549 行）**、関数 85.81%、リージョン 85.34%（16:29 回の行 86.04% から上昇）。中核 transport モジュールは clock/context/crc32c/descriptor/layout/notify/slot/snapshot が行 100%。未達行の内訳：Windows 専用コード（fls・agent-dll・transport-win 等、CI の Windows 実走で閉じるもの）、compare/diff・view の残り数行（normalize.rs 99.1%・diff.rs 99.8%・view.rs 99.7% まで 14:29 回のテスト追加で到達。残りは到達不能な防御コードと閉じ行の帰属のクセ——所感参照）。emitter.rs は 276/278 行、writer.rs は 340/367 行まで 15:29 回のテスト追加で到達（残りは到達不能な None 腕と 256 MiB 超の上限チェック——所感参照）。recorder.rs は 430/443 行（97.07%）まで 16:29 回のテスト追加で到達（残り 8 行は Linux では到達不能——所感参照）。metadata-gen は lib.rs 477/487 行（97.95%）・main.rs 56/56 行（100%）まで 17:29 回のテスト追加で到達（残り 10 行は実 winmd に実例の無い防御コードと winmd 不在時のスキップ腕——所感参照）。e2e は supervisor 実行のため本測定では 0% になる (別途 16 シナリオ通過で確認)。旧行の「e2e 除き全体 98.5%」は Phase 3/4 以前の測定で、今回の全ワークスペース測定と食い違うため訂正した | CI ジョブなし（ローカルで回すもの） |
 | cargo-fuzz 4 targets (10 分ずつ) | **長時間実行済み・クラッシュなし**: validate_control 15,132,063 runs/600s、decode_descriptor 16,332,921 runs/600s、decode_payload 12,909,484 runs/600s、snapshot_fragments (4 本目として追加) 404,754 runs/600s、合計約 4478 万 runs。成長したコーパスは hex 種 79 件に書き戻し済み | CI ジョブあり (continue-on-error、短時間版) |
 | Phase 2: Trace 形式の単体・PBT・回復意味論テスト (shirusu-trace 88 件 + host 変換 9 件) | **通過**（往復・前方参照禁止・チャンク分割・回復意味論は形式仕様の表の各行に対応するケーステスト、手組みバイト列のテストベクター、破壊入力 PBT） | run #6（2026-11-10、全 12 ジョブ成功）で確認 |
 | Phase 2: cargo-fuzz 2 targets (decode_compact / recover_trace) | **実行済み・クラッシュなし**: decode_compact 5,843,310 runs/75s、recover_trace 1,120,017 runs/75s（2026-11-09 ローカル）。test.md の 5 ターゲットが全て揃った | CI ジョブあり (continue-on-error、短時間版) |
@@ -98,8 +98,8 @@ CI と同じ手順は `scripts/ci/` にあります（`linux.sh` / `windows.ps1`
 
 ### テスト総数（ローカル実測）
 
-`cargo test --workspace` で **2151 件**がローカルで通過
-（2026-11-12 02:29 JST に再実行し 2,151 passed / 0 failed を確認。実行ログは goal の hidden_files 参照）。
+`cargo test --workspace` で **2232 件**がローカルで通過
+（2026-11-12 07:29 JST に再実行し 2,232 passed / 0 failed を確認。実行ログは goal の hidden_files 参照）。
 下の内訳は 1773 件時点（2026-11-09 18:17 測定）の分解で、現在の実測（2142 件）とは
 loom 13→18、transport lib 52→54、host lib 21→24、行列 slot 28→29、writer/reader 7→9、
 回復意味論 14→15、invalid_handle_width 新規 7 件、F24 の 2 件（container_compact・recovery 各 +1）、F17 の 3 件（recovery +3）、F23 の 3 件（recovery +3）、H14 の 3 件（cli +3）、F21 の 4 件（durability 新規）、F19 の 4 件（schema 2 + hook api 1 + capture 1）、F20 の 9 件（schema 4 + hook api 1 + capture 1 + emit 1 + compare 1 + view 1）、F22 の 5 件（writer/reader 3 + analysis 1 + cli 1）、G15 の 6 件（hook runtime 5 + engine 1）、F18 の 13 件（blob_schema 4 + writer/reader 3 + recovery 4 + conformance 2）、F25 の 3 件（writer/reader +3）、L12 の 8 件（cli +8）、L11 の 24 件（transport 2 + agent 5 + trace 7 + host 3 + cli 6 + hook 1）、A77 の 10 件（e2e lib の検証ロジック）などの増加分で食い違う。
@@ -1597,6 +1597,158 @@ Bootstrap は v7 になったが、サイズは 600 のままだった。8 個�
 制限は仕様に明記した。表に無いランタイムクラスは `IInspectable` として追跡する（クラス名はアクティベーションイベントに残る）。メソッドが返すインターフェイスは表に載せた 4 メソッドに限る。Windows.winmd からの生成への置き換えは、winmd を入手できる環境ができてからの将来の拡張だ。
 
 分母は 311 のまま、未着手は 6→5 になった。検証済みは 245 のまま。CI 検証は run #8 待ち。テストは 2,142→2,151 件。残る未着手は L15・L16・L18・L19・L20 の 5 件。
+
+### 2026-11-12 03:29 — L15: 「内部呼び出しを記録する」は、表を増やすことではなくモードを増やすことだった
+
+L15 の文言を読むと、やることは「Nt* をフックする」ように見える。だが実装してみると、本質はモードだった。`CreateFileW` → `NtCreateFile` の親子関係は、A43 / C18 の入れ子記録が作ったスレッドローカルの呼び出しスタックに既にあった。`parent_call_id` も Compact Binary も Trace への保存も、既に動いている。足りなかったのは三つだけ。内部 API の定義表と、その Detour と、「詳細調査モードのときだけ記録する」というゲートだ。入れ子の仕組みを新しく作る必要はなかった。L15 は、L01（Inline Hook）＋L23（呼び出し元分類）＋A43（入れ子）の上に、モードという薄い層を載せただけの項目だった。
+
+表の扱いでは、一つだけ判断が必要だった。Nt* を `api_table()` に入れるか、別表に分けるかだ。分ければ Coverage の欠落汚染は起きないが、Schema 登録・名前解決・Detour 割り当て・`originals` 表の大きさが二経路になる。一つの表にして「欠落には数えない」と決めれば、経路は一つで済む。欠落は「そのモードで期待する API のうち設置できなかったもの」という意味にすれば、内部 API を欠落から外すのは自然な定義変更だ。`build_plan` と agent-dll の両方で同じフィルタを書いたのは、その定義を二箇所で守るためだ。片方だけだと、plan の欠落と DLL の欠落が食い違う。
+
+壊れたテストが二つあった。どちらも「全 API の leave は last_error で終わる」という前提で書かれていた。Nt* は GetLastError を使わないため leave は return のみで、前提が崩れた。前提の方が間違っていた。Win32 API については今も正しいが、内部 API には当てはまらない。テストの前提は、表が広がると最初に壊れる場所だ。
+
+Bootstrap は v8 になり、サイズは 600→608 になった。v7 のときは 8 個目の u32 が末尾パディングに収まってサイズが変わらなかったが、今回は 2 個足したのでパディングでは吸収しきれなかった。レイアウトテストの期待値は、フィールド数ではなく実サイズで書いてあるので、608 と書けば通る。
+
+残る罠は一つ、Nt* の引数個数だ。汎用 Detour のトランポリンは API ごとの正しい引数個数の `extern "system" fn` でなければならず、x86 の stdcall では引数個数の違いがスタックの後始末の違いになる。`NtCreateFile` の 11 引数は、公開されているシグネチャ通り（FileHandle / DesiredAccess / ObjectAttributes / IoStatusBlock / AllocationSize / FileAttributes / ShareAccess / CreateDisposition / CreateOptions / EaBuffer / EaLength）だと確認して書いた。記憶で書いた箇所は、L14 の IID と同じく照合なしでは信用できない。Windows での実動確認（`--verify-apps` の詳細調査モード検査）が、個数の正しさの最終確認になる。
+
+分母は 311 のまま、未着手は 5→4 になった。検証済みは 245 のまま。CI 検証は run #8 待ち（L15 の Windows 実動は run #9 以降）。残る未着手は L16・L18・L19・L20 の 4 件。
+
+### 2026-11-12 04:29 — L16: コールバックを「別種のイベント」にするには、WndProc をすり替えるしかない
+
+L16 の文言は「Windows からアプリへ入るコールバックも別種のイベントとして記録する」だ。API 呼び出しのフックでは届かない。コールバックは Windows がアプリの関数を呼ぶ方向で、フックすべき「API 呼び出し」が存在しないからだ。だから WndProc そのものをすり替える。`RegisterClassExW/A` で登録されるクラスプロシージャと、`SetWindowLongPtrW/A (GWLP_WNDPROC)` で差し替えられるプロシージャを Inline Hook で捕捉し、shirusu のラッパーを差し込む。ラッパーが enter/leave を記録してから元のプロシージャを呼ぶ。
+
+すり替えで一番気を使ったのは透明性だ。`RegisterClassEx` にはアプリの構造体そのものではなくコピーを渡す。アプリが渡した構造体を書き換えると、アプリが同じ構造体を使い回したときにラッパーが見えてしまう。`SetWindowLongPtr` の戻り値は、以前のプロシージャがラッパーだった場合は元のプロシージャへ解決して返す。アプリはラッパーの存在を観測しない。`GetWindowLongPtrW/A` はフックしていないため、アプリが現在のプロシージャを読み戻すとラッパーのアドレスが見えるが、その値を `SetWindowLongPtr` へ渡した場合は再利用して二重ラップしない。二重ラップは動くが、1 回のディスパッチで 2 重のコールバックイベントが記録されてしまう。
+
+ラッパーと元のプロシージャの対応づけは、スロット表にした。ラッパー関数は引数だけでは「どの元のプロシージャを呼ぶか」が判別できない。ディスパッチ時の引数（hwnd・msg・wparam・lparam）には、元のプロシージャの情報が無いからだ。だからラッパー関数自体にスロット番号を固定で持たせ、32 件のラッパーをマクロで生成した。COM の vtable 複製と同じ発想だが、こちらは「関数ポインタをすり替える」ための表だ。同じ元のプロシージャは同じスロットを再利用する。スロットが尽きたらラップせず素通しにする。コールバックの記録だけが無く、アプリの動作は変わらない。
+
+WndProc の失敗値には、特に気を使った。元のプロシージャを呼ばずに 0 を返す経路は作らなかった。WndProc が 0 を返すと、WM_NCCREATE / WM_CREATE でのウィンドウ作成の失敗など、アプリの挙動が変わるからだ。ランタイムが無い場合も、スロット表から元のプロシージャを引いて素通しで呼ぶ。記録の都合でアプリを壊してはいけない。
+
+入れ子の仕組みは、作る必要が無かった。コールバック enter を記録して呼出スタックへ積めば、コールバック中の API 呼び出しは A43 / C18 の仕組みで親子として記録される。L15 と同じく、L16 は既存の仕組みの上に薄い層を載せただけの項目だった。コールバックイベントはトップレベル（`parent_call_id == 0`）なので、L15 の再実行規則（トップレベルの呼び出しだけを実行する）にもそのまま従う。
+
+制限は仕様に明記した。検出は WndProc のみで、DialogProc・タイマープロシージャ・列挙コールバックは未対応。`CallbackKind` に種別コードを持たせてあるため、形式を変えずに追加できる。`RegisterClassW/A`・`SetWindowLongW/A`・`GetWindowLongPtrW/A` は未フック。アタッチ前に登録されたクラスはラップされない。
+
+Bootstrap は v9 になり、サイズは 608→616 になった。v8 で 2 個足したときはパディングでは吸収しきれず 608 になったが、今回は 1 個足して 612 になり、8 バイト整列のパディングで 616 になった。レイアウトテストの期待値は、最初 612 と書いて失敗した。フィールド数ではなく実サイズで書く、という L14 での教訓を、また忘れていた。
+
+分母は 311 のまま、未着手は 4→3 になった。検証済みは 245 のまま。CI 検証は run #9 待ち。テストは 2,157→2,169 件。残る未着手は L18・L19・L20 の 3 件。
+
+### 2026-11-12 05:29 — L18: Golden の「期待」は、参照 Trace に通るものだけを集めればいい
+
+L18 の文言は「期待値は Windows で毎回取り直す方式と、保存済み Golden を使う方式の両方に対応する」だ。二つの方式は、実は同じ導出の両端だった。参照 Trace から期待ルールを導出する関数が一つあれば、`fresh` はその場で導出して評価し、`record` は導出結果をファイルに書いて `check` が読む。モードの違いは「導出結果を保存するか」だけで、導出の意味は一つにできた。
+
+導出の鍵は、ルールを「作る」のではなく「選ぶ」ことにした点だ。参照に出た API ごとに `api-called` を出すのは作る側だが、`no-integrity-loss` と `object-closed` は、候補のルールを参照 Trace 自身に `evaluate` で probe し、pass したものだけを採用する。参照に損失があれば `no-integrity-loss` は含めないし、閉じていないオブジェクトがあればその `object-closed` は含めない。こうすれば導出ルールは定義上、参照自身にすべて pass する。Golden が参照と矛盾する、という自己矛盾が起きない。`event-count` だけは導出しなかった。呼び出し回数は実行ごとのタイミングで変わりうるので、Golden の期待としては脆すぎる。回数の期待が要る場合は、保存済み Golden の `rules` に手で追加する。
+
+環境情報は、Golden に付けるものであって Trace 形式を変えるものではない、と線を引いた。`os_version`／`os_build`／`cpu_arch` は参照 Trace の `CaptureEnvironment` から取れる。だが `cpu`／`locale`／`gpu` は Trace 形式が持たない。Host に自動収集を載せる手もあったが、Windows 専用コード（CPUID・ロケール・DXGI）を増やす変更で、ローカルでは検証できない。L18 の範囲は Golden の仕組みなので、ここは記録時のフラグ（`--cpu`／`--locale`／`--gpu`）で補うことにし、Host の自動収集は将来の拡張として明記した。指定が無ければ unknown としてキーを省略する。
+
+環境の照合を fail にしなかったのも、同じ線引きだ。Golden の環境と候補の環境が違えば、同じ期待が当てはまらない可能性がある。その可能性を人間に示すのが目的で、判定そのものはルールに任せる。だから照合の結果は警告（note）どまりで、終了コードには影響しない。`cpu`／`locale`／`gpu` は候補 Trace が持たないため照合すらできず、報告書の環境欄に表示するだけにした。
+
+分母は 311 のまま、未着手は 3→2 になった。検証済みは 245 のまま。CI 検証は run #9 待ち。テストは 2,169→2,182 件。残る未着手は L19・L20 の 2 件。
+
+### 2026-11-12 06:29 — L19: 前提条件の「不足」は、断定できるものだけを報告する
+
+L19 の文言は「初期状態やコールバックなど再実行に必要なものが足りなければ、その不足を報告する」だ。実装前に Trace 形式が何を持っているかを洗い直すと、報告できる不足とできない不足がはっきりした。環境ブロック、Finalization、Loss Record、Reader の回復 issue、モジュール一覧、引数の取得状態、Payload の欠落は、形式が持っているので検査できる。だがコールバックの登録呼び出し（RegisterClassExW / SetWindowLongPtrW）は検出専用フックで記録イベントではなく、モジュール分類はベースアドレスを持たないため、コールバックの proc アドレスを関数・モジュールに結び付ける材料は Trace に存在しない。だからコールバックは「正体不明」として報告し、再実行では UI 操作で呼び出させるか運用者が対応付ける、という線引きにした。
+
+ハンドルも同じ考え方だ。生成 API の戻り値が `CreatedObject` と宣言されているものだけが値で結び付けられる。L1 の生成 API は out 引数の値を記録しないため、L1 で作られたハンドルは、記録開始前から存在したものと区別できない。ここで「初期状態が欠けている」と断定すれば誤報になる。だから種別名は「結び付かないハンドル」にし、詳細に L1 の限界を書いて、判断は生成側に残した。定義済み HKEY 定数（0x80000000〜0x80000006）は生成が不要な定数なので除外した。`Unspecified` の U64 フィールドは推定に頼るため検査しない（レビュー #4 の #7 と同じ理由）。
+
+入力値の欠落はトップレベルの呼び出しだけを検査する。下位呼び出しは親の実行の一部として起きるので、テストが直接用意する入力ではない。L15 の再実行規則（トップレベルの呼び出しだけを実行する）と同じ線引きだ。コールバック enter は DispatchMessage の内側で親を持つため、この検査からは外れ、コールバック専用の検査が受け持つ。
+
+分母は 311 のまま、未着手は 2→1 になった。検証済みは 245 のまま。CI 検証は run #9 待ち。テストは 2,182→2,202 件。残る未着手は L20 の 1 件。
+
+### 2026-11-12 07:29 — L20: Probe の「実行」を、Runner と生成 exe の二か所に書かない
+
+L20 の文言は「Windows の x86・x64 向け Probe exe を生成できる。exe を動かせない互換実装には、JSON 仕様をそのまま解釈する Runner を用意する」だ。仕様（JSON）が正規形式なら、実行の意味論は一か所になければならない。Runner が解釈する仕様と、生成 exe が実行する仕様がずれれば、同じ仕様が環境によって違う振る舞いをする。だから実行の中核（`runner_exec.rs`）は `std` のみにし、Runner はそれを呼び、生成 exe はそのファイル全文を埋め込む形にした。生成 exe の `main.rs` は依存クレートを持たず、`rustc` 1 本でビルドできる。
+
+呼び出し表をフック定義表から流用しなかったのは、フック定義表が記録用の Schema だからだ。`ReadFile` の表には `lpNumberOfBytesRead` や `lpOverlapped` が無く、`DeleteFileW` の `lpFileName` はポインタ値としてしか載っていない。呼び出しには Win32 の署名そのものが要るため、Probe が実行できる 11 API の署名表（`CALL_TABLE`）を手書きの厳選表として別に置いた。載せるのはフック定義表にも載る（＝記録される）API だけに絞った。記録されない API を呼ぶ Probe は、トレーサーの試験にならないからだ。WinMD からの生成は将来の拡張として明記した。
+
+引数の値の形は、文字列リテラルと参照の曖昧さを無くすため、`{"ref": "hFile"}` のオブジェクト形式にした。`"$hFile"` のような文字列形式だと、`$` で始まるファイル名が書けなくなる。バッファの期待値は前方一致にした。読み戻しバッファは指定サイズ全体で、書き込まれた部分だけが意味を持つことが多いため、全体一致では書いた側の意図と合わない。
+
+実装中に本物の欠陥が 1 件出た。`materialize` の即値クロージャが `name` を move してしまい、後続の arms で使えなくなっていた。Linux ではこの関数は `cfg(windows)` のためコンパイルされず、欠陥は見えなかった。生成 exe の gnu ビルド（統合テスト）で初めて発覚した。Windows 専用コードは Linux の `cargo test` では型検査すらされない、という当たり前の落とし穴を、生成物の実ビルドが塞いでいる。
+
+CI には `scripts/ci/probe-l20.ps1` を新設し、x64 ジョブと x86 ジョブの両方から呼ぶ。x64 の Probe exe と Runner、x86 の Probe exe と Runnerを、それぞれのジョブで実行し、書き戻した `"hello shirusu\n"` が両方の JSON 報告に出ることを確かめる。ps1 の構文は手元の VM に pwsh が無いため未検証で、CI が初回検証になる。
+
+分母は 311 のまま、未着手は 1→0 になった。未着手項目は無くなった。検証済みは 245 のまま。CI 検証は run #9 待ち。テストは 2,202→2,232 件。残るのは実装済み未検証 66 件の CI 検証と、push #8（L15＋L16＋L18＋L19＋L20、5 コミット）の kota の承認待ちである。
+
+### 2026-11-12 08:29 — L20 行の書き漏れ：集計は行単位で数え直す
+
+07:29 回は L20 を実装して「未着手 0・実装済み未検証 66」と報告したが、traceability.md の L20 行は状態欄が未着手のままだった。実施メモを項目欄に書いてしまい、項目文（Probe exe 生成と JSON Runner の文言）が消え、状態欄の更新が漏れていた。行単位で数え直すと 245＋65＋1＝311 で、報告と 1 件ずれていた。訂正は、項目文を 06de2a5 時点のものへ復元し、実施メモを実装欄へ移し、状態欄を実装済み未検証にすること。訂正後の数え直しは 245＋66＋0＝311 で報告と一致した。集計の数字は要約文ではなく表の行から数える、という当たり前の手順を、表の列構成が節ごとに違う（A・L 節は 4 列、C〜K・M 節は 3 列）このファイルでは特に守る必要がある。
+
+ps1 の構文確認も今回片付けた。07:29 回は「手元の VM に pwsh が無いため未検証」と書いたが、PowerShell 7.7.0 の Linux 版を ~/workspace/tools/pwsh-7.7.0 に入れて Parser::ParseFile で scripts/ci/*.ps1 5 件を構文検査し、全て通過した。windows.ps1・windows-x86.ps1 から probe-l20.ps1 を呼ぶ配線（-Target x86_64 / i686、i686 側は shirusu-test を x64 でビルド）も確認済み。ただし構文が通ることと Windows 上で動くことは別で、L20 の検証済みへの反転には run #9 の実走が要る。
+
+run #8 の Windows ジョブ失敗の原因は、今回も診断できなかった。gh CLI は未ログインで、GitHub コネクタの MCP ツール一覧には Actions の run・ログを読む道具が無い。ジョブログ本文は kota の GitHub サインイン待ちのままである。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,232 件のまま（再実行で 2,232 passed / 0 failed を確認）。残るのは実装済み未検証 66 件の CI 検証と、push #8 の kota の承認待ちである。
+
+### 2026-11-12 12:29 — カバレッジ初測定と run #8 診断の前進
+
+カバレッジは「テストが足りない」と言われ続けてきたが、数えたことがなかった。`cargo llvm-cov --workspace` を初めて回した。全体は行 83.24%（21,692/26,060）、関数 82.6%、リージョン 82.62%（doctest は含まない。llvm-cov は `cargo test --tests`）。関数数の「未カバー」はバイナリごとの単相化で水増しされるので、行で見るのが正しい。compact.rs は関数 58% に見えたが、decode_compact 等は container_compact テストで実行済みで、行は 94.25% ある。
+
+本当に薄いのは 3 か所だった。metadata-gen の main.rs は行 0%（バイナリ全体がテストから一度も起動されていない）、trace の error.rs は行 24%（Display・From・source() が一度も実行されていない）、hook の fls.rs は行 25%（Windows 専用）。error.rs の 3 つの Display と source()・From 3 件、inline.rs の build_patch（jump_bytes の別名だが engine.rs が使う公開入口）と InlineRefusal::reason() にテスト 7 件を追加し、再計測で error.rs は行 98.71%・関数/リージョン 100% になった。テストは 2,232→2,239 件。metadata-gen の main.rs は、バイナリ起動のテストを書くところまで今回は届かなかった。次回の候補である。
+
+run #8 の診断も進んだ。Jobs API が初めて未認証で通り、落ちたのは 3 Windows ジョブとも step 6（windows.ps1 本体）のみで、所要 52 秒 / 41 秒 / 95 秒だった。アノテーションは "Process completed with exit code 1" だけで、ジョブログ本文は 403（admin 権限が必要）で kota のサインイン待ちのまま。ただしローカルで Windows ターゲットのテストビルドを通した。`cargo test --workspace --target x86_64-pc-windows-gnu --no-run` が 98 バイナリ・0 エラーで通過した（mingw に無い libcombase.a は 7 シンボルの .def から dlltool で生成した。msvc 向けは rust-lld で DLL import までは解決したが、MSVC CRT の起動/例外シンボルが mingw に無く断念）。repo 内に `target_env = "msvc"` のコードは無いので、gnu でのビルドは Windows ビルドフェーズの実質的な再現になる。よって run #8 の失敗はコンパイル/リンクではなく `cargo test` 実行時のテスト失敗である可能性が高い。正確な失敗テストはジョブログ待ちである。
+
+なお README の検証表「コードカバレッジ」行の「e2e 除き全体 98.5%」は Phase 3/4 以前の測定で、今回の全ワークスペース測定（83.24%）と食い違う。中核モジュール（transport の context/crc32c/descriptor/layout/notify/slot は行 100%、ring 98.4%、validate 96.1%）は今も 96% 以上だが、全体の数字は見直しが必要である。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,232→2,239 件（全て通過）。残るのは実装済み未検証 66 件の CI 検証と、push #8（7 コミット）の kota の承認待ちである。
+
+### 2026-11-12 13:29 — カバレッジ gap のテスト追加：main.rs と runtime.rs
+
+12:29 回の持ち越しで、カバレッジが薄かった 2 ファイルにテストを追加した。metadata-gen の main.rs はバイナリ起動のテストが無く行 0%だったため、`crates/shirusu-metadata-gen/tests/cli.rs` に統合テスト 8 件を追加した（`--check` の通過・欠落・内容不一致・生成物の一致・未知フラグ・値欠落・winmd 欠落・設定欠落）。hook の runtime.rs はビルダ・取得子と WinRT / COM 中断の記録経路に 12 件を追加した。main.rs は行 0%→92.4%、runtime.rs は行 86.7%→97.1% になった。テストは 2,239→2,259 件（全て通過）。
+
+バイナリ起動テストで 1 つ罠があった。`env!("CARGO_BIN_EXE_win32_metadata_gen")` はこのパッケージではコンパイル時に設定されない。bin 専用の shirusu-cli では通るのに、lib＋bin の両方を持つ metadata-gen では設定されない（実行時の環境変数も未設定だった）。`current_exe()` からテストバイナリと同じ `<target-dir>/debug/` 直下のバイナリを引くようにしたら解決した。副次的な発見として、llvm-cov 実行時はこの解決で計測対象のバイナリが子プロセスとして走るため、子プロセスの profraw がマージされて main.rs のカバレッジが付く。フォールバックで `target/debug/` の非計測バイナリを掴むと、テストは通ってもカバレッジは 0% のままになる。テストが通ることと計測されることは別だ。
+
+runtime.rs のテスト追加で、公開 API の `record_com_aborted` に呼び出し元が 1 件も無いことが分かった。`ComCallGuard` の Drop は `record_aborted_for` を直接呼んでおり、`record_com_aborted` は誰も使っていない。今回はテストで固定したが、残すか削るかは未判断である（COM 経路の公開 API として残す意味はあるが、死んだ公開関数は仕様の読み手を惑わす）。
+
+カバレッジの読み方も 1 つ学んだ。残った未実行行の多くは `}` や `);` だけの行で、実行されている構文の閉じ括弧にカウンタが付かない llvm-cov の帰属の癖である。`record_winrt_activation_enter` のようにテストで Ring の中身まで確認している関数でも、閉じ括弧の行だけ 0% に見える。未実行行の一覧は、振る舞いが検証されているかを確かめてから gap と呼ぶべきだ。逆に本物の gap は `Ok(_) =>` の内容不一致の分岐のように、一覧の中で分岐そのものが欠けているものだけだ。
+
+README の検証表「コードカバレッジ」行の「e2e 除き全体 98.5%」は Phase 3/4 以前の測定で、12:29 回の全ワークスペース測定（行 83.24%）と食い違っていたため、今回の測定値に訂正した。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,239→2,259 件（全て通過）。残るのは実装済み未検証 66 件の CI 検証と、push #8（8 コミット）の kota の承認待ちである。
+
+### 2026-11-12 14:29 — カバレッジ gap のテスト追加：compare / analysis
+
+12:29 回の持ち越しの第2弾で、compare（normalize.rs・diff.rs）と analysis（view.rs）の未実行行にテスト 41 件を追加した。normalize.rs は行 67.7%→99.1%、diff.rs は行 77.0%→99.8%、view.rs は行 72.7%→99.7% になった（2 クレート合計では行 77.06%→98.68%。計測は `-p shirusu-compare -p shirusu-analysis` の範囲で、他クレートのテストが駆動する分を含む全ワークスペース計測とは数字が違う）。テストは 2,259→2,300 件（全て通過）。
+
+追加したのは、統合テスト `crates/shirusu-compare/tests/coverage_gaps.rs`（21 件）と `crates/shirusu-analysis/tests/view.rs` の追記（8 件）、および両クレートの単体テスト（diff.rs 4 件、view.rs 8 件）である。内容は、正規化の `describe()` 全バリアント、`norm_value` の Ptr32/Ptr64・I64・Bool・F32/F64・Str・BlobRef・U64 Pointer 各アーム、Other 相・Completed の代替経路・二重 Enter・未登録スキーマ・Inline/Blob/Dropped の Payload 各アーム、差分の左のみ生成・対向オブジェクトへの追加操作・Capture 相違・フィールド欠落（両方向）・Payload 相違・完全性の相違（未 Finalization・Medium 重要度・落ちた Payload・欠落 Blob）、`align_greedy` の巨大入力経路、表示側の名前関数・整形関数・JSON 化の全バリアント、回復 issue 全 13 種の整形である。
+
+書いていて分かったことが 3 つある。1 つ目は、Writer は未追加 Blob への参照を書けない（`validate_batch` が拒否する）ため、未知 Blob のテストは読取後に `ReadTrace` の `payload` を差し替えるしかないこと。欠落 Blob は Reader の回復意味論で実際に生える状態なので、差し替えは正当な入力の再現である。2 つ目は、`schema_content_hash` が公開されているため、未知の型タグ（99）を持つスキーマ定義を正規のハッシュ付きで作れ、`decode_fields` の「型一覧が引けない」分岐（`has unknown types`）を駆動できたこと。3 つ目は、残った未実行行はほぼ「到達不能な防御コード」か「閉じ行の帰属のクセ」であること。`field{i}` のフォールバックは types と fields が常に同長のため到達せず、`Phase::Completed/Other => unreachable!()` は上位の早期 continue があるため到達せず、pending に enter 無しの呼び出しが残る分岐も Leave/Aborted が同イテレーションで pending を外すため到達しない。diff.rs の 277・366 行目、view.rs の 423 行目、normalize.rs の 208 行目（今回は解消）は、実行されている構文の閉じ括弧にカウンタが付かない llvm-cov の帰属の癖で、分岐そのものは既存テストで通っている。未実行行の一覧は、振る舞いが検証されているかを確かめてから gap と呼ぶべきだ（13:29 回の所感と同じ結論）。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,259→2,300 件（全て通過。`cargo test --workspace` で 2,300 passed / 0 failed、fmt・clippy・Windows x64/i686 check・MSRV 1.87 check 通過）。残るのは実装済み未検証 66 件の CI 検証と、push #8（10 コミット）の kota の承認待ちである。
+
+### 2026-11-12 15:29 — カバレッジ gap のテスト追加：emit / trace writer
+
+14:29 回の持ち越しの第3弾で、emitter.rs と writer.rs の未実行行にテスト 41 件を追加した。emitter.rs は行 241/278→276/278、writer.rs は行 307/367→340/367 になった（計測は `-p shirusu-emit -p shirusu-trace` の範囲。全ワークスペース計測でも同じ数字で、他クレートのテストはこの 2 ファイルを駆動しない）。テストは 2,300→2,341 件（全て通過）。全ワークスペースの行カバレッジは 85.56%→85.86%（22,716→22,796 / 26,549 行）。
+
+追加したのは、統合テスト `crates/shirusu-emit/tests/coverage_gaps.rs`（20 件）と `crates/shirusu-trace/tests/writer_coverage_gaps.rs`（21 件）である。内容は、EmitError の Display 全 7 バリアントと From 変換 2 件、getter 類、`end_call` の未知 api_id・誤った leave 値列・`abandon_call` の未知スレッド／未知呼び出し、Loss Record の往復、flush の早期 return、Inline Payload の往復、フィールド無し API（`encode_args` の None 分岐）、書き込み失敗時の `?` 伝播（FailingWriter で注入。256 件の自動 flush、Blob の flush、finish の flush／書き込みの各腕）、および Writer 側の `DurableWrite::sync_all` 各実装（`Vec<u8>`・`Cursor`・`BufWriter`）と `SyncOnFinish`／`SyncPerBlock` の経路、Schema 登録の拒否（id 0・再定義）、Checkpoint の両腕、Blob 更新のオーバーフロー、Blob Chunk の分割腕と各 `write_block` の `?` エラー腕、`estimate_event_len` の一致である。
+
+書いていて分かったことが 3 つある。1 つ目は、`add_payload` は 512 KiB までバッファするため、Blob 経路の失敗注入には `chunk_raw_target` を小さくした `with_options` が要ること（2 KiB の Blob で `flush_blobs` が走る）。2 つ目は、`write_block` は 1 Block あたり `write_all` を 2 回呼ぶため、狙った `?` を踏むには構築時の 4 回（Header・Environment 各 2 回）を含めて書き込み回数を数える必要があること（最初は 2 回と数え間違えて 2 件落とした）。3 つ目は、残った未実行行は「到達不能」と「実測不能」に分かれること。emitter.rs の 267 行目（`register_schema` の `?`）は `ApiSet` から重複 Schema ID を作れないため到達せず、462 行目（`finish` の `if let Some` の None 腕）は `thread_ids` が `threads` のキー由来で常に Some のため到達しない。writer.rs の 263・380 行目は同じく None 腕（`registry.ids()` は存在する id しか返さない、空 Batch は `validate_batch` で拒否される）。585 行目（raw_len 上限）は 1 Block で 256 MiB 超のペイロードが必要で単体テストの割に合わず、592 行目（stored_len 上限）は到達不能——stored は raw 以下で、stored > 512 MiB なら raw > 512 MiB > 256 MiB で先に 585 行目が発火する。`matches!` の偽腕（api_set.rs の 426・431 行目）はアサーションが通る限り覆らない、という 14:29 回と同じ帰属の癖も確認した。
+
+罠も一つあった。`expect_err` は `T: Debug` を要求するため、`Emitter`／`TraceWriter` の構築失敗は `match` で受ける必要がある（コンパイルエラーで発覚）。また clippy 1.99 は `io::Error::new(ErrorKind::Other, _)` を `Error::other` へ、`i as u64`（`i` が既に u64）を不要キャストとして指摘する——テストコードも clippy clean を保つこと。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,300→2,341 件（全て通過。`cargo test --workspace` で 2,341 passed / 0 failed、fmt・clippy・Windows x64/i686 check・MSRV 1.87 check 通過）。残るのは実装済み未検証 66 件の CI 検証と、push #8（11 コミット）の kota の承認待ちである。次回のカバレッジ候補は host recorder.rs（76 行）・metadata-gen lib.rs（86 行）・CLI バイナリ群（14:29 回の持ち越し）。
+
+### 2026-11-12 16:29 — カバレッジ gap のテスト追加：host recorder
+
+15:29 回の持ち越しの第4弾で、recorder.rs の未実行行にテスト 11 件を追加した（`crates/shirusu-host/tests/recorder_coverage_gaps.rs`）。recorder.rs は行 384/443→430/443（86.68%→97.07%）になった。テストは 2,341→2,352 件（全て通過）。全ワークスペースの行カバレッジは 85.86%→86.04%（22,796→22,842 / 26,549 行）。
+
+内容は、`SessionError` の Display（Linux で構築できる全 5 バリアント）と `From<io::Error>`／`From<TraceError>`、`SessionState::name` の全 4 バリアント、`shutdown_integrity_impact` の全 7 バリアント、各種 setter（hook／COM／WinRT／内部 API／コールバックの設置数、`coverage_missing_calls`、注入不可の子）と getter（`trace_path`／`ring_count`）の要約への反映、`add_borrowed_ring` の小さすぎる Mapping 拒否、`/dev/full` による `create_file` の Writer 構築失敗、世代交代時の旧 Worker 確定（Enter のみ残して Control を新世代で再初期化→次 poll で Loss 1 件）である。世代交代テストは `layout::init_control` で直接再初期化する——Agent の SlotPool 経由では世代を進められないため、Control の公開点（Magic の Release 書き込み）を直接使うのが筋である。
+
+数え方で 1 つ訂正がある。15:29 回の「recorder.rs 76 行」は、`has_count=false` のセグメント（実行行でない閉じ括弧等）まで未実行に数えたもので、真の未実行は 53 行だった。llvm-cov JSON の segments は `[line, col, count, has_count, ...]` で、`has_count=false` の行はカウンタ自体が付いていない（閉じ括弧の帰属の癖と同じ話）。未実行行の一覧は `has_count=true` かつ count 0 のものだけを拾うのが正しい。同じ罠は metadata-gen lib.rs の「86 行」にも当てはまる可能性があるため、次回は数え直してから着手する。
+
+残った 8 行はすべて Linux では到達不能で、テストファイルのヘッダーコメントに理由を記録した。`retire_ring_worker` の worker なし早期 return は `poll_once` が `is_some` のときだけ呼ぶため、`poll_once` の retire 失敗 `?` は `CaptureSession` が `W = File` に固定で Writer 失敗を注入できないため、`space_notify` の `Some` 腕は `Some` を渡せるのが cfg(windows) の `add_shared_mapping` だけのため、`stop` の `InvalidTransition` 腕は `stop` が `self` を消費して入口が常に Created／Recording のため。`create_file` の `?` 伝播行（451 行目相当）は `/dev/full` テストで覆えた——`TraceWriter::with_options` は構築時に Header／Environment を書くため、ENOSPC がそのまま `SessionError::Trace` になる。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,341→2,352 件（全て通過。`cargo test --workspace` で 2,352 passed / 0 failed、fmt・clippy・Windows x64/i686 check・MSRV 1.87 check 通過）。残るのは実装済み未検証 66 件の CI 検証と、push #8（12 コミット）の kota の承認待ちである。次回のカバレッジ候補は metadata-gen lib.rs（数え直し要）・CLI バイナリ群（compare／probe／test bin）・hook runtime.rs の残り（Windows 専用が大半）。
+
+### 2026-11-12 17:29 — カバレッジ gap のテスト追加：metadata-gen
+
+16:29 回の持ち越しの第5弾で、metadata-gen の未実行行にテスト 25 件を追加した（新規 `crates/shirusu-metadata-gen/tests/metadata_gen_coverage_gaps.rs` 18 件、`tests/cli.rs` に 7 件）。lib.rs は行 456/487→477/487（93.63%→97.95%）、main.rs は行 56/56（100%）になった。テストは 2,352→2,377 件（全て通過）。全ワークスペースの行カバレッジは 86.04%→86.26%（22,842→22,900 / 26,549 行）。
+
+内容は、`load_config` の max_params 既定値（12）と TOML 解析失敗、`generate` の空リスト・重複・Apis クラス無し・関数無し・重載・DLL 不一致・last_error 不正、map_api のスキップ腕（VARARG の WdsCliLog、呼出規約 C の ldap_openW、エクスポート名不一致の RtlGenRandom、引数上限の CreateProcessW、POINT 値渡しの WindowFromPoint、F32 戻りの D2D1ComputeMaximumScaleFactor）、`map_type` の ArrayRef／AttributeEnum／ジェネリック名前付き型、`rust_str` の `"` と `\` のエスケープである。CLI 側は `--config`／`--out-dir` の値欠落、`SHIRUSU_WINMD` 環境変数と既定パスの winmd 解決、生成誤り（対象 API 0 件）、api／engine の書き込み失敗（engine 側は同名ディレクトリを置いて api 成功・engine 失敗を作る）を覆った。
+
+実例の選定は、実 winmd の 18,364 件の Apis メソッドを一時プローブで走査して決めた（プローブは削除し、結果だけテストファイルのヘッダーに記録）。重載 45 件・VARARG 56 件・非 system 呼出規約 1,374 件・エクスポート名不一致 4 件が実在する。一方、ICU の float 戻り API は全て cc=C のため戻り値の写像失敗（329 行目）には届かず、cc=system で引数がポインタのみの D2D1ComputeMaximumScaleFactor（戻り値 F32）を選んだ。SetFilePointerEx のスキップ理由は「値渡し構造体」ではなく「2 スロット」である——LARGE_INTEGER は winmd 上は 1 フィールド構造体として I64 に写るため、シードテストのコメントは大枠正しいが理由の分類としては 2 スロット側である。
+
+罠が 1 つあった。重複テストは「重複検査は各反復の map_api より先」と思い空の index で書いたが、1 件目の map_api が先に走るため空の index では重複に届かず「Apis クラスが無い」で失敗した。検査が先なのは反復の中での話で、前の反復の map_api は既に終わっている。実 winmd を使うよう直して通った。
+
+残った 10 行はすべて実 winmd に実例が無く、到達不能としてテストファイルのヘッダーに理由を記録した。HASTHIS は Apis メソッドに 0 件、ImplMap 無しも 0 件、引数名と引数型の個数不一致に実例は無く、enum は全て value__ を持つ整数基底型で、COM／クラス／インターフェイス型が値渡しで現れることは無く、winmd 不在時のスキップ腕は CI では fetch-winmd.sh が先に取得するため通常は通らない。
+
+分母は 311 のまま、未着手は 0 のまま。検証済みは 245 のまま。テストは 2,352→2,377 件（全て通過。`cargo test --workspace` で 2,377 passed / 0 failed、fmt・clippy・Windows x64/i686 check・MSRV 1.87 check 通過）。残るのは実装済み未検証 66 件の CI 検証と、push #8（13 コミット）の kota の承認待ちである。次回のカバレッジ候補は CLI バイナリ群（compare／probe／test bin）・hook runtime.rs の残り（Windows 専用が大半）。
 
 ## ライセンス
 

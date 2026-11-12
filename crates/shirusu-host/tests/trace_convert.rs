@@ -409,6 +409,43 @@ fn filtered_mode_keeps_only_listed_apis() {
     assert_eq!(kept, vec![1, 3]);
 }
 
+/// L15: `detailed` は `full` と同じく全イベントを保存する（内部 API
+/// のイベントも落とさない）。親子関係（parent_call_id）も Trace に
+/// 残る。config_text は `mode=detailed`。
+#[test]
+fn detailed_mode_keeps_all_events_including_internal_calls() {
+    use shirusu_host::trace_convert::RecordMode;
+    let mut rec = TraceRecorder::from_environment(Vec::new(), environment()).unwrap();
+    rec.set_record_mode(RecordMode::Detailed);
+    assert_eq!(RecordMode::Detailed.config_text(&[]), "mode=detailed");
+    // CreateFileW (api 1) の enter と、その内側の NtCreateFile (api 79)
+    // の enter。NtCreateFile は親の call_id を parent_call_id に持つ。
+    let mut outer = received_call(1, EventKind::CallEnter, 1, 1000, 1001);
+    outer.descriptor.parent_call_id = 0;
+    let mut inner = received_call(2, EventKind::CallEnter, 79, 1010, 1002);
+    inner.descriptor.parent_call_id = 1001;
+    let mut inner_leave = received_call(3, EventKind::CallLeave, 79, 1020, 1002);
+    inner_leave.descriptor.parent_call_id = 1001;
+    let mut outer_leave = received_call(4, EventKind::CallLeave, 1, 1030, 1001);
+    outer_leave.descriptor.parent_call_id = 0;
+    rec.record_batch(&ctx(3), &[outer, inner, inner_leave, outer_leave])
+        .unwrap();
+    let bytes = rec.finish(&IntegrityReport::default()).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.issues.is_empty(), "issues: {:?}", trace.issues);
+    let events: Vec<&shirusu_trace::model::TraceEvent> =
+        trace.batches.iter().flat_map(|b| b.events.iter()).collect();
+    assert_eq!(events.len(), 4);
+    let kept: Vec<u32> = events.iter().map(|e| e.api_id).collect();
+    assert_eq!(kept, vec![1, 79, 79, 1]);
+    // 内部呼び出しの親子関係が残る。
+    assert_eq!(events[1].parent_call_id, 1001);
+    assert_eq!(events[1].call_id, 1002);
+    assert_eq!(events[2].parent_call_id, 1001);
+    assert_eq!(events[0].parent_call_id, 0);
+    assert_eq!(events[3].parent_call_id, 0);
+}
+
 /// L09: `profile` は個別イベントを保存せず、API ごとに呼び出し回数・
 /// 分布・所要時間を集計して ProfileSummary Block として書く。enter /
 /// leave の対応付けは (thread, call_id) で行い、Batch をまたいでも

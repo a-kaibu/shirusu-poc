@@ -48,8 +48,11 @@ pub fn build_plan(sites: &[ImportSite]) -> HookPlan {
         });
     }
     let hooked: std::collections::HashSet<u32> = entries.iter().map(|e| e.api.api_id).collect();
+    // L15: 内部 API (Nt*) は詳細調査モードでのみ設置するため、通常の
+    // Coverage 欠落には数えない（詳細調査モードでの設置数は Bootstrap の
+    // result_internal_hook_count で別に報告する）。
     let missing = api_table()
-        .filter(|a| !hooked.contains(&a.api_id))
+        .filter(|a| !crate::api::is_internal_api(a.api_id) && !hooked.contains(&a.api_id))
         .collect();
     HookPlan { entries, missing }
 }
@@ -151,13 +154,17 @@ mod tests {
         assert_eq!(got, vec![API_CREATE_FILE_W, API_READ_FILE, API_WRITE_FILE]);
         // CloseHandle と完了観測の 2 API はこのモジュール経由で
         // フックできない = Coverage 欠落（生成 API 72 件も同様に欠落）。
-        assert_eq!(plan.missing.len(), API_COUNT - 3);
+        // L15: 内部 API 7 件は欠落に数えないため分母から除く。
+        assert_eq!(plan.missing.len(), API_COUNT - INTERNAL_API_COUNT - 3);
         let missing_ids: Vec<u32> = plan.missing.iter().map(|a| a.api_id).collect();
         assert!(missing_ids.contains(&API_CLOSE_HANDLE));
         assert!(missing_ids.contains(&API_GET_OVERLAPPED_RESULT));
         assert!(missing_ids.contains(&API_GET_QUEUED_COMPLETION_STATUS));
         // 生成 API も欠落に含まれる（先頭の RegCloseKey = api_id 7）。
         assert!(missing_ids.contains(&7));
+        // 内部 API (Nt*) は欠落に含まれない。
+        assert!(!missing_ids.contains(&API_NT_CREATE_FILE));
+        assert!(!missing_ids.contains(&API_NT_CLOSE));
     }
 
     #[test]
@@ -283,6 +290,7 @@ mod tests {
         assert_eq!(plan.entries.len(), 1);
         let empty = build_plan(&[]);
         assert!(empty.entries.is_empty());
-        assert_eq!(empty.missing.len(), API_COUNT);
+        // L15: 内部 API 7 件は欠落に数えないため分母から除く。
+        assert_eq!(empty.missing.len(), API_COUNT - INTERNAL_API_COUNT);
     }
 }

@@ -10,6 +10,10 @@
 //! `win32-metadata-gen` で再生成する。手書き API と生成 API のどちらも、
 //! 追加は末尾のみとする（Schema ID の安定性のため）。
 //!
+//! L15 以降は、詳細調査モード専用の内部 API（ntdll の Nt*。
+//! `INTERNAL_API_TABLE`）がさらに末尾に続く。内部 API は通常モードの
+//! Coverage 欠落には数えず、詳細調査モードでのみ記録する。
+//!
 //! Schema ID はファイル内連番であり、Agent 側（取得）と Host 側
 //! （Trace への Schema 登録）で同じ定義表から同じ順序で割り当てるため、
 //! この表の並びが ID を決める。並びを変えることは既存 Trace の意味を
@@ -265,22 +269,191 @@ pub const HANDWRITTEN_API_TABLE: &[ApiDef] = &[
     },
 ];
 
+/// L15: 詳細調査モード専用の内部 API の api_id（ntdll.dll の Nt*）。
+/// Win32 API 表（1〜78）の直後に置き、api_id は連続させる（表全体の
+/// 連続性テストが通る）。Nt* は通常モードの Coverage 欠落には数えない
+/// （plan.rs / agent-dll で除外する）。戻り値は NTSTATUS（U32）。
+/// Nt* は GetLastError を使わないため leave には `last_error` が無く、
+/// `last_error_meaning` は Never。
+pub const API_NT_CREATE_FILE: u32 = 79;
+pub const API_NT_OPEN_FILE: u32 = 80;
+pub const API_NT_READ_FILE: u32 = 81;
+pub const API_NT_WRITE_FILE: u32 = 82;
+pub const API_NT_CLOSE: u32 = 83;
+pub const API_NT_QUERY_INFORMATION_FILE: u32 = 84;
+pub const API_NT_SET_INFORMATION_FILE: u32 = 85;
+
+/// 内部 API の api_id 範囲（`INTERNAL_API_TABLE` と一致させること）。
+pub const INTERNAL_API_ID_BASE: u32 = API_NT_CREATE_FILE;
+pub const INTERNAL_API_COUNT: usize = 7;
+
+/// L15: 詳細調査モードでだけ記録する Windows 内部 API の定義表。
+/// `CreateFileW` → `NtCreateFile` のように、Win32 API の内側で実際に
+/// 起きた呼び出しを、親子関係付きの別の呼び出しとして記録するための
+/// 表。手書きの厳選表である（WinMD の生成対象は Win32 公開 API であり、
+/// ntdll の Nt* は生成器の対象外。L14 の WinRT 表と同じ方針）。
+/// 引数は全て 1 スロット（HANDLE / ポインタは U64、ULONG 等は U32）。
+/// 設置は Inline Hook のみ（IAT は対象プロセスの ntdll への直接
+/// インポートには使わない）。詳細調査モードが無効な場合、Detour は
+/// 設置されても記録せず素通しにする（engine の prepare で判定）。
+/// 再実行では下位呼び出しを重ねて実行しない（trace-format.md 参照）。
+pub const INTERNAL_API_TABLE: &[ApiDef] = &[
+    ApiDef {
+        api_id: API_NT_CREATE_FILE,
+        module: "ntdll.dll",
+        function: "NtCreateFile",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：CreateFileW 等の内側で起きる \
+                     ファイル生成・オープン。親は呼び出し元の Win32 API。\
+                     NTSTATUS を返す（LastError は使わない）",
+        enter_fields: &[
+            ("FileHandle", HANDLE, ValueKind::Pointer, BEFORE),
+            ("DesiredAccess", DWORD, ValueKind::Scalar, BEFORE),
+            ("ObjectAttributes", HANDLE, ValueKind::Pointer, BEFORE),
+            ("IoStatusBlock", HANDLE, ValueKind::Pointer, BEFORE),
+            ("AllocationSize", HANDLE, ValueKind::Pointer, BEFORE),
+            ("FileAttributes", DWORD, ValueKind::Scalar, BEFORE),
+            ("ShareAccess", DWORD, ValueKind::Scalar, BEFORE),
+            ("CreateDisposition", DWORD, ValueKind::Scalar, BEFORE),
+            ("CreateOptions", DWORD, ValueKind::Scalar, BEFORE),
+            ("EaBuffer", HANDLE, ValueKind::Pointer, BEFORE),
+            ("EaLength", DWORD, ValueKind::Scalar, BEFORE),
+        ],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+    ApiDef {
+        api_id: API_NT_OPEN_FILE,
+        module: "ntdll.dll",
+        function: "NtOpenFile",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：Win32 の Open 系 API の内側で \
+                     起きるファイルオープン。親は呼び出し元の Win32 API",
+        enter_fields: &[
+            ("FileHandle", HANDLE, ValueKind::Pointer, BEFORE),
+            ("DesiredAccess", DWORD, ValueKind::Scalar, BEFORE),
+            ("ObjectAttributes", HANDLE, ValueKind::Pointer, BEFORE),
+            ("IoStatusBlock", HANDLE, ValueKind::Pointer, BEFORE),
+            ("ShareAccess", DWORD, ValueKind::Scalar, BEFORE),
+            ("OpenOptions", DWORD, ValueKind::Scalar, BEFORE),
+        ],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+    ApiDef {
+        api_id: API_NT_READ_FILE,
+        module: "ntdll.dll",
+        function: "NtReadFile",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：ReadFile 等の内側で起きる \
+                     ファイル読み取り。親は呼び出し元の Win32 API",
+        enter_fields: &[
+            ("FileHandle", HANDLE, ValueKind::Handle, BEFORE),
+            ("Event", HANDLE, ValueKind::Handle, BEFORE),
+            ("ApcRoutine", HANDLE, ValueKind::Pointer, BEFORE),
+            ("ApcContext", HANDLE, ValueKind::Pointer, BEFORE),
+            ("IoStatusBlock", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Buffer", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Length", DWORD, ValueKind::Scalar, BEFORE),
+            ("ByteOffset", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Key", HANDLE, ValueKind::Pointer, BEFORE),
+        ],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+    ApiDef {
+        api_id: API_NT_WRITE_FILE,
+        module: "ntdll.dll",
+        function: "NtWriteFile",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：WriteFile 等の内側で起きる \
+                     ファイル書き込み。親は呼び出し元の Win32 API",
+        enter_fields: &[
+            ("FileHandle", HANDLE, ValueKind::Handle, BEFORE),
+            ("Event", HANDLE, ValueKind::Handle, BEFORE),
+            ("ApcRoutine", HANDLE, ValueKind::Pointer, BEFORE),
+            ("ApcContext", HANDLE, ValueKind::Pointer, BEFORE),
+            ("IoStatusBlock", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Buffer", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Length", DWORD, ValueKind::Scalar, BEFORE),
+            ("ByteOffset", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Key", HANDLE, ValueKind::Pointer, BEFORE),
+        ],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+    ApiDef {
+        api_id: API_NT_CLOSE,
+        module: "ntdll.dll",
+        function: "NtClose",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：CloseHandle 等の内側で起きる \
+                     ハンドルクローズ。親は呼び出し元の Win32 API",
+        enter_fields: &[("Handle", HANDLE, ValueKind::Handle, BEFORE)],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+    ApiDef {
+        api_id: API_NT_QUERY_INFORMATION_FILE,
+        module: "ntdll.dll",
+        function: "NtQueryInformationFile",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：GetFileInformation 系の内側で \
+                     起きるファイル情報の問い合わせ。親は呼び出し元の Win32 API",
+        enter_fields: &[
+            ("FileHandle", HANDLE, ValueKind::Handle, BEFORE),
+            ("IoStatusBlock", HANDLE, ValueKind::Pointer, BEFORE),
+            ("FileInformation", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Length", DWORD, ValueKind::Scalar, BEFORE),
+            ("FileInformationClass", DWORD, ValueKind::Scalar, BEFORE),
+        ],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+    ApiDef {
+        api_id: API_NT_SET_INFORMATION_FILE,
+        module: "ntdll.dll",
+        function: "NtSetInformationFile",
+        level: 1,
+        level_note: "L15（詳細調査モード専用）：SetFileInformation 系の内側で \
+                     起きるファイル情報の設定。親は呼び出し元の Win32 API",
+        enter_fields: &[
+            ("FileHandle", HANDLE, ValueKind::Handle, BEFORE),
+            ("IoStatusBlock", HANDLE, ValueKind::Pointer, BEFORE),
+            ("FileInformation", HANDLE, ValueKind::Pointer, BEFORE),
+            ("Length", DWORD, ValueKind::Scalar, BEFORE),
+            ("FileInformationClass", DWORD, ValueKind::Scalar, BEFORE),
+        ],
+        leave_fields: &[("return", DWORD, ValueKind::Scalar, AFTER)],
+        last_error_meaning: LastErrorMeaning::Never,
+    },
+];
+
 /// L03: Win32 Metadata から生成した L1 API の定義表（api_id 7〜）。
 /// 生成物は crates/shirusu-metadata-gen/apis.toml の記載順に並ぶ。
 /// 再生成: cargo run -p shirusu-metadata-gen -- --winmd <path>
 /// （--check で最新性を CI が検査する）。
 pub const GENERATED_API_TABLE: &[ApiDef] = include!("api_generated.inc");
 
-/// 全 API 数（手書き + 生成）。ランタイムの固定長表の大きさに使う。
-pub const API_COUNT: usize = HANDWRITTEN_API_TABLE.len() + GENERATED_API_TABLE.len();
+/// 全 API 数（手書き + 生成 + 内部）。ランタイムの固定長表の大きさに使う。
+pub const API_COUNT: usize =
+    HANDWRITTEN_API_TABLE.len() + GENERATED_API_TABLE.len() + INTERNAL_API_TABLE.len();
 
-/// 全 API の定義表（手書き + 生成）を api_id 順に並べたもの。
+/// 全 API の定義表（手書き + 生成 + 内部）を api_id 順に並べたもの。
 /// `&[ApiDef]` 1 枚では持てない（const でのスライス連結ができない）
 /// ため、反復子で連結して見る。
 pub fn api_table() -> impl Iterator<Item = &'static ApiDef> {
     HANDWRITTEN_API_TABLE
         .iter()
         .chain(GENERATED_API_TABLE.iter())
+        .chain(INTERNAL_API_TABLE.iter())
+}
+
+/// L15: 詳細調査モード専用の内部 API（Nt*）かどうか。詳細調査モードが
+/// 無効な場合、この API の呼び出しは記録しない（素通しにする）。
+/// Coverage の欠落にも数えない。
+pub fn is_internal_api(api_id: u32) -> bool {
+    (INTERNAL_API_ID_BASE..INTERNAL_API_ID_BASE + INTERNAL_API_COUNT as u32).contains(&api_id)
 }
 
 pub fn api_by_id(api_id: u32) -> Option<&'static ApiDef> {
@@ -370,13 +543,15 @@ mod tests {
 
     #[test]
     fn generated_entries_are_l1_and_generic_capture_compatible() {
-        // L03: 生成 API (api_id 7〜) は全て L1 で、汎用取得が扱える型
+        // L03: 生成 API (api_id 7〜78) は全て L1 で、汎用取得が扱える型
         // (U32 / I32 / U64 / I64 / Bool) だけを使い、引数は 12 個以下。
         // 生成表の検査はここが担う（capture::generic_enter は対応外の
-        // 型で panic するため、表の側で保証する）。
-        let generated: Vec<&ApiDef> = api_table().filter(|a| a.api_id >= 7).collect();
+        // 型で panic するため、表の側で保証する）。L15 の内部 API
+        // (79〜) は生成表ではないため対象外（別テストで検査する）。
+        let generated: Vec<&ApiDef> = GENERATED_API_TABLE.iter().collect();
         assert!(!generated.is_empty(), "generated table must not be empty");
         assert_eq!(generated[0].api_id, 7);
+        assert_eq!(generated[generated.len() - 1].api_id, 78);
         for api in &generated {
             assert_eq!(api.level, 1, "{} must be L1", api.function);
             assert!(
@@ -405,6 +580,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn internal_entries_are_l1_nt_apis_for_detailed_mode() {
+        // L15: 内部 API 表は ntdll の Nt* 7 件で、api_id は 79〜85 の
+        // 連続、表全体の連続性と合わせて 1〜85 になる。全て L1 で
+        // 引数は 12 個以下、leave は NTSTATUS の return のみ
+        // （last_error は無い。Nt* は GetLastError を使わない）。
+        assert_eq!(INTERNAL_API_TABLE.len(), INTERNAL_API_COUNT);
+        assert_eq!(INTERNAL_API_ID_BASE, 79);
+        assert_eq!(API_COUNT, 85);
+        for (i, api) in INTERNAL_API_TABLE.iter().enumerate() {
+            assert_eq!(api.api_id, INTERNAL_API_ID_BASE + i as u32);
+            assert_eq!(api.module, "ntdll.dll");
+            assert!(api.function.starts_with("Nt"), "{}", api.function);
+            assert_eq!(api.level, 1, "{}", api.function);
+            assert!(
+                api.enter_fields.len() <= 12,
+                "{} has {} params (max 12)",
+                api.function,
+                api.enter_fields.len()
+            );
+            for &(name, ty, _, _) in api.enter_fields.iter() {
+                assert!(
+                    matches!(ty, Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool),
+                    "{} enter field {name} uses unsupported {ty:?}",
+                    api.function
+                );
+            }
+            assert_eq!(api.leave_fields.len(), 1, "{}", api.function);
+            assert_eq!(api.leave_fields[0].0, "return");
+            assert_eq!(api.last_error_meaning, LastErrorMeaning::Never);
+            assert!(is_internal_api(api.api_id));
+            // Schema ID は表の順に enter = 2n-1, leave = 2n。COM (10001〜)
+            // / WinRT (10011〜) の予約ブロックと衝突しない。
+            assert_eq!(api.enter_schema_id(), (api.api_id - 1) * 2 + 1);
+            assert_eq!(api.leave_schema_id(), (api.api_id - 1) * 2 + 2);
+            assert!(api.leave_schema_id() < 1000, "{}", api.function);
+        }
+        // 境界：78 は Win32（生成）、79 と 85 は内部、86 は範囲外。
+        assert!(!is_internal_api(78));
+        assert!(is_internal_api(79));
+        assert!(is_internal_api(85));
+        assert!(!is_internal_api(86));
+        assert!(!is_internal_api(0));
+        // 内部 API も名前・インポート照合で引ける（--api / IAT 照合用）。
+        assert_eq!(
+            api_by_name("ntdll!NtCreateFile").map(|a| a.api_id),
+            Some(API_NT_CREATE_FILE)
+        );
+        assert_eq!(api_by_name("NtClose").map(|a| a.api_id), Some(API_NT_CLOSE));
+        assert_eq!(
+            api_by_import("NTDLL.DLL", "NtReadFile").map(|a| a.api_id),
+            Some(API_NT_READ_FILE)
+        );
     }
 
     #[test]
@@ -468,7 +698,15 @@ mod tests {
 
     #[test]
     fn every_leave_schema_ends_with_last_error() {
+        // L15: 内部 API (Nt*) は GetLastError を使わないため leave には
+        // last_error が無く、return のみ。Win32 API は全て last_error で
+        // 終わる。
         for api in api_table() {
+            if is_internal_api(api.api_id) {
+                assert_eq!(api.leave_fields.len(), 1, "{}", api.function);
+                assert_eq!(api.leave_fields[0].0, "return", "{}", api.function);
+                continue;
+            }
             let last = api.leave_fields.last().expect("leave fields");
             assert_eq!(
                 last.0, "last_error",

@@ -21,6 +21,7 @@
 use crate::trace_convert::{ArgsConversionStats, RecordMode, TraceBatchContext, TraceRecorder};
 use crate::{DrainWorker, IntegrityLevel, IntegrityReport, RingIdentity};
 use shirusu_hook::api as hook_api;
+use shirusu_hook::callback as hook_callback;
 use shirusu_hook::com as hook_com;
 use shirusu_hook::winrt as hook_winrt;
 use shirusu_trace::proto::{CaptureEnvironment, ProfileSummary};
@@ -239,6 +240,13 @@ pub struct SessionSummary {
     /// Agent DLL が報告した WinRT アクティベーション関数の設置数
     /// （L14。0〜2）。プロセス間記録で DLL から読み戻せた場合のみ Some。
     pub winrt_activation_count: Option<usize>,
+    /// Agent DLL が報告した内部 API (Nt*) の設置数（L15。0〜7）。
+    /// 詳細調査モードでのみ設置される。プロセス間記録で DLL から
+    /// 読み戻せた場合のみ Some。
+    pub internal_hook_count: Option<usize>,
+    /// Agent DLL が報告したコールバック検出フックの設置数（L16。0〜4）。
+    /// プロセス間記録で DLL から読み戻せた場合のみ Some。
+    pub callback_hook_count: Option<usize>,
     /// 注入できなかった子プロセス (pid, 理由)。L05: 保護されたプロセス
     /// や注入前に終了した子はここに残り、Capture Coverage の劣化として
     /// Finalization の注記にも写る。
@@ -395,6 +403,13 @@ pub struct CaptureSession {
     /// Agent DLL が Bootstrap 経由で報告した WinRT アクティベーション
     /// 関数の設置数（L14。0〜2）。プロセス間記録でのみ設定される。
     winrt_activation_count: Option<usize>,
+    /// Agent DLL が Bootstrap 経由で報告した内部 API (Nt*) の設置数
+    /// （L15。0〜7）。詳細調査モードでのみ設定される。プロセス間記録
+    /// でのみ設定される。
+    internal_hook_count: Option<usize>,
+    /// Agent DLL が Bootstrap 経由で報告したコールバック検出フックの
+    /// 設置数（L16。0〜4）。プロセス間記録でのみ設定される。
+    callback_hook_count: Option<usize>,
     /// Agent 終了手順の結果（レビュー第5回 #6）。プロセス間記録で
     /// 対象を生かしたまま閉じる場合のみ設定される。
     shutdown_outcome: Option<ShutdownOutcome>,
@@ -449,6 +464,10 @@ impl CaptureSession {
         for def in hook_winrt::winrt_schemas() {
             recorder.register_schema(def)?;
         }
+        // L16: コールバックイベントの Schema も登録する（COM と同じ理由）。
+        for def in hook_callback::callback_schemas() {
+            recorder.register_schema(def)?;
+        }
         Ok(Self {
             config,
             recorder,
@@ -460,6 +479,8 @@ impl CaptureSession {
             hook_coverage: None,
             com_factory_count: None,
             winrt_activation_count: None,
+            internal_hook_count: None,
+            callback_hook_count: None,
             shutdown_outcome: None,
             retired_reports: Vec::new(),
             retired_loss_records: 0,
@@ -500,6 +521,16 @@ impl CaptureSession {
     /// 知らせる (L14)。
     pub fn set_winrt_activation_count(&mut self, count: usize) {
         self.winrt_activation_count = Some(count);
+    }
+
+    /// Agent DLL が報告した内部 API (Nt*) の設置数を知らせる (L15)。
+    pub fn set_internal_hook_count(&mut self, count: usize) {
+        self.internal_hook_count = Some(count);
+    }
+
+    /// L16: コールバック検出フックの設置数を記録する。
+    pub fn set_callback_hook_count(&mut self, count: usize) {
+        self.callback_hook_count = Some(count);
     }
 
     /// Agent 終了手順の結果を知らせる (レビュー第5回 #6)。
@@ -815,6 +846,8 @@ impl CaptureSession {
             hook_coverage: self.hook_coverage,
             com_factory_count: self.com_factory_count,
             winrt_activation_count: self.winrt_activation_count,
+            internal_hook_count: self.internal_hook_count,
+            callback_hook_count: self.callback_hook_count,
             uninjectable_children: std::mem::take(&mut self.uninjectable_children),
             profile_summary,
             integrity: report,

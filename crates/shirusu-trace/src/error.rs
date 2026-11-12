@@ -153,3 +153,182 @@ impl From<CompactError> for TraceError {
 }
 
 pub type Result<T> = std::result::Result<T, TraceError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn proto_error_display_covers_all_variants() {
+        assert_eq!(
+            ProtoError::VarintTooLong.to_string(),
+            "varint too long or unterminated"
+        );
+        assert_eq!(
+            ProtoError::LengthOutOfRange {
+                len: 10,
+                remaining: 3
+            }
+            .to_string(),
+            "length 10 exceeds remaining 3 bytes"
+        );
+        assert_eq!(
+            ProtoError::InvalidWireType(7).to_string(),
+            "invalid wire type 7"
+        );
+        assert_eq!(
+            ProtoError::InvalidFieldNumber.to_string(),
+            "field number 0 is invalid"
+        );
+        assert_eq!(
+            ProtoError::TruncatedFixed.to_string(),
+            "fixed-width field truncated"
+        );
+        assert_eq!(
+            ProtoError::InvalidUtf8.to_string(),
+            "string field is not valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn compact_error_display_covers_all_variants() {
+        assert_eq!(
+            CompactError::Truncated.to_string(),
+            "compact input truncated"
+        );
+        assert_eq!(
+            CompactError::Leb128TooLong.to_string(),
+            "LEB128 too long or unterminated"
+        );
+        assert_eq!(
+            CompactError::InvalidBool(2).to_string(),
+            "invalid bool value 2"
+        );
+        assert_eq!(
+            CompactError::InvalidCapture(9).to_string(),
+            "invalid capture state 9"
+        );
+        assert_eq!(
+            CompactError::InvalidUtf8.to_string(),
+            "string is not valid UTF-8"
+        );
+        assert_eq!(
+            CompactError::FieldCountMismatch {
+                expected: 3,
+                actual: 2
+            }
+            .to_string(),
+            "field count mismatch: expected 3, got 2"
+        );
+        assert_eq!(
+            CompactError::TypeMismatch { field: 1 }.to_string(),
+            "type mismatch at field 1"
+        );
+        assert_eq!(
+            CompactError::UnknownType(99).to_string(),
+            "unknown type tag 99"
+        );
+        assert_eq!(
+            CompactError::TrailingBytes(5).to_string(),
+            "5 trailing bytes after values"
+        );
+    }
+
+    #[test]
+    fn trace_error_display_covers_all_variants() {
+        assert_eq!(
+            TraceError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "nope")).to_string(),
+            "io error: nope"
+        );
+        assert_eq!(
+            TraceError::Proto(ProtoError::VarintTooLong).to_string(),
+            "protobuf error: varint too long or unterminated"
+        );
+        assert_eq!(
+            TraceError::Compact(CompactError::Truncated).to_string(),
+            "compact binary error: compact input truncated"
+        );
+        assert_eq!(
+            TraceError::NotATrace.to_string(),
+            "input does not start with a trace header block"
+        );
+        assert_eq!(
+            TraceError::CorruptBlock {
+                offset: 128,
+                reason: "crc mismatch".to_string()
+            }
+            .to_string(),
+            "corrupt block at 128: crc mismatch"
+        );
+        assert_eq!(
+            TraceError::UnknownCompression(7).to_string(),
+            "unknown compression 7"
+        );
+        assert_eq!(
+            TraceError::ZstdDecode("bad frame".to_string()).to_string(),
+            "zstd decode failed: bad frame"
+        );
+        assert_eq!(
+            TraceError::BlobHashMismatch.to_string(),
+            "blob content does not match its BLAKE3 id"
+        );
+        assert_eq!(
+            TraceError::WriterInvariant("seq regressed".to_string()).to_string(),
+            "writer invariant violated: seq regressed"
+        );
+        assert_eq!(
+            TraceError::InvalidInput("no schema".to_string()).to_string(),
+            "invalid input: no schema"
+        );
+        assert_eq!(
+            TraceError::LimitExceeded("blocks").to_string(),
+            "reader limit exceeded: blocks"
+        );
+    }
+
+    #[test]
+    fn trace_error_source_links_wrapped_errors_only() {
+        let io = TraceError::Io(std::io::Error::other("x"));
+        assert!(io.source().is_some());
+        assert_eq!(
+            TraceError::Proto(ProtoError::InvalidUtf8)
+                .source()
+                .unwrap()
+                .to_string(),
+            "string field is not valid UTF-8"
+        );
+        assert_eq!(
+            TraceError::Compact(CompactError::Truncated)
+                .source()
+                .unwrap()
+                .to_string(),
+            "compact input truncated"
+        );
+        assert!(TraceError::NotATrace.source().is_none());
+        assert!(TraceError::BlobHashMismatch.source().is_none());
+        assert!(TraceError::CorruptBlock {
+            offset: 0,
+            reason: String::new()
+        }
+        .source()
+        .is_none());
+    }
+
+    #[test]
+    fn trace_error_from_conversions_wrap_each_layer() {
+        let io: TraceError =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied").into();
+        assert!(matches!(io, TraceError::Io(_)));
+        let proto: TraceError = ProtoError::TruncatedFixed.into();
+        assert!(matches!(
+            proto,
+            TraceError::Proto(ProtoError::TruncatedFixed)
+        ));
+        let compact: TraceError = CompactError::Leb128TooLong.into();
+        assert!(matches!(
+            compact,
+            TraceError::Compact(CompactError::Leb128TooLong)
+        ));
+    }
+}

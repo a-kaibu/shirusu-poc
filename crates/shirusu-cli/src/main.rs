@@ -11,7 +11,7 @@
 //!   イベントを推測で作らない（overview「完全性と復旧」）。
 //! - `shirusu capture [--output <path>] [--dll <path>] [--timeout <secs>]
 //!   [--order=global] [--module-class <module>=<class>] [--record-runtime-apis]
-//!   [--mode <full|profile|filtered>] [--api <name>]
+//!   [--mode <full|profile|filtered|detailed>] [--api <name>]
 //!   -- <exe> [args...]`: 対象を起動して最初から記録する
 //!   （L22、Windows 専用）。
 //! - `shirusu attach <PID> [options]`: 動作中のプロセスに途中から記録する
@@ -91,9 +91,12 @@ fn usage() -> &'static str {
      \x20 --module-class <module>=<class>  (repeatable; windows/runtime/application/unknown, L07)\n\
      \x20 --record-runtime-apis  (also record the Runtime's own APIs, L07; default: off)\n\
      \x20 --diagnostic-query-interface  (let the interceptor call QueryInterface(IID_IUnknown) to confirm identity, L02; default: off)\n\
-     \x20 --mode <full|profile|filtered>  (record mode, L09; default: full)\n\
+     \x20 --mode <full|profile|filtered|detailed>  (record mode, L09/L15; default: full)\n\
      \x20 --api <name>  (repeatable; only with --mode filtered, e.g. CreateFileW)\n\
      \x20 --follow-children  (also record child processes of the launched target, L05; capture only)\n\
+     \n\
+     detailed mode (L15) also records Windows internal calls (Nt*) as separate\n\
+     calls with a parent link, and forces --record-runtime-apis on.\n\
      \n\
      dump filters:\n\
      \x20 --api <substr|api_id>  --kind <enter|leave|number>\n\
@@ -1259,6 +1262,8 @@ impl CaptureOptions {
         let record_mode = match parsed.opt("mode") {
             None | Some("full") => RecordMode::Full,
             Some("profile") => RecordMode::Profile,
+            // L15: 詳細調査モード。Windows 内部の呼び出し (Nt*) も記録する。
+            Some("detailed") => RecordMode::Detailed,
             Some("filtered") => {
                 if api_names.is_empty() {
                     return Err(ToolError::Usage(
@@ -1271,7 +1276,7 @@ impl CaptureOptions {
             }
             Some(other) => {
                 return Err(ToolError::Usage(format!(
-                    "unknown --mode value: {other} (expected full, profile, or filtered)"
+                    "unknown --mode value: {other} (expected full, profile, filtered, or detailed)"
                 )))
             }
         };
@@ -1285,7 +1290,10 @@ impl CaptureOptions {
             order_global,
             module_classes,
             // L07: Runtime 独自の API を記録するか（既定は記録しない）。
-            record_runtime_apis: parsed.has("record-runtime-apis"),
+            // L15: 詳細調査モードでは Runtime 起源の内部呼び出しも記録
+            // するため、ここで強制的に有効にする。
+            record_runtime_apis: parsed.has("record-runtime-apis")
+                || matches!(record_mode, RecordMode::Detailed),
             // L02: 診断用の追加 QueryInterface を有効にするか
             // （既定は無効。標準では Interceptor 自身は QI を呼ばない）。
             diagnostic_query_interface: parsed.has("diagnostic-query-interface"),
@@ -2036,6 +2044,16 @@ mod tests {
         let parsed = parse_args(&args(&["--mode", "profile"]), &[]).unwrap();
         let opts = CaptureOptions::parse(&parsed).unwrap();
         assert_eq!(opts.record_mode, RecordMode::Profile);
+    }
+
+    // L15: `--mode detailed` は詳細調査モードになり、Runtime 起源の
+    // 呼び出しの記録も強制的に有効になる。
+    #[test]
+    fn capture_options_parses_mode_detailed() {
+        let parsed = parse_args(&args(&["--mode", "detailed"]), &[]).unwrap();
+        let opts = CaptureOptions::parse(&parsed).unwrap();
+        assert_eq!(opts.record_mode, RecordMode::Detailed);
+        assert!(opts.record_runtime_apis);
     }
 
     #[test]

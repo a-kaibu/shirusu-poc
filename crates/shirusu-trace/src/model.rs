@@ -79,6 +79,32 @@ pub struct TraceEvent {
     pub global_order: Option<u64>,
 }
 
+impl TraceEvent {
+    /// L15: トップレベルの呼び出しか（親を持たない呼び出しか）。
+    /// 詳細調査モードで記録された内部呼び出し（Nt* など）は
+    /// `parent_call_id` に親の call_id を持つため false になる。
+    /// 再実行・Probe 生成ではトップレベルの呼び出しだけを実行し、
+    /// 下位呼び出しを重ねて実行しない（overview「記録境界と
+    /// モジュール分類」節。`top_level_events` も参照）。
+    pub fn is_top_level(&self) -> bool {
+        self.parent_call_id == 0
+    }
+
+    /// L15: 下位呼び出しか（親を持つ呼び出しか）。
+    pub fn is_nested(&self) -> bool {
+        !self.is_top_level()
+    }
+}
+
+/// L15: イベント列からトップレベルの呼び出しだけを抜き出す（順序は
+/// 維持する）。再実行・Probe 生成の入力にするためのもの。下位呼び出し
+/// （`parent_call_id != 0` のイベント）は、親の操作の一部として既に
+/// 実行されるため、ここには含めない。親子関係の検証（子の親が列に
+/// 存在するか等）は呼び出し側の責任。
+pub fn top_level_events(events: &[TraceEvent]) -> Vec<&TraceEvent> {
+    events.iter().filter(|e| e.is_top_level()).collect()
+}
+
 /// Event Batch：同一 Writer（スレッド）のイベント列と、その文脈。
 /// 共通情報はバッチに一度だけ書く（overview の決定）。
 #[derive(Debug, Clone, PartialEq)]
@@ -98,5 +124,53 @@ impl EventBatch {
     }
     pub fn base_timestamp_qpc(&self) -> u64 {
         self.events.first().map(|e| e.timestamp_qpc).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(call_id: u64, parent_call_id: u64, api_id: u32) -> TraceEvent {
+        TraceEvent {
+            kind: 1,
+            sequence: call_id,
+            timestamp_qpc: 1000 + call_id,
+            call_id,
+            parent_call_id,
+            api_id,
+            schema_id: 0,
+            capture: EventCapture::Captured,
+            payload: PayloadRef::None,
+            args: None,
+            global_order: None,
+        }
+    }
+
+    #[test]
+    fn top_level_events_keeps_only_calls_without_a_parent() {
+        // L15: CreateFileW (call 10) の内側の NtCreateFile (call 11) と
+        // NtClose (call 13) は親を持つため除外され、トップレベルの
+        // CreateFileW / CloseHandle だけが残る（順序は維持）。
+        let events = vec![
+            event(10, 0, 1),
+            event(11, 10, 79),
+            event(12, 0, 4),
+            event(13, 12, 83),
+        ];
+        assert!(events[0].is_top_level());
+        assert!(!events[0].is_nested());
+        assert!(!events[1].is_top_level());
+        assert!(events[1].is_nested());
+        let top = top_level_events(&events);
+        let ids: Vec<u64> = top.iter().map(|e| e.call_id).collect();
+        assert_eq!(ids, vec![10, 12]);
+        assert_eq!(top.len(), 2);
+    }
+
+    #[test]
+    fn top_level_events_of_empty_is_empty() {
+        let events: Vec<TraceEvent> = Vec::new();
+        assert!(top_level_events(&events).is_empty());
     }
 }

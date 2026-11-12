@@ -1,0 +1,130 @@
+{
+  "name": "probe-sample",
+  "rules": [],
+  "steps": [
+    {
+      "args": {
+        "dwCreationDisposition": 2,
+        "dwDesiredAccess": 3221225472,
+        "dwFlagsAndAttributes": 128,
+        "dwShareMode": 0,
+        "hTemplateFile": null,
+        "lpFileName": "probe-sample.txt",
+        "lpSecurityAttributes": null
+      },
+      "call": "kernel32!CreateFileW",
+      "expect": {
+        "return": "nonzero"
+      },
+      "store": "hFile"
+    },
+    {
+      "args": {
+        "hFile": {
+          "ref": "hFile"
+        },
+        "lpBuffer": {
+          "buffer": 14,
+          "fill_text": "hello shirusu\n"
+        },
+        "lpNumberOfBytesWritten": {
+          "out": "u32"
+        },
+        "lpOverlapped": null,
+        "nNumberOfBytesToWrite": 14
+      },
+      "call": "kernel32!WriteFile",
+      "expect": {
+        "outputs": {
+          "lpNumberOfBytesWritten": 14
+        },
+        "return": "nonzero"
+      }
+    },
+    {
+      "args": {
+        "hFile": {
+          "ref": "hFile"
+        },
+        "lpFileSizeHigh": {
+          "out": "u32"
+        }
+      },
+      "call": "kernel32!GetFileSize",
+      "expect": {
+        "return": 14
+      }
+    },
+    {
+      "args": {
+        "hObject": {
+          "ref": "hFile"
+        }
+      },
+      "call": "kernel32!CloseHandle",
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "args": {
+        "dwCreationDisposition": 3,
+        "dwDesiredAccess": 2147483648,
+        "dwFlagsAndAttributes": 128,
+        "dwShareMode": 0,
+        "hTemplateFile": null,
+        "lpFileName": "probe-sample.txt",
+        "lpSecurityAttributes": null
+      },
+      "call": "kernel32!CreateFileW",
+      "expect": {
+        "return": "nonzero"
+      },
+      "store": "hRead"
+    },
+    {
+      "args": {
+        "hFile": {
+          "ref": "hRead"
+        },
+        "lpBuffer": {
+          "buffer": 32
+        },
+        "lpNumberOfBytesRead": {
+          "out": "u32"
+        },
+        "lpOverlapped": null,
+        "nNumberOfBytesToRead": 32
+      },
+      "call": "kernel32!ReadFile",
+      "expect": {
+        "outputs": {
+          "lpBuffer": "68656c6c6f20736869727573750a",
+          "lpNumberOfBytesRead": 14
+        },
+        "return": "nonzero"
+      }
+    },
+    {
+      "args": {
+        "hObject": {
+          "ref": "hRead"
+        }
+      },
+      "call": "kernel32!CloseHandle",
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "args": {
+        "lpFileName": "probe-sample.txt"
+      },
+      "call": "kernel32!DeleteFileW",
+      "expect": {
+        "return": "nonzero"
+      }
+    }
+  ],
+  "version": 1
+}

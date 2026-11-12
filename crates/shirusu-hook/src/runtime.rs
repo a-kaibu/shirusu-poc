@@ -16,6 +16,9 @@
 //! に従い、ここでも待機する操作は行わない（SetEvent は待たない操作）。
 
 use crate::api::{ApiDef, API_COUNT};
+use crate::callback::{
+    CALLBACK_API_ID, CALLBACK_ENTER_SCHEMA_ID, CALLBACK_HOOK_COUNT, CALLBACK_LEAVE_SCHEMA_ID,
+};
 use crate::capture::{OverlappedRegistry, PendingOverlapped};
 use crate::com::{
     ComTracker, COM_FACTORY_COUNT, COM_METHOD_API_ID, COM_METHOD_ENTER_SCHEMA_ID,
@@ -476,6 +479,10 @@ pub struct HookRuntime {
     /// Runtime 独自の API も記録するか（L07/L23）。既定は false
     /// （記録しない）。Bootstrap v5 で Host から渡す。
     record_runtime_apis: bool,
+    /// 詳細調査モード（L15）。既定は false（内部 API を記録しない）。
+    /// 有効な場合のみ、内部 API（Nt*）の呼び出しを記録する。
+    /// Bootstrap v8 で Host から渡す。
+    detailed_mode: bool,
     /// 呼び出し元分類のためのモジュール一覧（L23）。Detour の入口で
     /// 戻りアドレスから呼び出し元を引く。DLL 起動時に作り、遅れて
     /// ロードされたモジュールには再列挙で追随する。
@@ -490,6 +497,9 @@ pub struct HookRuntime {
     /// WinRT アクティベーション関数の元関数ポインタ（L14）。COM Factory
     /// と同じく API 表に無いため、別の表に持つ。
     winrt_activation_originals: [AtomicUsize; WINRT_ACTIVATION_COUNT],
+    /// コールバック検出フック関数の元関数ポインタ（L16）。COM Factory /
+    /// WinRT と同じく API 表に無いため、別の表に持つ。
+    callback_hook_originals: [AtomicUsize; CALLBACK_HOOK_COUNT],
 }
 
 impl HookRuntime {
@@ -509,10 +519,12 @@ impl HookRuntime {
             in_flight: AtomicUsize::new(0),
             pending_overlapped: OverlappedRegistry::new(),
             record_runtime_apis: false,
+            detailed_mode: false,
             caller_modules: RwLock::new(crate::caller::CallerModules::new()),
             com_tracker: Mutex::new(ComTracker::new()),
             com_factory_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
             winrt_activation_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
+            callback_hook_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
     }
 
@@ -565,6 +577,21 @@ impl HookRuntime {
             .unwrap_or(0)
     }
 
+    /// コールバック検出フック関数の元関数ポインタを格納する（L16）。
+    pub fn set_callback_original(&self, hook_index: usize, addr: usize) {
+        if let Some(slot) = self.callback_hook_originals.get(hook_index) {
+            slot.store(addr, Ordering::Release);
+        }
+    }
+
+    /// コールバック検出フック関数の元関数ポインタを引く。
+    pub fn callback_original(&self, hook_index: usize) -> usize {
+        self.callback_hook_originals
+            .get(hook_index)
+            .map(|s| s.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     /// Runtime 独自の API も記録するかを設定する（L23）。構築時に
     /// 1 回だけ呼ぶ（`Arc` 化する前）。既定は false（記録しない）。
     pub fn with_record_runtime_apis(mut self, enabled: bool) -> Self {
@@ -575,6 +602,25 @@ impl HookRuntime {
     /// Runtime 独自の API も記録するか。
     pub fn record_runtime_apis(&self) -> bool {
         self.record_runtime_apis
+    }
+
+    /// 詳細調査モード（L15）を設定する。構築時に 1 回だけ呼ぶ
+    /// （`Arc` 化する前）。既定は false（内部 API を記録しない）。
+    pub fn with_detailed_mode(mut self, enabled: bool) -> Self {
+        self.detailed_mode = enabled;
+        self
+    }
+
+    /// 詳細調査モード（L15）が有効か。
+    pub fn detailed_mode(&self) -> bool {
+        self.detailed_mode
+    }
+
+    /// 今回の Detour 呼び出しが内部 API（Nt*）で、詳細調査モードが
+    /// 無効な場合に真。詳細調査モードが無効な間は、内部 API の Detour
+    /// が設置されていても記録せず素通しにする（L15）。
+    pub fn should_suppress_internal(&self, api_id: u32) -> bool {
+        !self.detailed_mode && crate::api::is_internal_api(api_id)
     }
 
     /// 呼び出し元分類のためのモジュール一覧を作り直す。DLL 初期化時と、
@@ -890,6 +936,47 @@ impl HookRuntime {
         result
     }
 
+    /// コールバックの enter を記録する（L16）。COM / WinRT イベントと
+    /// 同じく ApiDef を持たないため、api_id / schema_id を直接指定する。
+    pub fn record_callback_enter(
+        &self,
+        thread_id: u64,
+        call_id: u64,
+        payload: &[u8],
+    ) -> RecordResult {
+        let parent = current_parent_call();
+        let result = self.agent.record_enter(
+            thread_id,
+            CALLBACK_API_ID,
+            CALLBACK_ENTER_SCHEMA_ID,
+            call_id,
+            parent,
+            payload,
+        );
+        self.signal_if_needed(&result);
+        result
+    }
+
+    /// コールバックの leave を記録する（L16）。
+    pub fn record_callback_leave(
+        &self,
+        thread_id: u64,
+        call_id: u64,
+        payload: &[u8],
+    ) -> RecordResult {
+        let parent = current_parent_call();
+        let result = self.agent.record_leave(
+            thread_id,
+            CALLBACK_API_ID,
+            CALLBACK_LEAVE_SCHEMA_ID,
+            call_id,
+            parent,
+            payload,
+        );
+        self.signal_if_needed(&result);
+        result
+    }
+
     /// 非同期 I/O の完了を記録する（F27）。完了を観測した Detour から
     /// 呼ぶ。`api` は元の呼び出し（ReadFile / WriteFile）の定義で、
     /// payload はその leave Schema の値列。
@@ -1137,6 +1224,74 @@ mod tests {
         // 範囲外は静かに 0。
         rt.set_com_original(99, 1);
         assert_eq!(rt.com_original(99), 0);
+    }
+
+    #[test]
+    fn callback_hook_originals_roundtrip() {
+        // L16: コールバック検出フック関数の元関数は API 表とは別の表に置く。
+        let (_agent, rt) = runtime();
+        assert_eq!(
+            rt.callback_original(crate::callback::CALLBACK_HOOK_REGISTER_CLASS_EX_W),
+            0
+        );
+        rt.set_callback_original(
+            crate::callback::CALLBACK_HOOK_REGISTER_CLASS_EX_W,
+            0xCAFEBABE,
+        );
+        assert_eq!(
+            rt.callback_original(crate::callback::CALLBACK_HOOK_REGISTER_CLASS_EX_W),
+            0xCAFEBABE
+        );
+        assert_eq!(
+            rt.callback_original(crate::callback::CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W),
+            0
+        );
+        // 範囲外は静かに 0。
+        rt.set_callback_original(99, 1);
+        assert_eq!(rt.callback_original(99), 0);
+    }
+
+    #[test]
+    fn callback_enter_leave_reach_the_ring() {
+        // L16: コールバックイベントが API 表と別の api_id / schema_id で
+        // Ring へ記録され、親子関係が付く（コールバック中の API 呼び出しは
+        // この call_id を親として記録される）。
+        use crate::callback::{self, CallbackKind};
+        let (agent, rt) = runtime();
+        let tid = 4247u64;
+        rt.ensure_thread(tid);
+        let call_id = rt.alloc_call_id();
+        let enter = callback::callback_enter_values(
+            0x1000,
+            CallbackKind::WndProc,
+            0x0010,
+            0,
+            0,
+            0x7FFA_1234,
+        );
+        let bytes = callback::encode_callback_enter(&enter).expect("encode enter");
+        let r = rt.record_callback_enter(tid, call_id, &bytes);
+        assert!(matches!(r, RecordResult::Written(_)));
+        // コールバック中の呼び出しは、コールバックイベントを親とする。
+        push_call(call_id);
+        assert_eq!(current_parent_call(), call_id);
+        let leave = callback::callback_leave_values(0);
+        let bytes = callback::encode_callback_leave(&leave).expect("encode leave");
+        let r = rt.record_callback_leave(tid, call_id, &bytes);
+        assert!(matches!(r, RecordResult::Written(_)));
+        pop_call(call_id);
+        assert_eq!(current_parent_call(), 0);
+        // Ring に enter/leave の 2 イベントが残る。
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].descriptor.api_id, callback::CALLBACK_API_ID);
+        assert_eq!(
+            batch.events[0].descriptor.schema_id,
+            callback::CALLBACK_ENTER_SCHEMA_ID
+        );
+        assert_eq!(batch.events[1].descriptor.call_id, call_id);
     }
 
     #[test]
@@ -1526,5 +1681,219 @@ mod tests {
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.events[0].descriptor.call_id, outer);
         assert_eq!(batch.events[1].descriptor.call_id, outer);
+    }
+
+    // --- カバレッジ gap（2026-11-12 13:29）: ビルダ・取得子と
+    // WinRT / コールバック / COM 中断の記録経路 ---
+
+    #[test]
+    fn runtime_option_builders_roundtrip() {
+        // 既定は両方 false。ビルダで立てると取得子がそれを返す。
+        let (agent, rt) = runtime();
+        assert!(!rt.record_runtime_apis());
+        assert!(!rt.detailed_mode());
+        let rt = HookRuntime::new(Arc::clone(&agent), Vec::new(), None)
+            .with_record_runtime_apis(true)
+            .with_detailed_mode(true);
+        assert!(rt.record_runtime_apis());
+        assert!(rt.detailed_mode());
+    }
+
+    #[test]
+    fn should_suppress_internal_depends_on_detailed_mode() {
+        let (agent, rt) = runtime();
+        // 内部 API（Nt*、79〜85）は詳細調査モードが無効な間だけ抑止する。
+        assert!(rt.should_suppress_internal(API_NT_CREATE_FILE));
+        assert!(rt.should_suppress_internal(API_NT_CREATE_FILE + 6));
+        assert!(!rt.should_suppress_internal(API_NT_CREATE_FILE + 7));
+        assert!(!rt.should_suppress_internal(API_CREATE_FILE_W));
+        let rt = HookRuntime::new(Arc::clone(&agent), Vec::new(), None).with_detailed_mode(true);
+        assert!(!rt.should_suppress_internal(API_NT_CREATE_FILE));
+    }
+
+    #[test]
+    fn original_slots_roundtrip_and_out_of_range() {
+        let (_agent, rt) = runtime();
+        assert_eq!(rt.com_original(0), 0);
+        rt.set_com_original(0, 0x1234);
+        assert_eq!(rt.com_original(0), 0x1234);
+        rt.set_com_original(999, 0x5678);
+        assert_eq!(rt.com_original(999), 0);
+
+        assert_eq!(rt.winrt_original(1), 0);
+        rt.set_winrt_original(1, 0x2233);
+        assert_eq!(rt.winrt_original(1), 0x2233);
+        rt.set_winrt_original(999, 0x4455);
+        assert_eq!(rt.winrt_original(999), 0);
+
+        assert_eq!(rt.callback_original(3), 0);
+        rt.set_callback_original(3, 0x3344);
+        assert_eq!(rt.callback_original(3), 0x3344);
+        rt.set_callback_original(999, 0x6677);
+        assert_eq!(rt.callback_original(999), 0);
+    }
+
+    #[test]
+    fn diagnostic_query_interface_option_roundtrips() {
+        let (_agent, rt) = runtime();
+        assert!(!rt.with_com_tracker(|t| t.diagnostic_query_interface()));
+        let rt = rt.with_diagnostic_query_interface(true);
+        assert!(rt.with_com_tracker(|t| t.diagnostic_query_interface()));
+    }
+
+    #[test]
+    fn runtime_slot_register_unregister() {
+        // Default とプロセス全体のスロット取得子もここで通す（engine
+        // 経由でしか呼ばれないため、Linux のテストでは未実行だった）。
+        let _default_slot = RuntimeSlot::default();
+        let _ = runtime_slot().current();
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let rt2 = Arc::new(HookRuntime::new(Arc::clone(&agent), Vec::new(), None));
+        let slot = RuntimeSlot::new();
+        assert!(slot.current().is_none());
+        assert!(slot.register(Arc::clone(&rt)).is_ok());
+        assert!(Arc::ptr_eq(&slot.current().unwrap(), &rt));
+        // 既に登録がある間は 2 件目を拒み、渡したランタイムを返す。
+        let back = slot.register(Arc::clone(&rt2)).expect_err("2 件目は拒否");
+        assert!(Arc::ptr_eq(&back, &rt2));
+        assert!(!slot.unregister(&rt2));
+        assert!(slot.unregister(&rt));
+        assert!(slot.current().is_none());
+        assert!(slot.register(rt2).is_ok());
+    }
+
+    #[test]
+    fn agent_accessor_returns_the_agent() {
+        let (agent, rt) = runtime();
+        assert!(Arc::ptr_eq(rt.agent(), &agent));
+    }
+
+    #[test]
+    fn should_suppress_caller_is_false_without_caller() {
+        // Linux では呼び出し元アドレスは取れないため、常に記録する
+        //（fail-open）。record_runtime_apis が有効でも同じく false。
+        let (agent, rt) = runtime();
+        assert!(!rt.should_suppress_caller());
+        let rt =
+            HookRuntime::new(Arc::clone(&agent), Vec::new(), None).with_record_runtime_apis(true);
+        assert!(!rt.should_suppress_caller());
+    }
+
+    #[test]
+    fn refresh_caller_modules_does_not_panic() {
+        let (_agent, rt) = runtime();
+        rt.refresh_caller_modules();
+    }
+
+    #[test]
+    fn record_com_aborted_writes_aborted_event() {
+        use shirusu_transport::descriptor::EventKind;
+        let (agent, rt) = runtime();
+        let tid = 4250u64;
+        rt.ensure_thread(tid);
+        let call_id = rt.alloc_call_id();
+        rt.record_com_aborted(tid, call_id);
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            batch.events[0].descriptor.kind_enum(),
+            Some(EventKind::CallAborted)
+        );
+        assert_eq!(batch.events[0].descriptor.call_id, call_id);
+        assert_eq!(
+            batch.events[0].descriptor.schema_id,
+            COM_METHOD_LEAVE_SCHEMA_ID
+        );
+    }
+
+    #[test]
+    fn com_call_guard_drop_records_aborted() {
+        use shirusu_transport::descriptor::EventKind;
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let tid = 4251u64;
+        rt.ensure_thread(tid);
+        let call_id = rt.alloc_call_id();
+        push_call(call_id);
+        {
+            let _guard = ComCallGuard::new(&rt, tid, call_id);
+            // 完了させずに drop（元の呼び出しが例外で中断したのと同じ）。
+        }
+        assert_eq!(current_parent_call(), 0, "aborted call pops the stack");
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            batch.events[0].descriptor.kind_enum(),
+            Some(EventKind::CallAborted)
+        );
+        assert_eq!(batch.events[0].descriptor.call_id, call_id);
+        assert_eq!(
+            batch.events[0].descriptor.schema_id,
+            COM_METHOD_LEAVE_SCHEMA_ID
+        );
+        assert_eq!(batch.events[0].descriptor.parent_call_id, 0);
+    }
+
+    #[test]
+    fn com_call_guard_completed_drop_records_nothing() {
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let tid = 4252u64;
+        rt.ensure_thread(tid);
+        let call_id = rt.alloc_call_id();
+        push_call(call_id);
+        {
+            let mut guard = ComCallGuard::new(&rt, tid, call_id);
+            guard.complete();
+        }
+        pop_call(call_id);
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 0);
+    }
+
+    #[test]
+    fn winrt_activation_enter_leave_reach_the_ring() {
+        use shirusu_transport::descriptor::EventKind;
+        let (agent, rt) = runtime();
+        let tid = 4253u64;
+        rt.ensure_thread(tid);
+        let call_id = rt.alloc_call_id();
+        assert!(matches!(
+            rt.record_winrt_activation_enter(tid, call_id, b"winrt-enter"),
+            RecordResult::Written(_)
+        ));
+        assert!(matches!(
+            rt.record_winrt_activation_leave(tid, call_id, b"winrt-leave"),
+            RecordResult::Written(_)
+        ));
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(
+            batch.events[0].descriptor.kind_enum(),
+            Some(EventKind::CallEnter)
+        );
+        assert_eq!(
+            batch.events[0].descriptor.schema_id,
+            WINRT_ACTIVATION_ENTER_SCHEMA_ID
+        );
+        assert_eq!(batch.events[0].payload, b"winrt-enter");
+        assert_eq!(
+            batch.events[1].descriptor.kind_enum(),
+            Some(EventKind::CallLeave)
+        );
+        assert_eq!(
+            batch.events[1].descriptor.schema_id,
+            WINRT_ACTIVATION_LEAVE_SCHEMA_ID
+        );
+        assert_eq!(batch.events[1].payload, b"winrt-leave");
     }
 }

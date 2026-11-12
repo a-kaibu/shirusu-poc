@@ -18,7 +18,17 @@
 
 use crate::api::{
     api_by_id, api_table, ApiDef, API_CLOSE_HANDLE, API_CREATE_FILE_W, API_GET_OVERLAPPED_RESULT,
-    API_GET_QUEUED_COMPLETION_STATUS, API_READ_FILE, API_WRITE_FILE,
+    API_GET_QUEUED_COMPLETION_STATUS, API_NT_CLOSE, API_NT_CREATE_FILE, API_NT_OPEN_FILE,
+    API_NT_QUERY_INFORMATION_FILE, API_NT_READ_FILE, API_NT_SET_INFORMATION_FILE,
+    API_NT_WRITE_FILE, API_READ_FILE, API_WRITE_FILE,
+};
+use crate::callback::{
+    callback_procs, resolve_prev_proc, should_wrap_set_window_long, wrap_wndproc_in_class,
+    CallbackKind, CALLBACK_API_ID, CALLBACK_HOOKS, CALLBACK_HOOK_COUNT,
+    CALLBACK_HOOK_REGISTER_CLASS_EX_A, CALLBACK_HOOK_REGISTER_CLASS_EX_W,
+    CALLBACK_HOOK_REPORT_ID_BASE, CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A,
+    CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W, CALLBACK_LEAVE_SCHEMA_ID, CALLBACK_PROC_SLOTS,
+    MAX_WNDCLASSEX_BYTES, WNDPROC_FIELD_OFFSET,
 };
 use crate::capture::{self, MemoryReader};
 use crate::com::{
@@ -311,22 +321,25 @@ pub struct InlineInstallOutcome {
 
 /// Inline Hook の設置時にトランポリンを指す元関数ポインタの格納先。
 /// API 表のものはランタイムの API 別表へ、COM Factory 関数のものは
-/// Factory 別表へ、WinRT アクティベーション関数のものは WinRT 別表へ
-/// 格納する（L02・L14）。
+/// Factory 別表へ、WinRT アクティベーション関数のものは WinRT 別表へ、
+/// コールバック検出フック関数のものはコールバック別表へ格納する
+/// （L02・L14・L16）。
 enum InlineOriginalSlot {
     Api(u32),
     ComFactory(usize),
     WinRtActivation(usize),
+    Callback(usize),
 }
 
 impl InlineOriginalSlot {
-    /// 設置結果の報告用 ID。Factory 関数・アクティベーション関数は
-    /// API 表に無いため、予約値を使う。
+    /// 設置結果の報告用 ID。Factory 関数・アクティベーション関数・
+    /// コールバック検出フック関数は API 表に無いため、予約値を使う。
     fn report_id(&self) -> u32 {
         match self {
             InlineOriginalSlot::Api(id) => *id,
             InlineOriginalSlot::ComFactory(i) => COM_FACTORY_REPORT_ID_BASE + *i as u32,
             InlineOriginalSlot::WinRtActivation(i) => WINRT_ACTIVATION_REPORT_ID_BASE + *i as u32,
+            InlineOriginalSlot::Callback(i) => CALLBACK_HOOK_REPORT_ID_BASE + *i as u32,
         }
     }
 }
@@ -558,6 +571,7 @@ fn install_one_inline(
         InlineOriginalSlot::Api(api_id) => rt.set_original(api_id, trampoline),
         InlineOriginalSlot::ComFactory(index) => rt.set_com_original(index, trampoline),
         InlineOriginalSlot::WinRtActivation(index) => rt.set_winrt_original(index, trampoline),
+        InlineOriginalSlot::Callback(index) => rt.set_callback_original(index, trampoline),
     }
     Ok(InlineHook {
         api_id: p.slot.report_id(),
@@ -569,7 +583,32 @@ fn install_one_inline(
     })
 }
 
-/// 全 API へ Inline Hook を設置する（L01）。
+/// 全 API へ Inline Hook を設置する（L01）。設置の詳細は
+/// `install_inline_hooks_for` を参照。
+///
+/// # Safety
+/// `install_inline_hooks_for` と同じ前提。
+pub unsafe fn install_inline_hooks(rt: &HookRuntime) -> InlineInstallOutcome {
+    // SAFETY: install_inline_hooks_for と同じ前提。
+    unsafe { install_inline_hooks_for(rt, api_table()) }
+}
+
+/// L15: 内部 API (Nt*) へ Inline Hook を設置する（詳細調査モード専用）。
+/// 対象は `INTERNAL_API_TABLE` のみ。IAT フックは行わない（対象プロセスが
+/// ntdll を直接インポートしていなくても、Inline Hook で捕捉できる）。
+/// 詳細調査モードが無効な場合、Agent DLL はこれを呼ばない（設置自体を
+/// しないため、通常モードの Detour オーバーヘッドは増えない）。
+/// 設置は API ごとの best-effort であり、見送りがあっても初期化は成功
+/// として継続する（L01 と同じ扱い）。
+///
+/// # Safety
+/// `install_inline_hooks` と同じ前提。
+pub unsafe fn install_internal_inline_hooks(rt: &HookRuntime) -> InlineInstallOutcome {
+    // SAFETY: install_inline_hooks_for と同じ前提。
+    unsafe { install_inline_hooks_for(rt, crate::api::INTERNAL_API_TABLE.iter()) }
+}
+
+/// Inline Hook の設置本体。`apis` に挙げた API へ Inline Hook を設置する。
 ///
 /// IAT フックの後で呼ぶこと。成功した API の `original` は IAT 値
 /// （生の関数アドレス）からトランポリンへ差し替える。Detour は
@@ -584,12 +623,15 @@ fn install_one_inline(
 /// 対象プロセスの全スレッドを一時停止してからパッチするため、
 /// 呼び出し元スレッド以外が対象 API の先頭命令を実行中でないことを
 /// 確認してから書き換える。Loader Lock 下（DllMain 内）では呼ばないこと。
-pub unsafe fn install_inline_hooks(rt: &HookRuntime) -> InlineInstallOutcome {
+unsafe fn install_inline_hooks_for(
+    rt: &HookRuntime,
+    apis: impl Iterator<Item = &'static ApiDef>,
+) -> InlineInstallOutcome {
     let bitness: u32 = if cfg!(target_arch = "x86_64") { 64 } else { 32 };
     let mut outcome = InlineInstallOutcome::default();
     // 計画: 解決・デコードまでを先に行い、パッチ対象だけを残す。
     let mut planned: Vec<PlannedInline> = Vec::new();
-    for api in api_table() {
+    for api in apis {
         let target = match resolve_export(api.module, api.function) {
             Some(t) => t,
             None => {
@@ -760,12 +802,23 @@ fn winrt_activation_name(index: usize) -> &'static str {
     }
 }
 
+fn callback_hook_name(index: usize) -> &'static str {
+    match index {
+        CALLBACK_HOOK_REGISTER_CLASS_EX_W => "RegisterClassExW",
+        CALLBACK_HOOK_REGISTER_CLASS_EX_A => "RegisterClassExA",
+        CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W => "SetWindowLongPtrW",
+        CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A => "SetWindowLongPtrA",
+        _ => "?",
+    }
+}
+
 /// 計画済み Inline Hook の表示名（見送り理由の報告用）。
 fn planned_inline_name(p: &PlannedInline) -> &'static str {
     match p.slot {
         InlineOriginalSlot::Api(_) => "?",
         InlineOriginalSlot::ComFactory(i) => com_factory_name(i),
         InlineOriginalSlot::WinRtActivation(i) => winrt_activation_name(i),
+        InlineOriginalSlot::Callback(i) => callback_hook_name(i),
     }
 }
 
@@ -993,6 +1046,104 @@ pub unsafe fn install_winrt_activation_hooks(rt: &HookRuntime) -> WinRtActivatio
     outcome
 }
 
+/// コールバック検出フック関数の Inline Hook 設置結果。解除は
+/// `uninstall_inline_hooks` で行う（agent-dll が保持する）。
+#[derive(Debug, Default)]
+pub struct CallbackOutcome {
+    pub installed: Vec<InlineHook>,
+    /// (関数名, 見送り理由)
+    pub skipped: Vec<(&'static str, &'static str)>,
+}
+
+/// コールバック検出フック関数（RegisterClassExW/A /
+/// SetWindowLongPtrW/A）へ Inline Hook を設置する（L16）。
+///
+/// COM Factory 関数・WinRT アクティベーション関数と同じ手順（全スレッド
+/// 一時停止＋命令ポインタ検査＋トランポリン近傍確保）で、IAT フックの後・
+/// Inline Hook とは別に呼ぶこと。設置は関数ごとの best-effort で、見送りが
+/// あっても初期化は成功として継続する（COM Factory と同じ扱い）。
+///
+/// # Safety
+/// 対象プロセスの全スレッドを一時停止してからパッチするため、呼び出し元
+/// スレッド以外が対象 API の先頭命令を実行中でないことを確認してから
+/// 書き換える。Loader Lock 下（DllMain 内）では呼ばないこと。
+pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
+    let mut outcome = CallbackOutcome::default();
+    let bitness: u32 = if cfg!(target_arch = "x86_64") { 64 } else { 32 };
+    let hooks: [(usize, usize); CALLBACK_HOOK_COUNT] = [
+        (
+            CALLBACK_HOOK_REGISTER_CLASS_EX_W,
+            detour_register_class_ex_w as RegisterClassExFn as usize,
+        ),
+        (
+            CALLBACK_HOOK_REGISTER_CLASS_EX_A,
+            detour_register_class_ex_a as RegisterClassExFn as usize,
+        ),
+        (
+            CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W,
+            detour_set_window_long_ptr_w as SetWindowLongPtrFn as usize,
+        ),
+        (
+            CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A,
+            detour_set_window_long_ptr_a as SetWindowLongPtrFn as usize,
+        ),
+    ];
+    let mut planned: Vec<PlannedInline> = Vec::new();
+    for (index, detour) in hooks {
+        let def = &CALLBACK_HOOKS[index];
+        let target = match resolve_export(def.module, def.function) {
+            Some(t) => t,
+            None => {
+                outcome.skipped.push((def.function, "not-exported"));
+                continue;
+            }
+        };
+        let mut bytes = [0u8; 32];
+        if !ProcessMemory.read_exact(target as u64, &mut bytes) {
+            outcome.skipped.push((def.function, "read-failed"));
+            continue;
+        }
+        if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
+            outcome.skipped.push((def.function, "already-hooked"));
+            continue;
+        }
+        match plan_stolen(&bytes, target as u64, detour as u64, bitness) {
+            Ok(plan) => planned.push(PlannedInline {
+                slot: InlineOriginalSlot::Callback(index),
+                target,
+                detour,
+                original_bytes: bytes[..plan.stolen_len].to_vec(),
+                plan,
+            }),
+            Err(e) => outcome.skipped.push((def.function, e.reason())),
+        }
+    }
+    if planned.is_empty() {
+        return outcome;
+    }
+    let Ok(suspender) = SuspendedThreads::suspend_all() else {
+        for p in planned {
+            outcome
+                .skipped
+                .push((planned_inline_name(&p), "thread-suspend-failed"));
+        }
+        return outcome;
+    };
+    for p in planned {
+        let name = planned_inline_name(&p);
+        if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
+            outcome.skipped.push((name, "thread-in-target"));
+            continue;
+        }
+        match install_one_inline(rt, &p, bitness) {
+            Ok(hook) => outcome.installed.push(hook),
+            Err(reason) => outcome.skipped.push((name, reason)),
+        }
+    }
+    suspender.resume();
+    outcome
+}
+
 /// 追跡対象のインターフェイスへ vtable 複製による Detour を設置する。
 ///
 /// 手順：元の vtable とメソッド列を読み、複製を作って Detour で
@@ -1142,8 +1293,107 @@ fn detour_for(api_id: u32) -> usize {
         API_GET_QUEUED_COMPLETION_STATUS => {
             (detour_get_queued_completion_status as GetQueuedCompletionStatusFn) as usize
         }
+        // L15: 内部 API (Nt*) は汎用 Detour で中継する（手書きの
+        // トランポリン。引数個数は Nt* のシグネチャ通り）。
+        API_NT_CREATE_FILE => (detour_nt_create_file as GenericFn11) as usize,
+        API_NT_OPEN_FILE => (detour_nt_open_file as GenericFn6) as usize,
+        API_NT_READ_FILE => (detour_nt_read_file as GenericFn9) as usize,
+        API_NT_WRITE_FILE => (detour_nt_write_file as GenericFn9) as usize,
+        API_NT_CLOSE => (detour_nt_close as GenericFn1) as usize,
+        API_NT_QUERY_INFORMATION_FILE => (detour_nt_query_information_file as GenericFn5) as usize,
+        API_NT_SET_INFORMATION_FILE => (detour_nt_set_information_file as GenericFn5) as usize,
         _ => detour_for_generated(api_id),
     }
+}
+
+// ---- L15: 内部 API (Nt*) 用の汎用 Detour トランポリン ----
+//
+// 生成 API と同じく `generic_detour` へ中継する。トランポリンは API
+// ごとの正しい引数個数の `extern "system" fn` であるため、元の関数が
+// 見るレジスタ・スタック配置は手書き Detour と同じになる。引数個数は
+// Nt* の公開シグネチャ通り（NtCreateFile 11 / NtOpenFile 6 /
+// NtReadFile・NtWriteFile 9 / NtClose 1 /
+// NtQueryInformationFile・NtSetInformationFile 5）。
+unsafe extern "system" fn detour_nt_create_file(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+    a9: usize,
+    a10: usize,
+) -> usize {
+    generic_detour(
+        API_NT_CREATE_FILE,
+        &[a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10],
+    )
+}
+
+unsafe extern "system" fn detour_nt_open_file(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> usize {
+    generic_detour(API_NT_OPEN_FILE, &[a0, a1, a2, a3, a4, a5])
+}
+
+unsafe extern "system" fn detour_nt_read_file(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+) -> usize {
+    generic_detour(API_NT_READ_FILE, &[a0, a1, a2, a3, a4, a5, a6, a7, a8])
+}
+
+unsafe extern "system" fn detour_nt_write_file(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+) -> usize {
+    generic_detour(API_NT_WRITE_FILE, &[a0, a1, a2, a3, a4, a5, a6, a7, a8])
+}
+
+unsafe extern "system" fn detour_nt_close(a0: usize) -> usize {
+    generic_detour(API_NT_CLOSE, &[a0])
+}
+
+unsafe extern "system" fn detour_nt_query_information_file(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> usize {
+    generic_detour(API_NT_QUERY_INFORMATION_FILE, &[a0, a1, a2, a3, a4])
+}
+
+unsafe extern "system" fn detour_nt_set_information_file(
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> usize {
+    generic_detour(API_NT_SET_INFORMATION_FILE, &[a0, a1, a2, a3, a4])
 }
 
 // ---- L03: 生成 API 用の汎用 Detour ----
@@ -1785,6 +2035,419 @@ unsafe extern "system" fn detour_ro_get_activation_factory(
     }
 }
 
+// ---- コールバック (L16) ----
+
+/// コールバック検出フックと WndProc ラッパー共通の前処理。
+/// `prepare_com` / `prepare_winrt` と同じ判定だが、元関数は呼び出し側が
+/// 解決して渡す（検出フック関数はランタイムの別表、WndProc はスロット表から）。
+///
+/// WndProc の入口では Unavailable を返さない：ランタイムが無くても元の
+/// プロシージャはスロット表から判明しているため、記録せず素通しで呼ぶ。
+/// WndProc が 0 を返すとウィンドウ作成の失敗（WM_NCCREATE / WM_CREATE）
+/// などアプリの挙動が変わるため、元のプロシージャを呼ばずに失敗値を
+/// 返す経路は作らない。
+enum CallbackPrepare {
+    Proceed {
+        rt: Arc<HookRuntime>,
+        original: usize,
+        tid: u64,
+        flight: crate::runtime::DetourFlight,
+        guard: ReentrancyGuard,
+        last_error: crate::runtime::LastErrorGuard<WinLastError>,
+    },
+    Passthrough {
+        original: usize,
+    },
+    Unavailable,
+}
+
+/// コールバック検出フック関数の Detour 共通の前処理。元関数はランタイムの
+/// コールバック別表から引く（`prepare_com` と同じ形）。
+fn prepare_callback_hook(hook_index: usize) -> CallbackPrepare {
+    let le = crate::runtime::LastErrorGuard::capture(WinLastError);
+    let Some(guard) = ReentrancyGuard::try_enter() else {
+        let Some(rt) = runtime() else {
+            return CallbackPrepare::Unavailable;
+        };
+        let original = rt.callback_original(hook_index);
+        if original == 0 {
+            return CallbackPrepare::Unavailable;
+        }
+        le.restore_before_original();
+        return CallbackPrepare::Passthrough { original };
+    };
+    let Some(rt) = runtime() else {
+        return CallbackPrepare::Unavailable;
+    };
+    let original = rt.callback_original(hook_index);
+    if original == 0 {
+        return CallbackPrepare::Unavailable;
+    }
+    // L23: 呼び出し元が Runtime なら記録しない（元の呼び出しだけ素通し）。
+    if rt.should_suppress_caller() {
+        le.restore_before_original();
+        return CallbackPrepare::Passthrough { original };
+    }
+    match crate::runtime::DetourFlight::begin(&rt) {
+        Some(flight) => {
+            let tid = unsafe { GetCurrentThreadId() } as u64;
+            rt.ensure_thread(tid);
+            CallbackPrepare::Proceed {
+                rt,
+                original,
+                tid,
+                flight,
+                guard,
+                last_error: le,
+            }
+        }
+        None => {
+            le.restore_before_original();
+            CallbackPrepare::Passthrough { original }
+        }
+    }
+}
+
+/// WndProc ラッパーの前処理。元関数はスロット表から判明済みのため、
+/// ランタイムが無くても Passthrough で元のプロシージャを呼ぶ。
+fn prepare_callback_dispatch(original: usize) -> CallbackPrepare {
+    let le = crate::runtime::LastErrorGuard::capture(WinLastError);
+    let Some(guard) = ReentrancyGuard::try_enter() else {
+        le.restore_before_original();
+        return CallbackPrepare::Passthrough { original };
+    };
+    let Some(rt) = runtime() else {
+        // ランタイムが無い（終了手順の後など）：記録せず素通しで呼ぶ。
+        le.restore_before_original();
+        return CallbackPrepare::Passthrough { original };
+    };
+    // L23: 呼び出し元は user32.dll の DispatchMessageW（Windows 分類）の
+    // ため通常は抑制されない。Runtime 分類の場合は記録しない。
+    if rt.should_suppress_caller() {
+        le.restore_before_original();
+        return CallbackPrepare::Passthrough { original };
+    }
+    match crate::runtime::DetourFlight::begin(&rt) {
+        Some(flight) => {
+            let tid = unsafe { GetCurrentThreadId() } as u64;
+            rt.ensure_thread(tid);
+            CallbackPrepare::Proceed {
+                rt,
+                original,
+                tid,
+                flight,
+                guard,
+                last_error: le,
+            }
+        }
+        None => {
+            le.restore_before_original();
+            CallbackPrepare::Passthrough { original }
+        }
+    }
+}
+
+/// WndProc の型（`extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT`）。
+type WndProcFn = unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize;
+type RegisterClassExFn = unsafe extern "system" fn(*const c_void) -> u16;
+type SetWindowLongPtrFn = unsafe extern "system" fn(*mut c_void, i32, usize) -> usize;
+
+/// WndProc ラッパー 1 件。スロット番号を固定で持ち、共通の dispatch へ渡す。
+macro_rules! wnd_proc_wrapper {
+    ($name:ident, $slot:expr) => {
+        unsafe extern "system" fn $name(
+            hwnd: *mut c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize {
+            unsafe { wnd_proc_dispatch($slot, hwnd, msg, wparam, lparam) }
+        }
+    };
+}
+
+macro_rules! wnd_proc_wrappers {
+    ($($name:ident = $slot:expr),* $(,)?) => {
+        $(wnd_proc_wrapper!($name, $slot);)*
+        /// スロット番号順の WndProc ラッパー関数列。
+        static CALLBACK_WRAPPERS: [WndProcFn; CALLBACK_PROC_SLOTS] = [
+            $($name as WndProcFn),*
+        ];
+    };
+}
+
+wnd_proc_wrappers!(
+    wnd_proc_wrapper_00 = 0,
+    wnd_proc_wrapper_01 = 1,
+    wnd_proc_wrapper_02 = 2,
+    wnd_proc_wrapper_03 = 3,
+    wnd_proc_wrapper_04 = 4,
+    wnd_proc_wrapper_05 = 5,
+    wnd_proc_wrapper_06 = 6,
+    wnd_proc_wrapper_07 = 7,
+    wnd_proc_wrapper_08 = 8,
+    wnd_proc_wrapper_09 = 9,
+    wnd_proc_wrapper_10 = 10,
+    wnd_proc_wrapper_11 = 11,
+    wnd_proc_wrapper_12 = 12,
+    wnd_proc_wrapper_13 = 13,
+    wnd_proc_wrapper_14 = 14,
+    wnd_proc_wrapper_15 = 15,
+    wnd_proc_wrapper_16 = 16,
+    wnd_proc_wrapper_17 = 17,
+    wnd_proc_wrapper_18 = 18,
+    wnd_proc_wrapper_19 = 19,
+    wnd_proc_wrapper_20 = 20,
+    wnd_proc_wrapper_21 = 21,
+    wnd_proc_wrapper_22 = 22,
+    wnd_proc_wrapper_23 = 23,
+    wnd_proc_wrapper_24 = 24,
+    wnd_proc_wrapper_25 = 25,
+    wnd_proc_wrapper_26 = 26,
+    wnd_proc_wrapper_27 = 27,
+    wnd_proc_wrapper_28 = 28,
+    wnd_proc_wrapper_29 = 29,
+    wnd_proc_wrapper_30 = 30,
+    wnd_proc_wrapper_31 = 31,
+);
+
+/// スロット番号からラッパー関数のアドレスを引く。
+fn wrapper_for_slot(slot: usize) -> Option<usize> {
+    CALLBACK_WRAPPERS.get(slot).map(|f| *f as usize)
+}
+
+/// ラッパー関数のアドレスからスロット番号を引く。ラッパーでなければ None。
+fn slot_for_wrapper(wrapper: usize) -> Option<usize> {
+    CALLBACK_WRAPPERS
+        .iter()
+        .position(|f| *f as usize == wrapper)
+}
+
+/// ラッパー関数のアドレスから元の WndProc を引く。ラッパーでなければ None。
+fn original_for_wrapper(wrapper: usize) -> Option<usize> {
+    slot_for_wrapper(wrapper).and_then(|slot| callback_procs().original(slot))
+}
+
+/// ラップされた WndProc の本体。コールバック enter を記録し、呼出スタックへ
+/// 積んでから元のプロシージャを呼ぶ。コールバック中の API 呼び出しは
+/// このイベントを親として入れ子に記録される（A43 / C18）。
+/// 元のプロシージャが例外で中断したら、ComCallGuard が CallAborted を
+/// 記録する（L08。例外は捕捉しない）。
+unsafe fn wnd_proc_dispatch(
+    slot: usize,
+    hwnd: *mut c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    let Some(original) = callback_procs().original(slot) else {
+        // 到達しないはずの防御：スロットが空なら元のプロシージャは
+        // 呼べない。0 を返す（呼ぶ先が無いため他に手段が無い）。
+        return 0;
+    };
+    // SAFETY: スロット表から引いた元のプロシージャ。
+    let orig: WndProcFn = unsafe { std::mem::transmute(original) };
+    let (rt, tid, _flight, mut guard, mut le) = match prepare_callback_dispatch(original) {
+        CallbackPrepare::Proceed {
+            rt,
+            original: _,
+            tid,
+            flight,
+            guard,
+            last_error,
+        } => (rt, tid, flight, guard, last_error),
+        CallbackPrepare::Passthrough { original } => {
+            // SAFETY: スロット表から引いた元のプロシージャ。
+            let orig: WndProcFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(hwnd, msg, wparam, lparam) };
+        }
+        CallbackPrepare::Unavailable => return 0,
+    };
+    let call_id = rt.alloc_call_id();
+    let values = crate::callback::callback_enter_values(
+        hwnd as u64,
+        CallbackKind::WndProc,
+        msg,
+        wparam as u64,
+        lparam as i64,
+        original as u64,
+    );
+    if let Ok(bytes) = crate::callback::encode_callback_enter(&values) {
+        rt.record_callback_enter(tid, call_id, &bytes);
+    }
+    push_call(call_id);
+    // L08: 元のプロシージャが例外で中断したら、巻き戻しで ComCallGuard が
+    // CallAborted を記録する（例外は捕捉しない）。
+    let mut call_guard =
+        ComCallGuard::new_for(&rt, tid, call_id, CALLBACK_API_ID, CALLBACK_LEAVE_SCHEMA_ID);
+    le.restore_before_original();
+    guard.suspend();
+    // SAFETY: スロット表から引いた元のプロシージャ。
+    let result = unsafe { orig(hwnd, msg, wparam, lparam) };
+    guard.resume();
+    call_guard.complete();
+    let _ = le.capture_after_original();
+    pop_call(call_id);
+    let values = crate::callback::callback_leave_values(result as i64);
+    if let Ok(bytes) = crate::callback::encode_callback_leave(&values) {
+        rt.record_callback_leave(tid, call_id, &bytes);
+    }
+    // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
+    le.restore_for_return();
+    result
+}
+
+/// `RegisterClassExW/A` の構造体バイト列を読む。`cbSize` が範囲外・
+/// 読めない場合は None（素通し）。
+fn read_class_bytes(wc: *const c_void) -> Option<Vec<u8>> {
+    if wc.is_null() {
+        return None;
+    }
+    let mut size_buf = [0u8; 4];
+    if !ProcessMemory.read_exact(wc as u64, &mut size_buf) {
+        return None;
+    }
+    let cb_size = u32::from_le_bytes(size_buf) as usize;
+    if !(16..=MAX_WNDCLASSEX_BYTES).contains(&cb_size) {
+        return None;
+    }
+    let mut buf = vec![0u8; cb_size];
+    if !ProcessMemory.read_exact(wc as u64, &mut buf) {
+        return None;
+    }
+    Some(buf)
+}
+
+/// `RegisterClassExW/A` の Detour 本体。アプリが渡した構造体のコピーを
+/// 作り、コピー内の `lpfnWndProc` だけをラッパーへすり替えて元の関数へ
+/// 渡す。読めない・`cbSize` が範囲外・ラップできない場合は素通しする
+/// （クラス登録自体は成功させ、コールバックの記録だけが無い）。
+/// この Detour 自体は API 呼び出しイベントを記録しない（RegisterClassEx
+/// は API 表に無い）。記録されるのはラッパー経由のコールバックである。
+unsafe fn detour_register_class_ex(hook_index: usize, wc: *const c_void) -> u16 {
+    let (_rt, original, _tid, _flight, mut guard, mut le) = match prepare_callback_hook(hook_index)
+    {
+        CallbackPrepare::Proceed {
+            rt,
+            original,
+            tid,
+            flight,
+            guard,
+            last_error,
+        } => (rt, original, tid, flight, guard, last_error),
+        CallbackPrepare::Passthrough { original } => {
+            // SAFETY: ランタイムの別表から引いた元の関数。
+            let orig: RegisterClassExFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(wc) };
+        }
+        CallbackPrepare::Unavailable => return 0,
+    };
+    // SAFETY: 設置時に保存した元の RegisterClassEx。
+    let orig: RegisterClassExFn = unsafe { std::mem::transmute(original) };
+    // 構造体をコピーし、コピー内の lpfnWndProc だけをラッパーへすり替える。
+    // 読めない・cbSize が範囲外・ラップできない場合は None（素通し）。
+    let replaced: Option<Vec<u8>> = read_class_bytes(wc).and_then(|bytes| {
+        let original_proc = read_usize(wc as u64 + WNDPROC_FIELD_OFFSET as u64)?;
+        let slot = callback_procs().wrap(original_proc)?;
+        let wrapper = wrapper_for_slot(slot)?;
+        wrap_wndproc_in_class(&bytes, wrapper).map(|(_, replaced)| replaced)
+    });
+    let call_with: *const c_void = match &replaced {
+        Some(bytes) => bytes.as_ptr() as *const c_void,
+        None => wc,
+    };
+    le.restore_before_original();
+    guard.suspend();
+    // SAFETY: コピーした構造体（または元の構造体）を渡す。
+    let result = unsafe { orig(call_with) };
+    guard.resume();
+    let _ = le.capture_after_original();
+    le.restore_for_return();
+    result
+}
+
+unsafe extern "system" fn detour_register_class_ex_w(wc: *const c_void) -> u16 {
+    unsafe { detour_register_class_ex(CALLBACK_HOOK_REGISTER_CLASS_EX_W, wc) }
+}
+
+unsafe extern "system" fn detour_register_class_ex_a(wc: *const c_void) -> u16 {
+    unsafe { detour_register_class_ex(CALLBACK_HOOK_REGISTER_CLASS_EX_A, wc) }
+}
+
+/// `SetWindowLongPtrW/A` の Detour 本体。`GWLP_WNDPROC` の差し替えだけを
+/// ラップする。それ以外（他のインデックス・0 の指定）は素通しする。
+/// 戻り値が shirusu のラッパーだった場合は元のプロシージャへ解決して
+/// アプリへ返す（アプリはラッパーの存在を観測しない）。
+/// この Detour 自体は API 呼び出しイベントを記録しない（SetWindowLongPtr
+/// は API 表に無い）。記録されるのはラッパー経由のコールバックである。
+unsafe fn detour_set_window_long_ptr(
+    hook_index: usize,
+    hwnd: *mut c_void,
+    n_index: i32,
+    new_long: usize,
+) -> usize {
+    let (_rt, original, _tid, _flight, mut guard, mut le) = match prepare_callback_hook(hook_index)
+    {
+        CallbackPrepare::Proceed {
+            rt,
+            original,
+            tid,
+            flight,
+            guard,
+            last_error,
+        } => (rt, original, tid, flight, guard, last_error),
+        CallbackPrepare::Passthrough { original } => {
+            // SAFETY: ランタイムの別表から引いた元の関数。
+            let orig: SetWindowLongPtrFn = unsafe { std::mem::transmute(original) };
+            return unsafe { orig(hwnd, n_index, new_long) };
+        }
+        CallbackPrepare::Unavailable => return 0,
+    };
+    // SAFETY: 設置時に保存した元の SetWindowLongPtr。
+    let orig: SetWindowLongPtrFn = unsafe { std::mem::transmute(original) };
+    let mut call_with = new_long;
+    if should_wrap_set_window_long(n_index, new_long) {
+        // 既にラッパーになっている値（アプリが GetWindowLongPtrW で
+        // 読み戻したもの）をそのまま渡した場合は二重ラップしない。
+        if slot_for_wrapper(new_long).is_none() {
+            if let Some(slot) = callback_procs().wrap(new_long) {
+                if let Some(wrapper) = wrapper_for_slot(slot) {
+                    call_with = wrapper;
+                }
+            }
+        }
+    }
+    le.restore_before_original();
+    guard.suspend();
+    // SAFETY: ラップ済みまたは元の値を渡す。
+    let prev = unsafe { orig(hwnd, n_index, call_with) };
+    guard.resume();
+    let _ = le.capture_after_original();
+    le.restore_for_return();
+    // 戻り値（以前のプロシージャ）がラッパーなら元へ解決して返す。
+    resolve_prev_proc(prev, original_for_wrapper)
+}
+
+unsafe extern "system" fn detour_set_window_long_ptr_w(
+    hwnd: *mut c_void,
+    n_index: i32,
+    new_long: usize,
+) -> usize {
+    unsafe {
+        detour_set_window_long_ptr(CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W, hwnd, n_index, new_long)
+    }
+}
+
+unsafe extern "system" fn detour_set_window_long_ptr_a(
+    hwnd: *mut c_void,
+    n_index: i32,
+    new_long: usize,
+) -> usize {
+    unsafe {
+        detour_set_window_long_ptr(CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A, hwnd, n_index, new_long)
+    }
+}
+
 /// 元の COM メソッドを呼ぶ。`args` は `this` を除く引数（最大 4 個）。
 ///
 /// # Safety
@@ -2232,6 +2895,14 @@ fn prepare(api_id: u32) -> Prepare {
     // 場合は記録する（fail-open）。再入ゲートや終了ゲートの後に判定
     // することで、Agent 自身の呼び出しはそちらで素通しになる。
     if rt.should_suppress_caller() {
+        le.restore_before_original();
+        return Prepare::Passthrough { original };
+    }
+    // L15: 内部 API (Nt*) は詳細調査モードでのみ記録する。無効なら
+    // 元の API だけ素通しで呼ぶ（Detour が設置されていても記録しない）。
+    // 呼び出し元抑制の後に置くことで、詳細調査モードでは Runtime 起源の
+    // 内部呼び出しも record_runtime_apis と合わせて記録される。
+    if rt.should_suppress_internal(api.api_id) {
         le.restore_before_original();
         return Prepare::Passthrough { original };
     }
@@ -2937,6 +3608,66 @@ mod tests {
         drop(guard);
         assert!(!ReentrancyGuard::is_active());
 
+        assert!(clear_runtime(&rt));
+        assert!(runtime().is_none());
+    }
+
+    #[test]
+    fn prepare_suppresses_internal_api_unless_detailed() {
+        // L15: 内部 API (Nt*) は詳細調査モードでのみ記録経路に入る。
+        // 無効な場合は元の API だけ素通しで呼ぶ。Win32 API は影響を
+        // 受けない。グローバルスロットはこのテストだけが使う（他の
+        // テストは触らない）。
+        assert!(runtime().is_none());
+        let pool = Arc::new(SlotPool::new(2));
+        let agent = Arc::new(Agent::new(
+            pool,
+            RingConfig::new(64, 4096),
+            Arc::new(HostMonitor::always_alive()),
+        ));
+        let rt = Arc::new(HookRuntime::new(agent, Vec::new(), None));
+        rt.set_original(API_NT_CREATE_FILE, 0x1234_5678);
+        rt.set_original(API_CREATE_FILE_W, 0x1234_5678);
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+
+        // 詳細調査モード無効（既定）: NtCreateFile は素通し。
+        match prepare(API_NT_CREATE_FILE) {
+            Prepare::Passthrough { original } => assert_eq!(original, 0x1234_5678),
+            Prepare::Record { .. } => panic!("expected Passthrough for internal API"),
+            Prepare::Unavailable => panic!("expected Passthrough, runtime/original missing"),
+        }
+        // 同じ条件で CreateFileW は記録経路に入る（ガードはすぐ落とす）。
+        match prepare(API_CREATE_FILE_W) {
+            Prepare::Record { guard, flight, .. } => {
+                drop(flight);
+                drop(guard);
+            }
+            Prepare::Passthrough { .. } => panic!("expected Record for Win32 API"),
+            Prepare::Unavailable => panic!("expected Record, runtime/original missing"),
+        }
+        assert!(clear_runtime(&rt));
+        assert!(runtime().is_none());
+
+        // 詳細調査モード有効: NtCreateFile も記録経路に入る。
+        let pool = Arc::new(SlotPool::new(2));
+        let agent = Arc::new(Agent::new(
+            pool,
+            RingConfig::new(64, 4096),
+            Arc::new(HostMonitor::always_alive()),
+        ));
+        let rt = Arc::new(HookRuntime::new(agent, Vec::new(), None).with_detailed_mode(true));
+        rt.set_original(API_NT_CREATE_FILE, 0x1234_5678);
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        match prepare(API_NT_CREATE_FILE) {
+            Prepare::Record { guard, flight, .. } => {
+                drop(flight);
+                drop(guard);
+            }
+            Prepare::Passthrough { .. } => {
+                panic!("expected Record for internal API in detailed mode")
+            }
+            Prepare::Unavailable => panic!("expected Record, runtime/original missing"),
+        }
         assert!(clear_runtime(&rt));
         assert!(runtime().is_none());
     }

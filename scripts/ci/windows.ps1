@@ -12,6 +12,9 @@ Set-Location (Join-Path $PSScriptRoot "..\..")
 Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "canary-exit-code.ps1") } "exit-code canary"
 Invoke-Native { cargo test --workspace --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
 Invoke-Native { cargo build --workspace --target x86_64-pc-windows-msvc } "cargo build (workspace, x64)"
+# L20: Probe exe 生成と JSON Runner の実動（サンプル仕様から x64 の
+# Probe exe を生成・実行し、Runner でも同じ仕様を実行する）。
+Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "probe-l20.ps1") -Target x86_64-pc-windows-msvc } "probe-exe + runner (L20, x64)"
 Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --all } "e2e supervisor --all"
 # Phase 3: Agent DLL 注入＋フック記録の実 E2E（対象プロセスを起動して Trace を検証）
 # D54: Application Verifier を対象プロセス (shirusu-hook-target) に併用する。

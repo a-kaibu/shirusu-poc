@@ -732,6 +732,7 @@ fn decode_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shirusu_trace::model::PayloadLossReason;
 
     #[test]
     fn aborted_phase_has_its_own_name() {
@@ -750,5 +751,202 @@ mod tests {
         assert_eq!(KIND_COMPLETED, 8);
         assert_eq!(Phase::of_kind(KIND_COMPLETED), Phase::Completed);
         assert_eq!(Phase::Completed.name(), "completed");
+    }
+
+    #[test]
+    fn other_phase_name_and_schema_name_without_suffix() {
+        // カバレッジ gap: Phase::Other の名前と、/enter・/leave 接尾辞
+        // の無いスキーマ名の API 名抽出。
+        assert_eq!(Phase::Other(5).name(), "event");
+        assert_eq!(Phase::Enter.name(), "enter");
+        assert_eq!(Phase::Leave.name(), "leave");
+        assert_eq!(
+            api_name_of_schema("kernel32!CreateFileW/enter"),
+            "kernel32!CreateFileW"
+        );
+        assert_eq!(
+            api_name_of_schema("kernel32!CreateFileW/leave"),
+            "kernel32!CreateFileW"
+        );
+        assert_eq!(api_name_of_schema("test!Ping"), "test!Ping");
+    }
+
+    #[test]
+    fn reason_capture_and_value_capture_names() {
+        // カバレッジ gap: 各種の名前関数の全バリアント。
+        assert_eq!(reason_name(PayloadLossReason::Backpressure), "backpressure");
+        assert_eq!(reason_name(PayloadLossReason::TooLarge), "too_large");
+        assert_eq!(reason_name(PayloadLossReason::Overflow), "overflow");
+        assert_eq!(reason_name(PayloadLossReason::HostStopped), "host_stopped");
+        assert_eq!(reason_name(PayloadLossReason::Other), "other");
+        assert_eq!(capture_name(EventCapture::Captured), "captured");
+        assert_eq!(
+            capture_name(EventCapture::MemoryUnreadable),
+            "memory_unreadable"
+        );
+        assert_eq!(
+            capture_name(EventCapture::CaptureLimitExceeded),
+            "capture_limit_exceeded"
+        );
+        assert_eq!(
+            capture_name(EventCapture::DroppedByBackpressure),
+            "dropped_by_backpressure"
+        );
+        assert_eq!(capture_name(EventCapture::Truncated), "truncated");
+        assert_eq!(capture_name(EventCapture::Unsupported), "unsupported");
+        assert_eq!(capture_name(EventCapture::Other(9)), "other(9)");
+        assert_eq!(value_capture_name(ValueCapture::Captured), "captured");
+        assert_eq!(value_capture_name(ValueCapture::Unreadable), "unreadable");
+        assert_eq!(value_capture_name(ValueCapture::Truncated), "truncated");
+        assert_eq!(value_capture_name(ValueCapture::Unsupported), "unsupported");
+        assert_eq!(
+            value_capture_name(ValueCapture::LimitExceeded),
+            "limit_exceeded"
+        );
+        assert_eq!(value_capture_name(ValueCapture::Stale), "stale");
+    }
+
+    #[test]
+    fn integrity_and_loss_kind_names() {
+        // カバレッジ gap: 完全性レベル名と Loss 種別名の全バリアント。
+        assert_eq!(integrity_level_name(0), "Complete");
+        assert_eq!(integrity_level_name(1), "Degraded");
+        assert_eq!(integrity_level_name(2), "Lost");
+        assert_eq!(integrity_level_name(3), "Unknown");
+        assert_eq!(integrity_level_name(4), "Invalid");
+        assert_eq!(integrity_level_name(99), "Invalid");
+        assert_eq!(loss_kind_name(1), "sequence_gap");
+        assert_eq!(loss_kind_name(2), "counters");
+        assert_eq!(loss_kind_name(3), "unknown_termination");
+        assert_eq!(loss_kind_name(4), "integrity_lost");
+        assert_eq!(loss_kind_name(0), "other");
+        assert_eq!(loss_kind_name(99), "other");
+    }
+
+    #[test]
+    fn payload_view_describe_covers_all_variants() {
+        // カバレッジ gap: PayloadView::describe の Inline / Dropped。
+        let id = BlobId::of_content(b"payload");
+        assert_eq!(PayloadView::None.describe(), "none");
+        assert_eq!(
+            PayloadView::Blob(id).describe(),
+            format!("blob:{}", id.to_hex())
+        );
+        assert_eq!(PayloadView::Inline(vec![1, 2, 3]).describe(), "inline[3]");
+        assert_eq!(
+            PayloadView::Dropped {
+                original_len: 100,
+                reason: PayloadLossReason::Overflow,
+            }
+            .describe(),
+            "dropped(len=100, reason=overflow)"
+        );
+    }
+
+    #[test]
+    fn format_value_covers_all_types() {
+        // カバレッジ gap: format_value の I64 / F32 / F64 / Bool /
+        // Str / BlobRef / Ptr32 / Ptr64。
+        assert_eq!(format_value(&TypedValue::I32(-3)), "-3");
+        assert_eq!(format_value(&TypedValue::I64(-4)), "-4");
+        assert_eq!(format_value(&TypedValue::U32(5)), "5");
+        assert_eq!(format_value(&TypedValue::U64(0x2a4)), "0x2a4");
+        assert_eq!(
+            format_value(&TypedValue::F32Bits(0x3F80_0000)),
+            "f32(0x3f800000)"
+        );
+        assert_eq!(
+            format_value(&TypedValue::F64Bits(0x3FF0_0000_0000_0000)),
+            "f64(0x3ff0000000000000)"
+        );
+        assert_eq!(format_value(&TypedValue::Bool(true)), "true");
+        assert_eq!(format_value(&TypedValue::Str("a".into())), "\"a\"");
+        assert_eq!(format_value(&TypedValue::Str16(vec![0x61])), "\"a\"");
+        assert_eq!(
+            format_value(&TypedValue::Bytes(vec![0xde, 0xad])),
+            "bytes[2]=dead"
+        );
+        let id = BlobId::of_content(b"payload");
+        assert_eq!(
+            format_value(&TypedValue::BlobRef(id)),
+            format!("blob:{}", id.to_hex())
+        );
+        assert_eq!(format_value(&TypedValue::Ptr32(0x1234)), "0x00001234");
+        assert_eq!(
+            format_value(&TypedValue::Ptr64(0x1234)),
+            "0x0000000000001234"
+        );
+    }
+
+    #[test]
+    fn value_to_json_covers_all_types() {
+        // カバレッジ gap: value_to_json の I64 / F32 / F64 / Bool /
+        // Str / Bytes / BlobRef / Ptr32 / Ptr64。
+        assert_eq!(value_to_json(&TypedValue::I32(-3)).render(), "-3");
+        assert_eq!(value_to_json(&TypedValue::I64(-4)).render(), "-4");
+        assert_eq!(value_to_json(&TypedValue::U32(5)).render(), "5");
+        assert_eq!(value_to_json(&TypedValue::U64(0x2a4)).render(), "\"0x2a4\"");
+        assert_eq!(
+            value_to_json(&TypedValue::F32Bits(0x3F80_0000)).render(),
+            "\"f32(0x3f800000)\""
+        );
+        assert_eq!(
+            value_to_json(&TypedValue::F64Bits(0x3FF0_0000_0000_0000)).render(),
+            "\"f64(0x3ff0000000000000)\""
+        );
+        assert_eq!(value_to_json(&TypedValue::Bool(true)).render(), "true");
+        assert_eq!(
+            value_to_json(&TypedValue::Str("hi".into())).render(),
+            "\"hi\""
+        );
+        assert_eq!(
+            value_to_json(&TypedValue::Str16(vec![0x68, 0x69])).render(),
+            "\"hi\""
+        );
+        assert_eq!(
+            value_to_json(&TypedValue::Bytes(vec![0xde, 0xad])).render(),
+            "\"dead\""
+        );
+        let id = BlobId::of_content(b"payload");
+        assert_eq!(
+            value_to_json(&TypedValue::BlobRef(id)).render(),
+            format!("\"blob:{}\"", id.to_hex())
+        );
+        assert_eq!(
+            value_to_json(&TypedValue::Ptr32(0x1234)).render(),
+            "\"0x00001234\""
+        );
+        assert_eq!(
+            value_to_json(&TypedValue::Ptr64(0x1234)).render(),
+            "\"0x0000000000001234\""
+        );
+    }
+
+    #[test]
+    fn hex_prefix_truncates_with_ellipsis() {
+        // カバレッジ gap: 上限を超えるバイト列は末尾に `..`。
+        assert_eq!(hex_prefix(&[0xde, 0xad, 0xbe, 0xef], 2), "dead..");
+        assert_eq!(hex_prefix(&[1, 2], 16), "0102");
+        assert_eq!(hex_prefix(&[], 16), "");
+    }
+
+    #[test]
+    fn format_field_covers_non_captured_states() {
+        // カバレッジ gap: Captured 以外の取得状態は値ではなく状態名。
+        for (capture, name) in [
+            (ValueCapture::Unreadable, "unreadable"),
+            (ValueCapture::Truncated, "truncated"),
+            (ValueCapture::Unsupported, "unsupported"),
+            (ValueCapture::LimitExceeded, "limit_exceeded"),
+        ] {
+            let f = FieldView {
+                name: "x".into(),
+                ty: Ty::U32,
+                kind: ValueKind::Unspecified,
+                capture,
+                value: TypedValue::U32(0),
+            };
+            assert_eq!(format_field(&f), format!("x=<{name}>"));
+        }
     }
 }

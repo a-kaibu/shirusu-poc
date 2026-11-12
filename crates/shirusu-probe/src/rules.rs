@@ -188,6 +188,7 @@ pub fn generate_rules(left: &ReadTrace, right: &ReadTrace, cand: &Candidate) -> 
     for strat in strategies(left, right, cand) {
         let spec = TestSpec {
             name: spec_name(cand),
+            steps: Vec::new(),
             rules: vec![strat.rule.clone()],
         };
         let l = evaluate(&spec, left);
@@ -297,6 +298,7 @@ mod tests {
     fn spec_json_roundtrips_through_the_v1_parser() {
         let spec = TestSpec {
             name: "probe-return-difference-readfile".into(),
+            steps: Vec::new(),
             rules: vec![
                 Rule::ApiCalled {
                     api: "kernel32!ReadFile".into(),

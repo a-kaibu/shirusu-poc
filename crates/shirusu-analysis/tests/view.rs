@@ -1,18 +1,20 @@
 //! ビューの単体テスト。合成 Trace を Writer で作り、復号・整形・
 //! 完全性サマリが期待どおりになることを確認する。
 
-use shirusu_analysis::{EventFilter, TraceView};
+use shirusu_analysis::{EventFilter, IntegritySummary, TraceView};
 use shirusu_trace::blob::BlobId;
 use shirusu_trace::compact::encode_values;
 use shirusu_trace::container::{
     parse_raw_header, serialize_header, BlockHeader, BlockType, Compression,
 };
-use shirusu_trace::model::{EventBatch, TraceEvent};
-use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
-use shirusu_trace::reader::{PayloadResolution, RecoveryIssue};
-use shirusu_trace::schema::{make_schema, CapturedValue, EventCapture, Ty, TypedValue};
+use shirusu_trace::model::{EventBatch, PayloadLossReason, TraceEvent};
+use shirusu_trace::proto::{CaptureEnvironment, FieldDef, LossRecord, SchemaDef, SessionMetadata};
+use shirusu_trace::reader::{PayloadResolution, ReadTrace, RecoveryIssue};
+use shirusu_trace::schema::{
+    make_schema, schema_content_hash, CapturedValue, EventCapture, Ty, TypedValue, ValueKind,
+};
 use shirusu_trace::writer::FinalizationInfo;
-use shirusu_trace::TraceWriter;
+use shirusu_trace::{PayloadRef, TraceWriter};
 
 pub fn cv(v: TypedValue) -> CapturedValue {
     CapturedValue::captured(v)
@@ -442,4 +444,596 @@ fn corrupt_blob_keeps_api_call_searchable() {
         PayloadResolution::MissingBlob(id)
     );
     assert!(ev.line().contains("kernel32!CreateFileW"), "{}", ev.line());
+}
+
+/// 任意の kind / Payload / 取得状態 / 全体順序でイベントを積める
+/// 合成 Trace ビルダ（sample_trace_bytes() では作れない形用）。
+struct Flex {
+    events: Vec<TraceEvent>,
+    seq: u64,
+    global_order: bool,
+}
+
+impl Flex {
+    fn new(global_order: bool) -> Self {
+        Flex {
+            events: Vec::new(),
+            seq: 0,
+            global_order,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        kind: u16,
+        call: u64,
+        api_id: u32,
+        schema_id: u32,
+        args: Option<Vec<u8>>,
+        payload: PayloadRef,
+        capture: EventCapture,
+    ) {
+        self.seq += 1;
+        self.events.push(TraceEvent {
+            kind,
+            sequence: self.seq,
+            timestamp_qpc: 1000 + self.seq * 10,
+            call_id: call,
+            parent_call_id: 0,
+            api_id,
+            schema_id,
+            capture,
+            payload,
+            args,
+            global_order: if self.global_order {
+                Some(self.seq)
+            } else {
+                None
+            },
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_typed(
+        &mut self,
+        kind: u16,
+        call: u64,
+        api_id: u32,
+        schema_id: u32,
+        types: &[Ty],
+        values: Vec<CapturedValue>,
+        payload: PayloadRef,
+        capture: EventCapture,
+    ) {
+        self.push(
+            kind,
+            call,
+            api_id,
+            schema_id,
+            Some(encode_values(types, &values).unwrap()),
+            payload,
+            capture,
+        );
+    }
+
+    fn finish(
+        self,
+        schemas: Vec<SchemaDef>,
+        fin: FinalizationInfo,
+        losses: &[LossRecord],
+        blobs: &[&[u8]],
+    ) -> ReadTrace {
+        let env = CaptureEnvironment {
+            session: SessionMetadata {
+                session_id: 42,
+                created_by: "view-coverage".into(),
+                qpc_frequency: 10_000_000,
+            },
+            os_version: "Windows 11".into(),
+            cpu_arch: "x86_64".into(),
+            pointer_width: 64,
+            ..Default::default()
+        };
+        let mut w = TraceWriter::new(Vec::new(), env).unwrap();
+        for def in schemas {
+            w.register_schema(def).unwrap();
+        }
+        for b in blobs {
+            w.add_payload(b).unwrap();
+        }
+        if !losses.is_empty() {
+            w.write_loss_records(losses).unwrap();
+        }
+        if !self.events.is_empty() {
+            w.write_batch(&EventBatch {
+                session_id: 42,
+                process_id: 7,
+                raw_pid: 1234,
+                thread_id: 55,
+                qpc_frequency: 10_000_000,
+                events: self.events,
+            })
+            .unwrap();
+        }
+        let bytes = w.finish(fin).unwrap();
+        shirusu_trace::read_trace(&bytes).unwrap()
+    }
+}
+
+fn flex_schemas() -> Vec<SchemaDef> {
+    vec![
+        make_schema(301, "test!Ping/enter", vec![]),
+        make_schema(
+            302,
+            "test!Ping/leave",
+            vec![("return".into(), Ty::U32, ValueKind::Scalar.flags())],
+        ),
+        make_schema(
+            303,
+            "test!OneField/enter",
+            vec![("only".into(), Ty::U32, 0)],
+        ),
+    ]
+}
+
+#[test]
+fn line_and_json_cover_payload_global_order_and_unknown_schema() {
+    let known = BlobId::of_content(b"flex-blob");
+    let mut f = Flex::new(true);
+    // enter: Inline Payload + 全体順序。
+    f.push_typed(
+        1,
+        1,
+        70,
+        301,
+        &[],
+        vec![],
+        PayloadRef::Inline(vec![1, 2]),
+        EventCapture::Captured,
+    );
+    // leave: Blob Payload。
+    f.push_typed(
+        2,
+        1,
+        70,
+        302,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(7))],
+        PayloadRef::Blob(known),
+        EventCapture::Captured,
+    );
+    // enter: Dropped Payload。
+    f.push_typed(
+        1,
+        2,
+        70,
+        301,
+        &[],
+        vec![],
+        PayloadRef::Dropped {
+            original_len: 55,
+            reason: PayloadLossReason::Overflow,
+        },
+        EventCapture::Captured,
+    );
+    f.push_typed(
+        2,
+        2,
+        70,
+        302,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(7))],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    // 未登録スキーマの leave（api_name なし・args_error あり）。
+    f.push_typed(
+        2,
+        3,
+        70,
+        999,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(7))],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    let trace = f.finish(
+        flex_schemas(),
+        FinalizationInfo::default(),
+        &[],
+        &[b"flex-blob"],
+    );
+    let view = TraceView::build(&trace);
+    assert_eq!(view.events.len(), 5);
+    // 全体順序が line() に出る。
+    assert!(
+        view.events[0].line().contains("g=1"),
+        "{}",
+        view.events[0].line()
+    );
+    // Inline / Blob / Dropped の payload 要約。
+    assert!(
+        view.events[0].line().contains("payload=inline[2]"),
+        "{}",
+        view.events[0].line()
+    );
+    assert!(
+        view.events[1]
+            .line()
+            .contains(&format!("payload=blob:{}", known.to_hex())),
+        "{}",
+        view.events[1].line()
+    );
+    assert!(
+        view.events[2]
+            .line()
+            .contains("payload=dropped(len=55, reason=overflow)"),
+        "{}",
+        view.events[2].line()
+    );
+    // 未登録スキーマは api# 表示と args_error。
+    let ev = &view.events[4];
+    assert!(ev.api_name.is_none());
+    assert!(
+        ev.args_error.as_deref().unwrap().contains("not registered"),
+        "{:?}",
+        ev.args_error
+    );
+    assert!(ev.line().contains("api#70 kind=2"), "{}", ev.line());
+    assert!(ev.line().contains("args_error="), "{}", ev.line());
+    // to_json の payload 各種と全体順序。
+    let j0 = view.events[0].to_json().render();
+    assert!(j0.contains("\"kind\":\"inline\""), "{j0}");
+    assert!(j0.contains("\"global_order\":1"), "{j0}");
+    let j1 = view.events[1].to_json().render();
+    assert!(j1.contains("\"kind\":\"blob\""), "{j1}");
+    let j2 = view.events[2].to_json().render();
+    assert!(j2.contains("\"kind\":\"dropped\""), "{j2}");
+    assert!(j2.contains("\"reason\":\"overflow\""), "{j2}");
+    // api_name が無い場合の to_json は null。
+    let j4 = view.events[4].to_json().render();
+    assert!(j4.contains("\"api\":null"), "{j4}");
+    assert!(
+        j4.contains("\"args_error\":\"schema 999 not registered\""),
+        "{j4}"
+    );
+}
+
+#[test]
+fn filter_mismatches_return_false_on_each_field() {
+    let bytes = sample_trace_bytes();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let view = TraceView::build(&trace);
+    let ev = &view.events[0]; // api_id 1, kind 1, seq 1, thread 55
+                              // 数値 api_id の不一致。
+    assert!(!EventFilter {
+        api: Some("9999".into()),
+        ..Default::default()
+    }
+    .matches(ev));
+    // 名前の不一致。
+    assert!(!EventFilter {
+        api: Some("NoSuchApi".into()),
+        ..Default::default()
+    }
+    .matches(ev));
+    // kind の不一致。
+    assert!(!EventFilter {
+        kind: Some(2),
+        ..Default::default()
+    }
+    .matches(ev));
+    // seq 範囲外。
+    assert!(!EventFilter {
+        seq_min: Some(2),
+        ..Default::default()
+    }
+    .matches(ev));
+    assert!(!EventFilter {
+        seq_max: Some(0),
+        ..Default::default()
+    }
+    .matches(ev));
+    // thread の不一致。
+    assert!(!EventFilter {
+        thread_id: Some(56),
+        ..Default::default()
+    }
+    .matches(ev));
+    // text の不一致。
+    assert!(!EventFilter {
+        text: Some("no-such-text".into()),
+        ..Default::default()
+    }
+    .matches(ev));
+}
+
+#[test]
+fn decode_fields_reports_undecodable_args() {
+    // 復号できない args バイト列（空バイト列に U32 1 件を要求）：
+    // decode failed として args_error に残る。
+    let mut f = Flex::new(false);
+    f.push(
+        1,
+        1,
+        70,
+        303,
+        Some(Vec::new()),
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    let trace = f.finish(flex_schemas(), FinalizationInfo::default(), &[], &[]);
+    let view = TraceView::build(&trace);
+    assert!(view.events[0].fields.is_empty());
+    let err = view.events[0].args_error.as_deref().unwrap();
+    assert!(err.contains("decode failed"), "{err}");
+}
+
+#[test]
+fn api_stats_counts_only_enter_and_leave() {
+    // Aborted / Completed / Other は Enter にも Leave にも数えない。
+    let mut f = Flex::new(false);
+    f.push_typed(
+        1,
+        1,
+        70,
+        301,
+        &[],
+        vec![],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    f.push_typed(
+        2,
+        1,
+        70,
+        302,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(1))],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    f.push(
+        7,
+        2,
+        70,
+        302,
+        None,
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    f.push_typed(
+        8,
+        3,
+        70,
+        302,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(1))],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    f.push_typed(
+        5,
+        4,
+        70,
+        301,
+        &[],
+        vec![],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    let trace = f.finish(flex_schemas(), FinalizationInfo::default(), &[], &[]);
+    let view = TraceView::build(&trace);
+    assert_eq!(view.api_stats(), vec![("test!Ping".to_string(), 1, 1)]);
+    assert_eq!(view.thread_count(), 1);
+    // 未登録スキーマのイベントは api#<id> で集計される。
+    let mut f2 = Flex::new(false);
+    f2.push_typed(
+        1,
+        1,
+        70,
+        999,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(1))],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    let trace2 = f2.finish(flex_schemas(), FinalizationInfo::default(), &[], &[]);
+    let view2 = TraceView::build(&trace2);
+    assert_eq!(view2.api_stats(), vec![("api#70".to_string(), 1, 0)]);
+}
+
+#[test]
+fn integrity_summary_counts_losses_degraded_and_missing_blobs() {
+    let unknown = BlobId::from_bytes([0xEE; 32]);
+    let mut f = Flex::new(false);
+    // Dropped Payload の enter。
+    f.push_typed(
+        1,
+        1,
+        70,
+        301,
+        &[],
+        vec![],
+        PayloadRef::Dropped {
+            original_len: 100,
+            reason: PayloadLossReason::Backpressure,
+        },
+        EventCapture::Captured,
+    );
+    // 取得状態が Captured でない leave（degraded）。
+    f.push_typed(
+        2,
+        1,
+        70,
+        302,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(1))],
+        PayloadRef::None,
+        EventCapture::Truncated,
+    );
+    // 欠落 Blob の参照先にするための平凡な enter。
+    f.push_typed(
+        1,
+        2,
+        70,
+        301,
+        &[],
+        vec![],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    let mut trace = f.finish(
+        flex_schemas(),
+        FinalizationInfo {
+            event_integrity: 2,
+            ..Default::default()
+        },
+        &[LossRecord {
+            kind: 1,
+            count: 3,
+            ..Default::default()
+        }],
+        &[],
+    );
+    // Writer は未追加 Blob への参照を書けないため、読取後に差し替える。
+    trace.batches[0].events[2].payload = PayloadRef::Blob(unknown);
+    // 回復 issue は全バリアントを直接積む（Reader が出す形の再現）。
+    let id = BlobId::of_content(b"issue-blob");
+    trace.issues = vec![
+        RecoveryIssue::TruncatedTail { offset: 10 },
+        RecoveryIssue::CorruptBlock {
+            offset: 20,
+            reason: "crc".into(),
+        },
+        RecoveryIssue::Resync { from: 30, to: 40 },
+        RecoveryIssue::DuplicateBlob { id },
+        RecoveryIssue::BlobHashMismatch {
+            id,
+            computed: BlobId::of_content(b"other"),
+        },
+        RecoveryIssue::MissingBlob { id },
+        RecoveryIssue::ForwardBlobReference { id },
+        RecoveryIssue::IndexMismatch,
+        RecoveryIssue::LimitExceeded { what: "blocks" },
+        RecoveryIssue::SessionMismatch {
+            what: "environment",
+            expected: 42,
+            found: 43,
+        },
+        RecoveryIssue::BlobUpdateMissingBase { resource_id: id },
+        RecoveryIssue::BlobUpdateOutOfRange {
+            resource_id: id,
+            offset: 1,
+            size: 2,
+            base_len: 3,
+        },
+        RecoveryIssue::BlobUpdateHashMismatch {
+            resource_id: id,
+            expected: BlobId::of_content(b"expected"),
+            computed: BlobId::of_content(b"computed"),
+        },
+    ];
+    let s = IntegritySummary::of(&trace);
+    assert_eq!(s.loss_records_by_kind.get(&1), Some(&1));
+    assert_eq!(s.total_loss_count, 3);
+    assert_eq!(s.dropped_payload_events, 1);
+    assert_eq!(s.dropped_payload_bytes, 100);
+    assert_eq!(s.degraded_events, 1);
+    assert_eq!(s.missing_blob_refs, 1);
+    assert!(s.has_event_loss());
+    let issues = s.recovery_issues.join("\n");
+    for expect in [
+        "truncated_tail(offset=10)",
+        "corrupt_block(offset=20, reason=crc)",
+        "resync(30..40)",
+        "index_mismatch",
+        "limit_exceeded(blocks)",
+        "session_mismatch(what=environment, expected=42, found=43)",
+    ] {
+        assert!(issues.contains(expect), "{issues}");
+    }
+    let hex = id.to_hex();
+    for expect in [
+        format!("duplicate_blob({hex})"),
+        format!("blob_hash_mismatch(id={hex}, computed="),
+        format!("missing_blob({hex})"),
+        format!("forward_blob_reference({hex})"),
+        format!("blob_update_missing_base(resource={hex})"),
+        format!("blob_update_out_of_range(resource={hex}, offset=1, size=2, base_len=3)"),
+        format!("blob_update_hash_mismatch(resource={hex}, expected="),
+    ] {
+        assert!(issues.contains(&expect), "{issues}");
+    }
+}
+
+#[test]
+fn has_event_loss_uses_each_disjunct() {
+    let bytes = sample_trace_bytes();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let view = TraceView::build(&trace);
+    let mut s = view.integrity.clone();
+    // クリーンな Trace は損失なし。
+    assert!(!s.has_event_loss());
+    // event_integrity だけが非 Complete でも損失あり（596 行）。
+    s.event_integrity = Some(1);
+    assert!(s.has_event_loss());
+    s.event_integrity = Some(0);
+    assert!(!s.has_event_loss());
+    s.event_integrity = None;
+    assert!(!s.has_event_loss());
+    // 他の内訳だけでも損失あり。
+    s.dropped_payload_events = 1;
+    assert!(s.has_event_loss());
+    s.dropped_payload_events = 0;
+    s.missing_blob_refs = 1;
+    assert!(s.has_event_loss());
+    s.missing_blob_refs = 0;
+    s.loss_records_by_kind.insert(2, 1);
+    assert!(s.has_event_loss());
+}
+
+#[test]
+fn event_field_lookup_finds_by_name() {
+    let bytes = sample_trace_bytes();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let view = TraceView::build(&trace);
+    let first = &view.events[0];
+    assert_eq!(first.field("lpFileName").unwrap().name, "lpFileName");
+    assert!(first.field("no_such_field").is_none());
+}
+
+#[test]
+fn decode_fields_reports_schema_with_unknown_types() {
+    // 未知の型タグ（99）を持つスキーマ定義：正規化ハッシュは公開関数
+    // で計算するため Writer の検証を通り、Reader 側で型一覧が引けない。
+    let fields = vec![FieldDef {
+        name: "x".into(),
+        ty: 99,
+        flags: 0,
+    }];
+    let def = SchemaDef {
+        schema_id: 404,
+        name: "test!Weird/enter".into(),
+        content_hash: schema_content_hash("test!Weird/enter", &fields),
+        fields,
+        annotation: String::new(),
+    };
+    let mut f = Flex::new(false);
+    f.push_typed(
+        1,
+        1,
+        70,
+        404,
+        &[Ty::U32],
+        vec![cv(TypedValue::U32(1))],
+        PayloadRef::None,
+        EventCapture::Captured,
+    );
+    let trace = f.finish(vec![def], FinalizationInfo::default(), &[], &[]);
+    let view = TraceView::build(&trace);
+    assert!(view.events[0].fields.is_empty());
+    let err = view.events[0].args_error.as_deref().unwrap();
+    assert!(err.contains("has unknown types"), "{err}");
 }

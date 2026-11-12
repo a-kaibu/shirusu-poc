@@ -742,4 +742,95 @@ mod tests {
         assert_eq!(align(&["x"], &[]), vec![AlignStep::OnlyLeft(0)]);
         assert!(align(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn severity_names_cover_all_variants() {
+        // カバレッジ gap: Severity::name の Info/Low は候補の重要度
+        // としては未使用だが、表示層の網羅として固定する。
+        assert_eq!(Severity::Info.name(), "info");
+        assert_eq!(Severity::Low.name(), "low");
+        assert_eq!(Severity::Medium.name(), "medium");
+        assert_eq!(Severity::High.name(), "high");
+    }
+
+    #[test]
+    fn candidate_kind_names_cover_all_variants() {
+        // カバレッジ gap: report の描画で呼ばれない種別の名前も固定。
+        assert_eq!(CandidateKind::MissingCall.name(), "missing-call");
+        assert_eq!(CandidateKind::ExtraCall.name(), "extra-call");
+        assert_eq!(
+            CandidateKind::ArgumentDifference.name(),
+            "argument-difference"
+        );
+        assert_eq!(CandidateKind::ReturnDifference.name(), "return-difference");
+        assert_eq!(
+            CandidateKind::PayloadDifference.name(),
+            "payload-difference"
+        );
+        assert_eq!(
+            CandidateKind::ObjectStateDifference.name(),
+            "object-state-difference"
+        );
+        assert_eq!(
+            CandidateKind::IntegrityDifference.name(),
+            "integrity-difference"
+        );
+        assert_eq!(
+            CandidateKind::CaptureDifference.name(),
+            "capture-difference"
+        );
+        assert_eq!(
+            CandidateKind::CallShapeDifference.name(),
+            "call-shape-difference"
+        );
+    }
+
+    #[test]
+    fn align_greedy_falls_back_for_huge_inputs() {
+        // カバレッジ gap: 積が MAX_CELLS (4,000,000) を超えると
+        // align_greedy へ切り替わる。2500×2500 でその経路に入る。
+        let mk = |prefix: &str, n: usize| -> Vec<String> {
+            (0..n).map(|i| format!("{prefix}{i}")).collect()
+        };
+        let a = mk("a", 2500);
+        let b = mk("b", 2500);
+        let a_refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let b_refs: Vec<&str> = b.iter().map(|s| s.as_str()).collect();
+        let steps = align(&a_refs, &b_refs);
+        // 共通要素が無いので、a 側が全て OnlyLeft の後に b 側が全て
+        // OnlyRight になる（貪欲経路の contains 偽・両末尾ループ）。
+        assert_eq!(steps.len(), 5000);
+        assert!(steps[..2500]
+            .iter()
+            .all(|s| matches!(s, AlignStep::OnlyLeft(_))));
+        assert!(steps[2500..]
+            .iter()
+            .all(|s| matches!(s, AlignStep::OnlyRight(_))));
+        // 全て一致する場合は Pair だけになる。
+        let steps = align(&a_refs, &a_refs);
+        assert_eq!(steps.len(), 2500);
+        assert!(steps.iter().all(|s| matches!(s, AlignStep::Pair(_, _))));
+    }
+
+    #[test]
+    fn align_greedy_skips_unmatched_right_items() {
+        // カバレッジ gap: 貪欲経路で b 側の先行要素を飛ばす分岐
+        // （a[i] != b[j] だが a[i] が b[j..] にあるときの OnlyRight）。
+        let a: Vec<String> = (0..2500).map(|i| format!("k{i}")).collect();
+        let mut b: Vec<String> = Vec::with_capacity(2500);
+        b.push("zz".to_string());
+        b.extend((0..2499).map(|i| format!("k{i}")));
+        assert_eq!(b.len(), 2500);
+        let a_refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let b_refs: Vec<&str> = b.iter().map(|s| s.as_str()).collect();
+        let steps = align(&a_refs, &b_refs);
+        // 最初は b の "zz" を飛ばし (OnlyRight)、その後は k0..k2498
+        // が Pair になり、a の末尾 1 件 (k2499) だけ OnlyLeft になる。
+        assert_eq!(steps[0], AlignStep::OnlyRight(0));
+        assert_eq!(steps[1], AlignStep::Pair(0, 1));
+        assert_eq!(steps[2498], AlignStep::Pair(2497, 2498));
+        assert_eq!(steps[2499], AlignStep::Pair(2498, 2499));
+        assert_eq!(steps[2500], AlignStep::OnlyLeft(2499));
+        assert_eq!(steps.len(), 2501);
+    }
 }

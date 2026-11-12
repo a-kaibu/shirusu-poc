@@ -11,10 +11,31 @@
 //! 断定ではない。記録の完全性（Capture Coverage）が欠けていれば、
 //! まずそちらを疑うべきであり、その判断材料は `no-integrity-loss`
 //! ルールと inspect の完全性表示が提供する。
+//!
+//! L20: 仕様は `steps`（実行する呼び出し列）も持てる。JSON Runner
+//! （`runner`）が仕様をそのまま解釈して実行し、Probe exe 生成
+//! （`probe_exe`）が同じ仕様から Windows 向け exe を作る。実行の
+//! 意味論は `runner_exec` に一か所だけあり、両者はそれを共有する。
 
 pub mod eval;
+pub mod golden;
 pub mod json_parse;
+pub mod prereq;
+pub mod probe_exe;
+pub mod runner;
+pub mod runner_exec;
 pub mod spec;
+pub mod steps;
 
 pub use eval::{evaluate, RuleResult, TestReport};
+pub use golden::{
+    check, derive_from_trace, fresh_check, Golden, GoldenEnvironment, GoldenOverrides, GoldenReport,
+};
+pub use prereq::{check_prerequisites, PrereqItem, PrereqKind, PrereqReport};
+pub use probe_exe::{build_probe_exe, generate_probe_main_rs};
+pub use runner::{run_spec, RunMode, RunReport};
+pub use runner_exec::{
+    plan_steps, ArgValue, Expect, ExpectedOutput, ParamKind, RetExpect, RunReportData, Step,
+    StepOutcome,
+};
 pub use spec::{Rule, TestSpec};

@@ -23,8 +23,15 @@
 //! 判定ではない（compare の候補と同じ線引き）。Phase 5 では、差分
 //! 候補からこの形式の最小仕様（Probe）を生成する想定であり、
 //! そのため形式は言語非依存の JSON に固定する。
+//!
+//! 仕様は、期待（`rules`）だけでなく実行する呼び出し列（`steps`）も
+//! 持てる（L20）。`steps` がある仕様は、JSON Runner（`runner.rs`）が
+//! そのまま解釈して実行するか、Probe exe 生成（`probe_exe.rs`）で
+//! Windows 向け exe にできる。`steps` の値の形は `steps.rs` 参照。
 
 use crate::json_parse::{as_str, as_u64, get};
+use crate::runner_exec::Step;
+use crate::steps::{parse_steps, steps_to_json};
 use shirusu_analysis::JsonValue;
 
 /// ルール 1 件。
@@ -78,12 +85,61 @@ impl Rule {
             }
         }
     }
+
+    /// JSON 形式へ戻す（Golden の書き出し用）。`TestSpec::parse`
+    /// と往復できることが `rule_roundtrips_through_json` で保証される。
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            Rule::ApiCalled {
+                api,
+                field,
+                equals,
+                contains,
+            } => {
+                let mut pairs: Vec<(&str, JsonValue)> = vec![
+                    ("type", JsonValue::Str("api-called".into())),
+                    ("api", JsonValue::Str(api.clone())),
+                ];
+                if let Some(field) = field {
+                    pairs.push(("field", JsonValue::Str(field.clone())));
+                }
+                if let Some(e) = equals {
+                    pairs.push(("equals", e.clone()));
+                }
+                if let Some(c) = contains {
+                    pairs.push(("contains", JsonValue::Str(c.clone())));
+                }
+                JsonValue::obj(pairs)
+            }
+            Rule::NoIntegrityLoss => {
+                JsonValue::obj(vec![("type", JsonValue::Str("no-integrity-loss".into()))])
+            }
+            Rule::ObjectClosed { created_by } => JsonValue::obj(vec![
+                ("type", JsonValue::Str("object-closed".into())),
+                ("created_by", JsonValue::Str(created_by.clone())),
+            ]),
+            Rule::EventCount { min, max } => {
+                let mut pairs: Vec<(&str, JsonValue)> =
+                    vec![("type", JsonValue::Str("event-count".into()))];
+                if let Some(min) = min {
+                    pairs.push(("min", JsonValue::U64(*min)));
+                }
+                if let Some(max) = max {
+                    pairs.push(("max", JsonValue::U64(*max)));
+                }
+                JsonValue::obj(pairs)
+            }
+        }
+    }
 }
 
 /// 仕様ファイル全体。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestSpec {
     pub name: String,
+    /// Probe が実行する呼び出し列（無ければ空）。ルールだけの仕様では
+    /// 使わない（`shirusu-test <trace> <spec>` は `rules` だけを見る）。
+    pub steps: Vec<Step>,
     pub rules: Vec<Rule>,
 }
 
@@ -104,6 +160,7 @@ impl TestSpec {
             .and_then(as_str)
             .unwrap_or("(unnamed)")
             .to_string();
+        let steps = parse_steps(root)?;
         let rules_json =
             get(root, "rules").ok_or_else(|| "spec has no \"rules\" array".to_string())?;
         let JsonValue::Array(items) = rules_json else {
@@ -113,7 +170,24 @@ impl TestSpec {
         for (i, item) in items.iter().enumerate() {
             rules.push(parse_rule(item).map_err(|e| format!("rules[{i}]: {e}"))?);
         }
-        Ok(TestSpec { name, rules })
+        Ok(TestSpec { name, steps, rules })
+    }
+
+    /// JSON 形式へ戻す。`TestSpec::parse` と往復できることが
+    /// `spec_roundtrips_through_json` で保証される。
+    pub fn to_json(&self) -> JsonValue {
+        let mut pairs: Vec<(&str, JsonValue)> = vec![
+            ("version", JsonValue::U64(1)),
+            ("name", JsonValue::Str(self.name.clone())),
+        ];
+        if !self.steps.is_empty() {
+            pairs.push(("steps", steps_to_json(&self.steps)));
+        }
+        pairs.push((
+            "rules",
+            JsonValue::Array(self.rules.iter().map(|r| r.to_json()).collect()),
+        ));
+        JsonValue::obj(pairs)
     }
 }
 
@@ -196,5 +270,51 @@ mod tests {
         );
         assert!(TestSpec::parse(r#"{"rules":[{"type":"event-count"}]}"#).is_err());
         assert!(TestSpec::parse("not json").is_err());
+    }
+
+    #[test]
+    fn spec_with_steps_roundtrips_through_json() {
+        let spec = TestSpec::parse(
+            r#"{"version":1,"name":"t","steps":[
+                {"call":"kernel32!CreateFileW","args":{"lpFileName":"x.txt","dwDesiredAccess":3221225472,"dwShareMode":0,"lpSecurityAttributes":null,"dwCreationDisposition":2,"dwFlagsAndAttributes":128,"hTemplateFile":null},"store":"h"},
+                {"call":"kernel32!CloseHandle","args":{"hObject":{"ref":"h"}}}
+            ],"rules":[
+                {"type":"api-called","api":"kernel32!CreateFileW"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.steps.len(), 2);
+        assert_eq!(spec.rules.len(), 1);
+        let reparsed = TestSpec::from_json(&spec.to_json()).unwrap();
+        assert_eq!(reparsed, spec);
+        // steps が無い仕様は "steps" を出さない。
+        let rules_only = TestSpec::parse(r#"{"version":1,"name":"r","rules":[]}"#).unwrap();
+        assert!(rules_only.steps.is_empty());
+        let rendered = rules_only.to_json().render();
+        assert!(!rendered.contains("steps"));
+    }
+
+    #[test]
+    fn rule_roundtrips_through_json() {
+        // Golden の書き出しで使う。parse したルールを JSON に戻し、
+        // もう一度 parse して同じルールになること。
+        let spec = TestSpec::parse(
+            r#"{"version":1,"name":"t","rules":[
+                {"type":"api-called","api":"kernel32!ReadFile","field":"n","equals":4},
+                {"type":"api-called","api":"kernel32!CreateFileW","field":"lpFileName","contains":"save.dat"},
+                {"type":"no-integrity-loss"},
+                {"type":"object-closed","created_by":"kernel32!CreateFileW"},
+                {"type":"event-count","min":1,"max":100}
+            ]}"#,
+        )
+        .unwrap();
+        let rendered: Vec<JsonValue> = spec.rules.iter().map(|r| r.to_json()).collect();
+        let reparsed = TestSpec::from_json(&JsonValue::obj(vec![
+            ("version", JsonValue::U64(1)),
+            ("name", JsonValue::Str("t".into())),
+            ("rules", JsonValue::Array(rendered)),
+        ]))
+        .unwrap();
+        assert_eq!(reparsed, spec);
     }
 }

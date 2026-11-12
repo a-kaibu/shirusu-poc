@@ -140,6 +140,11 @@ mod win {
         com_factories: Vec<InlineHook>,
         /// L14: WinRT アクティベーション関数の Inline Hook の設置状態。
         winrt_activations: Vec<InlineHook>,
+        /// L15: 内部 API (Nt*) の Inline Hook の設置状態（詳細調査
+        /// モードでのみ設置する）。
+        internal_hooks: Vec<InlineHook>,
+        /// L16: コールバック検出フック関数の Inline Hook の設置状態。
+        callbacks: Vec<InlineHook>,
     }
     static STATE: Mutex<Option<DllState>> = Mutex::new(None);
 
@@ -227,7 +232,10 @@ mod win {
                 .with_record_runtime_apis(b.record_runtime_apis != 0)
                 // L02: Bootstrap v6 で Host から渡された診断用 QI
                 // オプションをランタイムへ渡す（既定は無効）。
-                .with_diagnostic_query_interface(b.com_options & 1 != 0),
+                .with_diagnostic_query_interface(b.com_options & 1 != 0)
+                // L15: Bootstrap v8 で Host から渡された詳細調査モードを
+                // ランタイムへ渡す（既定は無効。内部 API を記録しない）。
+                .with_detailed_mode(b.detailed_mode != 0),
         );
         // L23: 呼び出し元分類のためのモジュール一覧を初期化時に作る。
         // 列挙に失敗しても一覧が空のままになるだけで、呼び出し元不明
@@ -315,6 +323,25 @@ mod win {
         // （WinRT の記録だけが無い）。
         // SAFETY: 初期化専用スレッドからの呼び出し（L01 と同じ前提）。
         let winrt_activation_outcome = unsafe { engine::install_winrt_activation_hooks(&rt) };
+        // L15: 内部 API (Nt*) の Inline Hook を詳細調査モードでのみ設置
+        // する。無効な場合は設置自体をしない（通常モードの Detour
+        // オーバーヘッドは増えない）。Inline と同じく best-effort であり、
+        // 見送りがあっても初期化は成功として継続する。内部 API が 1 つも
+        // フックできなくても、Win32 API の記録は続く（内部呼び出しの記録
+        // だけが無い）。詳細調査モードが有効でも、記録可否はランタイムの
+        // detailed_mode が決める（prepare のゲート）。
+        // SAFETY: 初期化専用スレッドからの呼び出し（L01 と同じ前提）。
+        let internal_hook_outcome = if b.detailed_mode != 0 {
+            unsafe { engine::install_internal_inline_hooks(&rt) }
+        } else {
+            engine::InlineInstallOutcome::default()
+        };
+        // L16: コールバック検出フック関数の Inline Hook を WinRT の後で
+        // 設置する。COM Factory と同じく best-effort であり、見送りが
+        // あっても初期化は成功として継続する。1 つもフックできなくても、
+        // Win32 API と COM の記録は続く（コールバックの記録だけが無い）。
+        // SAFETY: 初期化専用スレッドからの呼び出し（L01 と同じ前提）。
+        let callback_outcome = unsafe { engine::install_callback_hooks(&rt) };
         // 設置済み API の合算（IAT と Inline の和集合）で Bootstrap へ
         // 書き戻す。IAT では欠落していた API も Inline で捕捉できれば
         // 「設置済み」になり、Coverage の欠落は正直に減る。
@@ -327,8 +354,14 @@ mod win {
         let inline_ids: std::collections::HashSet<u32> =
             inline_outcome.installed.iter().map(|h| h.api_id).collect();
         let hooked = iat_ids.union(&inline_ids).count();
+        // L15: 内部 API (Nt*) は通常の Coverage 欠落に数えない（詳細調査
+        // モードでの設置数は別欄で報告する）。
         let missing = api_table()
-            .filter(|a| !iat_ids.contains(&a.api_id) && !inline_ids.contains(&a.api_id))
+            .filter(|a| {
+                !shirusu_hook::api::is_internal_api(a.api_id)
+                    && !iat_ids.contains(&a.api_id)
+                    && !inline_ids.contains(&a.api_id)
+            })
             .count();
         // Host が読み戻せるよう、init_done を立てる前に Bootstrap へ
         // 設置/欠落件数を書き戻す。
@@ -352,12 +385,25 @@ mod win {
                 bootstrap as *mut AgentBootstrap,
                 winrt_activation_outcome.installed.len() as u32,
             );
+            // L15: 内部 API (Nt*) の設置数も書き戻す（Host の Coverage へ。
+            // 詳細調査モードが無効な場合は 0）。
+            AgentBootstrap::write_internal_hook_count(
+                bootstrap as *mut AgentBootstrap,
+                internal_hook_outcome.installed.len() as u32,
+            );
+            // L16: コールバック検出フックの設置数も書き戻す（Host の Coverage へ）。
+            AgentBootstrap::write_callback_hook_count(
+                bootstrap as *mut AgentBootstrap,
+                callback_outcome.installed.len() as u32,
+            );
         }
         *STATE.lock().unwrap() = Some(DllState {
             installed,
             inline: inline_outcome.installed,
             com_factories: com_factory_outcome.installed,
             winrt_activations: winrt_activation_outcome.installed,
+            internal_hooks: internal_hook_outcome.installed,
+            callbacks: callback_outcome.installed,
         });
         if b.init_done_handle != 0 {
             // SAFETY: Host が複製して渡したイベント。立てた後は所有を
@@ -406,6 +452,14 @@ mod win {
                 // SAFETY: 同上。
                 unrestored
                     .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
+                // L15: 内部 API (Nt*) のプロローグ復元も同じく
+                // IAT 復元より先に行う。
+                // SAFETY: 同上。
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.internal_hooks) });
+                // L16: コールバック検出フックのプロローグ復元も同じく
+                // IAT 復元より先に行う。
+                // SAFETY: 同上。
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.callbacks) });
                 // L01: Inline プロローグの復元を IAT 復元より先に行う。
                 // SAFETY: 設置時に保存した Inline Hook 情報。対象モジュールは
                 // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
@@ -434,6 +488,7 @@ mod win {
                 unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.com_factories) });
                 unrestored
                     .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.internal_hooks) });
                 unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.inline) });
                 unrestored.extend(unsafe { engine::uninstall_hooks(&state.installed) });
                 drained = false;

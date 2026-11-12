@@ -447,4 +447,50 @@ mod tests {
         let last = instrs.last().unwrap();
         assert_eq!(last.near_branch_target(), target + 6);
     }
+
+    #[test]
+    fn build_patch_matches_jump_bytes() {
+        // build_patch は engine.rs が使う公開の入口で、jump_bytes の別名。
+        // 近距離は E9 rel32（5 バイト）、遠距離は絶対間接ジャンプ。
+        assert_eq!(
+            build_patch(0x1000, 0x2000, 64),
+            vec![0xE9, 0xFB, 0x0F, 0x00, 0x00]
+        );
+        assert_eq!(
+            build_patch(0x1000, 0x2000, 64),
+            jump_bytes(0x1000, 0x2000, 64)
+        );
+        assert_eq!(build_patch(0x1000, 0x1_0000_1000, 64).len(), 14);
+        assert_eq!(
+            build_patch(0x1000, 0x1_0000_1000, 64),
+            jump_bytes(0x1000, 0x1_0000_1000, 64)
+        );
+        assert_eq!(build_patch(0x1000, 0x9000_0000, 32).len(), 10);
+        assert_eq!(
+            build_patch(0x1000, 0x9000_0000, 32),
+            jump_bytes(0x1000, 0x9000_0000, 32)
+        );
+    }
+
+    #[test]
+    fn refusal_reason_strings() {
+        // Coverage へ残す短い理由文字列（全バリアント）。
+        assert_eq!(
+            InlineRefusal::TooShort {
+                available: 2,
+                needed: 5
+            }
+            .reason(),
+            "too-short"
+        );
+        assert_eq!(InlineRefusal::DecodeFailed.reason(), "decode-failed");
+        assert_eq!(
+            InlineRefusal::Unrelocatable("x".to_string()).reason(),
+            "unrelocatable"
+        );
+        assert_eq!(
+            InlineRefusal::InvalidBitness(16).reason(),
+            "invalid-bitness"
+        );
+    }
 }

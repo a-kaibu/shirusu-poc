@@ -1,0 +1,250 @@
+{
+  "$defs": {
+    "argValue": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/bufferArg"
+        },
+        {
+          "$ref": "#/$defs/outArg"
+        },
+        {
+          "$ref": "#/$defs/refArg"
+        }
+      ],
+      "description": "引数の値。数値・文字列・真理値・null のほか、バッファ・out スロット・先行ステップへの参照をオブジェクトで書く。"
+    },
+    "bufferArg": {
+      "additionalProperties": false,
+      "description": "サイズ指定のバッファ。fill_text / fill_bytes は排他。",
+      "properties": {
+        "buffer": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fill_bytes": {
+          "items": {
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "fill_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "buffer"
+      ],
+      "type": "object"
+    },
+    "expect": {
+      "additionalProperties": false,
+      "description": "戻り値と出力への期待。outputs の値は out スロットなら数値、バッファなら 16 進文字列（前方一致）。",
+      "properties": {
+        "outputs": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "pattern": "^[0-9a-fA-F]*$",
+                "type": "string"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "return": {
+          "anyOf": [
+            {
+              "enum": [
+                "nonzero",
+                "zero"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "outArg": {
+      "additionalProperties": false,
+      "properties": {
+        "out": {
+          "enum": [
+            "u32",
+            "u64"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "out"
+      ],
+      "type": "object"
+    },
+    "refArg": {
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "rule": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "api": {
+              "type": "string"
+            },
+            "contains": {
+              "type": "string"
+            },
+            "equals": {},
+            "field": {
+              "type": "string"
+            },
+            "type": {
+              "const": "api-called"
+            }
+          },
+          "required": [
+            "api",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "no-integrity-loss"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "created_by": {
+              "type": "string"
+            },
+            "type": {
+              "const": "object-closed"
+            }
+          },
+          "required": [
+            "created_by",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "max": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "min": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "event-count"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Trace に対する期待 1 件。"
+    },
+    "step": {
+      "additionalProperties": false,
+      "description": "Probe が実行する 1 回の API 呼び出し。call は \"dll!Function\" 形式で、呼び出し表（runner_exec.rs の CALL_TABLE）に載るものだけが使える。",
+      "properties": {
+        "args": {
+          "additionalProperties": {
+            "$ref": "#/$defs/argValue"
+          },
+          "type": "object"
+        },
+        "call": {
+          "type": "string"
+        },
+        "expect": {
+          "$ref": "#/$defs/expect"
+        },
+        "store": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/a-kaibu/shirusu-poc/blob/main/docs/test-spec-schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "shirusu-test の JSON 仕様 v1（overview「比較とテスト生成」）。rules は Trace に対する期待、steps は Probe が実行する呼び出し列。steps がある仕様は JSON Runner がそのまま解釈して実行するか、Probe exe 生成で Windows 向け exe にできる。",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "rules": {
+      "items": {
+        "$ref": "#/$defs/rule"
+      },
+      "type": "array"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "type": "array"
+    },
+    "version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "rules"
+  ],
+  "title": "shirusu-test spec v1",
+  "type": "object"
+}
