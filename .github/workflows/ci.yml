@@ -20,13 +20,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Keep only the newest run per ref and suite. A manual CI run supersedes a
+  # push run; long scheduled/manual verification suites remain independent.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.suite || github.event.schedule || 'ci' }}
+  cancel-in-progress: true
 
 jobs:
   plan:
     name: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -68,14 +71,33 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - uses: dtolnay/rust-toolchain@master
+      - if: ${{ !matrix.java }}
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
           targets: ${{ matrix.targets }}
           components: ${{ matrix.components }}
-      - uses: Swatinem/rust-cache@v2
+      - if: ${{ !matrix.java }}
+        uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+          # Preserve freshly compiled dependencies even when a later E2E fails.
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            fuzz -> target
+          cache-directories: ${{ matrix.name == 'kani' && '~/.kani' || '' }}
+      - if: ${{ matrix.name == 'linux' }}
+        uses: actions/cache@v4
+        with:
+          path: target/winmd
+          key: winmd-${{ hashFiles('scripts/ci/fetch-winmd.sh') }}
+      - if: ${{ matrix.java }}
+        uses: actions/cache@v4
+        with:
+          path: tla/tla2tools.jar
+          key: tla-tools-${{ hashFiles('scripts/ci/tla.sh') }}
       - name: ${{ matrix.name }}
         # shell は検証規則で matrix 参照が使えないため bash に固定する。
         # Windows 向けスクリプトは matrix 側のコマンドで pwsh を起動して実行する。
@@ -84,14 +106,19 @@ jobs:
 
   done:
     name: done
-    needs: run
-    if: always()
+    needs: [plan, run]
+    # Unlike always(), this still reports failures but is cancellable when a
+    # newer commit arrives. Do not strand an obsolete run in the concurrency slot.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: check matrix result
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          MATRIX_RESULT: ${{ needs.run.result }}
         run: |
-          result="${{ needs.run.result }}"
-          echo "matrix result: $result"
-          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+          echo "plan result: $PLAN_RESULT; matrix result: $MATRIX_RESULT"
+          if [ "$PLAN_RESULT" != "success" ] || [ "$MATRIX_RESULT" != "success" ]; then
             exit 1
           fi
