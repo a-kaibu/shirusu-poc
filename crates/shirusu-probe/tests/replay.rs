@@ -286,6 +286,18 @@ fn candidate_slice_retains_reopened_file_history_and_excludes_reused_handles() {
 fn reduction_fixture() -> shirusu_probe::replay::ReplaySlice {
     let mut spec = generate_replay(&record(1, 42)).unwrap();
     spec.steps.insert(2, spec.steps[1].clone());
+    // Read one byte from a two-byte buffer, leaving a semantically unused tail.
+    for (name, arg) in &mut spec.steps[5].args {
+        if name == "nNumberOfBytesToRead" {
+            *arg = ArgValue::Int(2);
+        }
+        if name == "lpBuffer" {
+            *arg = ArgValue::Buffer {
+                size: 2,
+                fill: vec![],
+            };
+        }
+    }
     shirusu_probe::replay::ReplaySlice {
         spec,
         source_steps: 7,
@@ -377,4 +389,198 @@ fn reduction_revisits_rejected_deletions_after_dependencies_change() {
     .unwrap();
     assert_eq!(result.replay.kept_steps, [0, 3, 4, 5, 6]);
     assert!(result.single_deletion_fixed_point);
+}
+
+fn oracle_reports(
+    trial: &shirusu_probe::reduce::Trial<'_>,
+) -> (
+    shirusu_test::runner_exec::RunReportData,
+    shirusu_test::runner_exec::RunReportData,
+) {
+    use shirusu_test::runner_exec::{dry_run_report, OutputValue};
+    let mut baseline = dry_run_report(&trial.spec.name, &plan_steps(&trial.spec.steps).unwrap());
+    baseline.executed = true;
+    for step in &mut baseline.steps {
+        step.executed = true;
+        step.returned = Some(1);
+        step.last_error = Some(0);
+    }
+    baseline.steps[trial.target_replay_step].outputs = vec![
+        ("lpNumberOfBytesRead".into(), OutputValue::U64(1)),
+        ("lpBuffer".into(), OutputValue::Hex("2a00".into())),
+    ];
+    let mut candidate = baseline.clone();
+    candidate.all_ok = false;
+    let target = &mut candidate.steps[trial.target_replay_step];
+    target.ok = false;
+    target.error = Some("output expectation mismatch".into());
+    target.outputs[1].1 = OutputValue::Hex("2b00".into());
+    (baseline, candidate)
+}
+
+#[test]
+fn report_oracle_pins_target_values_and_rejects_unrelated_failures() {
+    use shirusu_probe::{
+        oracle::DifferenceFingerprint,
+        reduce::{Trial, TrialOutcome::*},
+    };
+    use shirusu_test::runner_exec::OutputValue;
+    let replay = reduction_fixture();
+    let trial = Trial {
+        spec: &replay.spec,
+        source_steps: &replay.kept_steps,
+        target_replay_step: 5,
+    };
+    let (baseline, candidate) = oracle_reports(&trial);
+    let fingerprint = DifferenceFingerprint::establish(&trial, &baseline, &candidate).unwrap();
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &candidate),
+        SameTargetDifference
+    );
+    let mut changed = candidate.clone();
+    changed.steps[5].outputs[1].1 = OutputValue::Hex("2c00".into());
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        DifferenceAbsent
+    );
+    changed = candidate.clone();
+    changed.steps[0].ok = false;
+    changed.steps[0].error = Some("CREATE_NEW failed".into());
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        Inconclusive
+    );
+    changed = candidate.clone();
+    changed.steps[5].executed = false;
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        Inconclusive
+    );
+    changed = candidate.clone();
+    changed.steps[5].outputs_truncated.push("lpBuffer".into());
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        Inconclusive
+    );
+    changed = candidate.clone();
+    let duplicate = changed.steps[5].outputs[0].clone();
+    changed.steps[5].outputs.push(duplicate);
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        Inconclusive
+    );
+    let mut dry = baseline.clone();
+    dry.executed = false;
+    assert_eq!(fingerprint.evaluate(&trial, &dry, &candidate), Inconclusive);
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &baseline),
+        DifferenceAbsent
+    );
+    changed = candidate.clone();
+    changed.steps[5].outputs[0].1 = OutputValue::U64(3);
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        Inconclusive
+    );
+    changed = candidate.clone();
+    changed.steps.pop();
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        Inconclusive
+    );
+    changed = candidate.clone();
+    changed.steps[5].returned = Some(0);
+    changed.steps[5].last_error = Some(5);
+    let failed = DifferenceFingerprint::establish(&trial, &baseline, &changed).unwrap();
+    assert_eq!(failed.candidate.failure_error, Some(5));
+    assert_eq!(failed.candidate.data, None);
+    changed.steps[5].last_error = Some(6);
+    assert_eq!(
+        failed.evaluate(&trial, &baseline, &changed),
+        DifferenceAbsent
+    );
+    // Successful last-error and the unused buffer tail are not semantic data.
+    changed = candidate.clone();
+    changed.steps[5].last_error = Some(999);
+    changed.steps[5].outputs[1].1 = OutputValue::Hex("2Bff".into());
+    assert_eq!(
+        fingerprint.evaluate(&trial, &baseline, &changed),
+        SameTargetDifference
+    );
+}
+
+#[test]
+fn typed_runner_oracle_drives_reduction_with_stable_source_identity() {
+    use shirusu_probe::{
+        oracle::DifferenceFingerprint,
+        reduce::{reduce_file_io, Trial},
+    };
+    let replay = reduction_fixture();
+    let trial = Trial {
+        spec: &replay.spec,
+        source_steps: &replay.kept_steps,
+        target_replay_step: 5,
+    };
+    let (baseline, candidate) = oracle_reports(&trial);
+    let fingerprint = DifferenceFingerprint::establish(&trial, &baseline, &candidate).unwrap();
+    let result = reduce_file_io(replay, 30, |trial| {
+        let (mut baseline, candidate) = oracle_reports(&trial);
+        if !trial.source_steps.contains(&1) {
+            baseline.all_ok = false;
+            baseline.steps[trial.target_replay_step].ok = false;
+            baseline.steps[trial.target_replay_step].error = Some("required write missing".into());
+        }
+        Ok::<_, ()>(fingerprint.evaluate(&trial, &baseline, &candidate))
+    })
+    .unwrap();
+    assert_eq!(result.replay.kept_steps, [0, 1, 3, 4, 5, 6]);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_runner_pair_does_not_invent_a_difference_between_windows_runs() {
+    use shirusu_probe::{
+        oracle::DifferenceFingerprint,
+        reduce::{Trial, TrialOutcome},
+    };
+    use shirusu_test::runner_exec::execute_planned;
+    let spec = generate_replay(&record(1, 42)).unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "shirusu-oracle-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let execute = |side: &str| {
+        let dir = root.join(side);
+        std::fs::create_dir(&dir).unwrap();
+        let mut isolated = spec.clone();
+        for step in &mut isolated.steps {
+            for (name, arg) in &mut step.args {
+                if name == "lpFileName" {
+                    if let ArgValue::Text(path) = arg {
+                        *path = dir.join(&*path).to_str().unwrap().to_owned();
+                    }
+                }
+            }
+        }
+        execute_planned(&isolated.name, &plan_steps(&isolated.steps).unwrap())
+    };
+    let left = execute("left");
+    let right = execute("right");
+    assert!(left.all_ok && right.all_ok, "{left:?} / {right:?}");
+    let source_steps: Vec<_> = (0..spec.steps.len()).collect();
+    let trial = Trial {
+        spec: &spec,
+        source_steps: &source_steps,
+        target_replay_step: 4,
+    };
+    assert_eq!(
+        DifferenceFingerprint::establish(&trial, &left, &right),
+        Err(TrialOutcome::DifferenceAbsent)
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
