@@ -108,7 +108,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-performance-${{ matrix.name }}
-          path: target/ci-diagnostics/native-performance-*.json
+          path: |
+            target/ci-diagnostics/native-performance-*.json
+            target/ci-diagnostics/native-performance-phases-*.txt
           if-no-files-found: ignore
           retention-days: 14
       - name: Preserve Windows capture diagnostics

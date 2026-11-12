@@ -8,11 +8,17 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $repo
 $arch = if ($Target -eq "i686-pc-windows-msvc") { "x86" } else { "x64" }
 Invoke-Native { cargo build -p shirusu-cli -p shirusu-agent-dll --release --target $Target } "native performance release binaries"
+Invoke-Native { cargo build -p shirusu-e2e --release --target $Target --bin shirusu-phases-bench } "capture component benchmark"
 $bin = Join-Path $repo "target\$Target\release"
 $cli = Join-Path $bin "shirusu.exe"
 $dll = Join-Path $bin "shirusu_agent_dll.dll"
 $work = Join-Path $repo ("target\native-performance-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory $work | Out-Null
+$phasesPath = Join-Path $work "native-performance-phases-$arch.txt"
+& (Join-Path $bin "shirusu-phases-bench.exe") | Tee-Object -FilePath $phasesPath
+$phasesExit = $LASTEXITCODE
+if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR }
+if ($phasesExit -ne 0) { throw "component benchmark failed: $phasesExit" }
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "MSVC compiler not found" }
