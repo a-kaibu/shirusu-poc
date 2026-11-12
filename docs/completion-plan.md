@@ -77,3 +77,9 @@ CI の `SHIRUSU_DIAGNOSTIC_DIR` 指定時は、Agent の初期化前に 4 KiB �
 relay と元関数の trampoline は同じ確保領域に置き、既存の保持上限と寿命を
 共有する。再設置時は relay 経由の既存パッチも認識する。5 バイト未満や
 近傍確保失敗は引き続き見送り、隣接コードを上書きして成功扱いにしない。
+
+`9d19318` の run `43274704982` で x86 の実注入 Capture と ABI E2E、
+RoGetActivationFactory の 3 引数転送、debug / release の native TLS
+欠落回帰テストが通過した。以前の WoW64 transport 検証と区別する。
+x64 は独立シナリオを最後まで実行してから失敗を集約するよう変更し、
+先行ケースの失敗で WinRT・callback・SEH・replay の問題を隠さない。
