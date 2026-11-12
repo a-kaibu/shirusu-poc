@@ -711,6 +711,103 @@ pub fn generic_leave(api: &ApiDef, return_value: u64, last_error: u32) -> Vec<Ca
         .collect()
 }
 
+/// Stack storage for generated L1 scalar fields. Each field needs at most one
+/// capture byte plus ten LEB128 bytes. This has no allocator or destructor.
+pub struct GenericPayload<const FIELDS: usize> {
+    bytes: [[u8; 11]; FIELDS],
+    len: usize,
+}
+
+impl<const FIELDS: usize> GenericPayload<FIELDS> {
+    fn new() -> Self {
+        Self {
+            bytes: [[0; 11]; FIELDS],
+            len: 0,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes.as_flattened()[..self.len]
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.bytes.as_flattened_mut()[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn uleb(&mut self, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            self.byte(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn scalar(&mut self, value: CapturedValue) {
+        self.byte(value.capture.code());
+        match value.value {
+            TypedValue::U32(v) => self.uleb(v as u64),
+            TypedValue::U64(v) => self.uleb(v),
+            TypedValue::I32(v) => {
+                let v = v as i64;
+                self.uleb(((v << 1) ^ (v >> 63)) as u64);
+            }
+            TypedValue::I64(v) => self.uleb(((v << 1) ^ (v >> 63)) as u64),
+            TypedValue::Bool(v) => self.byte(v as u8),
+            TypedValue::F32Bits(v) => {
+                for byte in v.to_le_bytes() {
+                    self.byte(byte);
+                }
+            }
+            TypedValue::F64Bits(v) => {
+                for byte in v.to_le_bytes() {
+                    self.byte(byte);
+                }
+            }
+            _ => unreachable!("generated L1 capture only produces scalar values"),
+        }
+    }
+}
+
+/// Encode generated arguments directly into bounded stack storage.
+/// FIELDS must cover every argument; the generated wrapper uses its exact arity.
+pub fn encode_generic_enter<const FIELDS: usize>(
+    api: &ApiDef,
+    args: &[u64],
+) -> GenericPayload<FIELDS> {
+    assert_eq!(
+        args.len(),
+        api.enter_fields.len(),
+        "generated detour arity mismatch"
+    );
+    assert!(args.len() <= FIELDS, "generated payload capacity exceeded");
+    let mut payload = GenericPayload::new();
+    for ((name, ty, _, _), raw) in api.enter_fields.iter().zip(args) {
+        payload.scalar(raw_to_value(api.function, name, *ty, *raw));
+    }
+    payload
+}
+
+/// Encode the optional return value and LastError without heap allocation.
+pub fn encode_generic_leave(api: &ApiDef, return_value: u64, last_error: u32) -> GenericPayload<2> {
+    assert!(
+        api.leave_fields.len() <= 2,
+        "generated leave capacity exceeded"
+    );
+    let mut payload = GenericPayload::new();
+    for (name, ty, _, _) in api.leave_fields {
+        payload.scalar(match *name {
+            "return" => raw_to_value(api.function, name, *ty, return_value),
+            "last_error" => last_error_value(api.last_error_meaning, return_value, last_error),
+            other => panic!("{}: unexpected leave field {other}", api.function),
+        });
+    }
+    payload
+}
+
 /// 生の u64 値を Schema の型に沿った `CapturedValue` へ変換する。
 /// 32bit 型は下位ビット、64bit 型は全ビット、Bool は 0 以外を真とする。
 /// 生成表で使わない型（Str16 / Bytes 等）は panic する。
@@ -752,6 +849,18 @@ mod tests {
                 let enter = generic_enter(api, &args);
                 let leave = generic_leave(api, raw, u32::MAX);
                 assert_eq!(
+                    encode_generic_enter::<32>(api, &args).as_bytes(),
+                    encode_enter(api, &enter).unwrap(),
+                    "{} stack enter",
+                    api.function
+                );
+                assert_eq!(
+                    encode_generic_leave(api, raw, u32::MAX).as_bytes(),
+                    encode_leave(api, &leave).unwrap(),
+                    "{} stack leave",
+                    api.function
+                );
+                assert_eq!(
                     encode_enter(api, &enter).unwrap(),
                     encode_values(&schema_types(&api.enter_schema()).unwrap(), &enter).unwrap(),
                     "{} enter",
@@ -765,6 +874,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn stack_encoding_matches_reference_for_arbitrary_scalar_bits(
+            api_index in 0usize..GENERATED_API_TABLE.len(),
+            raw_args in proptest::collection::vec(proptest::prelude::any::<u64>(), 32),
+            returned in proptest::prelude::any::<u64>(),
+            last_error in proptest::prelude::any::<u32>(),
+        ) {
+            let api = &GENERATED_API_TABLE[api_index];
+            let args = &raw_args[..api.enter_fields.len()];
+            let expected = encode_enter(api, &generic_enter(api, args)).unwrap();
+            let actual = encode_generic_enter::<32>(api, args);
+            proptest::prop_assert_eq!(actual.as_bytes(), expected);
+            let expected = encode_leave(api, &generic_leave(api, returned, last_error)).unwrap();
+            let actual = encode_generic_leave(api, returned, last_error);
+            proptest::prop_assert_eq!(actual.as_bytes(), expected);
+        }
+    }
+
+    #[test]
+    fn scalar_payload_handles_zero_fields_and_maximum_varint() {
+        let api = api_by_name("GetCurrentProcessId").unwrap();
+        assert!(encode_generic_enter::<0>(api, &[]).as_bytes().is_empty());
+        let mut payload = GenericPayload::<1>::new();
+        payload.scalar(CapturedValue::captured(TypedValue::U64(u64::MAX)));
+        assert_eq!(payload.as_bytes().len(), 11);
+        assert_eq!(
+            decode_values(&[Ty::U64], payload.as_bytes()).unwrap(),
+            vec![CapturedValue::captured(TypedValue::U64(u64::MAX))]
+        );
     }
 
     fn mem_with_str(addr: u64, s: &str) -> MapMemory {

@@ -1667,9 +1667,9 @@ fn generic_detour_with<const N: usize>(
         Prepare::Unavailable => return 0,
     };
     let call_id = rt.alloc_call_id();
-    let values = capture::generic_enter(api, args);
-    if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+    {
+        let bytes = capture::encode_generic_enter::<N>(api, args);
+        rt.record_enter(tid, api, call_id, bytes.as_bytes());
     }
     if api.module.eq_ignore_ascii_case("kernel32.dll") && api.function == "ExitThread" {
         // ExitThread does not unwind Rust frames. Release recorder ownership
@@ -1678,14 +1678,12 @@ fn generic_detour_with<const N: usize>(
         // Stop capture before TLS/DllMain teardown starts, not only when this
         // DLL's native thread-detach callback is eventually reached.
         ReentrancyGuard::mark_thread_exiting();
-        drop(values);
         drop(_flight);
         drop(rt);
         drop(guard);
         le.restore_before_original();
         return invoke(original);
     }
-    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
@@ -1711,10 +1709,8 @@ fn generic_detour_with<const N: usize>(
     }
     guard.resume();
     pop_call(call_id);
-    let values = capture::generic_leave(api, ret, last_error);
-    if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
-    }
+    let bytes = capture::encode_generic_leave(api, ret, last_error);
+    rt.record_leave(tid, api, call_id, bytes.as_bytes());
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();
     ret

@@ -59,4 +59,28 @@ fn main() {
             times[1] / times[0]
         );
     }
+    let raw_args = [0x1234, 0, 64];
+    for round in 0..5 {
+        let mut times = [0.0; 2];
+        for mode in [round % 2, 1 - round % 2] {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                if mode == 0 {
+                    let values = capture::generic_enter(black_box(api), black_box(&raw_args));
+                    black_box(capture::encode_enter(api, &values).unwrap());
+                } else {
+                    let bytes =
+                        capture::encode_generic_enter::<3>(black_box(api), black_box(&raw_args));
+                    black_box(bytes.as_bytes());
+                }
+            }
+            times[mode] = start.elapsed().as_nanos() as f64 / iterations as f64;
+        }
+        println!(
+            "round={round} allocating_capture_ns={:.1} stack_capture_ns={:.1} ratio={:.3}",
+            times[0],
+            times[1],
+            times[1] / times[0]
+        );
+    }
 }

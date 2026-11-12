@@ -166,3 +166,10 @@ fuzz を追加した。Linux release の HeapAlloc enter 局所測定では約82
 約36〜39nsとなった。Windows 全体の倍率への効果は別途 CI で測る。
 単一対象の回収ループも、イベントを回収できた間は再回収し、空の場合だけ
 指定間隔待つよう変更する。Ring の容量や欠落の判定基準は変更しない。
+
+生成 L1 Detour の enter/leave 符号化には、フィールド数 × 11 バイトの
+スタック領域を使う（capture byte + 最大 10 バイトの LEB128）。
+元 API の呼び出し前に一時領域の使用を終え、SEH と ExitThread の所有権回収は
+維持する。従来の Codec との全生成 API 境界値・任意の scalar bit pattern の
+差分検査を追加した。Linux release の HeapAlloc enter 取得＋符号化は局所測定で
+約70〜87nsから約15〜17ns。手書き L2 や実行時管理には別の確保・ロックが残る。
