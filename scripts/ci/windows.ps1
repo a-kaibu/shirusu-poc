@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..\..")
 # カナリア: 失敗するネイティブコマンドがジョブを落とすこと自体を検証する。
 Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "canary-exit-code.ps1") } "exit-code canary"
-Invoke-Native { cargo test --workspace --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
+Invoke-Native { cargo test --workspace --no-fail-fast --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
 Invoke-Native { cargo build --workspace --target x86_64-pc-windows-msvc } "cargo build (workspace, x64)"
 # L20: Probe exe 生成と JSON Runner の実動（サンプル仕様から x64 の
 # Probe exe を生成・実行し、Runner でも同じ仕様を実行する）。

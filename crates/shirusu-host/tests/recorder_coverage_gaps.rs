@@ -295,6 +295,7 @@ fn add_borrowed_ring_too_small_is_config_error() {
 
 /// `/dev/full` へ Trace を作ると Writer 構築（Header 書き込み）で
 /// 失敗し、`create_file` の `?` 伝播（451 行目相当）が走る。
+#[cfg(target_os = "linux")]
 #[test]
 fn create_file_on_dev_full_fails_at_writer_construction() {
     let err = match CaptureSession::create_file("/dev/full", config()) {
@@ -371,4 +372,15 @@ fn com_methods_missing_for_safety_degrade_coverage_with_reason() {
         .notes
         .iter()
         .any(|n| n.contains("shared-object-safety-unproven")));
+}
+
+#[test]
+fn create_file_in_missing_directory_reports_io_error() {
+    let missing = temp_trace("missing-parent").join("capture.trace");
+    assert!(!missing.parent().unwrap().exists());
+    let error = match CaptureSession::create_file(&missing, config()) {
+        Ok(_) => panic!("missing parent must fail before writer construction"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::Io(_)), "{error}");
 }
