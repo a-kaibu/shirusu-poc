@@ -11,12 +11,12 @@
 //!   高負荷のケース (high-load、上限 5 倍) で、記録なし走行に対する記録あり
 //!   走行の時間比。基準は開発中の評価基準であり保証値ではない。
 //!
-//! Linux では実 Windows API を呼べないため、API 本体のコストは校正済み
+//! すべての OS で API 本体のコストは校正済み
 //! スピンでモデル化する (`spin_loop` の 1 回あたり時間をベンチ開始時に測り、
 //! 目標時間から反復回数を決める。校正値は出力する)。記録経路そのもの
 //! (Agent・Ring・DrainWorker・TraceRecorder・TraceWriter) は本物を使う。
-//! Windows 実機での実測は CI の Windows ジョブで同じバイナリを回す
-//! (scripts/ci/windows.ps1・windows-x86.ps1 に配線済み)。
+//! Windows CI でも同じモデルを使う。実アプリへの DLL 注入・Detour を
+//! 含む実行時間の倍率は、このベンチでは測定していない。
 //!
 //! 使い方: `cargo run -p shirusu-e2e --bin shirusu-perf-bench --release [-- --rounds 3]`
 //! 終了コードは常に 0。基準は開発中の評価目標でありゲートではないため、
@@ -82,10 +82,10 @@ fn env(session_id: u64) -> CaptureEnvironment {
             created_by: "shirusu-perf-bench".into(),
             qpc_frequency: 10_000_000,
         },
-        os_version: "Windows 11".into(),
-        os_build: 26100,
-        cpu_arch: "x86_64".into(),
-        pointer_width: 64,
+        os_version: std::env::consts::OS.into(),
+        os_build: 0,
+        cpu_arch: std::env::consts::ARCH.into(),
+        pointer_width: usize::BITS,
         capture_config: "L10".into(),
         feature_flags: 3,
         target_description: "bench.exe".into(),
@@ -567,6 +567,6 @@ fn main() {
         println!("note: the burst exceeded the production ring; the trace would be incomplete (full mode does not guarantee recording under any load).");
     }
 
-    println!("\nnote: Linux numbers only measure the record path (Agent/Ring/Host/Writer). The Windows Detour cost and real API costs are not in these numbers; the same binary runs on Windows CI (windows.ps1 / windows-x86.ps1).");
-    println!("note: medians of {rounds} rounds on this shared Linux VM; absolute numbers vary by machine. The criteria are development targets, not guarantees (overview).");
+    println!("\nnote: these numbers measure Agent/Ring/Host/Writer with simulated API costs on every OS. They do not measure DLL injection, Detour overhead, or real GUI/API execution.");
+    println!("note: medians of {rounds} rounds on {} / {}; absolute numbers vary by machine. These modeled criteria do not establish the real-application performance targets.", std::env::consts::OS, std::env::consts::ARCH);
 }
