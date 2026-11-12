@@ -244,6 +244,10 @@ mod win {
         if engine::set_runtime(Arc::clone(&rt)).is_err() {
             return STATUS_ALREADY_INITIALIZED;
         }
+        // Hook installation uses the same heap, handle and memory APIs that
+        // become intercepted below. Those operations belong to the Agent and
+        // must stay on the passthrough path throughout initialization.
+        let _initialization_guard = shirusu_hook::runtime::ReentrancyGuard::try_enter();
         // レビュー #6 P1-4: スレッド終了の検出を FLS デストラクタへ
         // 結線する。DisableThreadLibraryCalls のため DLL_THREAD_DETACH
         // は届かないが、FLS デストラクタはスレッド終了時に呼ばれる。
@@ -489,6 +493,7 @@ mod win {
                 unrestored
                     .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
                 unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.internal_hooks) });
+                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.callbacks) });
                 unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.inline) });
                 unrestored.extend(unsafe { engine::uninstall_hooks(&state.installed) });
                 drained = false;

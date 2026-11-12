@@ -334,6 +334,24 @@ enum InlineOriginalSlot {
 }
 
 impl InlineOriginalSlot {
+    fn original(&self, rt: &HookRuntime) -> usize {
+        match *self {
+            Self::Api(id) => rt.original(id),
+            Self::ComFactory(i) => rt.com_original(i),
+            Self::WinRtActivation(i) => rt.winrt_original(i),
+            Self::Callback(i) => rt.callback_original(i),
+        }
+    }
+
+    fn set_original(&self, rt: &HookRuntime, address: usize) {
+        match *self {
+            Self::Api(id) => rt.set_original(id, address),
+            Self::ComFactory(i) => rt.set_com_original(i, address),
+            Self::WinRtActivation(i) => rt.set_winrt_original(i, address),
+            Self::Callback(i) => rt.set_callback_original(i, address),
+        }
+    }
+
     /// 設置結果の報告用 ID。Factory 関数・アクティベーション関数・
     /// コールバック検出フック関数は API 表に無いため、予約値を使う。
     fn report_id(&self) -> u32 {
@@ -587,20 +605,21 @@ fn install_one_inline(
         std::ptr::copy_nonoverlapping(code.as_ptr(), trampoline as *mut u8, code.len());
         FlushInstructionCache(GetCurrentProcess(), trampoline as *const c_void, code.len());
     }
+    // patch_target itself calls GetCurrentProcess/VirtualProtect and can enter
+    // an already installed IAT detour. Publish the trampoline BEFORE changing
+    // the entry point, so those calls never follow the patched entry recursively.
+    let previous = p.slot.original(rt);
+    p.slot.set_original(rt, trampoline);
     if patch_target(
         p.target,
         &build_patch(p.target as u64, p.detour as u64, bitness),
     )
     .is_err()
     {
-        unsafe { VirtualFree(trampoline as *mut c_void, 0, MEM_RELEASE) };
+        p.slot.set_original(rt, previous);
+        // Publication also exposed this address to IAT callers. Keep it alive
+        // under the same cumulative allocation budget as retired trampolines.
         return Err("protect-failed");
-    }
-    match p.slot {
-        InlineOriginalSlot::Api(api_id) => rt.set_original(api_id, trampoline),
-        InlineOriginalSlot::ComFactory(index) => rt.set_com_original(index, trampoline),
-        InlineOriginalSlot::WinRtActivation(index) => rt.set_winrt_original(index, trampoline),
-        InlineOriginalSlot::Callback(index) => rt.set_callback_original(index, trampoline),
     }
     Ok(InlineHook {
         api_id: p.slot.report_id(),
@@ -3637,6 +3656,49 @@ mod tests {
             rt.with_com_tracker(|t| t.lookup(ptr as u64).unwrap().interception_skip_reason),
             Some("shared-object-safety-unproven")
         );
+    }
+
+    #[test]
+    fn installing_process_pseudo_handle_hook_does_not_recurse() {
+        const CHILD: &str = "SHIRUSU_INLINE_PUBLICATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::installing_process_pseudo_handle_hook_does_not_recurse",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("inline publication regression timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let api = api_table()
+            .find(|api| api.function == "GetCurrentProcess")
+            .unwrap();
+        let rt = Arc::new(test_runtime());
+        let original = resolve_export(api.module, api.function).unwrap();
+        rt.set_original(api.api_id, original); // The state after IAT installation.
+        rt.shutdown_recording();
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let result = unsafe { install_inline_hooks_for(&rt, std::iter::once(api)) };
+        assert_eq!(result.installed.len(), 1, "{:?}", result.skipped);
+        assert_eq!(unsafe { GetCurrentProcess() } as usize, usize::MAX);
+        assert!(unsafe { uninstall_inline_hooks(&result.installed) }.is_empty());
+        assert!(clear_runtime(&rt));
+        assert_eq!(unsafe { GetCurrentProcess() } as usize, usize::MAX);
     }
 
     #[test]
