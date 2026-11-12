@@ -144,20 +144,27 @@ impl LaunchedCapture {
     ) -> Result<Self, SessionError> {
         let process = win::open_process_for_injection(pid)?;
         match inject_and_init(&cfg, process, pid) {
-            Ok(injected) => match finalize_session(trace_path, injected) {
-                Ok((session, shutdown_addr, data_ready)) => Ok(Self {
-                    session: Some(session),
-                    process,
-                    pid,
-                    shutdown_addr,
-                    module_scan: start_module_scan(pid, Vec::new()),
-                    data_ready,
-                }),
-                Err(e) => {
-                    win::close_handle_value(process);
-                    Err(e)
+            Ok(injected) => {
+                let shutdown_addr = injected.shutdown_addr;
+                match finalize_session(trace_path, injected) {
+                    Ok((session, shutdown_addr, data_ready)) => Ok(Self {
+                        session: Some(session),
+                        process,
+                        pid,
+                        shutdown_addr,
+                        module_scan: start_module_scan(pid, Vec::new()),
+                        data_ready,
+                    }),
+                    Err(e) => {
+                        let rollback = rollback_initialized_agent(process, shutdown_addr);
+                        win::close_handle_value(process);
+                        Err(SessionError::PostInitialization {
+                            source: Box::new(e),
+                            rollback,
+                        })
+                    }
                 }
-            },
+            }
             Err(e) => {
                 win::close_handle_value(process);
                 Err(e)
@@ -250,6 +257,22 @@ impl LaunchedCapture {
         win::close_handle_value(self.process);
         self.process = 0;
         Ok(summary)
+    }
+}
+
+/// Only called after successful initialization. Never terminate an attached
+/// application, and never describe an unconfirmed rollback as restored.
+fn rollback_initialized_agent(
+    process: win::HandleValue,
+    shutdown_addr: Option<usize>,
+) -> ShutdownOutcome {
+    match win::process_exited(process) {
+        Ok(true) => ShutdownOutcome::NotRequired,
+        Err(e) => ShutdownOutcome::CallFailed(format!("checking attached target: {e}")),
+        Ok(false) => match shutdown_addr {
+            Some(addr) => shutdown_outcome_from_call(win::remote_call(process, addr, 0)),
+            None => ShutdownOutcome::ExportUnavailable,
+        },
     }
 }
 
@@ -921,9 +944,12 @@ fn inject_and_init(
         )));
     }
     if !init_done.wait_timeout(cfg.init_timeout) {
-        return Err(SessionError::Injection(
-            "agent did not signal init_done before timeout".into(),
-        ));
+        return Err(SessionError::PostInitialization {
+            source: Box::new(SessionError::Injection(
+                "agent did not signal init_done before timeout".into(),
+            )),
+            rollback: rollback_initialized_agent(process, shutdown_addr),
+        });
     }
     let hook_coverage = outcome
         .as_ref()

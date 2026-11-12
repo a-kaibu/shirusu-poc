@@ -51,6 +51,12 @@ pub enum SessionError {
     Win(shirusu_transport_win::WinError),
     /// DLL 注入や初期化の失敗（Windows ドライバ側）。
     Injection(String),
+    /// Target initialization succeeded, but Host preparation failed. Keep the
+    /// original error and the independently observed cleanup result together.
+    PostInitialization {
+        source: Box<SessionError>,
+        rollback: ShutdownOutcome,
+    },
 }
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,6 +70,12 @@ impl std::fmt::Display for SessionError {
             #[cfg(windows)]
             Self::Win(e) => write!(f, "windows error: {e}"),
             Self::Injection(m) => write!(f, "injection failed: {m}"),
+            Self::PostInitialization { source, rollback } => {
+                write!(
+                    f,
+                    "capture preparation failed: {source}; rollback: {rollback:?}"
+                )
+            }
         }
     }
 }

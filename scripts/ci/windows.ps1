@@ -117,6 +117,8 @@ try {
 
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "legacy-api.ps1")) } "native ANSI and file API coverage"
 
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "attach-rollback.ps1")) } "native attach rollback and reattach"
+
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1")) } "native injected performance"
 
     if ($captureFailures.Count -gt 0) {
