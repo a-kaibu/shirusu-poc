@@ -338,26 +338,34 @@ pub fn encode_event_fields(
 /// global_order は Batch 内で全件 Some なら Header に旗を立てて差分で
 /// 書く（先頭は絶対値）。混在は Writer が拒否するためここでは来ない。
 pub fn encode_event_chunk(batch: &EventBatch) -> Vec<u8> {
-    let has_global_order = batch.events.iter().any(|e| e.global_order.is_some());
+    encode_event_chunk_slice(batch, &batch.events)
+}
+
+/// Encode a chunk using batch identity and borrowed events, without copying
+/// every event's argument/payload buffers just to split a batch.
+pub(crate) fn encode_event_chunk_slice(batch: &EventBatch, events: &[TraceEvent]) -> Vec<u8> {
+    let first_sequence = events.first().map_or(0, |e| e.sequence);
+    let base_timestamp_qpc = events.first().map_or(0, |e| e.timestamp_qpc);
+    let has_global_order = events.iter().any(|e| e.global_order.is_some());
     let header = BatchHeader {
         session_id: batch.session_id,
         process_id: batch.process_id,
         raw_pid: batch.raw_pid,
         thread_id: batch.thread_id,
-        base_timestamp_qpc: batch.base_timestamp_qpc(),
+        base_timestamp_qpc,
         qpc_frequency: batch.qpc_frequency,
-        first_sequence: batch.first_sequence(),
-        event_count: batch.events.len() as u32,
+        first_sequence,
+        event_count: events.len() as u32,
         has_global_order,
     };
     let header_bytes = header.encode();
     let mut out = Vec::new();
     write_uleb(&mut out, header_bytes.len() as u64);
     out.extend_from_slice(&header_bytes);
-    let mut prev_seq = batch.first_sequence();
-    let mut prev_ts = batch.base_timestamp_qpc();
+    let mut prev_seq = first_sequence;
+    let mut prev_ts = base_timestamp_qpc;
     let mut prev_global: Option<u64> = None;
-    for e in &batch.events {
+    for e in events {
         let seq_delta = e.sequence.wrapping_sub(prev_seq);
         prev_seq = e.sequence;
         let ts_delta = e.timestamp_qpc.wrapping_sub(prev_ts) as i64;

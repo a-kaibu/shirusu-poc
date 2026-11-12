@@ -785,3 +785,33 @@ fn environment_update_rejects_identity_changes_without_writing() {
     assert_eq!(trace.environment.as_ref(), Some(&env(42)));
     assert!(trace.issues.is_empty(), "{:?}", trace.issues);
 }
+
+#[test]
+fn split_chunks_restart_sequence_clock_and_global_order_bases() {
+    let mut writer = TraceWriter::with_options(
+        Vec::new(),
+        env(42),
+        WriterOptions {
+            chunk_raw_target: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    for (i, timestamp) in [u64::MAX - 10, 5, 3].into_iter().enumerate() {
+        let mut item = event(10 + i as u64 * 7, PayloadRef::Inline(vec![i as u8; 30]));
+        item.timestamp_qpc = timestamp;
+        item.global_order = Some(u64::MAX - 2 + i as u64);
+        events.push(item);
+    }
+    writer.write_batch(&batch(19, events.clone())).unwrap();
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace_via(&bytes).unwrap();
+    assert!(trace.issues.is_empty(), "{:?}", trace.issues);
+    assert_eq!(trace.batches.len(), 3);
+    for (actual, expected) in trace.batches.iter().zip(events) {
+        assert_eq!(actual.session_id, 42);
+        assert_eq!(actual.thread_id, 19);
+        assert_eq!(actual.events, vec![expected]);
+    }
+}

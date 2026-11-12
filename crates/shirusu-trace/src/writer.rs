@@ -380,15 +380,7 @@ impl<W: DurableWrite> TraceWriter<W> {
         let mut start = 0;
         while start < batch.events.len() {
             let end = self.chunk_end(batch, start);
-            let sub = EventBatch {
-                session_id: batch.session_id,
-                process_id: batch.process_id,
-                raw_pid: batch.raw_pid,
-                thread_id: batch.thread_id,
-                qpc_frequency: batch.qpc_frequency,
-                events: batch.events[start..end].to_vec(),
-            };
-            let payload = compact::encode_event_chunk(&sub);
+            let payload = compact::encode_event_chunk_slice(batch, &batch.events[start..end]);
             self.write_block(BlockType::EventChunk, &payload, true)?;
             start = end;
         }
