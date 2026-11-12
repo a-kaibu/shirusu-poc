@@ -518,33 +518,30 @@ impl<W: DurableWrite> TraceWriter<W> {
         // Batch Header（Protobuf）の見積もり。実サイズより小さくならない
         // よう余裕を持たせる（目安なので厳密さは要らない）。
         let mut est = 128usize;
-        let mut scratch = Vec::new();
         let mut end = start;
-        // L11: 全体順序の差分の見積もりも encode と同じ規則で数える。
-        let has_global_order = batch.events.iter().any(|e| e.global_order.is_some());
-        let mut prev_global: Option<u64> = if start > 0 {
-            batch.events[start - 1].global_order
-        } else {
-            None
-        };
+        let mut prev_seq = batch.events[start].sequence;
+        let mut prev_ts = batch.events[start].timestamp_qpc;
+        // Every chunk restarts its delta bases; global order starts absolute.
+        let mut prev_global: Option<u64> = None;
         while end < batch.events.len() {
-            scratch.clear();
-            let global_delta = if has_global_order {
-                let g = batch.events[end].global_order.unwrap_or(0);
-                let d = match prev_global {
-                    None => g,
-                    Some(p) => g.wrapping_sub(p),
-                };
+            let event = &batch.events[end];
+            let global_delta = event.global_order.map(|g| {
+                let delta = prev_global.map_or(g, |previous| g.wrapping_sub(previous));
                 prev_global = Some(g);
-                Some(d)
-            } else {
-                None
-            };
-            compact::encode_event_fields(&mut scratch, &batch.events[end], 0, 0, global_delta);
-            if end > start && est + scratch.len() > self.chunk_raw_target {
+                delta
+            });
+            let size = compact::encoded_event_fields_len(
+                event,
+                event.sequence.wrapping_sub(prev_seq),
+                event.timestamp_qpc.wrapping_sub(prev_ts) as i64,
+                global_delta,
+            );
+            if end > start && est.saturating_add(size) > self.chunk_raw_target {
                 break;
             }
-            est += scratch.len();
+            est = est.saturating_add(size);
+            prev_seq = event.sequence;
+            prev_ts = event.timestamp_qpc;
             end += 1;
         }
         end

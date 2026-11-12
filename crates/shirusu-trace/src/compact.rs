@@ -275,6 +275,44 @@ pub fn decode_compact(
 // イベント列（Event Chunk の payload）
 // ---------------------------------------------------------------------------
 
+trait EventSink {
+    fn push(&mut self, byte: u8);
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+    fn uleb(&mut self, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            self.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    fn sleb(&mut self, value: i64) {
+        self.uleb(((value << 1) ^ (value >> 63)) as u64);
+    }
+}
+
+impl EventSink for Vec<u8> {
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+}
+
+#[derive(Default)]
+struct EventSize(usize);
+impl EventSink for EventSize {
+    fn push(&mut self, _byte: u8) {
+        self.0 = self.0.saturating_add(1);
+    }
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.0 = self.0.saturating_add(bytes.len());
+    }
+}
+
 /// 1 イベント分のフィールド列を書く（seq / ts は呼び出し側が差分を渡す）。
 /// `encode_event_chunk` と、Writer のチャンク分割サイズ見積もりで共有する。
 /// `global_delta` は Batch の `has_global_order` が真の場合にだけ Some
@@ -287,13 +325,36 @@ pub fn encode_event_fields(
     ts_delta: i64,
     global_delta: Option<u64>,
 ) {
-    write_uleb(out, seq_delta);
-    write_sleb(out, ts_delta);
-    write_uleb(out, e.kind as u64);
-    write_uleb(out, e.call_id);
-    write_uleb(out, e.parent_call_id);
-    write_uleb(out, e.api_id as u64);
-    write_uleb(out, e.schema_id as u64);
+    encode_event_fields_to(out, e, seq_delta, ts_delta, global_delta);
+}
+
+/// Count encoded bytes using the same field writer, without copying argument
+/// or payload buffers into temporary storage.
+pub fn encoded_event_fields_len(
+    e: &TraceEvent,
+    seq_delta: u64,
+    ts_delta: i64,
+    global_delta: Option<u64>,
+) -> usize {
+    let mut size = EventSize::default();
+    encode_event_fields_to(&mut size, e, seq_delta, ts_delta, global_delta);
+    size.0
+}
+
+fn encode_event_fields_to(
+    out: &mut impl EventSink,
+    e: &TraceEvent,
+    seq_delta: u64,
+    ts_delta: i64,
+    global_delta: Option<u64>,
+) {
+    out.uleb(seq_delta);
+    out.sleb(ts_delta);
+    out.uleb(e.kind as u64);
+    out.uleb(e.call_id);
+    out.uleb(e.parent_call_id);
+    out.uleb(e.api_id as u64);
+    out.uleb(e.schema_id as u64);
     out.push(e.capture.code());
     match &e.payload {
         PayloadRef::None => out.push(0),
@@ -303,7 +364,7 @@ pub fn encode_event_fields(
         }
         PayloadRef::Inline(bytes) => {
             out.push(2);
-            write_uleb(out, bytes.len() as u64);
+            out.uleb(bytes.len() as u64);
             out.extend_from_slice(bytes);
         }
         PayloadRef::Dropped {
@@ -311,7 +372,7 @@ pub fn encode_event_fields(
             reason,
         } => {
             out.push(3);
-            write_uleb(out, *original_len);
+            out.uleb(*original_len);
             out.push(reason.code());
         }
     }
@@ -319,14 +380,14 @@ pub fn encode_event_fields(
         None => out.push(0),
         Some(bytes) => {
             out.push(1);
-            write_uleb(out, bytes.len() as u64);
+            out.uleb(bytes.len() as u64);
             out.extend_from_slice(bytes);
         }
     }
     // L11: 全体順序は args の後に ULEB128 で 1 個だけ書く。BatchHeader の
     // has_global_order が真の場合にのみ存在する（旧ファイルには無い）。
     if let Some(delta) = global_delta {
-        write_uleb(out, delta);
+        out.uleb(delta);
     }
 }
 
