@@ -47,8 +47,11 @@ if ($appverif) {
     }
     Write-Host "D54: enabling Application Verifier for shirusu-hook-target.exe ($appverif)"
     & $appverif -enable Heaps Handles Locks -for shirusu-hook-target.exe | Out-Host
+    $captureStarted = Get-Date
+    $captureFailed = $true
     try {
         Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e (with Application Verifier)"
+        $captureFailed = $false
     } finally {
         # Export before deleting settings/logs, including when capture-e2e fails.
         # Keep diagnostic failures from replacing the original test failure.
@@ -58,6 +61,17 @@ if ($appverif) {
             & $appverif -export log -for shirusu-hook-target.exe -with "To=$diagnostics\appverifier.xml" | Out-Host
             Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter "shirusu-capture-e2e-*.trace" |
                 Copy-Item -Destination $diagnostics -ErrorAction Continue
+            if ($captureFailed) {
+                # WER can be disabled on hosted runners. Event 1000 still often
+                # identifies the faulting module and offset; retain matching
+                # symbols so a dump/offset from this build can be diagnosed.
+                Get-WinEvent -FilterHashtable @{ LogName = "Application"; StartTime = $captureStarted; Id = 1000, 1001 } -ErrorAction SilentlyContinue |
+                    Select-Object TimeCreated, Id, ProviderName, Message |
+                    ConvertTo-Json -Depth 4 | Set-Content (Join-Path $diagnostics "application-errors.json")
+                Get-ChildItem "target\x86_64-pc-windows-msvc\debug" -File |
+                    Where-Object { $_.Name -in @("shirusu_agent_dll.dll", "shirusu_agent_dll.pdb", "shirusu-hook-target.exe", "shirusu_hook_target.pdb") } |
+                    Copy-Item -Destination $diagnostics -ErrorAction Continue
+            }
         } catch {
             Write-Warning "Could not preserve capture diagnostics: $_"
         } finally {

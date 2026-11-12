@@ -1574,6 +1574,20 @@ fn generic_detour_with<const N: usize>(
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    if api.module.eq_ignore_ascii_case("kernel32.dll") && api.function == "ExitThread" {
+        // ExitThread does not unwind Rust frames. Release recorder ownership
+        // before entering the OS; otherwise DetourFlight and Arc references
+        // survive forever and shutdown cannot drain. There is no normal Leave.
+        // Stop capture before TLS/DllMain teardown starts, not only when this
+        // DLL's native thread-detach callback is eventually reached.
+        ReentrancyGuard::mark_thread_exiting();
+        drop(values);
+        drop(_flight);
+        drop(rt);
+        drop(guard);
+        le.restore_before_original();
+        return invoke(original);
+    }
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
@@ -3533,6 +3547,45 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[test]
+    fn exit_thread_releases_detour_ownership_without_unwinding() {
+        use windows_sys::Win32::System::Threading::{
+            CreateThread, ExitThread, GetExitCodeThread, WaitForSingleObject,
+        };
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
+            unsafe { detour_generated_kernel32_exit_thread(37) };
+            99 // A real ExitThread never reaches this point.
+        }
+        let api = api_table()
+            .find(|api| api.function == "ExitThread")
+            .unwrap();
+        let rt = Arc::new(test_runtime());
+        rt.set_original(api.api_id, ExitThread as *const () as usize);
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let references = Arc::strong_count(&rt);
+        let thread = unsafe {
+            CreateThread(
+                std::ptr::null(),
+                0,
+                Some(worker),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!thread.is_null());
+        assert_eq!(unsafe { WaitForSingleObject(thread, 10_000) }, 0);
+        let mut code = 0;
+        assert_ne!(unsafe { GetExitCodeThread(thread, &mut code) }, 0);
+        assert_ne!(unsafe { CloseHandle(thread) }, 0);
+        assert_eq!(code, 37);
+        assert_eq!(rt.in_flight(), 0);
+        assert_eq!(Arc::strong_count(&rt), references);
+        crate::fls::drain_pending_exits();
+        assert!(clear_runtime(&rt));
     }
 
     #[test]
