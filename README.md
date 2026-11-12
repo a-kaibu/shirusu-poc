@@ -6,7 +6,27 @@ shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC
 
 > 範囲について: 最初の実装対象は `shirusu-transport` の SPSC Ring と状態遷移でした（spec.md 末尾の決定）。
 > 2026-11-09 の指示で対象はトレーサー全体へ拡大し、Phase 2（公開 Trace への変換）、Phase 3（フック＋レコーダ）、Phase 4（解析 CLI）、Phase 5（ippai 連携基盤）まで実装済みです（いずれもローカル検証のみで、CI 検証はまだです）。
-> COM（L02）は 2026-11-12 に実装済みです。Inline Hook（L01）も 2026-11-12 に実装済みです。WinRT（L14）も 2026-11-12 に実装済みです（いずれもローカル検証のみで、CI 検証はまだです）。Host への再接続も初版では扱いません。予備 Queue は実装しません（理由は所感 2026-11-09 00:41）。
+> COMとWinRTはFactory／Activation呼び出しと返却ポインタを記録します。通常の記録では、返されたインターフェイスが他スレッドと共有されていないことを証明できないため、vtableを書き換えず、メソッド記録の不足をCoverageに`shared-object-safety-unproven`として残します。Inline Hookの解除ではトランポリンをプロセス終了まで保持し、再アタッチを含む累積確保試行を4,096回に制限します。Hostへの再接続と予備Queueは初版では扱いません。
+
+## 2026年11月12日のレビュー対応
+
+WinRT検証アプリのリンク先を、[RoActivateInstanceの指定](https://learn.microsoft.com/en-us/windows/win32/api/roapi/nf-roapi-roactivateinstance)に従って`RuntimeObject.lib`へ変更しました。
+Microsoft署名の判定では、成功したWinVerifyTrustの状態から署名者証明書を取得し、状態を閉じる前に組織名を確認します。
+埋め込み署名が確認できない場合はSHA256とSHA1のカタログを検索し、対象ファイルのハッシュに対する所属と信頼性を検証します。
+署名のないファイル、変更されたファイル、確認に失敗したファイルはMicrosoft製と分類しません。
+
+Metadata Generatorは、void、32bit整数、ポインタ幅整数、ポインタの引数と戻り値を区別したWrapperを生成します。
+元APIもその関数型で呼び出し、記録用の整数表現への変換は呼び出しの前後だけで行います。
+32bit未満の整数、固定64bit整数、浮動小数点数など、現在の生成器でABIを保持できない型は見送ります。
+
+WndProcの読み戻しにはGetWindowLongPtrとGetClassLongPtrのA/W版を追加し、既知のWrapperを元のプロシージャへ解決します。
+x86ではPtr版がマクロであるため、対応するLong版をフックします。
+現在の検証範囲は、登録、同じプロシージャへの差し替え、ウィンドウとクラスからの読み戻しです。
+GetClassInfo経由の読み戻し、A/W間の変換Thunk、解除後に存続するウィンドウまで含めた透過性は未保証です。
+
+回帰テストでは、解除後に取得済みトランポリンを呼ぶケース、COMメソッドの並行実行中にvtableを変更しないこと、生成Wrapperのvoid／整数／ポインタ戻り値、Coverageの不足理由のTraceへの保存を検査します。
+Inline Hookのスレッド停止方式は、新規スレッドの生成や停止先が保持するロックまで制御するものではありません。
+これらのテストの通過を、任意の既存プロセスへの安全なAttachの保証として扱わないでください。
 
 ## 構成
 

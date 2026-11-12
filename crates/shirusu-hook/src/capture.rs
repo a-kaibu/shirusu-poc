@@ -880,10 +880,13 @@ mod tests {
     }
 
     #[test]
-    fn overlapped_internal_high_reads_at_offset_8() {
-        // F27: OVERLAPPED.InternalHigh は先頭から 8 バイト目。
+    fn overlapped_internal_high_uses_native_pointer_width() {
+        // OVERLAPPED.InternalHigh follows one native-width ULONG_PTR.
         let mut m = MapMemory::new();
-        m.write(0x1008, &42u64.to_le_bytes());
+        m.write(
+            0x1000 + std::mem::size_of::<usize>() as u64,
+            &42usize.to_le_bytes(),
+        );
         assert_eq!(read_overlapped_internal_high(&m, 0x1000), Some(42));
         assert_eq!(read_overlapped_internal_high(&m, 0), None);
         assert_eq!(read_overlapped_internal_high(&m, 0x9000), None);
@@ -931,8 +934,10 @@ mod tests {
             read_overlapped_transferred_with_width(&m, 0, 0x1000, 8),
             Some(123_456)
         );
-        // 本番ラッパは自プロセスの幅を使う (このテスト環境は 64bit)。
-        assert_eq!(read_overlapped_internal_high(&m, 0x1000), Some(123_456));
+        // Only a 64-bit process can interpret this x64 fixture natively.
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(read_overlapped_internal_high(&m, 0x1000), Some(123_456));
+        }
         assert_eq!(overlapped_internal_high_offset(4), 4);
         assert_eq!(overlapped_internal_high_offset(8), 8);
         // 4 / 8 以外の幅は受理しない
@@ -999,7 +1004,10 @@ mod tests {
         // OVERLAPPED.InternalHigh から読む。
         let mut m = MapMemory::new();
         m.write_u32(0x5000, 77);
-        m.write(0x1008, &55u64.to_le_bytes());
+        m.write(
+            0x1000 + std::mem::size_of::<usize>() as u64,
+            &55usize.to_le_bytes(),
+        );
         assert_eq!(read_overlapped_transferred(&m, 0x5000, 0x1000), Some(77));
         assert_eq!(read_overlapped_transferred(&m, 0, 0x1000), Some(55));
         assert_eq!(read_overlapped_transferred(&m, 0x9000, 0x1000), Some(55));

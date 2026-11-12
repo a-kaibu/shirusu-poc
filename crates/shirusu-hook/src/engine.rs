@@ -297,10 +297,10 @@ pub unsafe fn uninstall_hooks(installed: &InstalledHooks) -> Vec<u32> {
 // - トランポリンは対象の近く（±2GB）に確保し、戻りジャンプが rel32 で
 //   届くようにする。近くに空きが無ければ全体確保し、絶対ジャンプを使う。
 // - 解除時はプロローグを元へ戻し、停止中のスレッドが中にいない
-//   トランポリンだけ解放する（P1-6 と同じ「残存は正直に報告」の扱い）。
+//   トランポリンはプロセス終了まで保持し、未復元を正直に報告する。
 
-/// Inline Hook 1 件分。解除時にプロローグを元へ戻し、トランポリンを
-/// 復元するために保持する。トランポリンはプロセス終了まで保持する。
+/// Inline Hook 1 件分。解除時にプロローグを復元するために保持する。
+/// トランポリンはプロセス終了まで保持する。
 #[derive(Debug)]
 pub struct InlineHook {
     pub api_id: u32,
@@ -3532,6 +3532,8 @@ mod tests {
         VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
     };
 
+    static TEST_RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_runtime() -> HookRuntime {
         HookRuntime::new(
             Arc::new(Agent::new(
@@ -3766,9 +3768,10 @@ mod tests {
 
     #[test]
     fn prepare_returns_passthrough_while_record_path_active() {
+        let _global = TEST_RUNTIME_LOCK.lock().unwrap();
         // G15: 記録経路の実行中に同じスレッドから prepare を呼ぶと、
         // Agent 自身の呼び出しとして記録せず素通しになる。
-        // グローバルスロットはこのテストだけが使う（他のテストは触らない）。
+        // Global runtime tests serialize registration with TEST_RUNTIME_LOCK.
         assert!(runtime().is_none());
         let pool = Arc::new(SlotPool::new(2));
         let agent = Arc::new(Agent::new(
@@ -3824,10 +3827,10 @@ mod tests {
 
     #[test]
     fn prepare_suppresses_internal_api_unless_detailed() {
+        let _global = TEST_RUNTIME_LOCK.lock().unwrap();
         // L15: 内部 API (Nt*) は詳細調査モードでのみ記録経路に入る。
         // 無効な場合は元の API だけ素通しで呼ぶ。Win32 API は影響を
-        // 受けない。グローバルスロットはこのテストだけが使う（他の
-        // テストは触らない）。
+        // 受けない。グローバルランタイムを使うテスト同士は排他する。
         assert!(runtime().is_none());
         let pool = Arc::new(SlotPool::new(2));
         let agent = Arc::new(Agent::new(

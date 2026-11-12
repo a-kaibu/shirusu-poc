@@ -165,29 +165,29 @@ impl CallerModules {
 #[cfg(windows)]
 #[inline(never)]
 pub fn caller_return_address() -> Option<usize> {
+    let self_base = allocation_base(caller_return_address as *const () as usize)?;
+    return_address_outside_module(self_base)
+}
+
+#[cfg(windows)]
+fn allocation_base(addr: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe {
+        VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    (n != 0).then_some(mbi.AllocationBase as usize)
+}
+
+#[cfg(windows)]
+#[inline(never)]
+fn return_address_outside_module(self_base: usize) -> Option<usize> {
     use std::ffi::c_void;
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
-
-    fn allocation_base(addr: usize) -> Option<usize> {
-        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: mbi は MEMORY_BASIC_INFORMATION 分の領域。
-        let n = unsafe {
-            VirtualQuery(
-                addr as *const c_void,
-                &mut mbi,
-                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-        if n == 0 {
-            return None;
-        }
-        Some(mbi.AllocationBase as usize)
-    }
-
-    // ヘルパ自身のアドレスから Agent DLL の AllocationBase を取る。
-    // Detour・prepare・ヘルパは同じモジュールにある。
-    let self_base = allocation_base(caller_return_address as *const () as usize)?;
     let mut frames = [std::ptr::null_mut::<c_void>(); 8];
     // SAFETY: frames は 8 要素分の領域。0 フレームをスキップし、
     // 最大 8 フレームを取る。
@@ -359,7 +359,14 @@ mod tests {
 
         #[test]
         fn caller_return_address_points_into_test_binary() {
-            let addr = caller_return_address().expect("return address captured");
+            // This unit test is linked into the exe, not the injected DLL.
+            // Excluding the exe would intentionally skip the test's own frames.
+            // Use kernel32 as the excluded module to exercise native stack capture
+            // and the same module-selection code with a known external caller.
+            let kernel32: Vec<u16> = "kernel32.dll".encode_utf16().chain([0]).collect();
+            let excluded = unsafe { GetModuleHandleW(kernel32.as_ptr()) } as usize;
+            assert_ne!(excluded, 0);
+            let addr = return_address_outside_module(excluded).expect("return address captured");
             // 呼び出し元はこのテスト関数自身（テストバイナリ内）であること。
             // SAFETY: NULL は実行ファイル自身のハンドルを返す。
             let exe_base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
@@ -381,6 +388,14 @@ mod tests {
                 mbi.AllocationBase as usize, exe_base,
                 "caller must be inside the test binary"
             );
+        }
+
+        #[test]
+        fn public_caller_capture_never_returns_its_own_module() {
+            let self_base = allocation_base(caller_return_address as *const () as usize).unwrap();
+            if let Some(address) = caller_return_address() {
+                assert_ne!(allocation_base(address), Some(self_base));
+            }
         }
 
         #[test]

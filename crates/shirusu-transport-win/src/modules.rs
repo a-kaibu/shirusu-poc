@@ -505,6 +505,32 @@ mod tests {
         }
 
         #[test]
+        fn copied_system_dll_verifies_but_tampered_copy_does_not() {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            let source = format!("{root}\\System32\\kernel32.dll");
+            let copy = std::env::temp_dir()
+                .join(format!("shirusu-signature-copy-{}.dll", std::process::id()));
+            std::fs::copy(&source, &copy).unwrap();
+            assert!(
+                verify_microsoft_signature(&copy.to_string_lossy()),
+                "signature verification follows content, including catalog membership"
+            );
+            let mut bytes = std::fs::read(&copy).unwrap();
+            assert!(bytes.len() > 0x1000);
+            bytes[0x1000] ^= 0x80;
+            std::fs::write(&copy, &bytes).unwrap();
+            assert!(
+                !verify_microsoft_signature(&copy.to_string_lossy()),
+                "a trusted catalog must not authorize changed member bytes"
+            );
+            assert!(
+                !verify_microsoft_signature(&format!("{source}\0ignored")),
+                "NUL must not truncate the requested path"
+            );
+            std::fs::remove_file(copy).unwrap();
+        }
+
+        #[test]
         fn api_set_contract_resolves_to_implementation() {
             // api-ms-win-core-file-l1-1-0.dll は kernel32/kernelbase の
             // どちらかへ解決される（版で変わるため両方を許す）。
