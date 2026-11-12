@@ -3,7 +3,7 @@
 //! 初期化の段階分け（overview「プロセスの起動・アタッチと Agent の
 //! 初期化」）:
 //! 1. `DllMain` では何もしない（Loader Lock の下で複雑な処理をしない）。
-//!    スレッドごとの通知を止めるだけに留める。
+//!    スレッド終了は native TLS callback で通知する。
 //! 2. Host が Bootstrap（Mapping とイベントのハンドル一式）を対象
 //!    プロセスへ書き込み、`shirusu_agent_init` をリモートスレッドで
 //!    呼ぶ。ここで Slot への Mapping 登録、ランタイム構築、メイン
@@ -22,6 +22,9 @@
 //! 「アクティブなセッションがある」場合にだけ返る。
 
 use shirusu_hook::bootstrap::AgentBootstrap;
+
+#[cfg(windows)]
+mod diagnostics;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_BAD_BOOTSTRAP: u32 = 1;
@@ -95,22 +98,15 @@ pub extern "system" fn shirusu_agent_shutdown() -> u32 {
     }
 }
 
-/// DllMain では初期化を行わない（overview の段階分け）。スレッド
-/// 通知を止めるだけに留める。
+/// DllMain では初期化を行わない。静的 TLS を使用するため、
+/// DisableThreadLibraryCalls は呼ばず、native thread-detach callback を保つ。
 #[cfg(windows)]
 #[no_mangle]
 pub extern "system" fn DllMain(
-    hinst: *mut std::ffi::c_void,
-    reason: u32,
+    _hinst: *mut std::ffi::c_void,
+    _reason: u32,
     _reserved: *mut std::ffi::c_void,
 ) -> i32 {
-    const DLL_PROCESS_ATTACH: u32 = 1;
-    if reason == DLL_PROCESS_ATTACH {
-        // SAFETY: hinst はこの DLL のインスタンスハンドル。
-        unsafe {
-            windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls(hinst);
-        }
-    }
     1
 }
 
@@ -157,6 +153,7 @@ mod win {
         if b.version != BOOTSTRAP_VERSION {
             return STATUS_BAD_BOOTSTRAP;
         }
+        crate::diagnostics::install();
         let config = match b.validate() {
             Ok(c) => c,
             Err(_) => return STATUS_BAD_BOOTSTRAP,

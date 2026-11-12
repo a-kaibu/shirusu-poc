@@ -65,3 +65,10 @@ Server 2022 の基本 Capture + Verifier が正常終了まで通過した。次
 `--child-tree` はルートの注入初期化が `0xC0000005` で失敗する。
 初回 Verifier だけでなく後続 E2E の失敗にもダンプ、Trace、イベントログ、
 対応する DLL/EXE と PDB を保存するよう診断の範囲を広げた。
+
+CI の `SHIRUSU_DIAGNOSTIC_DIR` 指定時は、Agent の初期化前に 4 KiB の
+ファイルマッピングと vectored exception handler を準備する。最初の AV の
+例外位置・アクセス先・整数レジスタを固定長 u64 列へ書き、例外は処理せず
+継続検索する。handler は確保・ロック・ファイル I/O を行わない。
+通常実行では有効にしない。診断を有効にしたプロセスでは view と handler を
+プロセス終了まで保持し、ロード済みモジュール範囲も別 TSV に保存する。

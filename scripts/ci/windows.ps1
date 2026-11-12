@@ -14,6 +14,7 @@ $dumpKey = $null
 if ($env:GITHUB_ACTIONS -eq "true") {
     $diagnostics = Join-Path (Get-Location) "target\ci-diagnostics"
     New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+    $env:SHIRUSU_DIAGNOSTIC_DIR = $diagnostics
     $dumpKey = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\shirusu-hook-target.exe"
     New-Item -Path $dumpKey -Force | Out-Null
     New-ItemProperty -Path $dumpKey -Name DumpFolder -PropertyType ExpandString -Value $diagnostics -Force | Out-Null
