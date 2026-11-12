@@ -43,6 +43,7 @@ fn prepare(dir: &std::path::Path) -> std::io::Result<()> {
         ));
     }
     std::fs::write(dir.join(format!("native-{pid}-modules.tsv")), text)?;
+    snapshot_exports(dir, pid)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -160,4 +161,70 @@ unsafe extern "system" fn exception(pointers: *mut EXCEPTION_POINTERS) -> i32 {
         unsafe { std::ptr::write_volatile(view.add(index), value) };
     }
     CONTINUE_SEARCH
+}
+
+fn snapshot_exports(dir: &std::path::Path, pid: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::System::{
+        Diagnostics::Debug::ReadProcessMemory,
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        Threading::GetCurrentProcess,
+    };
+    let mut text = String::from("module\tfunction\taddress\tbytes\n");
+    for module in ["kernel32.dll", "kernelbase.dll"] {
+        let wide: Vec<u16> = module.encode_utf16().chain([0]).collect();
+        let handle = unsafe { GetModuleHandleW(wide.as_ptr()) };
+        if handle.is_null() {
+            continue;
+        }
+        for name in [
+            "CreateFileW",
+            "CreateFile2",
+            "WriteFile",
+            "CloseHandle",
+            "HeapAlloc",
+        ] {
+            let cname = std::ffi::CString::new(name).unwrap();
+            let Some(function) = (unsafe { GetProcAddress(handle, cname.as_ptr().cast()) }) else {
+                continue;
+            };
+            let address = function as *const () as usize;
+            let mut bytes = [0u8; 32];
+            let mut count = 0;
+            if unsafe {
+                ReadProcessMemory(
+                    GetCurrentProcess(),
+                    address as *const _,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    &mut count,
+                )
+            } == 0
+            {
+                continue;
+            }
+            text.push_str(&format!("{module}\t{name}\t{address:x}\t"));
+            for byte in &bytes[..count] {
+                text.push_str(&format!("{byte:02x}"));
+            }
+            text.push('\n');
+        }
+    }
+    std::fs::write(dir.join(format!("native-{pid}-exports.tsv")), text)
+}
+
+pub fn report_inline(outcome: &shirusu_hook::engine::InlineInstallOutcome) {
+    let Some(dir) = std::env::var_os("SHIRUSU_DIAGNOSTIC_DIR") else {
+        return;
+    };
+    let mut text = String::from("api\tresult\n");
+    for hook in &outcome.installed {
+        text.push_str(&format!("{}\tinstalled\n", hook.api_id));
+    }
+    for (api, reason) in &outcome.skipped {
+        text.push_str(&format!("{api}\t{reason}\n"));
+    }
+    let _ = std::fs::write(
+        std::path::Path::new(&dir).join(format!("native-{}-inline.tsv", std::process::id())),
+        text,
+    );
 }

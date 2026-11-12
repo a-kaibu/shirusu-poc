@@ -20,3 +20,32 @@ function Invoke-Native {
         throw "native step failed: $What (exit code $code)"
     }
 }
+
+# Bound native fixtures so one hung target cannot suppress later scenarios.
+# ArgumentList preserves paths with spaces without a second shell parse.
+function Invoke-NativeWithTimeout {
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [int] $TimeoutSeconds = 180
+    )
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = (Get-Command $FilePath -ErrorAction Stop).Source
+    $start.WorkingDirectory = (Get-Location).Path
+    $start.UseShellExecute = $false
+    foreach ($argument in $ArgumentList) { $start.ArgumentList.Add($argument) }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw "Could not start $FilePath" }
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process.Kill($true)
+            $null = $process.WaitForExit(10000)
+            throw "Native fixture timed out after ${TimeoutSeconds}s: $FilePath $ArgumentList"
+        }
+        $global:LASTEXITCODE = $process.ExitCode
+        if ($process.ExitCode -ne 0) {
+            throw "Native fixture failed with exit code $($process.ExitCode): $FilePath $ArgumentList"
+        }
+    } finally { $process.Dispose() }
+}

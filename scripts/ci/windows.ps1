@@ -64,7 +64,7 @@ try {
         Write-Host "D54: enabling Application Verifier for shirusu-hook-target.exe ($appverif)"
         & $appverif -enable Heaps Handles Locks -for shirusu-hook-target.exe | Out-Host
         try {
-            Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e (with Application Verifier)"
+            Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e (with Application Verifier)"
         } finally {
             # Export before deleting settings/logs, including when capture-e2e fails.
             # Keep diagnostic failures from replacing the original test failure.
@@ -81,27 +81,27 @@ try {
         }
     } else {
         Write-Host "D54: appverif.exe not found; running capture-e2e without Application Verifier"
-        Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e"
+        Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe } "capture-e2e"
     }
     # L05: 子プロセス追跡の E2E（対象が子プロセスを起動し、子の Trace が
     # 別ファイルに記録されることを検証する）。
-    Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --child-tree } "capture-e2e --child-tree"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe -ArgumentList @("--child-tree") } "capture-e2e --child-tree"
     # L06: ABI 適合性テスト（浮動小数点引数・構造体の戻り値・コールバック・
     # 例外・LastError の Probe を Hook ありとなしで実行して結果を比べる）。
-    Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --abi } "capture-e2e --abi"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe -ArgumentList @("--abi") } "capture-e2e --abi"
     # L17: 検証用アプリ 3 種（コンソール / GUI / COM）の E2E。Hook なしと Hook ありで
     # アプリの観測結果が同じことと、ファイル I/O が Trace に記録されることを検証する。
     # レジストリ・USER32・GDI・DIB・COM の未記録分はカバレッジ評価として報告される。
-    Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --verify-apps } "capture-e2e --verify-apps"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe -ArgumentList @("--verify-apps") } "capture-e2e --verify-apps"
     # L01: Inline Hook の E2E（GetProcAddress 経由の呼び出しが Trace に
     # 記録されることと、生成 API の Inline Hook を検証する）。
-    Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --inline } "capture-e2e --inline"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe -ArgumentList @("--inline") } "capture-e2e --inline"
     # L23: モジュール列挙・署名検証・API Set 解決・フック時呼び出し元分類の E2E。
     # Trace の Environment.modules に列挙・分類されたモジュールが載ることと、
     # 直接呼び出しのファイル I/O が記録されることを検証する（record_runtime_apis の
     # on/off 両方）。CRT 経由の呼び出しは L01 の Inline Hook で Detour に届き、
     # 既定でも Windows API 呼び出しが記録されることを検証する。
-    Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe --modules } "capture-e2e --modules"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe -ArgumentList @("--modules") } "capture-e2e --modules"
     # A74: 64bit アトミック操作のコスト測定 (x64 側の対照値。判断は i686 側の実測で行う)
     Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (x64)"
     Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe } "atomic bench (x64)"
@@ -111,9 +111,9 @@ try {
     Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (x64)"
     Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\release\shirusu-perf-bench.exe --rounds 1 } "perf bench (x64)"
 
-    Invoke-CaptureScenario { pwsh -NoProfile -File (Join-Path $PSScriptRoot "exception-transparency.ps1") } "native SEH transparency"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "exception-transparency.ps1")) } "native SEH transparency"
     # Actual captured file I/O must produce an executable replay, not only a rule.
-    Invoke-CaptureScenario { pwsh -NoProfile -File (Join-Path $PSScriptRoot "replay-e2e.ps1") } "native capture-to-replay"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "replay-e2e.ps1")) } "native capture-to-replay"
 
     if ($captureFailures.Count -gt 0) {
         throw ("Windows scenarios failed:`n" + ($captureFailures -join "`n"))
@@ -127,6 +127,9 @@ try {
             Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter $pattern |
                 Copy-Item -Destination $diagnostics -ErrorAction Continue
         }
+        Get-ChildItem "target/native-exception", "target/native-replay-*" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @(".trace", ".json", ".txt") } |
+            ForEach-Object { Copy-Item $_.FullName (Join-Path $diagnostics ($_.Directory.Name + "-" + $_.Name)) -ErrorAction Continue }
         if (-not $ciComplete) {
             # WER can be disabled on hosted runners. Event 1000 still often
             # identifies the faulting module and offset; retain matching

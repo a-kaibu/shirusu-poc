@@ -307,6 +307,7 @@ mod win {
         // スレッドは Host が停止させたままか、アタッチ時は他スレッドを
         // 一時停止してからパッチするため、競合しない。
         let inline_outcome = unsafe { engine::install_inline_hooks(&rt) };
+        crate::diagnostics::report_inline(&inline_outcome);
         // L02: COM Factory 関数の Inline Hook を Inline の後で設置する。
         // Inline と同じく best-effort であり、見送りがあっても初期化は
         // 成功として継続する。Factory 関数が 1 つもフックできなくても、
@@ -402,6 +403,10 @@ mod win {
             internal_hooks: internal_hook_outcome.installed,
             callbacks: callback_outcome.installed,
         });
+        // This is the dedicated remote injection worker, not an application
+        // thread. Its return through ExitThread must not become an unmatched
+        // application call or block replay of an otherwise complete trace.
+        shirusu_hook::runtime::ReentrancyGuard::mark_thread_exiting();
         if b.init_done_handle != 0 {
             // SAFETY: Host が複製して渡したイベント。立てた後は所有を
             // 持たないよう forget する（Host 側の実体を閉じない）。
