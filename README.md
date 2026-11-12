@@ -1,5 +1,7 @@
 # shirusu-poc
 
+API 別の観測証拠は `shirusu coverage <trace> [--json]` で確認できます。範囲と制限は [Coverage 台帳](docs/coverage-ledger.md) を参照してください。
+
 Trace は `shirusu export capture.trace --format parquet --output events.parquet` で
 Parquet に出力できる。DuckDB からの検索とデータの扱いは
 [Parquet 出力仕様](docs/parquet-export.md) を参照。

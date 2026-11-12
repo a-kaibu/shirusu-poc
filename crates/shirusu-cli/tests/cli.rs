@@ -1389,3 +1389,114 @@ fn parquet_export_refuses_to_replace_its_input() {
     assert_eq!(std::fs::read(dir.join("sample.trace")).unwrap(), bytes);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn coverage_keeps_imports_hooks_and_observations_separate() {
+    use shirusu_trace::proto::HookEvidence;
+    use shirusu_trace::static_dep::{StaticDependency, StaticImport};
+    let env = CaptureEnvironment {
+        session: SessionMetadata {
+            session_id: 7,
+            qpc_frequency: 10_000_000,
+            ..Default::default()
+        },
+        target_description: "fixture.exe".into(),
+        static_dependencies: vec![StaticDependency {
+            module: "KERNEL32.DLL".into(),
+            imports: vec![
+                StaticImport::named("ReadFile"),
+                StaticImport::by_ordinal(42),
+            ],
+        }],
+        hook_evidence: vec![HookEvidence {
+            api_id: 2,
+            module: "kernel32.dll".into(),
+            function: "ReadFile".into(),
+            method: "inline".into(),
+            outcome: "not-installed".into(),
+            reason: "thread-set-changed".into(),
+            scope: "resolved-exports-at-initialization".into(),
+            semantic_level: 2,
+            semantic_detail: "synchronous output only".into(),
+        }],
+        ..Default::default()
+    };
+    let writer = TraceWriter::new(Vec::new(), env).unwrap();
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let (out, err, code) = run_cli_bytes(&bytes, &["coverage", "sample.trace", "--json"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("kernel32!ReadFile"));
+    assert!(out.contains("kernel32!#42"));
+    assert!(out.contains("thread-set-changed"));
+    assert!(out.contains("not-observed"));
+    assert!(out.contains("fixture.exe"));
+    assert!(out.contains("\"hook_evidence_status\": \"unknown\""));
+    assert!(!out.contains("\"unused\""));
+}
+
+#[test]
+fn coverage_old_trace_has_observations_but_no_invented_installation() {
+    let (out, err, code) = run_cli_bytes(
+        &sample_trace_bytes(),
+        &["coverage", "sample.trace", "--json"],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("\"observation\": \"observed\""));
+    assert!(out.contains("\"hook_evidence_status\": \"unknown\""));
+    assert!(!out.contains("\"outcome\": \"installed\""));
+}
+
+#[test]
+fn coverage_keeps_loss_visible_in_output_and_exit_status() {
+    let bytes = trace_bytes_with(
+        FinalizationInfo {
+            event_integrity: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    let (out, err, code) = run_cli_bytes(&bytes, &["coverage", "sample.trace", "--json"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(out.contains("\"event_integrity_lost\": true"));
+    assert!(out.contains("\"observation\": \"observed\""));
+}
+
+#[test]
+fn coverage_profile_counts_are_not_invented_event_records() {
+    use shirusu_trace::proto::{ApiProfile, HookEvidence, ProfileSummary};
+    let env = CaptureEnvironment {
+        session: SessionMetadata {
+            session_id: 7,
+            qpc_frequency: 10_000_000,
+            ..Default::default()
+        },
+        hook_evidence: vec![HookEvidence {
+            api_id: 123,
+            module: "kernel32.dll".into(),
+            function: "ReadFile".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut writer = TraceWriter::new(Vec::new(), env).unwrap();
+    writer
+        .write_profile_summary(&ProfileSummary {
+            qpc_frequency: 10_000_000,
+            total_events_seen: 24,
+            apis: vec![ApiProfile {
+                api_id: 123,
+                enters: 12,
+                leaves: 12,
+                calls: 12,
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let (out, err, code) = run_cli_bytes(&bytes, &["coverage", "sample.trace", "--json"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("kernel32!ReadFile"));
+    assert!(out.contains("\"profile_enter\": 12"));
+    assert!(out.contains("\"enter\": 0"));
+    assert!(out.contains("\"observation\": \"observed\""));
+}

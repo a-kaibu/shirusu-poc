@@ -71,6 +71,15 @@ try {
     if ($api.Count -ne 1 -or $api[0].enter -lt 100 -or $api[0].leave -lt 100) {
         throw "reattach did not record the requested API exercise"
     }
+    $coverageRaw = & $cli coverage $trace --json
+    if ($LASTEXITCODE -notin @(0,1)) { throw "coverage ledger failed" }
+    $coverage = ($coverageRaw -join [Environment]::NewLine) | ConvertFrom-Json
+    $pidApi = @($coverage.apis | Where-Object { $_.api -eq "kernel32!GetCurrentProcessId" })
+    if ($pidApi.Count -ne 1 -or $pidApi[0].enter -lt 100) { throw "coverage observation count missing" }
+    $iat = @($pidApi[0].hook_evidence | Where-Object { $_.method -eq "iat" -and $_.outcome -eq "installed" })
+    $inline = @($pidApi[0].hook_evidence | Where-Object { $_.method -eq "inline" })
+    if ($iat.Count -ne 1 -or $inline.Count -ne 1 -or -not $inline[0].reason) { throw "native per-API hook evidence missing" }
+    Write-Host "API coverage ledger passed ($arch)"
     Write-Host "Attach rollback and reattach passed ($arch)"
 } finally {
     foreach ($process in @($recorderProcess, $targetProcess)) {

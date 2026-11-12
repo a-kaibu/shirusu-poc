@@ -20,6 +20,7 @@ fn sample_env() -> CaptureEnvironment {
         target_description: "game.exe".into(),
         modules: Vec::new(),
         static_dependencies: Vec::new(),
+        hook_evidence: Vec::new(),
     }
 }
 
@@ -345,4 +346,32 @@ fn profile_summary_roundtrip() {
     assert_eq!(ProfileSummary::decode(&bytes).unwrap(), summary);
     let empty = ProfileSummary::default();
     assert_eq!(ProfileSummary::decode(&empty.encode()).unwrap(), empty);
+}
+
+#[test]
+fn environment_hook_evidence_roundtrips_and_is_optional() {
+    use shirusu_trace::proto::{CaptureEnvironment, HookEvidence};
+    let old = CaptureEnvironment::default();
+    let mut current = old.clone();
+    current.hook_evidence.push(HookEvidence {
+        api_id: 2,
+        module: "kernel32.dll".into(),
+        function: "ReadFile".into(),
+        method: "inline".into(),
+        outcome: "not-installed".into(),
+        reason: "thread-set-changed".into(),
+        scope: "resolved-exports-at-initialization".into(),
+        semantic_level: 2,
+        semantic_detail: "synchronous output only".into(),
+    });
+    assert_eq!(
+        CaptureEnvironment::decode(&current.encode()).unwrap(),
+        current
+    );
+    assert!(CaptureEnvironment::decode(&old.encode())
+        .unwrap()
+        .hook_evidence
+        .is_empty());
+    current.hook_evidence.clear();
+    assert_eq!(current.encode(), old.encode());
 }

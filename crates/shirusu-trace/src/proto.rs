@@ -219,6 +219,8 @@ pub struct CaptureEnvironment {
     /// 静的依存情報（L13）。空のときは field 10 を書かないので旧ファイル
     /// と同じバイト列になる。
     pub static_dependencies: Vec<StaticDependency>,
+    /// Agent-reported installation evidence; absent in older traces.
+    pub hook_evidence: Vec<HookEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -350,6 +352,54 @@ impl SessionMetadata {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HookEvidence {
+    pub api_id: u32,
+    pub module: String,
+    pub function: String,
+    pub method: String,
+    pub outcome: String,
+    pub reason: String,
+    pub scope: String,
+    pub semantic_detail: String,
+    pub semantic_level: u32,
+}
+
+impl HookEvidence {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = ProtoWriter::new();
+        w.string_field(1, &self.module);
+        w.string_field(2, &self.function);
+        w.string_field(3, &self.method);
+        w.string_field(4, &self.outcome);
+        w.string_field(5, &self.reason);
+        w.string_field(6, &self.scope);
+        w.string_field(7, &self.semantic_detail);
+        w.u32_field(8, self.semantic_level);
+        w.u32_field(9, self.api_id);
+        w.into_bytes()
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, ProtoError> {
+        let mut r = ProtoReader::new(bytes);
+        let mut m = Self::default();
+        while let Some((field, wire)) = r.next_field()? {
+            match (field, wire) {
+                (1, WIRE_LEN) => m.module = r.value_string()?,
+                (2, WIRE_LEN) => m.function = r.value_string()?,
+                (3, WIRE_LEN) => m.method = r.value_string()?,
+                (4, WIRE_LEN) => m.outcome = r.value_string()?,
+                (5, WIRE_LEN) => m.reason = r.value_string()?,
+                (6, WIRE_LEN) => m.scope = r.value_string()?,
+                (7, WIRE_LEN) => m.semantic_detail = r.value_string()?,
+                (8, WIRE_VARINT) => m.semantic_level = r.value_u64()? as u32,
+                (9, WIRE_VARINT) => m.api_id = r.value_u64()? as u32,
+                _ => r.skip(wire)?,
+            }
+        }
+        Ok(m)
+    }
+}
+
 impl CaptureEnvironment {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = ProtoWriter::new();
@@ -366,6 +416,9 @@ impl CaptureEnvironment {
         }
         for d in &self.static_dependencies {
             w.message_field(10, &d.encode());
+        }
+        for evidence in &self.hook_evidence {
+            w.message_field(11, &evidence.encode());
         }
         w.into_bytes()
     }
@@ -388,6 +441,9 @@ impl CaptureEnvironment {
                 (10, WIRE_LEN) => m
                     .static_dependencies
                     .push(StaticDependency::decode(r.value_bytes()?)?),
+                (11, WIRE_LEN) => m
+                    .hook_evidence
+                    .push(HookEvidence::decode(r.value_bytes()?)?),
                 _ => r.skip(wire)?,
             }
         }

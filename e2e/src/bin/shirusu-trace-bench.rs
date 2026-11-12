@@ -93,6 +93,7 @@ fn env(session_id: u64) -> CaptureEnvironment {
         modules: Vec::new(),
         // L13: ベンチは静的依存も記録しない（空）。
         static_dependencies: Vec::new(),
+        hook_evidence: Vec::new(),
     }
 }
 

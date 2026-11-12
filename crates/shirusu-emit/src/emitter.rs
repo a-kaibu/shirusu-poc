@@ -261,6 +261,7 @@ impl<W: DurableWrite> Emitter<W> {
             modules: Vec::new(),
             // L13: 外部エミッタは静的依存もまだ記録しない（空）。
             static_dependencies: Vec::new(),
+            hook_evidence: Vec::new(),
         };
         let mut writer = TraceWriter::with_options(inner, environment, options)?;
         for def in set.schemas() {

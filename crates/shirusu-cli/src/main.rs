@@ -24,6 +24,7 @@
 //! Windows 以外での capture / attach も 1（引数の検証まで済ませてから
 //! プラットフォーム制限を明言する）。
 
+mod coverage;
 mod parquet_export;
 
 use shirusu_analysis::{
@@ -76,6 +77,7 @@ fn usage() -> &'static str {
      \n\
      commands:\n\
      \x20 capabilities [--json]           supported APIs and capture limits\n\
+     \x20 coverage <trace> [--json]         per-API evidence ledger\n\
      \x20 inspect <trace> [--json]          metadata, integrity, per-API counts\n\
      \x20 dump <trace> [filters] [--json]   one line per event\n\
      \x20 export <trace> --format jsonl|parquet [--output <path>]\n\
@@ -115,6 +117,7 @@ fn run(args: &[String]) -> Result<(), ToolError> {
     };
     match cmd {
         "inspect" => cmd_inspect(rest),
+        "coverage" => coverage::run(rest),
         "capabilities" => cmd_capabilities(rest),
         "dump" => cmd_dump(rest),
         "export" => cmd_export(rest),

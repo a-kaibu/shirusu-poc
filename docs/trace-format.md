@@ -160,6 +160,17 @@ message SessionMetadata {           // Header とは別に Environment 先頭で
   string created_by = 2;            // 例 "shirusu-host 0.1"
   uint64 qpc_frequency = 3;         // イベント時刻の周波数（0 は不明）
 }
+message HookEvidence {
+  string module = 1;
+  string function = 2;
+  string method = 3;                // iat / inline
+  string outcome = 4;               // installed / not-installed / unknown
+  string reason = 5;                // engine reason; already-hooked != installed
+  string scope = 6;                 // initialization snapshot, limited scope
+  string semantic_detail = 7;       // recorder capability, not event completeness
+  uint32 semantic_level = 8;
+  uint32 api_id = 9;                // session API ID, also used by ProfileSummary
+}
 message CaptureEnvironment {
   SessionMetadata session = 1;
   string os_version = 2;
@@ -171,6 +182,7 @@ message CaptureEnvironment {
   string target_description = 8;    // 対象プロセスの説明（任意）
   repeated ModuleClassification modules = 9;  // L07: モジュール分類。
                                     // 空のときは書かないので旧ファイルと同じバイト列
+  repeated HookEvidence hook_evidence = 11; // 初期化時の API 別設置証拠。未記録は不明。
   repeated StaticDependency static_dependencies = 10;  // L13: 静的依存。
                                     // 空のときは書かないので旧ファイルと同じバイト列
 }

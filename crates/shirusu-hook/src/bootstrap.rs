@@ -50,7 +50,10 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v9: 末尾に result_callback_hook_count を追加した (L16)。
 /// DLL が設置したコールバック検出フックの数（0〜4。RegisterClassExW/A /
 /// SetWindowLongPtrW/A）。
-pub const BOOTSTRAP_VERSION: u32 = 9;
+/// v10: bounded per-API IAT and Inline installation evidence.
+pub const BOOTSTRAP_VERSION: u32 = 10;
+pub const HOOK_EVIDENCE_COUNT: usize = crate::api::API_COUNT + 1;
+pub const HOOK_REASON_BYTES: usize = 48;
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -114,6 +117,9 @@ pub struct AgentBootstrap {
     /// 初期化結果 (v9, L16): DLL が設置したコールバック検出フックの
     /// 数（0〜4）。Host は読み戻して Coverage へ写す。
     pub result_callback_hook_count: u32,
+    pub result_evidence_ready: u32,
+    pub result_iat: [u8; HOOK_EVIDENCE_COUNT],
+    pub result_inline: [[u8; HOOK_REASON_BYTES]; HOOK_EVIDENCE_COUNT],
 }
 
 impl Default for AgentBootstrap {
@@ -140,6 +146,9 @@ impl Default for AgentBootstrap {
             detailed_mode: 0,
             result_internal_hook_count: 0,
             result_callback_hook_count: 0,
+            result_evidence_ready: 0,
+            result_iat: [0; HOOK_EVIDENCE_COUNT],
+            result_inline: [[0; HOOK_REASON_BYTES]; HOOK_EVIDENCE_COUNT],
         }
     }
 }
@@ -154,6 +163,61 @@ pub enum BootstrapError {
 }
 
 impl AgentBootstrap {
+    /// Validate bounded native fields before producing portable Trace evidence.
+    pub fn hook_evidence(&self) -> Option<Vec<shirusu_trace::proto::HookEvidence>> {
+        if self.version != BOOTSTRAP_VERSION || self.result_evidence_ready != 1 {
+            return None;
+        }
+        let mut evidence = Vec::new();
+        for api in crate::api::api_table() {
+            let id = api.api_id as usize;
+            let iat_reason = match self.result_iat[id] {
+                0 => "unknown",
+                1 => "installed",
+                2 => "not-imported-in-main-module",
+                3 => "not-attempted-internal-api",
+                _ => return None,
+            };
+            let bytes = &self.result_inline[id];
+            let end = bytes.iter().position(|b| *b == 0)?;
+            if bytes[end..].iter().any(|b| *b != 0) {
+                return None;
+            }
+            let inline_reason = std::str::from_utf8(&bytes[..end]).ok()?;
+            if inline_reason.is_empty() {
+                return None;
+            }
+            for (method, reason, scope) in [
+                ("iat", iat_reason, "main-module-at-initialization"),
+                (
+                    "inline",
+                    inline_reason,
+                    "resolved-exports-at-initialization",
+                ),
+            ] {
+                evidence.push(shirusu_trace::proto::HookEvidence {
+                    api_id: api.api_id,
+                    module: api.module.into(),
+                    function: api.function.into(),
+                    method: method.into(),
+                    outcome: if reason == "installed" {
+                        "installed"
+                    } else if reason == "unknown" {
+                        "unknown"
+                    } else {
+                        "not-installed"
+                    }
+                    .into(),
+                    reason: reason.into(),
+                    scope: scope.into(),
+                    semantic_level: api.level.into(),
+                    semantic_detail: api.level_note.into(),
+                });
+            }
+        }
+        Some(evidence)
+    }
+
     /// Host 側の組み立て。`rings` は (mapping, space_available) の
     /// ハンドル値ペア（対象プロセス内で有効な値）。
     pub fn new(session_id: u64, config: RingConfig, rings: &[(u64, u64)]) -> Self {
@@ -350,35 +414,37 @@ mod tests {
     }
 
     #[test]
+    fn hook_evidence_rejects_incomplete_or_malformed_reports() {
+        let mut b = AgentBootstrap::default();
+        assert!(b.hook_evidence().is_none());
+        b.result_evidence_ready = 1;
+        assert!(b.hook_evidence().is_none());
+        for api in crate::api::api_table() {
+            b.result_iat[api.api_id as usize] = 2;
+            b.result_inline[api.api_id as usize][..9].copy_from_slice(b"installed");
+        }
+        let evidence = b.hook_evidence().unwrap();
+        assert_eq!(evidence.len(), crate::api::API_COUNT * 2);
+        assert!(evidence
+            .iter()
+            .filter(|h| h.method == "inline")
+            .all(|h| h.outcome == "installed"));
+        b.result_inline[1][0] = 0xff;
+        assert!(b.hook_evidence().is_none());
+        b.result_inline[1][0] = b'i';
+        b.result_iat[1] = 4;
+        assert!(b.hook_evidence().is_none());
+    }
+
+    #[test]
     fn layout_is_fixed_size() {
-        // repr(C) の固定レイアウトであること（プロセス間受け渡しの前提）
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            // フィールド合計 616 (8 バイト整列)。
-            // v5 で末尾に record_runtime_apis (u32) を追加したため、
-            // v4 の 584 から 592 になった。v6 で末尾に com_options (u32)
-            // と result_com_factory_count (u32) を追加したため 600。
-            // v7 で末尾に result_winrt_activation_count (u32) を追加したが、
-            // 8 個目の u32 が v6 の末尾パディング 4 バイト分に収まるため、
-            // サイズは 600 のまま。v8 で末尾に detailed_mode (u32) と
-            // result_internal_hook_count (u32) を追加したため 608。
-            // v9 で末尾に result_callback_hook_count (u32) を追加したため
-            // 612 になるが、8 バイト整列のパディングでサイズは 616。
-            4 + 4
-                + 8 * 6
-                + 8 * (MAX_BOOTSTRAP_RINGS * 2)
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
-                + 4
+            (616 + HOOK_EVIDENCE_COUNT * (1 + HOOK_REASON_BYTES)).next_multiple_of(8)
+        );
+        assert_eq!(
+            std::mem::offset_of!(AgentBootstrap, result_evidence_ready),
+            612
         );
     }
 

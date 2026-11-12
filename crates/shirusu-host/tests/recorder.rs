@@ -560,6 +560,15 @@ fn late_module_scan_preserves_initial_metadata_when_unavailable() {
     let path = temp_trace("late-modules");
     let mut cfg = config();
     cfg.environment.target_description = "short-lived.exe".into();
+    let evidence = shirusu_trace::proto::HookEvidence {
+        api_id: 1,
+        module: "kernel32.dll".into(),
+        function: "CreateFileW".into(),
+        method: "inline".into(),
+        outcome: "installed".into(),
+        ..Default::default()
+    };
+    cfg.environment.hook_evidence.push(evidence.clone());
     let mut session = CaptureSession::create_file(&path, cfg).unwrap();
     assert!(session.update_modules(Vec::new()).is_err());
     session.start().unwrap();
@@ -569,6 +578,7 @@ fn late_module_scan_preserves_initial_metadata_when_unavailable() {
     let trace = shirusu_trace::read_trace(&bytes).unwrap();
     let environment = trace.environment.unwrap();
     assert_eq!(environment.target_description, "short-lived.exe");
+    assert_eq!(environment.hook_evidence, vec![evidence]);
     assert!(environment
         .capture_config
         .contains("module_scan=unavailable"));

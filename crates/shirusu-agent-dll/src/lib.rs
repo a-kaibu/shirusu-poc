@@ -148,8 +148,13 @@ mod win {
         if bootstrap.is_null() {
             return STATUS_BAD_BOOTSTRAP;
         }
-        // SAFETY: 呼び出し側の契約（初期化が戻るまで有効）に従い値をコピーする。
-        let b = unsafe { *bootstrap };
+        // Read only the common prefix before copying the versioned structure:
+        // an older Host allocated a smaller Bootstrap.
+        if unsafe { bootstrap.cast::<u32>().read_unaligned() } != BOOTSTRAP_VERSION {
+            return STATUS_BAD_BOOTSTRAP;
+        }
+        // SAFETY: caller supplies this version's structure until init returns.
+        let mut b = unsafe { *bootstrap };
         if b.version != BOOTSTRAP_VERSION {
             return STATUS_BAD_BOOTSTRAP;
         }
@@ -361,6 +366,48 @@ mod win {
                     && !inline_ids.contains(&a.api_id)
             })
             .count();
+        // Preserve actual initialization evidence, independently of observations.
+        for api in api_table() {
+            let id = api.api_id as usize;
+            b.result_iat[id] = if shirusu_hook::api::is_internal_api(api.api_id) {
+                3
+            } else if iat_ids.contains(&api.api_id) {
+                1
+            } else {
+                2
+            };
+            let outcome = if shirusu_hook::api::is_internal_api(api.api_id) {
+                &internal_hook_outcome
+            } else {
+                &inline_outcome
+            };
+            let reason = if shirusu_hook::api::is_internal_api(api.api_id) && b.detailed_mode == 0 {
+                "detailed-mode-disabled"
+            } else if outcome.installed.iter().any(|h| h.api_id == api.api_id) {
+                "installed"
+            } else {
+                outcome
+                    .skipped
+                    .iter()
+                    .find(|(api_id, _)| *api_id == api.api_id)
+                    .map(|(_, reason)| *reason)
+                    .unwrap_or("unknown")
+            };
+            // Known engine reasons fit this fixed protocol field; do not truncate
+            // a future reason into a different claim.
+            let reason = if reason.len() < b.result_inline[id].len() {
+                reason
+            } else {
+                "unknown"
+            };
+            b.result_inline[id][..reason.len()].copy_from_slice(reason.as_bytes());
+        }
+        // SAFETY: writable Bootstrap owned by Host until initialization returns.
+        unsafe {
+            (*bootstrap.cast_mut()).result_iat = b.result_iat;
+            (*bootstrap.cast_mut()).result_inline = b.result_inline;
+            (*bootstrap.cast_mut()).result_evidence_ready = 1;
+        }
         // Host が読み戻せるよう、init_done を立てる前に Bootstrap へ
         // 設置/欠落件数を書き戻す。
         // SAFETY: bootstrap は Host が書き込み可能に確保した領域で、
@@ -507,6 +554,16 @@ mod win {
 mod tests {
     use super::*;
     use shirusu_hook::bootstrap::{SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK};
+
+    #[cfg(windows)]
+    #[test]
+    fn old_bootstrap_is_rejected_before_reading_new_fields() {
+        let version = 9u32;
+        assert_eq!(
+            super::win::init((&version as *const u32).cast()),
+            STATUS_BAD_BOOTSTRAP
+        );
+    }
 
     #[test]
     fn shutdown_status_distinguishes_outcomes() {

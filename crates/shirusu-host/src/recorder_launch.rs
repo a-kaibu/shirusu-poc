@@ -686,6 +686,7 @@ mod tests {
 
 /// Bootstrap の初期化結果（設置数・欠落数・復元失敗数・COM Factory 設置数）。
 struct BootstrapResult {
+    hook_evidence: Vec<shirusu_trace::proto::HookEvidence>,
     hooked: usize,
     missing: usize,
     /// 設置失敗時にロールバックでも復元できず、対象に残存した
@@ -749,6 +750,7 @@ fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<Boo
         return None;
     }
     Some(BootstrapResult {
+        hook_evidence: buf.hook_evidence().unwrap_or_default(),
         hooked: hooked as usize,
         missing: missing as usize,
         unrestored: unrestored as usize,
@@ -951,6 +953,10 @@ fn inject_and_init(
             rollback: rollback_initialized_agent(process, shutdown_addr),
         });
     }
+    session_cfg.environment.hook_evidence = outcome
+        .as_ref()
+        .map(|r| r.hook_evidence.clone())
+        .unwrap_or_default();
     let hook_coverage = outcome
         .as_ref()
         .map(|result| (result.hooked, result.missing));
