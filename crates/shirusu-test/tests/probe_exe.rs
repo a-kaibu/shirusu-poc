@@ -124,6 +124,7 @@ fn cli_probe_exe_builds_and_keeps_source() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(not(windows))]
 #[test]
 fn generated_exe_runs_on_host_with_clear_error() {
     // 生成物がホスト向けにもビルドでき、計画まで進んで「Windows が
@@ -140,8 +141,6 @@ fn generated_exe_runs_on_host_with_clear_error() {
             "--edition",
             "2021",
             "-O",
-            "--target",
-            "x86_64-unknown-linux-gnu",
             main_rs.to_str().unwrap(),
             "-o",
             exe.to_str().unwrap(),

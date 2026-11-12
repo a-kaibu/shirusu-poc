@@ -42,6 +42,17 @@ pub struct SpawnedProcess {
     pub pid: u32,
 }
 
+// Win32 waits accept integer milliseconds. Round positive fractional values up:
+// truncation turns the final sub-millisecond recheck slice into a busy poll.
+// Reserve INFINITE (u32::MAX); a finite Duration must remain a finite wait.
+#[cfg(any(windows, test))]
+fn wait_timeout_millis(timeout: Duration) -> u32 {
+    timeout
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(u128::from(u32::MAX - 1)) as u32
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -409,7 +420,7 @@ mod imp {
         }
         /// タイムアウト付き待機。true = signaled。
         pub fn wait_timeout(&self, timeout: Duration) -> bool {
-            let ms = timeout.as_millis().min(u32::MAX as u128 - 1) as u32;
+            let ms = super::wait_timeout_millis(timeout);
             unsafe { WaitForSingleObject(self.handle, ms) == 0 }
         }
     }
@@ -457,7 +468,7 @@ mod imp {
         use windows_sys::Win32::Foundation::CloseHandle as CH;
         use windows_sys::Win32::System::Threading::GetExitCodeProcess;
         let handle = h(process_handle_value as usize);
-        let ms = timeout.as_millis().min(u32::MAX as u128 - 1) as u32;
+        let ms = super::wait_timeout_millis(timeout);
         let r = unsafe { WaitForSingleObject(handle, ms) };
         if r != 0 {
             return None;
@@ -1243,6 +1254,15 @@ mod tests {
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+    #[test]
+    fn positive_waits_round_up_without_using_infinite() {
+        assert_eq!(wait_timeout_millis(Duration::ZERO), 0);
+        assert_eq!(wait_timeout_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(wait_timeout_millis(Duration::from_micros(999)), 1);
+        assert_eq!(wait_timeout_millis(Duration::from_millis(1)), 1);
+        assert_eq!(wait_timeout_millis(Duration::from_micros(1001)), 2);
+        assert_eq!(wait_timeout_millis(Duration::MAX), u32::MAX - 1);
+    }
     #[test]
     fn qpc_timestamp_source_is_monotonic_with_stable_frequency() {
         use shirusu_transport::TimestampSource as _;
