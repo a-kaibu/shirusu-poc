@@ -38,6 +38,10 @@ pub fn build_plan(sites: &[ImportSite]) -> HookPlan {
         let Some(api) = api_by_import(&site.dll_name, name) else {
             continue;
         };
+        // Nt exports belong exclusively to the detailed-mode inline path.
+        if crate::api::is_internal_api(api.api_id) {
+            continue;
+        }
         if !seen_iat.insert(site.iat_rva) {
             continue; // 同一スロットの重複は 1 件に
         }
@@ -165,6 +169,21 @@ mod tests {
         // 内部 API (Nt*) は欠落に含まれない。
         assert!(!missing_ids.contains(&API_NT_CREATE_FILE));
         assert!(!missing_ids.contains(&API_NT_CLOSE));
+    }
+
+    #[test]
+    fn direct_nt_imports_are_reserved_for_detailed_inline_capture() {
+        let plan = build_plan(&[
+            site("ntdll.dll", Some("NtCreateFile"), 0x1000),
+            site("ntdll.dll", Some("NtClose"), 0x1008),
+            site("kernel32.dll", Some("CloseHandle"), 0x1010),
+        ]);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].api.api_id, API_CLOSE_HANDLE);
+        assert!(plan
+            .missing
+            .iter()
+            .all(|api| !crate::api::is_internal_api(api.api_id)));
     }
 
     #[test]
