@@ -70,8 +70,9 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread,
-    SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetProcessIdOfThread, OpenThread,
+    ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 
 /// Agent DLL の初期化がランタイムを登録する。以後の Detour はこれを使う。
@@ -367,6 +368,8 @@ struct PlannedInline {
 /// Drop 時にも再開するため、途中で失敗しても停止したままにならない。
 struct SuspendedThreads {
     handles: Vec<*mut c_void>,
+    thread_ids: Vec<u32>,
+    snapshot: Option<crate::thread_snapshot::ThreadSnapshot>,
 }
 
 // The x64 Windows SDK declares CONTEXT with DECLSPEC_ALIGN(16), but the
@@ -392,15 +395,22 @@ fn thread_instruction_pointer(handle: *mut c_void) -> Result<usize, u32> {
 impl SuspendedThreads {
     /// 全スレッドを停止する。1 つでも停止できなければ、既に停止した
     /// スレッドを再開して Err を返す（パッチ中の実行と競合させない）。
-    fn suspend_all() -> Result<Self, ()> {
+    fn suspend_all() -> Result<Self, &'static str> {
+        Self::suspend_all_after_snapshot(|| {})
+    }
+
+    fn suspend_all_after_snapshot(before_suspend: impl FnOnce()) -> Result<Self, &'static str> {
+        let snapshot_buffer = crate::thread_snapshot::ThreadSnapshot::new()
+            .map_err(|_| "thread-snapshot-unavailable")?;
         let current_tid = unsafe { GetCurrentThreadId() };
         let current_pid = unsafe { GetCurrentProcessId() };
         // SAFETY: スレッド一覧のスナップショット。
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
-            return Err(());
+            return Err("thread-suspend-failed");
         }
         let mut handles: Vec<*mut c_void> = Vec::new();
+        let mut thread_ids = Vec::new();
         let mut entry = THREADENTRY32 {
             dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
             ..unsafe { std::mem::zeroed() }
@@ -421,7 +431,15 @@ impl SuspendedThreads {
                     failed = true;
                     break;
                 }
+                // A terminated thread ID may have been reused since Toolhelp.
+                // Never suspend a handle belonging to a different process.
+                if unsafe { GetProcessIdOfThread(handle) } != current_pid {
+                    unsafe { CloseHandle(handle) };
+                    failed = true;
+                    break;
+                }
                 handles.push(handle);
+                thread_ids.push(entry.th32ThreadID);
             }
             more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
         }
@@ -430,8 +448,9 @@ impl SuspendedThreads {
             for h in handles {
                 unsafe { CloseHandle(h) };
             }
-            return Err(());
+            return Err("thread-suspend-failed");
         }
+        before_suspend();
         #[cfg(test)]
         crate::heap_watch::begin();
         for (suspended, &handle) in handles.iter().enumerate() {
@@ -444,10 +463,43 @@ impl SuspendedThreads {
                 for &h in &handles {
                     unsafe { CloseHandle(h) };
                 }
-                return Err(());
+                return Err("thread-suspend-failed");
             }
         }
-        Ok(Self { handles })
+        let mut suspended = Self {
+            handles,
+            thread_ids,
+            snapshot: Some(snapshot_buffer),
+        };
+        // GetThreadContext establishes readable suspended contexts before the
+        // second native snapshot. Refuse rather than resize or suspend new
+        // arrivals while application locks may already be held.
+        let verified = suspended
+            .handles
+            .iter()
+            .all(|&handle| thread_instruction_pointer(handle).is_ok());
+        let result = if verified {
+            suspended
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .only_known_threads(current_pid, current_tid, &suspended.thread_ids)
+                .map_err(|_| "thread-snapshot-unavailable")
+                .and_then(|known| {
+                    if known {
+                        Ok(())
+                    } else {
+                        Err("thread-set-changed")
+                    }
+                })
+        } else {
+            Err("thread-context-unavailable")
+        };
+        if let Err(reason) = result {
+            suspended.resume();
+            return Err(reason);
+        }
+        Ok(suspended)
     }
 
     /// 停止中のいずれかのスレッドの命令ポインタが [start, end) にあるか。
@@ -761,30 +813,31 @@ fn install_planned(
     let _guard = ReentrancyGuard::try_enter();
     let mut prepared: Vec<_> = plans.iter().map(|p| prepare_inline(p, bitness)).collect();
     let mut status = vec![Ok(()); plans.len()];
-    if let Ok(suspender) = SuspendedThreads::suspend_all() {
-        for ((p, ready), result) in plans.iter().zip(&mut prepared).zip(&mut status) {
-            let Ok((hook, patch, allocation)) = ready else {
-                continue;
-            };
-            if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
-                *result = Err("thread-in-target");
-                continue;
+    match SuspendedThreads::suspend_all() {
+        Ok(suspender) => {
+            for ((p, ready), result) in plans.iter().zip(&mut prepared).zip(&mut status) {
+                let Ok((hook, patch, allocation)) = ready else {
+                    continue;
+                };
+                if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
+                    *result = Err("thread-in-target");
+                    continue;
+                }
+                if patch_target_with(p.target, patch, || {
+                    // VirtualProtect has succeeded, so the only remaining steps
+                    // publish the original and copy the patch. Once visible, retain
+                    // the trampoline even if a later operation cannot complete.
+                    allocation.published = true;
+                    p.slot.set_original(rt, hook.trampoline);
+                })
+                .is_err()
+                {
+                    *result = Err("protect-failed");
+                }
             }
-            if patch_target_with(p.target, patch, || {
-                // VirtualProtect has succeeded, so the only remaining steps
-                // publish the original and copy the patch. Once visible, retain
-                // the trampoline even if a later operation cannot complete.
-                allocation.published = true;
-                p.slot.set_original(rt, hook.trampoline);
-            })
-            .is_err()
-            {
-                *result = Err("protect-failed");
-            }
+            suspender.resume();
         }
-        suspender.resume();
-    } else {
-        status.fill(Err("thread-suspend-failed"));
+        Err(reason) => status.fill(Err(reason)),
     }
     prepared
         .drain(..)
@@ -4043,6 +4096,8 @@ mod tests {
         }
         let guard = SuspendedThreads {
             handles: vec![handle],
+            thread_ids: Vec::new(),
+            snapshot: None,
         };
         let ip = thread_instruction_pointer(handle);
         let outside = !guard.any_ip_in_range(usize::MAX - 1, usize::MAX);
@@ -4167,6 +4222,67 @@ mod tests {
         assert!(unsafe { uninstall_inline_hooks(&result.installed) }.is_empty());
         assert!(clear_runtime(&rt));
         assert_eq!(unsafe { GetCurrentProcess() } as usize, usize::MAX);
+    }
+
+    #[test]
+    fn thread_created_after_snapshot_refuses_freeze_and_recovers() {
+        // Isolate SuspendThread from the parallel test harness and its locks.
+        const CHILD: &str = "SHIRUSU_THREAD_SNAPSHOT_RACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::thread_created_after_snapshot_refuses_freeze_and_recovers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("thread snapshot regression timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let mut worker = None;
+        let result = SuspendedThreads::suspend_all_after_snapshot(|| {
+            let stop = Arc::clone(&stop);
+            let started_worker = Arc::clone(&started);
+            worker = Some(std::thread::spawn(move || {
+                started_worker.store(true, Ordering::Release);
+                while !stop.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            }));
+            while !started.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+        let reason = match result {
+            Ok(guard) => {
+                guard.resume();
+                None
+            }
+            Err(reason) => Some(reason),
+        };
+        stop.store(true, Ordering::Release);
+        worker.unwrap().join().unwrap();
+        assert_eq!(reason, Some("thread-set-changed"));
+        // A rejected freeze must resume all old threads and release its handles.
+        SuspendedThreads::suspend_all()
+            .expect("stable thread set after recovery")
+            .resume();
     }
 
     #[test]
