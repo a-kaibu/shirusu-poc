@@ -33,15 +33,32 @@ impl RuleGeneration {
 }
 
 /// 正規化済みの値を、ルールの `equals` に使える JSON 値へ写す。
-/// 表現できない値（オブジェクト参照・ポインタ・バイト列・Blob・
-/// 浮動小数点ビット列・未取得）は None：v1 の equals は整数・
-/// 真偽・文字列の等価しか判定できないため。
+/// バイト列と不正な UTF-16 はタグ付き配列で保存する。オブジェクト
+/// 参照・ポインタ・Blob・浮動小数点ビット列・未取得は None。
 fn norm_to_json(v: &NormValue) -> Option<JsonValue> {
     match v {
         NormValue::Int(i) if *i >= 0 => u64::try_from(*i).ok().map(JsonValue::U64),
         NormValue::Int(i) => i64::try_from(*i).ok().map(JsonValue::I64),
         NormValue::Bool(b) => Some(JsonValue::Bool(*b)),
         NormValue::Text(s) => Some(JsonValue::Str(s.clone())),
+        NormValue::Utf16(units) => Some(JsonValue::obj(vec![(
+            "utf16",
+            JsonValue::Array(
+                units
+                    .iter()
+                    .map(|&v| JsonValue::U64(u64::from(v)))
+                    .collect(),
+            ),
+        )])),
+        NormValue::Bytes(bytes) => Some(JsonValue::obj(vec![(
+            "bytes",
+            JsonValue::Array(
+                bytes
+                    .iter()
+                    .map(|&v| JsonValue::U64(u64::from(v)))
+                    .collect(),
+            ),
+        )])),
         _ => None,
     }
 }
@@ -80,7 +97,13 @@ fn strategies(left: &ReadTrace, right: &ReadTrace, cand: &Candidate) -> Vec<Stra
                 let norm = NormTrace::build(left);
                 if let Some(idx) = locate_call(&norm, ev) {
                     let call = &norm.calls[idx];
-                    for phase_ev in [&call.enter, &call.leave, &call.solo] {
+                    for phase_ev in [
+                        &call.enter,
+                        &call.leave,
+                        &call.completed,
+                        &call.aborted,
+                        &call.solo,
+                    ] {
                         let Some(nev) = phase_ev else { continue };
                         for f in &nev.fields {
                             if f.name == *field {
@@ -238,56 +261,7 @@ pub fn spec_name(cand: &Candidate) -> String {
 /// TestSpec を v1 JSON 形式のテキストへ書き出す（shirusu-test の
 /// パーサがそのまま読み戻せることが前提。往復はテストで固定）。
 pub fn spec_to_json(spec: &TestSpec) -> String {
-    let rules: Vec<JsonValue> = spec
-        .rules
-        .iter()
-        .map(|r| match r {
-            Rule::ApiCalled {
-                api,
-                field,
-                equals,
-                contains,
-            } => {
-                let mut pairs = vec![
-                    ("type", JsonValue::Str("api-called".into())),
-                    ("api", JsonValue::Str(api.clone())),
-                ];
-                if let Some(f) = field {
-                    pairs.push(("field", JsonValue::Str(f.clone())));
-                }
-                if let Some(e) = equals {
-                    pairs.push(("equals", e.clone()));
-                }
-                if let Some(c) = contains {
-                    pairs.push(("contains", JsonValue::Str(c.clone())));
-                }
-                JsonValue::obj(pairs)
-            }
-            Rule::NoIntegrityLoss => {
-                JsonValue::obj(vec![("type", JsonValue::Str("no-integrity-loss".into()))])
-            }
-            Rule::ObjectClosed { created_by } => JsonValue::obj(vec![
-                ("type", JsonValue::Str("object-closed".into())),
-                ("created_by", JsonValue::Str(created_by.clone())),
-            ]),
-            Rule::EventCount { min, max } => {
-                let mut pairs = vec![("type", JsonValue::Str("event-count".into()))];
-                if let Some(min) = min {
-                    pairs.push(("min", JsonValue::U64(*min)));
-                }
-                if let Some(max) = max {
-                    pairs.push(("max", JsonValue::U64(*max)));
-                }
-                JsonValue::obj(pairs)
-            }
-        })
-        .collect();
-    JsonValue::obj(vec![
-        ("version", JsonValue::U64(1)),
-        ("name", JsonValue::Str(spec.name.clone())),
-        ("rules", JsonValue::Array(rules)),
-    ])
-    .render_pretty()
+    spec.to_json().render_pretty()
 }
 
 #[cfg(test)]
@@ -349,6 +323,6 @@ mod tests {
         );
         assert_eq!(norm_to_json(&NormValue::Pointer), None);
         assert_eq!(norm_to_json(&NormValue::Null), None);
-        assert_eq!(norm_to_json(&NormValue::Bytes(vec![1])), None);
+        assert!(norm_to_json(&NormValue::Bytes(vec![1])).is_some());
     }
 }

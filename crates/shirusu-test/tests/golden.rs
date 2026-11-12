@@ -44,7 +44,7 @@ impl B {
             kind,
             sequence: self.seq,
             timestamp_qpc: 100 + self.seq * 10,
-            call_id: self.seq,
+            call_id: if kind == 2 { self.seq - 1 } else { self.seq },
             parent_call_id: 0,
             api_id,
             schema_id,

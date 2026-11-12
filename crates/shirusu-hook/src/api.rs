@@ -160,6 +160,7 @@ pub const HANDWRITTEN_API_TABLE: &[ApiDef] = &[
             ("hFile", HANDLE, ValueKind::Handle, BEFORE),
             ("lpBuffer", HANDLE, ValueKind::Pointer, BEFORE),
             ("nNumberOfBytesToRead", DWORD, ValueKind::Scalar, BEFORE),
+            ("lpOverlapped", HANDLE, ValueKind::Pointer, BEFORE),
         ],
         leave_fields: &[
             ("return", BOOL, ValueKind::Scalar, AFTER),
@@ -181,6 +182,7 @@ pub const HANDWRITTEN_API_TABLE: &[ApiDef] = &[
             ("hFile", HANDLE, ValueKind::Handle, BEFORE),
             ("data", Ty::Bytes, ValueKind::Scalar, BEFORE),
             ("nNumberOfBytesToWrite", DWORD, ValueKind::Scalar, BEFORE),
+            ("lpOverlapped", HANDLE, ValueKind::Pointer, BEFORE),
         ],
         leave_fields: &[
             ("return", BOOL, ValueKind::Scalar, AFTER),

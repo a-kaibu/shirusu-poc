@@ -128,6 +128,7 @@ fn payload_pair() -> (Vec<u8>, Vec<u8>) {
                     cv(TypedValue::U64(0x100)),
                     cv(TypedValue::U64(0x5000)),
                     cv(TypedValue::U32(4)),
+                    cv(TypedValue::U64(0)),
                 ],
                 tick(),
                 EventMeta::default(),

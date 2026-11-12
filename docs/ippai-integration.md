@@ -139,6 +139,7 @@ shirusu-conformance <trace> [--json]
   manifest.json        バンドルの素性と生成結果の要約（機械可読）
   brief.md             Probe ブリーフ（人間向け）
   rules.json           shirusu-test 仕様 v1（識別ルールがある場合のみ）
+  replay.json          API 再実行仕様（前提条件が揃う場合のみ）
   left.trimmed.trace   基準側（Windows）のトリム済み Trace
   right.trimmed.trace  被検側（sake）のトリム済み Trace
 ```
@@ -204,3 +205,38 @@ shirusu-conformance <trace> [--json]
   crates/shirusu-probe、crates/shirusu-compare、crates/shirusu-test
 - 背景：レビュー第3回（GOAL.md の「レビュー第3回」節と
   hidden_files のアーカイブ）
+
+### 同期ファイル I/O の再実行仕様
+
+バンドルには、基準側に記録された呼び出し列を再実行する `replay.json` も生成する。
+対応範囲は、単一プロセス・単一スレッドのトップレベル呼び出しで、
+`CreateFileW`、`WriteFile`、`ReadFile`、`CloseHandle` の成功した同期操作。
+最初のオープンは `CREATE_NEW`、以後は記録内で作成した同じファイルの
+`OPEN_EXISTING` に限る。排他的共有、通常属性、GENERIC_READ/WRITE のみ扱う。
+非 NULL の `lpOverlapped` は同期ハンドルでも明示位置の指定になり得るため拒否する。
+このフィールドが無い旧 Trace も再実行には使わず、不足を報告する。
+
+生成器は記録元のパスを `shirusu-replay-0.bin` 等の相対パスに置き換える。
+実行は新しい空の作業ディレクトリで行うこと。ファイルは検査用に残る。
+`CREATE_NEW` と `valid-handle` の期待値により、同名ファイルがあると最初の
+作成で失敗し後続を実行しない。`valid-handle` は NULL と
+INVALID_HANDLE_VALUE の両方を拒否する。元のパスを操作しない。
+
+書き込み内容と位置から読み込み結果を再構成し、記録と一致する場合だけ
+仕様を返す。1 回の I/O は 4096 バイト、モデル内の各ファイルは 1 MiB に
+制限する。記録の欠落、未対応 API、未知の初期状態、未閉鎖ハンドル等は
+`manifest.json` の `replay.missing` に理由を返し、`replay.json` は生成しない。
+生成された仕様は既存の `shirusu-test run` と Probe exe 生成で使用できる。
+これは差分候補だけへの最小化やアプリ全体の再生を保証するものではない。
+
+フィールド等価ルールでは `{"bytes":[0,255]}` と `{"utf16":[55296]}` も
+使える。後者は不正な UTF-16 コード単位を置換せず保存する。未取得・切り詰め・
+Stale の値は等価条件の証拠にしない。非同期完了イベントのフィールドも
+ルール生成対象に含む。独立した Payload と取得状態そのものの条件は未対応。
+
+Capture Coverage の警告だけでは再実行生成を禁止しない。例えば、対象が
+インポートしない API の分だけカバレッジが低くても、記録されたファイル操作の
+入出力を復元できる場合がある。元の評価値は manifest の
+`replay_source_capture_coverage` に残す。記録されなかった操作の再現を
+保証するものではない。Event Integrity と Semantic Completeness の劣化、
+Reader の回復 issue、欠落したイベントや入力は生成を禁止する。

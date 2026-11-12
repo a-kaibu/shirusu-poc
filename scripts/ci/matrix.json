@@ -114,7 +114,7 @@
       "toolchain": "stable"
     },
     {
-      "allow_failure": true,
+      "allow_failure": false,
       "components": "",
       "java": false,
       "name": "fuzz-short",
@@ -157,7 +157,7 @@
       "toolchain": "stable"
     },
     {
-      "allow_failure": true,
+      "allow_failure": false,
       "components": "",
       "java": false,
       "name": "long-fuzz",
@@ -167,7 +167,7 @@
         "weekly"
       ],
       "targets": "",
-      "timeout": 90,
+      "timeout": 120,
       "toolchain": "nightly"
     },
     {

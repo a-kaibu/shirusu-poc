@@ -126,6 +126,12 @@ fn run(args: &[String]) -> Result<u8, (u8, String)> {
                 "discriminating rule: NO (brief-only bundle; see manifest.json rule_generation)"
             ),
         }
+        match &bundle.replay {
+            Ok(_) => println!(
+                "API replay: replay.json (recorded calls only; run in a fresh scratch directory)"
+            ),
+            Err(reason) => println!("API replay unavailable: {reason}"),
+        }
         println!(
             "trimmed pair reproduces the candidate: {}",
             match bundle.trim_reproduced {

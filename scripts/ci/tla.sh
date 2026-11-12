@@ -22,3 +22,14 @@ if ! grep -q "Invariant ClaimedGenerationIsCurrent is violated" "$buggy_log"; th
   exit 1
 fi
 echo "OK: 変種モデル (旧順序) で ClaimedGenerationIsCurrent の違反を検出した"
+
+# Registration precedes OS submission; late cancellation cannot erase reuse.
+java -cp tla2tools.jar tlc2.TLC -config OverlappedLifecycle.cfg OverlappedLifecycle
+if java -cp tla2tools.jar tlc2.TLC -config OverlappedLifecycleBuggy.cfg OverlappedLifecycle >"$buggy_log" 2>&1; then
+  echo "ERROR: late registration mutation survived" >&2
+  exit 1
+fi
+if ! grep -Eq 'Invariant (NoLostCompletion|NoEraseReusedOperation) is violated' "$buggy_log"; then
+  cat "$buggy_log" >&2
+  exit 1
+fi

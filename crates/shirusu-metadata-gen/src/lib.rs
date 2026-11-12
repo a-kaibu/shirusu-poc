@@ -650,7 +650,7 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             String::new()
         };
         out.push_str(&format!(
-            "unsafe extern \"system\" fn {fname}({}){declaration_ret} {{\n",
+            "unsafe extern \"system-unwind\" fn {fname}({}){declaration_ret} {{\n",
             params.join(", ")
         ));
         let binding = if ret == "usize" || api.return_ty.is_none() {
@@ -659,7 +659,7 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             "let result = "
         };
         out.push_str(&format!(
-            "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"system\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
+            "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"system-unwind\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
             api.api_id, raw.join(", "), types.join(", ")
         ));
         if api.return_ty.is_some() {
@@ -898,11 +898,11 @@ mod tests {
         };
         let text = emit_engine_inc(&generated, "71.0.45-preview");
         assert!(text.contains(
-            "unsafe extern \"system\" fn detour_generated_advapi32_reg_close_key(a0: *mut core::ffi::c_void) -> u32"
+            "unsafe extern \"system-unwind\" fn detour_generated_advapi32_reg_close_key(a0: *mut core::ffi::c_void) -> u32"
         ));
         assert!(text.contains("generic_detour_with(7, &[a0 as usize]"));
         assert!(text.contains(
-            "unsafe extern \"system\" fn detour_generated_kernel32_get_current_process_id() -> u32"
+            "unsafe extern \"system-unwind\" fn detour_generated_kernel32_get_current_process_id() -> u32"
         ));
         assert!(text.contains("generic_detour_with(8, &[]"));
         assert!(

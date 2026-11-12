@@ -26,6 +26,10 @@ pub struct ReaderLimits {
     pub max_blocks: usize,
     pub max_events: u64,
     pub max_blobs: usize,
+    /// Cumulative decoded block bytes, including metadata and updates.
+    pub max_decoded_bytes: u64,
+    /// Retained Blob content, including derived versions.
+    pub max_blob_bytes: u64,
 }
 
 impl Default for ReaderLimits {
@@ -34,6 +38,8 @@ impl Default for ReaderLimits {
             max_blocks: 1_000_000,
             max_events: 100_000_000,
             max_blobs: 10_000_000,
+            max_decoded_bytes: 1024 * 1024 * 1024,
+            max_blob_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -203,6 +209,8 @@ pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadT
         finalized_cleanly: false,
         profile_summary: None,
         total_events: 0u64,
+        decoded_bytes: 0,
+        blob_bytes: 0,
         stopped_by_limit: false,
         resync_end: 0,
     };
@@ -333,6 +341,19 @@ fn fold_blob_updates(scan: &mut Scan) {
             continue;
         };
         let base_len = base.len() as u64;
+        if !scan.blobs.contains_key(&update.new_version_id) {
+            let exceeded = if scan.blobs.len() >= scan.limits.max_blobs {
+                Some("blobs")
+            } else if base_len > scan.limits.max_blob_bytes.saturating_sub(scan.blob_bytes) {
+                Some("blob bytes")
+            } else {
+                None
+            };
+            if let Some(what) = exceeded {
+                scan.issues.push(RecoveryIssue::LimitExceeded { what });
+                break;
+            }
+        }
         let working = current
             .entry(update.resource_id)
             .or_insert_with(|| base.clone());
@@ -354,7 +375,12 @@ fn fold_blob_updates(scan: &mut Scan) {
                 } else {
                     *working = folded.clone();
                     versions.insert(update.resource_id, update.new_version_id);
-                    scan.blobs.entry(update.new_version_id).or_insert(folded);
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        scan.blobs.entry(update.new_version_id)
+                    {
+                        scan.blob_bytes += folded.len() as u64;
+                        e.insert(folded);
+                    }
                 }
             }
         }
@@ -391,6 +417,8 @@ struct Scan<'a> {
     /// L09: ProfileSummary Block があれば最後の 1 件。
     profile_summary: Option<ProfileSummary>,
     total_events: u64,
+    decoded_bytes: u64,
+    blob_bytes: u64,
     stopped_by_limit: bool,
     /// 直近の再同期で受理した Block の末尾位置（走査再開位置）。
     resync_end: u64,
@@ -616,6 +644,19 @@ impl<'a> Scan<'a> {
         let corrupt = |issues: &mut Vec<RecoveryIssue>, reason: String| {
             issues.push(RecoveryIssue::CorruptBlock { offset, reason });
         };
+        if raw_len as u64
+            > self
+                .limits
+                .max_decoded_bytes
+                .saturating_sub(self.decoded_bytes)
+        {
+            self.issues.push(RecoveryIssue::LimitExceeded {
+                what: "decoded bytes",
+            });
+            self.stopped_by_limit = true;
+            return;
+        }
+        self.decoded_bytes += raw_len as u64;
         let raw_payload: Vec<u8> = match compression {
             Compression::None => {
                 if stored_payload.len() as u64 != raw_len as u64 {
@@ -763,6 +804,13 @@ impl<'a> Scan<'a> {
                     .push(RecoveryIssue::BlobHashMismatch { id, computed });
                 continue;
             }
+            if body.len() as u64 > self.limits.max_blob_bytes.saturating_sub(self.blob_bytes) {
+                self.issues
+                    .push(RecoveryIssue::LimitExceeded { what: "blob bytes" });
+                self.stopped_by_limit = true;
+                return;
+            }
+            self.blob_bytes += body.len() as u64;
             self.blob_offsets.insert(id, offset);
             self.blobs.insert(id, body);
         }

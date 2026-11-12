@@ -72,3 +72,7 @@ Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe
 # 常に 0。判定の読み取りはログで行う。CI 時間を抑えるため --rounds 1。
 Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (x64)"
 Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-perf-bench.exe --rounds 1 } "perf bench (x64)"
+
+Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "exception-transparency.ps1") } "native SEH transparency"
+# Actual captured file I/O must produce an executable replay, not only a rule.
+Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "replay-e2e.ps1") } "native capture-to-replay"

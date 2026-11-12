@@ -40,7 +40,7 @@ impl B {
             kind,
             sequence: self.seq,
             timestamp_qpc: 100 + self.seq * 10,
-            call_id: self.seq,
+            call_id: if kind == 2 { self.seq - 1 } else { self.seq },
             parent_call_id: 0,
             api_id,
             schema_id,
@@ -305,4 +305,40 @@ fn event_count_bounds() {
     assert!(evaluate(&s, &trace).all_passed());
     let s = spec(r#"{"rules":[{"type":"event-count","min":7}]}"#);
     assert!(!evaluate(&s, &trace).all_passed());
+}
+
+#[test]
+fn uncaptured_dummy_and_stale_values_are_not_evidence() {
+    use shirusu_trace::{compact::decode_values, schema::ValueCapture};
+    for capture in [
+        ValueCapture::Unreadable,
+        ValueCapture::Unsupported,
+        ValueCapture::Truncated,
+        ValueCapture::LimitExceeded,
+        ValueCapture::Stale,
+    ] {
+        let mut trace = clean_trace();
+        let event = &mut trace.batches[0].events[0];
+        let types = [Ty::Str16, Ty::U32];
+        let mut values = decode_values(&types, event.args.as_ref().unwrap()).unwrap();
+        values[0].capture = capture;
+        values[0].value = TypedValue::Str16("dummy".encode_utf16().collect());
+        event.args = Some(encode_values(&types, &values).unwrap());
+        for condition in [r#""equals":"dummy""#, r#""contains":"dum""#] {
+            let rule = spec(&format!(
+                r#"{{"rules":[{{"type":"api-called","api":"kernel32!CreateFileW","field":"lpFileName",{condition}}}]}}"#
+            ));
+            assert!(!evaluate(&rule, &trace).all_passed(), "{capture:?}");
+        }
+    }
+}
+
+#[test]
+fn integrity_rule_rejects_reader_recovery_even_with_complete_finalization() {
+    let mut trace = clean_trace();
+    trace
+        .issues
+        .push(shirusu_trace::reader::RecoveryIssue::IndexMismatch);
+    let rule = spec(r#"{"rules":[{"type":"no-integrity-loss"}]}"#);
+    assert!(!evaluate(&rule, &trace).all_passed());
 }

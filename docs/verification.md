@@ -175,3 +175,60 @@ PBTとDSTで見つけたSeed、Fuzzの最小入力、loomの失敗スケジュ�
 3. Hostの検証ロジックを分け、KaniとFuzzを通す。
 4. 故障操作を混ぜたPBT（DST）でOverflowと生成・回収を検証する。
 5. Windows E2Eでx86 Agentとx64 Host、強制終了、通知の欠落、Ringの再利用を確かめる。
+
+## 2026-11-12 レビュー修正の検証
+
+単体テストだけで完了とせず、次の独立した性質を検証する。
+
+| 手法 | 対象・実行方法 | 検出する問題 |
+| --- | --- | --- |
+| シリアライズを含むE2E | `cargo test -p shirusu-probe --test review_regressions` | Writer→Reader→比較→Probeトリム→Reader→再比較。プロセス別HANDLE、UTF-16、別スレッドの完了イベント |
+| 決定的スケジュール | `cargo test -p shirusu-hook --test lifecycle_schedules`、`late_detour_after_unregister_retains_original` | 完了先行・OVERLAPPED再利用・古い操作の取消・detach後の遅延進入。sleepのタイミングには依存しない |
+| WindowsのDetour経路 | `completion_can_arrive_inside_original_read_file` | 元APIの実行中に完了する順序でも、登録済みの操作を取得できる |
+| WindowsのネイティブE2E | `scripts/ci/exception-transparency.ps1` | C++のSEH捕捉がHookなし／ありで一致し、HeapAllocのCallAbortedも残る |
+| Windowsの寿命・割当検査 | `deleting_fiber_does_not_end_thread_capture`、Hook単体テストの`heap_watch` | Fiber削除をThread終了と誤認しない。停止区間のRust allocatorの確保・解放・再確保を検出する |
+| TLA+ / TLC | `OverlappedLifecycle.tla`、`scripts/ci/tla.sh` | OSへの発行前登録と、世代付き取消の不変条件。旧登録順のモデルでは反例を必須とする |
+| Mutation | `python3 scripts/ci/review-mutations.py` | UTF-16、プロセス分離、保存順、トリム、Blob数、hex解析、操作再利用、未取得値、閉鎖失敗、再実行の初期状態・明示位置の11変異を隔離コピーで実行。コンパイル失敗は検出成功に数えない |
+| Coverage-guided fuzz / ASan | `cargo +nightly fuzz run blob_hex` / `trace_budgets` | 不正UTF-8境界、任意バイト列、構造を保つBlob更新列に対するpanicと予算超過 |
+
+短時間・長時間のfuzzスクリプトは、既存の`decode_compact`と
+`recover_trace`も含めて実行する。新規seedは`fuzz/seeds`から再生成する。
+Mutationはnightlyスイート、SEHのE2EはWindows x64スイートに含める。
+fuzzは導入失敗・検出失敗を成功扱いせず、行列のallow_failureも無効にする。
+
+TLCモデルは登録／完了／取消の小さな状態機械であり、Windows全体やRust実装
+全体の証明ではない。`heap_watch`もOS内部のヒープ操作を計測するものではない。
+Windowsの実行検証とLinux上のモデル・回帰テストを分けて結果を記録する。
+
+実装上の契約:
+
+- Inline Hookでは列挙・ハンドル取得・トランポリン生成・結果領域の確保を
+  停止前に済ませ、全スレッド再開後に解放する。
+- detach後も無効化済みruntimeを素通し用に保持する。再登録時には未設定の
+  元関数スロットを引き継ぎ、登録の空白によってAPI呼び出しを失敗させない。
+- OSへ非同期I/Oを発行する前にpendingを登録し、取消はcall IDが一致する
+  操作だけに適用する。
+- 比較のHANDLEと完了呼び出しの識別にはsession/processを含める。
+  イベントの比較順はglobal orderが揃っていればそれを使い、それ以外はQPCを
+  周波数換算する。同時刻・時計不明の順序には依然として曖昧さがあり、
+  比較結果は契約違反の断定ではない。トリムは元のファイル位置を使う。
+- 不正なUTF-16は比較で生コード単位を保持し、JSON exportでは
+  `{"utf16":[55296,...]}`を返す。通常の有効な文字列の表現は従来通り。
+- Readerの`max_blobs`は派生版にも適用する。`max_decoded_bytes`は累積展開量、
+  `max_blob_bytes`は保持するBlobの合計を制限する。更新の作業コピー等があるため、
+  これらはプロセス全体のRSS上限を意味しない。
+
+
+再実行経路の回帰テストは `shirusu-probe/tests/replay.rs`。Emitter で作成した
+Trace を読み、再実行仕様を生成・JSON 往復・実行計画検証・バンドル化する。
+初期ファイル状態の欠落、矛盾した読取結果、OVERLAPPED 指定は生成失敗を確認する。
+Windows では生成した独立 exe を空のディレクトリで実行し、再実行時には
+既存ファイルを変更せず失敗することも検証する。この Windows 実動テストは
+Linux 上の型検査だけでは代替できない。
+
+
+`scripts/ci/replay-e2e.ps1` は合成 Trace を使わず、CRT に依存しない
+ネイティブ Windows アプリを実際に注入・記録する。読み込む 1 バイトが異なる
+2 実行から ReadFile.data の差分を選び、ルールの左 pass / 右 fail を確認し、
+基準側の記録から生成した exe と JSON Runner をそれぞれ空のディレクトリで
+実行して読み書き結果を検証する。windows.ps1 の必須ステップとして実行する。

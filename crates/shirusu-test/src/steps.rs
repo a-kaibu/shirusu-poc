@@ -27,7 +27,7 @@
 //! - `{"ref": "name"}` → 先行ステップの `store` に保存された戻り値
 //!
 //! 期待値（`"expect"`）の形:
-//! - `"return": "nonzero" | "zero" | <数値>`
+//! - `"return": "valid-handle" | "nonzero" | "zero" | <数値>`
 //! - `"outputs": {"<引数名>": <数値> | "<16 進文字列>"}`（数値は out
 //!   スロット、16 進文字列はバッファ内容との前方一致）
 
@@ -171,12 +171,16 @@ fn parse_expect(value: &JsonValue) -> Result<Expect, String> {
     let mut expect = Expect::default();
     if let Some(ret) = get(value, "return") {
         expect.ret = Some(match ret {
+            JsonValue::Str(s) if s == "valid-handle" => RetExpect::ValidHandle,
             JsonValue::Str(s) if s == "nonzero" => RetExpect::NonZero,
             JsonValue::Str(s) if s == "zero" => RetExpect::Zero,
             JsonValue::U64(n) => RetExpect::Equals(*n),
             JsonValue::I64(n) if *n >= 0 => RetExpect::Equals(*n as u64),
             _ => {
-                return Err("expect.return must be \"nonzero\", \"zero\", or a number".to_string());
+                return Err(
+                    "expect.return must be \"valid-handle\", \"nonzero\", \"zero\", or a number"
+                        .to_string(),
+                );
             }
         });
     }
@@ -265,6 +269,7 @@ fn expect_to_json(expect: &Expect) -> JsonValue {
         pairs.push((
             "return",
             match ret {
+                RetExpect::ValidHandle => JsonValue::Str("valid-handle".into()),
                 RetExpect::NonZero => JsonValue::Str("nonzero".into()),
                 RetExpect::Zero => JsonValue::Str("zero".into()),
                 RetExpect::Equals(n) => JsonValue::U64(n),

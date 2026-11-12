@@ -88,6 +88,8 @@ pub enum NormValue {
         is64: bool,
     },
     Text(String),
+    /// Ill-formed UTF-16 must remain distinguishable.
+    Utf16(Vec<u16>),
     Bytes(Vec<u8>),
     /// Blob の内容そのもの（BlobRef フィールドと Payload 共通）。
     BlobContent(Vec<u8>),
@@ -114,6 +116,7 @@ impl NormValue {
                 }
             }
             NormValue::Text(s) => format!("{s:?}"),
+            NormValue::Utf16(s) => format!("utf16:{s:04x?}"),
             NormValue::Bytes(b) => format!("bytes[{}]", b.len()),
             NormValue::BlobContent(b) => format!("blob-content[{}]", b.len()),
             NormValue::BlobUnknown(hex) => format!("blob:{hex}"),
@@ -155,6 +158,8 @@ impl NormPayload {
 /// 正規化済みイベント（Call の片側）。
 #[derive(Debug, Clone)]
 pub struct NormEvent {
+    /// Original file position, including the actual completion thread.
+    pub source_index: usize,
     pub sequence: u64,
     /// イベント単位の取得状態が Captured か（false なら値に欠けがある）。
     pub fully_captured: bool,
@@ -242,10 +247,35 @@ fn trace_invalid_handle(trace: &ReadTrace) -> u64 {
 impl NormTrace {
     pub fn build(trace: &ReadTrace) -> NormTrace {
         let invalid_handle = trace_invalid_handle(trace);
-        let view = TraceView::build(trace);
+        let mut view = TraceView::build(trace);
+        let identity: HashMap<usize, (u64, u64)> = view
+            .events
+            .iter()
+            .map(|e| (e.index, (e.session_id, e.process_id)))
+            .collect();
+        // File chunk order is drain order, not execution order. Prefer the
+        // explicit observation order; otherwise compare QPC in common units.
+        let global = view.events.iter().all(|e| e.global_order.is_some());
+        view.events.sort_by(|a, b| {
+            let order = if global {
+                a.global_order.cmp(&b.global_order)
+            } else if a.qpc_frequency != 0 && b.qpc_frequency != 0 {
+                ((a.timestamp_qpc as u128) * b.qpc_frequency as u128)
+                    .cmp(&((b.timestamp_qpc as u128) * a.qpc_frequency as u128))
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            order.then_with(|| a.index.cmp(&b.index))
+        });
+        let rank: HashMap<usize, usize> = view
+            .events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.index, i))
+            .collect();
         // --- パス A: オブジェクト生成の収集 ---
-        // raw value -> [(生成イベント index, ObjectKey)]（時刻順）
-        let mut productions: HashMap<u64, Vec<(usize, ObjectKey)>> = HashMap::new();
+        // (session, process, raw value) -> [(source index, ObjectKey)] in observation order.
+        let mut productions: HashMap<(u64, u64, u64), Vec<(usize, ObjectKey)>> = HashMap::new();
         // 生成イベント index -> ObjectKey（生成の帰属を正確に引くため）
         let mut created_by_event: HashMap<usize, ObjectKey> = HashMap::new();
         let mut objects: Vec<ObjectInfo> = Vec::new();
@@ -285,7 +315,7 @@ impl NormTrace {
                     ordinal,
                 };
                 productions
-                    .entry(raw)
+                    .entry((ev.session_id, ev.process_id, raw))
                     .or_default()
                     .push((ev.index, key.clone()));
                 created_by_event.insert(ev.index, key.clone());
@@ -297,10 +327,11 @@ impl NormTrace {
             }
         }
         let resolve = |raw: u64, at_event: usize| -> Option<ObjectKey> {
-            productions.get(&raw).and_then(|list| {
+            let (session, process) = identity[&at_event];
+            productions.get(&(session, process, raw)).and_then(|list| {
                 list.iter()
                     .rev()
-                    .find(|(idx, _)| *idx <= at_event)
+                    .find(|(idx, _)| rank[idx] <= rank[&at_event])
                     .map(|(_, key)| key.clone())
             })
         };
@@ -312,9 +343,8 @@ impl NormTrace {
         let mut pending: HashMap<(usize, u64), usize> = HashMap::new();
         // F27: leave が済んだ呼び出しの call_id -> 呼び出し index。
         // 完了は leave の後に来て、別スレッドで観測されることがある
-        // ため、スレッドを問わず call_id だけで引く（Host の track_call
-        // と同じ鍵。call_id はセッション内で一意）。
-        let mut completed_lookup: HashMap<u64, usize> = HashMap::new();
+        // ためスレッドは問わず、(session, process, call_id) で引く。
+        let mut completed_lookup: HashMap<(u64, u64, u64), usize> = HashMap::new();
         let mut object_calls: HashMap<ObjectKey, Vec<usize>> = HashMap::new();
 
         let norm_event = |ev: &shirusu_analysis::EventView| -> NormEvent {
@@ -342,6 +372,7 @@ impl NormTrace {
                 },
             };
             NormEvent {
+                source_index: ev.index,
                 sequence: ev.sequence,
                 fully_captured: ev.capture == shirusu_trace::schema::EventCapture::Captured,
                 fields,
@@ -386,12 +417,17 @@ impl NormTrace {
             // 単独イベント扱い。二重の完了は最初のものを残す。
             if phase == Phase::Completed {
                 let nev = norm_event(ev);
-                if let Some(&idx) = completed_lookup.get(&ev.call_id) {
+                if let Some(&idx) =
+                    completed_lookup.get(&(ev.session_id, ev.process_id, ev.call_id))
+                {
                     if calls[idx].completed.is_none() {
                         calls[idx].completed = Some(nev);
                     }
                 } else if let Some(idx) = calls.iter().rposition(|c| {
                     c.raw_call_id == ev.call_id
+                        && c.enter.as_ref().or(c.leave.as_ref()).is_some_and(|e| {
+                            identity[&e.source_index] == (ev.session_id, ev.process_id)
+                        })
                         && c.completed.is_none()
                         && (c.leave.is_some() || c.enter.is_some())
                 }) {
@@ -465,7 +501,7 @@ impl NormTrace {
                         calls[idx].created = Some(key.clone());
                     }
                     calls[idx].leave = Some(nev);
-                    completed_lookup.insert(ev.call_id, idx);
+                    completed_lookup.insert((ev.session_id, ev.process_id, ev.call_id), idx);
                     pending.remove(&pkey);
                 }
                 // L08: 中断は Leave と同じく呼び出しを閉じるが、正常終了
@@ -602,7 +638,10 @@ fn norm_value(
             is64: true,
         },
         TypedValue::Str(s) => NormValue::Text(s.clone()),
-        TypedValue::Str16(units) => NormValue::Text(String::from_utf16_lossy(units)),
+        TypedValue::Str16(units) => match String::from_utf16(units) {
+            Ok(s) => NormValue::Text(s),
+            Err(_) => NormValue::Utf16(units.clone()),
+        },
         TypedValue::Bytes(b) => NormValue::Bytes(b.clone()),
         TypedValue::BlobRef(id) => match trace.blobs.get(id) {
             Some(content) => NormValue::BlobContent(content.clone()),

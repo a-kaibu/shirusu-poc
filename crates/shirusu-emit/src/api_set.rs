@@ -265,6 +265,12 @@ pub fn file_io_api_set() -> ApiSet {
                     ValueKind::Scalar,
                     CaptureTiming::Before,
                 ),
+                (
+                    "lpOverlapped",
+                    HANDLE,
+                    ValueKind::Pointer,
+                    CaptureTiming::Before,
+                ),
             ],
             &[
                 ("return", BOOL, ValueKind::Scalar, CaptureTiming::After),
@@ -289,6 +295,12 @@ pub fn file_io_api_set() -> ApiSet {
                     "nNumberOfBytesToWrite",
                     DWORD,
                     ValueKind::Scalar,
+                    CaptureTiming::Before,
+                ),
+                (
+                    "lpOverlapped",
+                    HANDLE,
+                    ValueKind::Pointer,
                     CaptureTiming::Before,
                 ),
             ],

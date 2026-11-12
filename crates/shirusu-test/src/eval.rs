@@ -11,7 +11,7 @@ use crate::spec::{Rule, TestSpec};
 use shirusu_analysis::{EventView, JsonValue, TraceView};
 use shirusu_compare::NormTrace;
 use shirusu_trace::reader::ReadTrace;
-use shirusu_trace::schema::TypedValue;
+use shirusu_trace::schema::{TypedValue, ValueCapture};
 
 /// ルール 1 件の結果。
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +147,18 @@ fn eval_rule(rule: &Rule, trace: &ReadTrace, view: &TraceView) -> RuleResult {
             if s.missing_blob_refs > 0 {
                 problems.push(format!("{} missing blob reference(s)", s.missing_blob_refs));
             }
+            if !s.finalized_cleanly {
+                problems.push("trace was not finalized cleanly".into());
+            }
+            if !s.recovery_issues.is_empty() {
+                problems.push(format!(
+                    "{} reader recovery issue(s)",
+                    s.recovery_issues.len()
+                ));
+            }
+            if s.degraded_events > 0 {
+                problems.push(format!("{} degraded event(s)", s.degraded_events));
+            }
             if problems.is_empty() {
                 result(
                     rule,
@@ -181,7 +193,24 @@ fn eval_rule(rule: &Rule, trace: &ReadTrace, view: &TraceView) -> RuleResult {
                     if call.created.as_ref() == Some(&obj.key) {
                         return false;
                     }
-                    function_part(&call.api).starts_with("Close")
+                    let Some(leave) = &call.leave else {
+                        return false;
+                    };
+                    let Some(ret) = leave.fields.iter().find(|f| f.name == "return") else {
+                        return false;
+                    };
+                    // Closing was attempted is not evidence that it succeeded.
+                    match function_part(&call.api) {
+                        "CloseHandle" | "CloseServiceHandle" | "CloseDesktop"
+                        | "CloseWindowStation" | "FindClose" => {
+                            matches!(ret.value, shirusu_compare::NormValue::Int(n) if n != 0)
+                                || ret.value == shirusu_compare::NormValue::Bool(true)
+                        }
+                        "RegCloseKey" | "closesocket" => {
+                            ret.value == shirusu_compare::NormValue::Int(0)
+                        }
+                        _ => false,
+                    }
                 });
                 if !closed {
                     unclosed.push(obj.key.describe());
@@ -259,6 +288,13 @@ fn eval_api_called(
         let Some(f) = ev.field(field_name) else {
             continue;
         };
+        if f.capture != ValueCapture::Captured {
+            observed.push(format!(
+                "<{}>",
+                shirusu_analysis::view::value_capture_name(f.capture)
+            ));
+            continue;
+        }
         observed.push(shirusu_analysis::view::format_value(&f.value));
         if let Some(want) = equals {
             if json_equals_typed(want, &f.value) {
@@ -321,16 +357,38 @@ fn json_equals_typed(json: &JsonValue, value: &TypedValue) -> bool {
         (JsonValue::I64(a), TypedValue::U32(b)) => *a == *b as i64,
         (JsonValue::I64(a), TypedValue::U64(b)) => *b <= i64::MAX as u64 && *a == *b as i64,
         (JsonValue::Str(a), TypedValue::Str(b)) => a == b,
-        (JsonValue::Str(a), TypedValue::Str16(b)) => *a == String::from_utf16_lossy(b),
+        (JsonValue::Str(a), TypedValue::Str16(b)) => a.encode_utf16().eq(b.iter().copied()),
         (JsonValue::Bool(a), TypedValue::Bool(b)) => a == b,
+        (JsonValue::Object(fields), TypedValue::Str16(units)) if fields.len() == 1 => {
+            fields[0].0 == "utf16"
+                && json_units_equal(&fields[0].1, units.iter().map(|&v| u64::from(v)))
+        }
+        (JsonValue::Object(fields), TypedValue::Bytes(bytes)) if fields.len() == 1 => {
+            fields[0].0 == "bytes"
+                && json_units_equal(&fields[0].1, bytes.iter().map(|&v| u64::from(v)))
+        }
         _ => false,
     }
+}
+
+fn json_units_equal(json: &JsonValue, units: impl Iterator<Item = u64>) -> bool {
+    let JsonValue::Array(values) = json else {
+        return false;
+    };
+    values
+        .iter()
+        .map(|v| match v {
+            JsonValue::U64(n) => Some(*n),
+            JsonValue::I64(n) => u64::try_from(*n).ok(),
+            _ => None,
+        })
+        .eq(units.map(Some))
 }
 
 fn typed_as_text(value: &TypedValue) -> Option<String> {
     match value {
         TypedValue::Str(s) => Some(s.clone()),
-        TypedValue::Str16(units) => Some(String::from_utf16_lossy(units)),
+        TypedValue::Str16(units) => String::from_utf16(units).ok(),
         _ => None,
     }
 }

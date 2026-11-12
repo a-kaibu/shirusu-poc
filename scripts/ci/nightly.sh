@@ -7,3 +7,6 @@ PROPTEST_CASES=4096 cargo test --workspace --release
 cargo test -p shirusu-loom-tests --release
 # D56: 参照モデルが実装に追随していないことを mutation で実証する
 bash scripts/ci/model-independence.sh
+
+# Review regression tests must kill their corresponding implementation mutations.
+python3 scripts/ci/review-mutations.py

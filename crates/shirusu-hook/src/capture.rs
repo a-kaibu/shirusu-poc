@@ -243,8 +243,18 @@ pub fn create_file_w_leave(return_handle: u64, last_error: u32) -> Vec<CapturedV
     ]
 }
 
-pub fn read_file_enter(handle: u64, buffer: u64, bytes_to_read: u32) -> Vec<CapturedValue> {
-    vec![u64v(handle), u64v(buffer), u32v(bytes_to_read)]
+pub fn read_file_enter(
+    handle: u64,
+    buffer: u64,
+    bytes_to_read: u32,
+    overlapped: u64,
+) -> Vec<CapturedValue> {
+    vec![
+        u64v(handle),
+        u64v(buffer),
+        u32v(bytes_to_read),
+        u64v(overlapped),
+    ]
 }
 
 /// ReadFile の leave。`bytes_read_addr` は lpNumberOfBytesRead の
@@ -304,11 +314,13 @@ pub fn write_file_enter(
     handle: u64,
     buffer: u64,
     bytes_to_write: u32,
+    overlapped: u64,
 ) -> Vec<CapturedValue> {
     vec![
         u64v(handle),
         read_buffer(mem, buffer, bytes_to_write as usize),
         u32v(bytes_to_write),
+        u64v(overlapped),
     ]
 }
 
@@ -498,9 +510,40 @@ pub struct OverlappedRegistry {
     pending: std::sync::Mutex<std::collections::HashMap<u64, PendingOverlapped>>,
 }
 
+/// A provisional registration is cancelled on unwind as well as synchronous
+/// failure. Cancellation is generation checked so an early completion may reuse
+/// the address while the original submitter is still unwinding/returning.
+pub struct PendingSubmission<'a> {
+    registry: &'a OverlappedRegistry,
+    address: u64,
+    call_id: u64,
+    keep: bool,
+}
+impl PendingSubmission<'_> {
+    pub fn finish(mut self, pending: bool) {
+        self.keep = pending;
+    }
+}
+impl Drop for PendingSubmission<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.registry.cancel(self.address, self.call_id);
+        }
+    }
+}
+
 impl OverlappedRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn submit(&self, address: u64, pending: PendingOverlapped) -> PendingSubmission<'_> {
+        self.register(address, pending);
+        PendingSubmission {
+            registry: self,
+            address,
+            call_id: pending.call_id,
+            keep: false,
+        }
     }
     pub fn register(&self, overlapped_addr: u64, pending: PendingOverlapped) {
         if overlapped_addr == 0 {
@@ -510,6 +553,13 @@ impl OverlappedRegistry {
             .lock()
             .unwrap()
             .insert(overlapped_addr, pending);
+    }
+    /// Remove only this operation, never a newer reuse of the same address.
+    pub fn cancel(&self, address: u64, call_id: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.get(&address).is_some_and(|p| p.call_id == call_id) {
+            pending.remove(&address);
+        }
     }
     pub fn take(&self, overlapped_addr: u64) -> Option<PendingOverlapped> {
         self.pending.lock().unwrap().remove(&overlapped_addr)
@@ -798,7 +848,7 @@ mod tests {
     fn write_file_enter_captures_input_before_call() {
         let mut m = MapMemory::new();
         m.write(0x6000, &[1, 2, 3, 4, 5]);
-        let values = write_file_enter(&m, 0x1234, 0x6000, 5);
+        let values = write_file_enter(&m, 0x1234, 0x6000, 5, 0);
         assert_eq!(
             values[1],
             CapturedValue::captured(TypedValue::Bytes(vec![1, 2, 3, 4, 5]))
@@ -816,7 +866,7 @@ mod tests {
         // WriteFile の data は Before: enter で呼び出し前の内容を取る。
         let mut m = MapMemory::new();
         m.write(0x6000, &[9, 8, 7]);
-        let enter = write_file_enter(&m, 0x1234, 0x6000, 3);
+        let enter = write_file_enter(&m, 0x1234, 0x6000, 3, 0);
         assert_eq!(
             CaptureTiming::from_flags(write.enter_schema().fields[1].flags),
             CaptureTiming::Before

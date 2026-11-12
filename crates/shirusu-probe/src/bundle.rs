@@ -94,6 +94,8 @@ pub struct ProbeBundle {
     /// 識別ルールを含む shirusu-test 仕様。生成できなかった場合は
     /// None で、バンドルは「ブリーフ＋Trace のみ」になる。
     pub rules_json: Option<String>,
+    /// Full supported baseline call sequence; Err explains missing prerequisites.
+    pub replay: std::result::Result<TestSpec, String>,
     pub rule_generation: RuleGeneration,
     pub left_trimmed: Option<TrimmedTrace>,
     pub right_trimmed: Option<TrimmedTrace>,
@@ -177,13 +179,41 @@ pub fn build_bundle(
             trim_outcome: Some(trim_outcome),
         },
     );
-    let manifest_json = manifest(opts, cand, &rule_generation, Some(trim_outcome)).render_pretty();
+    let replay = crate::replay::generate_replay(left);
+    let mut manifest = manifest(opts, cand, &rule_generation, Some(trim_outcome));
+    if let JsonValue::Object(ref mut fields) = manifest {
+        fields.push((
+            "replay_source_capture_coverage".into(),
+            left.finalization
+                .as_ref()
+                .map(|f| JsonValue::U64(u64::from(f.capture_coverage)))
+                .unwrap_or(JsonValue::Null),
+        ));
+        fields.push((
+            "replay".into(),
+            match &replay {
+                Ok(_) => JsonValue::obj(vec![
+                    ("file", JsonValue::Str("replay.json".into())),
+                    (
+                        "scope",
+                        JsonValue::Str(
+                            "recorded baseline calls only, synchronous file I/O; run in a fresh scratch directory"
+                                .into(),
+                        ),
+                    ),
+                ]),
+                Err(reason) => JsonValue::obj(vec![("missing", JsonValue::Str(reason.clone()))]),
+            },
+        ));
+    }
+    let manifest_json = manifest.render_pretty();
     Ok(ProbeBundle {
         name: opts.name.clone(),
         candidate_index,
         brief_md,
         manifest_json,
         rules_json,
+        replay,
         rule_generation,
         left_trimmed: Some(left_trimmed),
         right_trimmed: Some(right_trimmed),
@@ -293,6 +323,9 @@ pub fn write_bundle(bundle: &ProbeBundle, dir: &Path) -> Result<Vec<PathBuf>> {
     };
     put("manifest.json", bundle.manifest_json.as_bytes())?;
     put("brief.md", bundle.brief_md.as_bytes())?;
+    if let Ok(spec) = &bundle.replay {
+        put("replay.json", spec.to_json().render_pretty().as_bytes())?;
+    }
     if let Some(rules) = &bundle.rules_json {
         put("rules.json", rules.as_bytes())?;
     }
@@ -301,6 +334,21 @@ pub fn write_bundle(bundle: &ProbeBundle, dir: &Path) -> Result<Vec<PathBuf>> {
     }
     if let Some(t) = &bundle.right_trimmed {
         put("right.trimmed.trace", &t.bytes)?;
+    }
+    // A regenerated bundle must not expose stale optional artifacts.
+    for (name, present) in [
+        ("replay.json", bundle.replay.is_ok()),
+        ("rules.json", bundle.rules_json.is_some()),
+        ("left.trimmed.trace", bundle.left_trimmed.is_some()),
+        ("right.trimmed.trace", bundle.right_trimmed.is_some()),
+    ] {
+        if !present {
+            match std::fs::remove_file(dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
     Ok(written)
 }

@@ -31,7 +31,7 @@ impl BlobId {
         s
     }
     pub fn parse_hex(s: &str) -> Option<Self> {
-        if s.len() != 64 {
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let mut out = [0u8; 32];

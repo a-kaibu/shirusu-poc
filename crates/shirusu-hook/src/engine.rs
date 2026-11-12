@@ -373,7 +373,7 @@ struct PlannedInline {
     original_bytes: Vec<u8>,
 }
 
-/// 対象プロセスの全スレッド（呼び出し元を除く）を一時停止するガード。
+/// Snapshot/open thread handles before suspension; no heap activity until resume.
 /// Drop 時にも再開するため、途中で失敗しても停止したままにならない。
 struct SuspendedThreads {
     handles: Vec<*mut c_void>,
@@ -431,12 +431,6 @@ impl SuspendedThreads {
                     failed = true;
                     break;
                 }
-                // SAFETY: 自プロセスのスレッド。
-                if unsafe { SuspendThread(handle) } == u32::MAX {
-                    unsafe { CloseHandle(handle) };
-                    failed = true;
-                    break;
-                }
                 handles.push(handle);
             }
             more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
@@ -444,10 +438,24 @@ impl SuspendedThreads {
         unsafe { CloseHandle(snapshot) };
         if failed {
             for h in handles {
-                unsafe { ResumeThread(h) };
                 unsafe { CloseHandle(h) };
             }
             return Err(());
+        }
+        #[cfg(test)]
+        crate::heap_watch::begin();
+        for (suspended, &handle) in handles.iter().enumerate() {
+            if unsafe { SuspendThread(handle) } == u32::MAX {
+                for &h in &handles[..suspended] {
+                    unsafe { ResumeThread(h) };
+                }
+                #[cfg(test)]
+                crate::heap_watch::end();
+                for &h in &handles {
+                    unsafe { CloseHandle(h) };
+                }
+                return Err(());
+            }
         }
         Ok(Self { handles })
     }
@@ -469,8 +477,12 @@ impl SuspendedThreads {
     /// 全スレッドを再開し、ハンドルを閉じる。
     fn resume(mut self) {
         let handles = std::mem::take(&mut self.handles);
-        for h in handles {
+        for &h in &handles {
             unsafe { ResumeThread(h) };
+        }
+        #[cfg(test)]
+        crate::heap_watch::end();
+        for h in handles {
             unsafe { CloseHandle(h) };
         }
     }
@@ -479,8 +491,12 @@ impl SuspendedThreads {
 impl Drop for SuspendedThreads {
     fn drop(&mut self) {
         let handles = std::mem::take(&mut self.handles);
-        for h in handles {
+        for &h in &handles {
             unsafe { ResumeThread(h) };
+        }
+        #[cfg(test)]
+        crate::heap_watch::end();
+        for h in handles {
             unsafe { CloseHandle(h) };
         }
     }
@@ -552,14 +568,8 @@ fn patch_target(target: usize, patch: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-/// 計画済み 1 件の Inline Hook を設置する（スレッド停止中に呼ぶこと）。
-/// トランポリンを確保・書き込み、対象の先頭をパッチし、ランタイムの
-/// `original` をトランポリンへ差し替える。
-fn install_one_inline(
-    rt: &HookRuntime,
-    p: &PlannedInline,
-    bitness: u32,
-) -> Result<InlineHook, &'static str> {
+/// Prepare the trampoline and patch bytes before suspending any thread.
+fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8>), &'static str> {
     const TRAMPOLINE_SIZE: usize = 0x1000;
     // Retired trampolines remain executable until process exit (P0-1).
     // Bound cumulative allocation attempts across reattachments. Failed attempts
@@ -605,30 +615,59 @@ fn install_one_inline(
         std::ptr::copy_nonoverlapping(code.as_ptr(), trampoline as *mut u8, code.len());
         FlushInstructionCache(GetCurrentProcess(), trampoline as *const c_void, code.len());
     }
-    // patch_target itself calls GetCurrentProcess/VirtualProtect and can enter
-    // an already installed IAT detour. Publish the trampoline BEFORE changing
-    // the entry point, so those calls never follow the patched entry recursively.
-    let previous = p.slot.original(rt);
-    p.slot.set_original(rt, trampoline);
-    if patch_target(
-        p.target,
-        &build_patch(p.target as u64, p.detour as u64, bitness),
-    )
-    .is_err()
-    {
-        p.slot.set_original(rt, previous);
-        // Publication also exposed this address to IAT callers. Keep it alive
-        // under the same cumulative allocation budget as retired trampolines.
-        return Err("protect-failed");
+    Ok((
+        InlineHook {
+            api_id: p.slot.report_id(),
+            target: p.target,
+            trampoline,
+            trampoline_size: TRAMPOLINE_SIZE,
+            stolen_len: p.plan.stolen_len,
+            original_bytes: p.original_bytes.clone(),
+        },
+        build_patch(p.target as u64, p.detour as u64, bitness),
+    ))
+}
+
+/// Allocate/decode before suspension; the stopped interval only inspects IPs,
+/// publishes atomics and copies prepared bytes. Keep plans alive until resume.
+fn install_planned(
+    rt: &HookRuntime,
+    plans: &[PlannedInline],
+    bitness: u32,
+) -> Vec<Result<InlineHook, &'static str>> {
+    if plans.is_empty() {
+        return Vec::new();
     }
-    Ok(InlineHook {
-        api_id: p.slot.report_id(),
-        target: p.target,
-        trampoline,
-        trampoline_size: TRAMPOLINE_SIZE,
-        stolen_len: p.plan.stolen_len,
-        original_bytes: p.original_bytes.clone(),
-    })
+    let _guard = ReentrancyGuard::try_enter();
+    let mut prepared: Vec<_> = plans.iter().map(|p| prepare_inline(p, bitness)).collect();
+    let mut status = vec![Ok(()); plans.len()];
+    if let Ok(suspender) = SuspendedThreads::suspend_all() {
+        for ((p, ready), result) in plans.iter().zip(&prepared).zip(&mut status) {
+            let Ok((hook, patch)) = ready else { continue };
+            if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
+                *result = Err("thread-in-target");
+                continue;
+            }
+            let previous = p.slot.original(rt);
+            p.slot.set_original(rt, hook.trampoline);
+            if patch_target(p.target, patch).is_err() {
+                p.slot.set_original(rt, previous);
+                *result = Err("protect-failed");
+            }
+        }
+        suspender.resume();
+    } else {
+        status.fill(Err("thread-suspend-failed"));
+    }
+    prepared
+        .drain(..)
+        .zip(status)
+        .map(|(p, status)| {
+            let (hook, _) = p?;
+            status?;
+            Ok(hook)
+        })
+        .collect()
 }
 
 /// 全 API へ Inline Hook を設置する（L01）。設置の詳細は
@@ -710,33 +749,12 @@ unsafe fn install_inline_hooks_for(
             Err(e) => outcome.skipped.push((api.api_id, e.reason())),
         }
     }
-    if planned.is_empty() {
-        return outcome;
-    }
-    // 他スレッドを止められない場合は全体を見送る。
-    let Ok(suspender) = SuspendedThreads::suspend_all() else {
-        for p in planned {
-            outcome
-                .skipped
-                .push((p.slot.report_id(), "thread-suspend-failed"));
-        }
-        return outcome;
-    };
-    for p in planned {
-        // 停止中のスレッドがパッチ範囲内で止まっていたら見送る
-        // （復帰後にパッチの途中バイトを実行してしまうため）。
-        if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
-            outcome
-                .skipped
-                .push((p.slot.report_id(), "thread-in-target"));
-            continue;
-        }
-        match install_one_inline(rt, &p, bitness) {
+    for (p, result) in planned.iter().zip(install_planned(rt, &planned, bitness)) {
+        match result {
             Ok(hook) => outcome.installed.push(hook),
             Err(reason) => outcome.skipped.push((p.slot.report_id(), reason)),
         }
     }
-    suspender.resume();
     outcome
 }
 
@@ -753,11 +771,12 @@ pub unsafe fn uninstall_inline_hooks(installed: &[InlineHook]) -> Vec<u32> {
     if installed.is_empty() {
         return Vec::new();
     }
+    let _guard = ReentrancyGuard::try_enter();
+    let mut unrestored = Vec::with_capacity(installed.len());
     // スレッドを止められない場合は何も復元しない（全件を未復元として報告）。
     let Ok(suspender) = SuspendedThreads::suspend_all() else {
         return installed.iter().map(|h| h.api_id).collect();
     };
-    let mut unrestored = Vec::new();
     for h in installed {
         match patch_target(h.target, &h.original_bytes) {
             Ok(()) => {}
@@ -960,29 +979,12 @@ pub unsafe fn install_com_factory_hooks(rt: &HookRuntime) -> ComFactoryOutcome {
             Err(e) => outcome.skipped.push((def.function, e.reason())),
         }
     }
-    if planned.is_empty() {
-        return outcome;
-    }
-    let Ok(suspender) = SuspendedThreads::suspend_all() else {
-        for p in planned {
-            outcome
-                .skipped
-                .push((planned_inline_name(&p), "thread-suspend-failed"));
-        }
-        return outcome;
-    };
-    for p in planned {
-        let name = planned_inline_name(&p);
-        if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
-            outcome.skipped.push((name, "thread-in-target"));
-            continue;
-        }
-        match install_one_inline(rt, &p, bitness) {
+    for (p, result) in planned.iter().zip(install_planned(rt, &planned, bitness)) {
+        match result {
             Ok(hook) => outcome.installed.push(hook),
-            Err(reason) => outcome.skipped.push((name, reason)),
+            Err(reason) => outcome.skipped.push((planned_inline_name(p), reason)),
         }
     }
-    suspender.resume();
     outcome
 }
 
@@ -1050,29 +1052,12 @@ pub unsafe fn install_winrt_activation_hooks(rt: &HookRuntime) -> WinRtActivatio
             Err(e) => outcome.skipped.push((def.function, e.reason())),
         }
     }
-    if planned.is_empty() {
-        return outcome;
-    }
-    let Ok(suspender) = SuspendedThreads::suspend_all() else {
-        for p in planned {
-            outcome
-                .skipped
-                .push((planned_inline_name(&p), "thread-suspend-failed"));
-        }
-        return outcome;
-    };
-    for p in planned {
-        let name = planned_inline_name(&p);
-        if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
-            outcome.skipped.push((name, "thread-in-target"));
-            continue;
-        }
-        match install_one_inline(rt, &p, bitness) {
+    for (p, result) in planned.iter().zip(install_planned(rt, &planned, bitness)) {
+        match result {
             Ok(hook) => outcome.installed.push(hook),
-            Err(reason) => outcome.skipped.push((name, reason)),
+            Err(reason) => outcome.skipped.push((planned_inline_name(p), reason)),
         }
     }
-    suspender.resume();
     outcome
 }
 
@@ -1164,29 +1149,12 @@ pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
             Err(e) => outcome.skipped.push((def.function, e.reason())),
         }
     }
-    if planned.is_empty() {
-        return outcome;
-    }
-    let Ok(suspender) = SuspendedThreads::suspend_all() else {
-        for p in planned {
-            outcome
-                .skipped
-                .push((planned_inline_name(&p), "thread-suspend-failed"));
-        }
-        return outcome;
-    };
-    for p in planned {
-        let name = planned_inline_name(&p);
-        if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
-            outcome.skipped.push((name, "thread-in-target"));
-            continue;
-        }
-        match install_one_inline(rt, &p, bitness) {
+    for (p, result) in planned.iter().zip(install_planned(rt, &planned, bitness)) {
+        match result {
             Ok(hook) => outcome.installed.push(hook),
-            Err(reason) => outcome.skipped.push((name, reason)),
+            Err(reason) => outcome.skipped.push((planned_inline_name(p), reason)),
         }
     }
-    suspender.resume();
     outcome
 }
 
@@ -1311,8 +1279,8 @@ fn diagnostic_confirm_identity(rt: &HookRuntime, ptr: usize, originals: &[usize]
         _ => return,
     };
     type QueryInterfaceFn =
-        unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32;
-    type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+        unsafe extern "system-unwind" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32;
+    type ReleaseFn = unsafe extern "system-unwind" fn(*mut c_void) -> u32;
     let mut unk: *mut c_void = std::ptr::null_mut();
     // SAFETY: qi / release は元の vtable から読んだ有効なメソッド。
     let hr = unsafe {
@@ -1334,13 +1302,16 @@ fn diagnostic_confirm_identity(rt: &HookRuntime, ptr: usize, originals: &[usize]
 
 type Handle = *mut c_void;
 type CreateFileWFn =
-    unsafe extern "system" fn(*const u16, u32, u32, *mut c_void, u32, u32, Handle) -> Handle;
-type ReadFileFn = unsafe extern "system" fn(Handle, *mut u8, u32, *mut u32, *mut c_void) -> i32;
-type WriteFileFn = unsafe extern "system" fn(Handle, *const u8, u32, *mut u32, *mut c_void) -> i32;
-type CloseHandleFn = unsafe extern "system" fn(Handle) -> i32;
-type GetOverlappedResultFn = unsafe extern "system" fn(Handle, *mut c_void, *mut u32, i32) -> i32;
+    unsafe extern "system-unwind" fn(*const u16, u32, u32, *mut c_void, u32, u32, Handle) -> Handle;
+type ReadFileFn =
+    unsafe extern "system-unwind" fn(Handle, *mut u8, u32, *mut u32, *mut c_void) -> i32;
+type WriteFileFn =
+    unsafe extern "system-unwind" fn(Handle, *const u8, u32, *mut u32, *mut c_void) -> i32;
+type CloseHandleFn = unsafe extern "system-unwind" fn(Handle) -> i32;
+type GetOverlappedResultFn =
+    unsafe extern "system-unwind" fn(Handle, *mut c_void, *mut u32, i32) -> i32;
 type GetQueuedCompletionStatusFn =
-    unsafe extern "system" fn(Handle, *mut u32, *mut u64, *mut *mut c_void, u32) -> i32;
+    unsafe extern "system-unwind" fn(Handle, *mut u32, *mut u64, *mut *mut c_void, u32) -> i32;
 
 fn detour_for(api_id: u32) -> usize {
     match api_id {
@@ -1375,9 +1346,9 @@ use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE};
 
 macro_rules! nt_detour {
     ($name:ident, $api:expr, ($($arg:ident: $ty:ty => $raw:expr),* $(,)?)) => {
-        unsafe extern "system" fn $name($($arg: $ty),*) -> i32 {
+        unsafe extern "system-unwind" fn $name($($arg: $ty),*) -> i32 {
             generic_detour_with($api, &[$($raw),*], |original| {
-                let original: unsafe extern "system" fn($($ty),*) -> i32 =
+                let original: unsafe extern "system-unwind" fn($($ty),*) -> i32 =
                     unsafe { std::mem::transmute(original) };
                 (unsafe { original($($arg),*) }) as usize
             }) as i32
@@ -1450,18 +1421,27 @@ nt_detour!(detour_nt_set_information_file, API_NT_SET_INFORMATION_FILE, (
 // engine_generated.inc supplies typed invokers to generic_detour_with. The
 // legacy arity helpers below are retained for the exclusive COM prototype.
 
-type GenericFn0 = unsafe extern "system" fn() -> usize;
-type GenericFn1 = unsafe extern "system" fn(usize) -> usize;
-type GenericFn2 = unsafe extern "system" fn(usize, usize) -> usize;
-type GenericFn3 = unsafe extern "system" fn(usize, usize, usize) -> usize;
-type GenericFn4 = unsafe extern "system" fn(usize, usize, usize, usize) -> usize;
-type GenericFn5 = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> usize;
-type GenericFn6 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> usize;
+type GenericFn0 = unsafe extern "system-unwind" fn() -> usize;
+type GenericFn1 = unsafe extern "system-unwind" fn(usize) -> usize;
+type GenericFn2 = unsafe extern "system-unwind" fn(usize, usize) -> usize;
+type GenericFn3 = unsafe extern "system-unwind" fn(usize, usize, usize) -> usize;
+type GenericFn4 = unsafe extern "system-unwind" fn(usize, usize, usize, usize) -> usize;
+type GenericFn5 = unsafe extern "system-unwind" fn(usize, usize, usize, usize, usize) -> usize;
+type GenericFn6 =
+    unsafe extern "system-unwind" fn(usize, usize, usize, usize, usize, usize) -> usize;
 type GenericFn7 =
-    unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize) -> usize;
-type GenericFn8 =
-    unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-type GenericFn9 = unsafe extern "system" fn(
+    unsafe extern "system-unwind" fn(usize, usize, usize, usize, usize, usize, usize) -> usize;
+type GenericFn8 = unsafe extern "system-unwind" fn(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) -> usize;
+type GenericFn9 = unsafe extern "system-unwind" fn(
     usize,
     usize,
     usize,
@@ -1472,20 +1452,7 @@ type GenericFn9 = unsafe extern "system" fn(
     usize,
     usize,
 ) -> usize;
-type GenericFn10 = unsafe extern "system" fn(
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-) -> usize;
-type GenericFn11 = unsafe extern "system" fn(
-    usize,
+type GenericFn10 = unsafe extern "system-unwind" fn(
     usize,
     usize,
     usize,
@@ -1497,7 +1464,20 @@ type GenericFn11 = unsafe extern "system" fn(
     usize,
     usize,
 ) -> usize;
-type GenericFn12 = unsafe extern "system" fn(
+type GenericFn11 = unsafe extern "system-unwind" fn(
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) -> usize;
+type GenericFn12 = unsafe extern "system-unwind" fn(
     usize,
     usize,
     usize,
@@ -1516,7 +1496,7 @@ type GenericFn12 = unsafe extern "system" fn(
 /// 関数ポインタであり、N は生成表の引数個数と一致する。
 ///
 /// # Safety
-/// 呼び出し側は `original` がこの `N` の `extern "system" fn` である
+/// 呼び出し側は `original` がこの `N` の `extern "system-unwind" fn` である
 /// ことを保証すること（生成表とトランポリンが保証する）。
 unsafe fn call_original<const N: usize>(original: usize, args: &[usize; N]) -> usize {
     // SAFETY: 各分岐は N に対応する引数個数の関数型へ transmute し、
@@ -1624,7 +1604,7 @@ include!("engine_generated.inc");
 // ---- L02: COM メソッド・Factory の Detour ----
 //
 // COM メソッドの Detour は (vtable インデックス, arity) の組ごとに
-// 1 個の `extern "system" fn` である。Detour は `this` から追跡表を
+// 1 個の `extern "system-unwind" fn` である。Detour は `this` から追跡表を
 // 引き、インターフェイス名・メソッド名を復元して記録する。同じ
 // (index, arity) の組は全インターフェイスで共有できる（例：index 6
 // arity 2 は IShellLinkW::GetDescription と IPersistFile::Save の両方）。
@@ -1658,7 +1638,7 @@ enum ComPrepare {
 fn prepare_com(factory_index: usize) -> ComPrepare {
     let le = crate::runtime::LastErrorGuard::capture(WinLastError);
     let Some(guard) = ReentrancyGuard::try_enter() else {
-        let Some(rt) = runtime() else {
+        let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
             return ComPrepare::Unavailable;
         };
         let original = rt.com_original(factory_index);
@@ -1668,7 +1648,7 @@ fn prepare_com(factory_index: usize) -> ComPrepare {
         le.restore_before_original();
         return ComPrepare::Passthrough { original };
     };
-    let Some(rt) = runtime() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
         return ComPrepare::Unavailable;
     };
     let original = rt.com_original(factory_index);
@@ -1700,10 +1680,20 @@ fn prepare_com(factory_index: usize) -> ComPrepare {
     }
 }
 
-type CoCreateInstanceFn =
-    unsafe extern "system" fn(*const Guid, *mut c_void, u32, *const Guid, *mut *mut c_void) -> i32;
-type CoGetClassObjectFn =
-    unsafe extern "system" fn(*const Guid, u32, *mut c_void, *const Guid, *mut *mut c_void) -> i32;
+type CoCreateInstanceFn = unsafe extern "system-unwind" fn(
+    *const Guid,
+    *mut c_void,
+    u32,
+    *const Guid,
+    *mut *mut c_void,
+) -> i32;
+type CoGetClassObjectFn = unsafe extern "system-unwind" fn(
+    *const Guid,
+    u32,
+    *mut c_void,
+    *const Guid,
+    *mut *mut c_void,
+) -> i32;
 
 /// Factory 呼び出しが返したインターフェイスを追跡対象に加え、既知
 /// インターフェイスなら vtable 複製による Detour を設置する。
@@ -1747,7 +1737,7 @@ fn on_activation_result(
     }
 }
 
-unsafe extern "system" fn detour_co_create_instance(
+unsafe extern "system-unwind" fn detour_co_create_instance(
     clsid: *const Guid,
     unk_outer: *mut c_void,
     cls_context: u32,
@@ -1827,7 +1817,7 @@ unsafe extern "system" fn detour_co_create_instance(
     hr
 }
 
-unsafe extern "system" fn detour_co_get_class_object(
+unsafe extern "system-unwind" fn detour_co_get_class_object(
     clsid: *const Guid,
     cls_context: u32,
     server_info: *mut c_void,
@@ -1907,8 +1897,8 @@ unsafe extern "system" fn detour_co_get_class_object(
     hr
 }
 
-type RoActivateInstanceFn = unsafe extern "system" fn(usize, *mut *mut c_void) -> i32;
-type RoGetActivationFactoryFn = unsafe extern "system" fn(usize, *mut *mut c_void) -> i32;
+type RoActivateInstanceFn = unsafe extern "system-unwind" fn(usize, *mut *mut c_void) -> i32;
+type RoGetActivationFactoryFn = unsafe extern "system-unwind" fn(usize, *mut *mut c_void) -> i32;
 
 /// WinRT アクティベーション関数の Detour 共通の前処理。COM の
 /// `prepare_com` と同じ判定だが、元関数は WinRT 別表から引く。
@@ -1930,7 +1920,7 @@ enum WinRtPrepare {
 fn prepare_winrt(activation_index: usize) -> WinRtPrepare {
     let le = crate::runtime::LastErrorGuard::capture(WinLastError);
     let Some(guard) = ReentrancyGuard::try_enter() else {
-        let Some(rt) = runtime() else {
+        let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
             return WinRtPrepare::Unavailable;
         };
         let original = rt.winrt_original(activation_index);
@@ -1940,7 +1930,7 @@ fn prepare_winrt(activation_index: usize) -> WinRtPrepare {
         le.restore_before_original();
         return WinRtPrepare::Passthrough { original };
     };
-    let Some(rt) = runtime() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
         return WinRtPrepare::Unavailable;
     };
     let original = rt.winrt_original(activation_index);
@@ -2049,7 +2039,7 @@ unsafe fn detour_winrt_activation(
     hr
 }
 
-unsafe extern "system" fn detour_ro_activate_instance(
+unsafe extern "system-unwind" fn detour_ro_activate_instance(
     class_id: usize,
     out: *mut *mut c_void,
 ) -> i32 {
@@ -2063,7 +2053,7 @@ unsafe extern "system" fn detour_ro_activate_instance(
     }
 }
 
-unsafe extern "system" fn detour_ro_get_activation_factory(
+unsafe extern "system-unwind" fn detour_ro_get_activation_factory(
     class_id: usize,
     out: *mut *mut c_void,
 ) -> i32 {
@@ -2108,7 +2098,7 @@ enum CallbackPrepare {
 fn prepare_callback_hook(hook_index: usize) -> CallbackPrepare {
     let le = crate::runtime::LastErrorGuard::capture(WinLastError);
     let Some(guard) = ReentrancyGuard::try_enter() else {
-        let Some(rt) = runtime() else {
+        let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
             return CallbackPrepare::Unavailable;
         };
         let original = rt.callback_original(hook_index);
@@ -2118,7 +2108,7 @@ fn prepare_callback_hook(hook_index: usize) -> CallbackPrepare {
         le.restore_before_original();
         return CallbackPrepare::Passthrough { original };
     };
-    let Some(rt) = runtime() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
         return CallbackPrepare::Unavailable;
     };
     let original = rt.callback_original(hook_index);
@@ -2158,7 +2148,7 @@ fn prepare_callback_dispatch(original: usize) -> CallbackPrepare {
         le.restore_before_original();
         return CallbackPrepare::Passthrough { original };
     };
-    let Some(rt) = runtime() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
         // ランタイムが無い（終了手順の後など）：記録せず素通しで呼ぶ。
         le.restore_before_original();
         return CallbackPrepare::Passthrough { original };
@@ -2189,15 +2179,15 @@ fn prepare_callback_dispatch(original: usize) -> CallbackPrepare {
     }
 }
 
-/// WndProc の型（`extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT`）。
-type WndProcFn = unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize;
-type RegisterClassExFn = unsafe extern "system" fn(*const c_void) -> u16;
-type SetWindowLongPtrFn = unsafe extern "system" fn(*mut c_void, i32, usize) -> usize;
+/// WndProc の型（`extern "system-unwind" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT`）。
+type WndProcFn = unsafe extern "system-unwind" fn(*mut c_void, u32, usize, isize) -> isize;
+type RegisterClassExFn = unsafe extern "system-unwind" fn(*const c_void) -> u16;
+type SetWindowLongPtrFn = unsafe extern "system-unwind" fn(*mut c_void, i32, usize) -> usize;
 
 /// WndProc ラッパー 1 件。スロット番号を固定で持ち、共通の dispatch へ渡す。
 macro_rules! wnd_proc_wrapper {
     ($name:ident, $slot:expr) => {
-        unsafe extern "system" fn $name(
+        unsafe extern "system-unwind" fn $name(
             hwnd: *mut c_void,
             msg: u32,
             wparam: usize,
@@ -2408,11 +2398,11 @@ unsafe fn detour_register_class_ex(hook_index: usize, wc: *const c_void) -> u16 
     result
 }
 
-unsafe extern "system" fn detour_register_class_ex_w(wc: *const c_void) -> u16 {
+unsafe extern "system-unwind" fn detour_register_class_ex_w(wc: *const c_void) -> u16 {
     unsafe { detour_register_class_ex(CALLBACK_HOOK_REGISTER_CLASS_EX_W, wc) }
 }
 
-unsafe extern "system" fn detour_register_class_ex_a(wc: *const c_void) -> u16 {
+unsafe extern "system-unwind" fn detour_register_class_ex_a(wc: *const c_void) -> u16 {
     unsafe { detour_register_class_ex(CALLBACK_HOOK_REGISTER_CLASS_EX_A, wc) }
 }
 
@@ -2470,7 +2460,7 @@ unsafe fn detour_set_window_long_ptr(
     resolve_prev_proc(prev, original_for_wrapper)
 }
 
-type GetLongPtrFn = unsafe extern "system" fn(*mut c_void, i32) -> usize;
+type GetLongPtrFn = unsafe extern "system-unwind" fn(*mut c_void, i32) -> usize;
 
 unsafe fn detour_get_long_ptr(
     index: usize,
@@ -2512,20 +2502,32 @@ unsafe fn detour_get_long_ptr(
     }
     value
 }
-unsafe extern "system" fn detour_get_window_long_ptr_w(hwnd: *mut c_void, field: i32) -> usize {
+unsafe extern "system-unwind" fn detour_get_window_long_ptr_w(
+    hwnd: *mut c_void,
+    field: i32,
+) -> usize {
     unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W, hwnd, field, -4) }
 }
-unsafe extern "system" fn detour_get_window_long_ptr_a(hwnd: *mut c_void, field: i32) -> usize {
+unsafe extern "system-unwind" fn detour_get_window_long_ptr_a(
+    hwnd: *mut c_void,
+    field: i32,
+) -> usize {
     unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_WINDOW_LONG_PTR_A, hwnd, field, -4) }
 }
-unsafe extern "system" fn detour_get_class_long_ptr_w(hwnd: *mut c_void, field: i32) -> usize {
+unsafe extern "system-unwind" fn detour_get_class_long_ptr_w(
+    hwnd: *mut c_void,
+    field: i32,
+) -> usize {
     unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_CLASS_LONG_PTR_W, hwnd, field, -24) }
 }
-unsafe extern "system" fn detour_get_class_long_ptr_a(hwnd: *mut c_void, field: i32) -> usize {
+unsafe extern "system-unwind" fn detour_get_class_long_ptr_a(
+    hwnd: *mut c_void,
+    field: i32,
+) -> usize {
     unsafe { detour_get_long_ptr(CALLBACK_HOOK_GET_CLASS_LONG_PTR_A, hwnd, field, -24) }
 }
 
-unsafe extern "system" fn detour_set_window_long_ptr_w(
+unsafe extern "system-unwind" fn detour_set_window_long_ptr_w(
     hwnd: *mut c_void,
     n_index: i32,
     new_long: usize,
@@ -2535,7 +2537,7 @@ unsafe extern "system" fn detour_set_window_long_ptr_w(
     }
 }
 
-unsafe extern "system" fn detour_set_window_long_ptr_a(
+unsafe extern "system-unwind" fn detour_set_window_long_ptr_a(
     hwnd: *mut c_void,
     n_index: i32,
     new_long: usize,
@@ -2548,7 +2550,7 @@ unsafe extern "system" fn detour_set_window_long_ptr_a(
 /// 元の COM メソッドを呼ぶ。`args` は `this` を除く引数（最大 4 個）。
 ///
 /// # Safety
-/// `original` はこの引数個数の `extern "system" fn` であること
+/// `original` はこの引数個数の `extern "system-unwind" fn` であること
 /// （呼び出し側は追跡表のメソッド定義で arity を確認している）。
 unsafe fn call_com_original(original: usize, this: usize, args: &[usize]) -> i32 {
     // SAFETY: 各分岐は引数個数に対応する関数型へ transmute し、その個数で呼ぶ。
@@ -2672,7 +2674,7 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
         // SAFETY: original はこの引数個数の COM メソッド。
         return unsafe { call_com_original(original, this, args) };
     };
-    let Some(rt) = runtime() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
         le.restore_before_original();
         // SAFETY: 同上。
         return unsafe { call_com_original(original, this, args) };
@@ -2752,27 +2754,32 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
 
 macro_rules! com_method_detour {
     ($name:ident, $index:expr, 0) => {
-        unsafe extern "system" fn $name(this: *mut c_void) -> i32 {
+        unsafe extern "system-unwind" fn $name(this: *mut c_void) -> i32 {
             com_method_dispatch(this as usize, $index, &[])
         }
     };
     ($name:ident, $index:expr, 1) => {
-        unsafe extern "system" fn $name(this: *mut c_void, a0: usize) -> i32 {
+        unsafe extern "system-unwind" fn $name(this: *mut c_void, a0: usize) -> i32 {
             com_method_dispatch(this as usize, $index, &[a0])
         }
     };
     ($name:ident, $index:expr, 2) => {
-        unsafe extern "system" fn $name(this: *mut c_void, a0: usize, a1: usize) -> i32 {
+        unsafe extern "system-unwind" fn $name(this: *mut c_void, a0: usize, a1: usize) -> i32 {
             com_method_dispatch(this as usize, $index, &[a0, a1])
         }
     };
     ($name:ident, $index:expr, 3) => {
-        unsafe extern "system" fn $name(this: *mut c_void, a0: usize, a1: usize, a2: usize) -> i32 {
+        unsafe extern "system-unwind" fn $name(
+            this: *mut c_void,
+            a0: usize,
+            a1: usize,
+            a2: usize,
+        ) -> i32 {
             com_method_dispatch(this as usize, $index, &[a0, a1, a2])
         }
     };
     ($name:ident, $index:expr, 4) => {
-        unsafe extern "system" fn $name(
+        unsafe extern "system-unwind" fn $name(
             this: *mut c_void,
             a0: usize,
             a1: usize,
@@ -2826,11 +2833,12 @@ com_method_detour!(com_d_20_1, 20, 1);
 com_method_detour!(com_d_21_2, 21, 2);
 com_method_detour!(com_d_22_2, 22, 2);
 
-type ComDetourFn0 = unsafe extern "system" fn(*mut c_void) -> i32;
-type ComDetourFn1 = unsafe extern "system" fn(*mut c_void, usize) -> i32;
-type ComDetourFn2 = unsafe extern "system" fn(*mut c_void, usize, usize) -> i32;
-type ComDetourFn3 = unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> i32;
-type ComDetourFn4 = unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> i32;
+type ComDetourFn0 = unsafe extern "system-unwind" fn(*mut c_void) -> i32;
+type ComDetourFn1 = unsafe extern "system-unwind" fn(*mut c_void, usize) -> i32;
+type ComDetourFn2 = unsafe extern "system-unwind" fn(*mut c_void, usize, usize) -> i32;
+type ComDetourFn3 = unsafe extern "system-unwind" fn(*mut c_void, usize, usize, usize) -> i32;
+type ComDetourFn4 =
+    unsafe extern "system-unwind" fn(*mut c_void, usize, usize, usize, usize) -> i32;
 
 /// (vtable インデックス, arity) の組に対応する Detour を引く。
 /// 既知インターフェイスの全メソッドに Detour があること。
@@ -2967,7 +2975,7 @@ fn prepare(api_id: u32) -> Prepare {
     // だけ Detour 側が suspend する）。再入の判定はこの入口に集約し、
     // 各 Detour は Prepare の結果に従うだけにする。
     let Some(guard) = ReentrancyGuard::try_enter() else {
-        let Some(rt) = runtime() else {
+        let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
             return Prepare::Unavailable;
         };
         let original = rt.original(api_id);
@@ -2977,7 +2985,7 @@ fn prepare(api_id: u32) -> Prepare {
         le.restore_before_original();
         return Prepare::Passthrough { original };
     };
-    let Some(rt) = runtime() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
         return Prepare::Unavailable;
     };
     let original = rt.original(api_id);
@@ -3026,7 +3034,7 @@ fn prepare(api_id: u32) -> Prepare {
 
 const INVALID_HANDLE: usize = usize::MAX;
 
-unsafe extern "system" fn detour_create_file_w(
+unsafe extern "system-unwind" fn detour_create_file_w(
     file_name: *const u16,
     desired_access: u32,
     share_mode: u32,
@@ -3112,7 +3120,7 @@ unsafe extern "system" fn detour_create_file_w(
     ret
 }
 
-unsafe extern "system" fn detour_read_file(
+unsafe extern "system-unwind" fn detour_read_file(
     file: Handle,
     buffer: *mut u8,
     bytes_to_read: u32,
@@ -3139,7 +3147,8 @@ unsafe extern "system" fn detour_read_file(
     // SAFETY: 設置時に保存した本物の ReadFile。
     let orig: ReadFileFn = unsafe { std::mem::transmute(original) };
     let call_id = rt.alloc_call_id();
-    let values = capture::read_file_enter(file as u64, buffer as u64, bytes_to_read);
+    let values =
+        capture::read_file_enter(file as u64, buffer as u64, bytes_to_read, overlapped as u64);
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
@@ -3148,6 +3157,18 @@ unsafe extern "system" fn detour_read_file(
     // CallAborted を記録する（例外は捕捉しない）。
     let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    let pending_submission = rt.begin_pending_overlapped(
+        overlapped as u64,
+        capture::PendingOverlapped {
+            api_id: API_READ_FILE,
+            call_id,
+            handle: file as u64,
+            buffer: buffer as u64,
+            requested_len: bytes_to_read,
+            direction: capture::OverlappedDirection::Read,
+            bytes_addr: bytes_read as u64,
+        },
+    );
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
@@ -3195,26 +3216,13 @@ unsafe extern "system" fn detour_read_file(
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.record_leave(tid, api, call_id, &bytes);
     }
-    if is_overlapped && ret == 0 && last_error == capture::ERROR_IO_PENDING {
-        rt.register_pending_overlapped(
-            overlapped as u64,
-            capture::PendingOverlapped {
-                api_id: API_READ_FILE,
-                call_id,
-                handle: file as u64,
-                buffer: buffer as u64,
-                requested_len: bytes_to_read,
-                direction: capture::OverlappedDirection::Read,
-                bytes_addr: bytes_read as u64,
-            },
-        );
-    }
+    pending_submission.finish(ret == 0 && last_error == capture::ERROR_IO_PENDING);
     // SAFETY: LastError を復元する。
     le.restore_for_return();
     ret
 }
 
-unsafe extern "system" fn detour_write_file(
+unsafe extern "system-unwind" fn detour_write_file(
     file: Handle,
     buffer: *const u8,
     bytes_to_write: u32,
@@ -3242,8 +3250,13 @@ unsafe extern "system" fn detour_write_file(
     let orig: WriteFileFn = unsafe { std::mem::transmute(original) };
     let call_id = rt.alloc_call_id();
     // 入力バッファは呼び出し前に取得する（before）
-    let values =
-        capture::write_file_enter(&ProcessMemory, file as u64, buffer as u64, bytes_to_write);
+    let values = capture::write_file_enter(
+        &ProcessMemory,
+        file as u64,
+        buffer as u64,
+        bytes_to_write,
+        overlapped as u64,
+    );
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
@@ -3252,6 +3265,18 @@ unsafe extern "system" fn detour_write_file(
     // CallAborted を記録する（例外は捕捉しない）。
     let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
+    let pending_submission = rt.begin_pending_overlapped(
+        overlapped as u64,
+        capture::PendingOverlapped {
+            api_id: API_WRITE_FILE,
+            call_id,
+            handle: file as u64,
+            buffer: buffer as u64,
+            requested_len: bytes_to_write,
+            direction: capture::OverlappedDirection::Write,
+            bytes_addr: bytes_written as u64,
+        },
+    );
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
@@ -3290,26 +3315,13 @@ unsafe extern "system" fn detour_write_file(
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.record_leave(tid, api, call_id, &bytes);
     }
-    if is_overlapped && ret == 0 && last_error == capture::ERROR_IO_PENDING {
-        rt.register_pending_overlapped(
-            overlapped as u64,
-            capture::PendingOverlapped {
-                api_id: API_WRITE_FILE,
-                call_id,
-                handle: file as u64,
-                buffer: buffer as u64,
-                requested_len: bytes_to_write,
-                direction: capture::OverlappedDirection::Write,
-                bytes_addr: bytes_written as u64,
-            },
-        );
-    }
+    pending_submission.finish(ret == 0 && last_error == capture::ERROR_IO_PENDING);
     // SAFETY: LastError を復元する。
     le.restore_for_return();
     ret
 }
 
-unsafe extern "system" fn detour_close_handle(object: Handle) -> i32 {
+unsafe extern "system-unwind" fn detour_close_handle(object: Handle) -> i32 {
     let (rt, original, tid, api, _flight, mut guard, mut le) = match prepare(API_CLOSE_HANDLE) {
         Prepare::Record {
             rt,
@@ -3361,7 +3373,7 @@ unsafe extern "system" fn detour_close_handle(object: Handle) -> i32 {
 /// 操作の完了を `CallCompleted` として記録する。FALSE でも
 /// ERROR_IO_INCOMPLETE 以外なら操作自体がエラーで終わった完了として
 /// 記録する。未完了 (996) の場合は何もしない（操作はまだ保留中）。
-unsafe extern "system" fn detour_get_overlapped_result(
+unsafe extern "system-unwind" fn detour_get_overlapped_result(
     file: Handle,
     overlapped: *mut c_void,
     bytes_transferred: *mut u32,
@@ -3435,7 +3447,7 @@ unsafe extern "system" fn detour_get_overlapped_result(
 /// OVERLAPPED 操作の完了を `CallCompleted` として記録する。戻り値が
 /// FALSE でも lpOverlapped が非 NULL なら完了した I/O の失敗として
 /// 記録する。タイムアウト等で lpOverlapped が NULL の場合は何もしない。
-unsafe extern "system" fn detour_get_queued_completion_status(
+unsafe extern "system-unwind" fn detour_get_queued_completion_status(
     port: Handle,
     bytes_transferred: *mut u32,
     completion_key: *mut u64,
@@ -3552,6 +3564,52 @@ mod tests {
     }
 
     #[test]
+    fn completion_can_arrive_inside_original_read_file() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        unsafe extern "system-unwind" fn original(
+            _: Handle,
+            _: *mut u8,
+            _: u32,
+            _: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32 {
+            let rt = runtime().unwrap();
+            let mut completed = rt
+                .take_pending_overlapped(overlapped as u64)
+                .expect("submission must already be registered before entering the OS");
+            completed.call_id += 1000;
+            rt.register_pending_overlapped(overlapped as u64, completed);
+            unsafe {
+                SetLastError(capture::ERROR_IO_PENDING);
+            }
+            0
+        }
+        let rt = Arc::new(test_runtime());
+        rt.set_original(API_READ_FILE, original as *const () as usize);
+        assert!(set_runtime(rt.clone()).is_ok());
+        let mut overlapped = [0usize; 8];
+        let address = overlapped.as_mut_ptr() as *mut c_void;
+        assert_eq!(
+            unsafe {
+                detour_read_file(
+                    1usize as Handle,
+                    std::ptr::null_mut(),
+                    4,
+                    std::ptr::null_mut(),
+                    address,
+                )
+            },
+            0
+        );
+        let pending = rt.take_pending_overlapped(address as u64).unwrap();
+        assert!(
+            pending.call_id >= 1000,
+            "late return must not overwrite reuse"
+        );
+        assert!(clear_runtime(&rt));
+    }
+
+    #[test]
     fn suspended_thread_context_has_native_alignment_and_valid_ip() {
         use std::sync::atomic::{AtomicBool, Ordering};
         assert!(std::mem::align_of::<AlignedContext>() >= 16);
@@ -3604,7 +3662,7 @@ mod tests {
     #[test]
     fn ntstatus_and_native_arguments_survive_record_and_passthrough() {
         let _global = TEST_RUNTIME_LOCK.lock().unwrap();
-        unsafe extern "system" fn close(handle: Handle) -> i32 {
+        unsafe extern "system-unwind" fn close(handle: Handle) -> i32 {
             assert_eq!(handle as usize, usize::MAX - 1);
             -0x1234567
         }
@@ -3616,7 +3674,7 @@ mod tests {
         let rt = Arc::new(HookRuntime::new(agent, Vec::new(), None).with_detailed_mode(true));
         rt.set_original(API_NT_CLOSE, close as *const () as usize);
         assert!(set_runtime(Arc::clone(&rt)).is_ok());
-        let detour: unsafe extern "system" fn(Handle) -> i32 = detour_nt_close;
+        let detour: unsafe extern "system-unwind" fn(Handle) -> i32 = detour_nt_close;
         assert_eq!(unsafe { detour((usize::MAX - 1) as Handle) }, -0x1234567);
         rt.shutdown_recording();
         assert_eq!(unsafe { detour((usize::MAX - 1) as Handle) }, -0x1234567);
@@ -3626,7 +3684,7 @@ mod tests {
     #[test]
     fn shared_com_methods_continue_without_vtable_mutation() {
         use crate::com::IID_IUNKNOWN;
-        unsafe extern "system" fn method(_: usize) -> u32 {
+        unsafe extern "system-unwind" fn method(_: usize) -> u32 {
             123
         }
         let vtable = Arc::new([method as *const () as usize; 3]);
@@ -3639,7 +3697,7 @@ mod tests {
         let other = Arc::clone(&object);
         let reader = std::thread::spawn(move || {
             for _ in 0..10000 {
-                let method: unsafe extern "system" fn(usize) -> u32 =
+                let method: unsafe extern "system-unwind" fn(usize) -> u32 =
                     unsafe { std::mem::transmute(*(*other as *const usize).add(1)) };
                 assert_eq!(unsafe { method(Arc::as_ptr(&other) as usize) }, 123);
             }

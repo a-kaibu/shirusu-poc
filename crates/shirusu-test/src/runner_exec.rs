@@ -286,6 +286,8 @@ pub enum ArgValue {
 /// 戻り値への期待。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetExpect {
+    /// A Win32 handle other than NULL or INVALID_HANDLE_VALUE.
+    ValidHandle,
     NonZero,
     Zero,
     Equals(u64),
@@ -1074,6 +1076,7 @@ fn execute_one(
     if let Some(expect) = &call.expect {
         if let Some(ret) = expect.ret {
             let ok = match ret {
+                RetExpect::ValidHandle => returned != 0 && returned != usize::MAX as u64,
                 RetExpect::NonZero => returned != 0,
                 RetExpect::Zero => returned == 0,
                 RetExpect::Equals(v) => returned == v,

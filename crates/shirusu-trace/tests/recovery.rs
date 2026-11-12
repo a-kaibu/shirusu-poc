@@ -495,6 +495,7 @@ fn reader_limits_stop_scan() {
         max_blocks: 3,
         max_events: 100,
         max_blobs: 10,
+        ..Default::default()
     };
     let trace = read_trace_with_limits(&bytes, limits).unwrap();
     assert!(trace
@@ -506,6 +507,7 @@ fn reader_limits_stop_scan() {
         max_blocks: 100,
         max_events: 1,
         max_blobs: 10,
+        ..Default::default()
     };
     let trace = read_trace_with_limits(&bytes, limits).unwrap();
     assert!(trace

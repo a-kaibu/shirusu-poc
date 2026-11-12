@@ -93,6 +93,7 @@ fn expect_to_rust(expect: &Expect) -> String {
     let mut out = String::new();
     out.push_str("Expect { ret: ");
     match expect.ret {
+        Some(RetExpect::ValidHandle) => out.push_str("Some(RetExpect::ValidHandle)"),
         Some(RetExpect::NonZero) => out.push_str("Some(RetExpect::NonZero)"),
         Some(RetExpect::Zero) => out.push_str("Some(RetExpect::Zero)"),
         Some(RetExpect::Equals(n)) => out.push_str(&format!("Some(RetExpect::Equals({n}))")),

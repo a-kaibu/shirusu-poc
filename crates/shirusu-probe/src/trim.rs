@@ -21,7 +21,6 @@
 //! 呼び出し側がその旨をバンドルへ正直に記録する。
 
 use crate::select::involved_calls;
-use shirusu_analysis::TraceView;
 use shirusu_compare::{compare_traces, Candidate, NormTrace};
 use shirusu_trace::compact::decode_values;
 use shirusu_trace::error::TraceError;
@@ -31,7 +30,7 @@ use shirusu_trace::reader::ReadTrace;
 use shirusu_trace::schema::TypedValue;
 use shirusu_trace::writer::{FinalizationInfo, TraceWriter};
 use shirusu_trace::BlobId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// トリム結果。
 #[derive(Debug)]
@@ -50,23 +49,20 @@ pub fn trim_trace(
 ) -> Result<TrimmedTrace, TraceError> {
     let norm = NormTrace::build(source);
     let call_indices = involved_calls(&norm, cand, side);
-    // 関与呼び出しのイベントを (正準スレッド序数, sequence) で特定する。
-    let view = TraceView::build(source);
-    let mut ordinal_of: HashMap<(u64, u64, u64), usize> = HashMap::new();
-    let mut view_index_of: HashMap<(usize, u64), usize> = HashMap::new();
-    for ev in &view.events {
-        let key = (ev.session_id, ev.process_id, ev.thread_id);
-        let next = ordinal_of.len();
-        let ordinal = *ordinal_of.entry(key).or_insert(next);
-        view_index_of.insert((ordinal, ev.sequence), ev.index);
-    }
     let mut keep: HashSet<usize> = HashSet::new();
     for &ci in &call_indices {
         let call = &norm.calls[ci];
-        for nev in [&call.enter, &call.leave, &call.solo].into_iter().flatten() {
-            if let Some(&vi) = view_index_of.get(&(call.thread, nev.sequence)) {
-                keep.insert(vi);
-            }
+        for nev in [
+            &call.enter,
+            &call.leave,
+            &call.solo,
+            &call.completed,
+            &call.aborted,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            keep.insert(nev.source_index);
         }
     }
 

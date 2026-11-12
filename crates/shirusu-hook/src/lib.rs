@@ -36,3 +36,50 @@ pub mod winrt;
 
 #[cfg(windows)]
 pub mod engine;
+
+// Windows native tests count allocator activity in the actual suspended interval.
+// No panic/assertion runs until every suspended thread has been resumed.
+#[cfg(all(test, windows))]
+pub(crate) mod heap_watch {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local! {
+        static WATCH: Cell<bool> = const { Cell::new(false) };
+        static HITS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub struct Allocator;
+    fn hit() {
+        if WATCH.try_with(Cell::get).unwrap_or(false) {
+            let _ = HITS.try_with(|h| h.set(h.get() + 1));
+        }
+    }
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            hit();
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            hit();
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            hit();
+            unsafe { System.realloc(p, l, n) }
+        }
+    }
+    pub fn begin() {
+        HITS.with(|h| h.set(0));
+        WATCH.with(|w| w.set(true));
+    }
+    pub fn end() {
+        WATCH.with(|w| w.set(false));
+        assert_eq!(
+            HITS.with(Cell::get),
+            0,
+            "heap activity while threads suspended"
+        );
+    }
+}
+#[cfg(all(test, windows))]
+#[global_allocator]
+static TEST_ALLOCATOR: heap_watch::Allocator = heap_watch::Allocator;

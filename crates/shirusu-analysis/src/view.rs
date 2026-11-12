@@ -354,7 +354,13 @@ pub fn value_to_json(v: &TypedValue) -> JsonValue {
         TypedValue::F64Bits(bits) => JsonValue::Str(format!("f64(0x{bits:016x})")),
         TypedValue::Bool(b) => JsonValue::Bool(*b),
         TypedValue::Str(s) => JsonValue::Str(s.clone()),
-        TypedValue::Str16(units) => JsonValue::Str(String::from_utf16_lossy(units)),
+        TypedValue::Str16(units) => match String::from_utf16(units) {
+            Ok(s) => JsonValue::Str(s),
+            Err(_) => JsonValue::obj(vec![(
+                "utf16",
+                JsonValue::Array(units.iter().map(|&u| JsonValue::U64(u as u64)).collect()),
+            )]),
+        },
         TypedValue::Bytes(b) => JsonValue::Str(hex_prefix(b, usize::MAX)),
         TypedValue::BlobRef(id) => JsonValue::Str(format!("blob:{}", id.to_hex())),
         TypedValue::Ptr32(x) => JsonValue::Str(format!("0x{x:08x}")),

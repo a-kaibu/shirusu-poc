@@ -158,11 +158,9 @@ impl Drop for ReentrancyGuard {
 /// `CallAborted` を記録する。例外自体は一切捕捉しないため、呼び出し側
 /// へ伝わる例外は Detour が無い場合と同一である。
 ///
-/// 前提: Windows では Rust のフレームも SEH アンワインド情報を持つため、
-/// 外来の例外が Detour フレームを巻き戻すときにこの Drop は走る。
-/// 仮に走らなかった場合の失敗モードは「中断の記録漏れ」だけで、例外の
-/// 伝播や対象プロセスの挙動は変わらない（記録漏れは Host 側の
-/// UnknownTermination として別途扱われる）。
+/// Detours and original function pointers use `system-unwind`: external
+/// exceptions may cross these frames. Native Windows exception transparency
+/// still requires platform E2E validation; unwind metadata alone is insufficient.
 ///
 /// Drop 中の記録は失敗してもプロセスを落とさないこと: 巻き戻し中の
 /// Drop でパニックするとプロセスが abort するため、記録は
@@ -198,6 +196,7 @@ impl Drop for CallGuard {
             return;
         }
         self.armed = false;
+        let _guard = ReentrancyGuard::try_enter();
         pop_call(self.call_id);
         let rt = Arc::clone(&self.rt);
         let (thread_id, api, call_id) = (self.thread_id, self.api, self.call_id);
@@ -345,6 +344,7 @@ impl Drop for ComCallGuard {
             return;
         }
         self.armed = false;
+        let _guard = ReentrancyGuard::try_enter();
         pop_call(self.call_id);
         let rt = Arc::clone(&self.rt);
         let (thread_id, call_id, api_id, leave_schema_id) = (
@@ -421,13 +421,20 @@ impl Drop for DetourFlight {
 ///   （install_hooks が毎回スロット実値を読む）ため、旧セッションの
 ///   ポインタが残ることはない。
 pub struct RuntimeSlot {
-    current: RwLock<Option<Arc<HookRuntime>>>,
+    current: RwLock<RuntimeState>,
+}
+struct RuntimeState {
+    active: Option<Arc<HookRuntime>>,
+    retired: Option<Arc<HookRuntime>>,
 }
 
 impl RuntimeSlot {
     pub const fn new() -> Self {
         Self {
-            current: RwLock::new(None),
+            current: RwLock::new(RuntimeState {
+                active: None,
+                retired: None,
+            }),
         }
     }
 
@@ -435,24 +442,56 @@ impl RuntimeSlot {
     /// 渡したランタイムをそのまま `Err` で返す。
     pub fn register(&self, rt: Arc<HookRuntime>) -> Result<(), Arc<HookRuntime>> {
         let mut cur = self.current.write().unwrap();
-        if cur.is_some() {
+        if cur.active.is_some() {
             return Err(rt);
         }
-        *cur = Some(rt);
+        if let Some(old) = &cur.retired {
+            for id in 0..=API_COUNT {
+                if rt.original(id as u32) == 0 {
+                    rt.set_original(id as u32, old.original(id as u32));
+                }
+            }
+            for i in 0..COM_FACTORY_COUNT {
+                if rt.com_original(i) == 0 {
+                    rt.set_com_original(i, old.com_original(i));
+                }
+            }
+            for i in 0..WINRT_ACTIVATION_COUNT {
+                if rt.winrt_original(i) == 0 {
+                    rt.set_winrt_original(i, old.winrt_original(i));
+                }
+            }
+            for i in 0..CALLBACK_HOOK_COUNT {
+                if rt.callback_original(i) == 0 {
+                    rt.set_callback_original(i, old.callback_original(i));
+                }
+            }
+        }
+        cur.active = Some(rt);
         Ok(())
     }
 
     /// 現在のセッションのランタイム（Detour の入口が掴む）。
     pub fn current(&self) -> Option<Arc<HookRuntime>> {
-        self.current.read().unwrap().clone()
+        self.current.read().unwrap().active.clone()
+    }
+
+    /// Late detours retain a disabled runtime even after IAT restoration.
+    pub fn for_detour(&self) -> Option<Arc<HookRuntime>> {
+        let state = self.current.read().unwrap();
+        state.active.as_ref().or(state.retired.as_ref()).cloned()
     }
 
     /// 登録解除は「自分が登録したランタイム」に対してだけ行う
     /// （後継セッションの登録を誤って消さない）。解除したら true。
     pub fn unregister(&self, rt: &Arc<HookRuntime>) -> bool {
         let mut cur = self.current.write().unwrap();
-        if cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, rt)) {
-            *cur = None;
+        if cur.active.as_ref().is_some_and(|c| Arc::ptr_eq(c, rt)) {
+            rt.shutdown_recording();
+            let retired = cur.active.take();
+            let previous = std::mem::replace(&mut cur.retired, retired);
+            drop(cur); // dropping an old runtime can itself call hooked HeapFree
+            drop(previous);
             true
         } else {
             false
@@ -1028,6 +1067,18 @@ impl HookRuntime {
         self.pending_overlapped.register(overlapped_addr, pending);
     }
 
+    pub fn begin_pending_overlapped(
+        &self,
+        address: u64,
+        pending: PendingOverlapped,
+    ) -> crate::capture::PendingSubmission<'_> {
+        self.pending_overlapped.submit(address, pending)
+    }
+
+    pub fn cancel_pending_overlapped(&self, address: u64, call_id: u64) {
+        self.pending_overlapped.cancel(address, call_id);
+    }
+
     /// 完了した非同期 I/O 操作を取り出す（F27）。未登録なら None。
     pub fn take_pending_overlapped(&self, overlapped_addr: u64) -> Option<PendingOverlapped> {
         self.pending_overlapped.take(overlapped_addr)
@@ -1453,6 +1504,31 @@ mod tests {
         assert!(rt.wait_in_flight_drained(Duration::from_secs(5)));
         holder.join().unwrap();
         assert_eq!(rt.in_flight(), 0);
+    }
+
+    #[test]
+    fn late_detour_after_unregister_retains_original() {
+        let slot = Arc::new(RuntimeSlot::new());
+        let (_, rt) = runtime();
+        let rt = Arc::new(rt);
+        rt.set_original(API_READ_FILE, 0x1234);
+        assert!(slot.register(rt.clone()).is_ok());
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let late_slot = slot.clone();
+        let late_gate = gate.clone();
+        let late = std::thread::spawn(move || {
+            late_gate.wait(); // entry delayed until restoration and unregistration
+            let rt = late_slot.for_detour().expect("late passthrough runtime");
+            assert!(!rt.recording_active());
+            assert_eq!(rt.original(API_READ_FILE), 0x1234);
+        });
+        assert!(slot.unregister(&rt));
+        gate.wait();
+        late.join().unwrap();
+        let (_, replacement) = runtime();
+        let replacement = Arc::new(replacement);
+        assert!(slot.register(replacement.clone()).is_ok());
+        assert_eq!(replacement.original(API_READ_FILE), 0x1234);
     }
 
     #[test]

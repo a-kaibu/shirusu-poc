@@ -147,7 +147,7 @@ pub struct TraceWriter<W: DurableWrite> {
     pending_blobs: Vec<(BlobId, Vec<u8>)>,
     pending_blob_raw: usize,
     index: Vec<IndexEntry>,
-    last_sequence_by_thread: HashMap<u64, u64>,
+    last_sequence_by_thread: HashMap<(u64, u64), u64>,
     total_events: u64,
     total_loss_records: u64,
     finished: bool,
@@ -376,7 +376,7 @@ impl<W: DurableWrite> TraceWriter<W> {
         }
         if let Some(last) = batch.events.last() {
             self.last_sequence_by_thread
-                .insert(batch.thread_id, last.sequence);
+                .insert((batch.process_id, batch.thread_id), last.sequence);
         }
         self.total_events += batch.events.len() as u64;
         Ok(())
@@ -444,7 +444,10 @@ impl<W: DurableWrite> TraceWriter<W> {
         if batch.events.is_empty() {
             return Err(TraceError::WriterInvariant("empty batch".into()));
         }
-        let mut prev = self.last_sequence_by_thread.get(&batch.thread_id).copied();
+        let mut prev = self
+            .last_sequence_by_thread
+            .get(&(batch.process_id, batch.thread_id))
+            .copied();
         for e in &batch.events {
             if let Some(p) = prev {
                 if e.sequence < p {

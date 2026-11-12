@@ -73,6 +73,7 @@
           "anyOf": [
             {
               "enum": [
+                "valid-handle",
                 "nonzero",
                 "zero"
               ],
