@@ -529,15 +529,16 @@ mod imp {
     /// DLL 注入に必要な権限（スレッド作成・VM 操作・複製）でプロセスを開く。
     pub fn open_process_for_injection(pid: u32) -> Result<HandleValue> {
         use windows_sys::Win32::System::Threading::{
-            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_READ, PROCESS_VM_WRITE,
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+            PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
         };
         let access = PROCESS_CREATE_THREAD
             | PROCESS_QUERY_INFORMATION
             | PROCESS_VM_OPERATION
             | PROCESS_VM_READ
             | PROCESS_VM_WRITE
-            | PROCESS_DUP_HANDLE;
+            | PROCESS_DUP_HANDLE
+            | PROCESS_SYNCHRONIZE;
         let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() {
             return Err(last_err("OpenProcess(inject)"));
@@ -546,8 +547,13 @@ mod imp {
     }
 
     /// プロセスが終了済みかどうか（待たない確認）。
-    pub fn process_exited(process: HandleValue) -> bool {
-        unsafe { WaitForSingleObject(h(process), 0) == 0 }
+    pub fn process_exited(process: HandleValue) -> Result<bool> {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        match unsafe { WaitForSingleObject(h(process), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(last_err("WaitForSingleObject(process)")),
+        }
     }
 
     pub fn close_handle_value(v: HandleValue) {
@@ -952,8 +958,8 @@ mod imp {
     pub fn open_process_for_injection(_pid: u32) -> Result<HandleValue> {
         Err(WinError::Unsupported)
     }
-    pub fn process_exited(_process: HandleValue) -> bool {
-        false
+    pub fn process_exited(_process: HandleValue) -> Result<bool> {
+        Err(WinError::Unsupported)
     }
     pub fn close_handle_value(_v: HandleValue) {}
     pub fn duplicate_handle_to_process(
@@ -1198,6 +1204,27 @@ impl shirusu_transport::TimestampSource for QpcTimestampSource {
 #[cfg(all(windows, test))]
 mod tests {
     use super::*;
+    #[test]
+    fn injection_handle_can_wait_for_process_exit() {
+        // Missing PROCESS_SYNCHRONIZE used to make WAIT_FAILED look like
+        // "still running", hanging child-tree capture after the child exited.
+        let own = open_process_for_injection(std::process::id()).unwrap();
+        assert!(!process_exited(own).unwrap());
+        close_handle_value(own);
+        let child = spawn_suspended("cmd.exe /C exit 0").unwrap();
+        let handle = open_process_for_injection(child.pid).unwrap();
+        resume_main_thread(child.thread).unwrap();
+        assert_eq!(wait_process(child.process, Duration::from_secs(5)), Some(0));
+        close_handle_value(child.thread);
+        close_handle_value(child.process);
+        assert!(process_exited(handle).unwrap());
+        close_handle_value(handle);
+        assert!(
+            process_exited(0).is_err(),
+            "invalid handle must not mean alive"
+        );
+    }
+
     #[test]
     fn mapping_and_event_roundtrip() {
         let m = SharedMapping::create(4096).unwrap();

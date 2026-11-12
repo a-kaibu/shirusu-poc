@@ -1508,6 +1508,18 @@ mod win {
 
 fn main() {
     #[cfg(windows)]
+    let _watchdog = std::thread::spawn(|| {
+        // These are bounded fixtures, not arbitrary applications. A deadlock in
+        // attach, shutdown or child reaping must fail CI instead of waiting for
+        // the hour-long job timeout. Include the mode in the failure output.
+        std::thread::sleep(std::time::Duration::from_secs(180));
+        eprintln!(
+            "FAIL capture E2E watchdog after 180s: {:?}",
+            std::env::args().collect::<Vec<_>>()
+        );
+        std::process::exit(124);
+    });
+    #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "--inline") {

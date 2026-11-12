@@ -163,8 +163,8 @@ impl LaunchedCapture {
     pub fn pid(&self) -> u32 {
         self.pid
     }
-    pub fn target_exited(&self) -> bool {
-        win::process_exited(self.process)
+    pub fn target_exited(&self) -> Result<bool, SessionError> {
+        Ok(win::process_exited(self.process)?)
     }
     pub fn session(&mut self) -> &mut CaptureSession {
         self.session.as_mut().expect("session present")
@@ -177,7 +177,7 @@ impl LaunchedCapture {
         poll_interval: Duration,
     ) -> Result<SessionSummary, SessionError> {
         loop {
-            if self.target_exited() {
+            if self.target_exited()? {
                 break;
             }
             self.session().poll_once()?;
@@ -207,7 +207,7 @@ impl LaunchedCapture {
         // Event Integrity が劣化する。呼び出しに失敗しても確定自体は
         // 続ける（対象が終了処理中などで応答しない場合がある）が、
         // 「正常終了として確定」はしない。
-        let outcome = if self.target_exited() {
+        let outcome = if self.target_exited()? {
             ShutdownOutcome::NotRequired
         } else if let Some(addr) = self.shutdown_addr {
             shutdown_outcome_from_call(win::remote_call(self.process, addr, 0))
@@ -343,7 +343,7 @@ impl TreeCapture {
             // 終了した子を回収して Trace を閉じる
             let mut i = 0;
             while i < self.children.len() {
-                if self.children[i].target_exited() {
+                if self.children[i].target_exited()? {
                     let child = self.children.remove(i);
                     let pid = child.pid();
                     let summary = child.finish()?;
@@ -352,7 +352,7 @@ impl TreeCapture {
                     i += 1;
                 }
             }
-            let root_exited = self.root.target_exited();
+            let root_exited = self.root.target_exited()?;
             match self.scan_once() {
                 Ok(()) => self.scan_failures = 0,
                 Err(e) => {
