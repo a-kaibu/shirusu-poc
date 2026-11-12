@@ -416,6 +416,8 @@ mod win {
     }
 
     pub fn shutdown() -> u32 {
+        let _shutdown_guard = shirusu_hook::runtime::ReentrancyGuard::try_enter();
+        shirusu_hook::fls::drain_pending_exits();
         // 順序（レビュー #4 の #9 + 第5回 #6/#7 + #6 の P1-6 + L01 + L02）:
         // (1) 新規記録を無効化し、以後の Detour は元関数を素通しで
         // 呼ぶ。(2) 進行中の Detour が完了するまで待つ。(3) COM Factory

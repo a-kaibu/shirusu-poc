@@ -795,6 +795,7 @@ impl HookRuntime {
     /// space_available 通知を Ring へ結線する。2 回目以降は何もしない
     /// （記録の通常経路はここを通らない）。
     pub fn ensure_thread(&self, thread_id: u64) {
+        crate::fls::drain_pending_exits();
         {
             let seen = self.seen_threads.lock().unwrap();
             if seen.contains(&thread_id) {

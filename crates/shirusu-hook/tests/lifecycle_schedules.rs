@@ -69,12 +69,28 @@ fn deleting_fiber_does_not_end_thread_capture() {
         assert!(!child.is_null());
         SwitchToFiber(child);
         DeleteFiber(child);
+        shirusu_hook::fls::drain_pending_exits();
         assert_eq!(observed.load(Ordering::SeqCst), 0);
         assert!(shirusu_hook::runtime::ReentrancyGuard::try_enter().is_some());
     })
     .join()
     .unwrap();
+    shirusu_hook::fls::drain_pending_exits();
     assert_eq!(exits.load(Ordering::SeqCst), 1);
+    let threads: Vec<_> = (0..32)
+        .map(|i| {
+            std::thread::spawn(move || {
+                shirusu_hook::fls::arm_current_thread(100 + i);
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    shirusu_hook::fls::drain_pending_exits();
+    assert_eq!(exits.load(Ordering::SeqCst), 33);
+    shirusu_hook::fls::drain_pending_exits();
+    assert_eq!(exits.load(Ordering::SeqCst), 33);
 }
 
 #[test]

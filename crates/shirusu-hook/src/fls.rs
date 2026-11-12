@@ -6,7 +6,6 @@ pub type ThreadExitHandler = Arc<dyn Fn(u64) + Send + Sync>;
 static HANDLER: OnceLock<ThreadExitHandler> = OnceLock::new();
 
 fn notify_exit(thread_id: u64) {
-    crate::runtime::ReentrancyGuard::mark_thread_exiting();
     if let Some(handler) = HANDLER.get() {
         handler(thread_id);
     }
@@ -16,7 +15,33 @@ fn notify_exit(thread_id: u64) {
 thread_local! {
     // No destructor: the callback runs exactly on DLL_THREAD_DETACH, including
     // when the first registration was performed inside a subsequently deleted fiber.
-    static THREAD_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static THREAD_NODE: std::cell::Cell<*mut ExitNode> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+#[cfg(windows)]
+struct ExitNode {
+    thread_id: u64,
+    next: *mut ExitNode,
+}
+#[cfg(windows)]
+static PENDING: std::sync::atomic::AtomicPtr<ExitNode> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Run exit handlers outside the native TLS callback. That callback holds the
+/// loader lock, so it must not allocate, free, or acquire runtime locks.
+/// Call from the recording management path or explicit shutdown.
+pub fn drain_pending_exits() {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering;
+        let mut node = PENDING.swap(std::ptr::null_mut(), Ordering::Acquire);
+        while !node.is_null() {
+            // The atomic swap grants sole ownership of this detached list.
+            let owned = unsafe { Box::from_raw(node) };
+            node = owned.next;
+            notify_exit(owned.thread_id);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -27,10 +52,29 @@ unsafe extern "system" fn thread_callback(
 ) {
     const DLL_THREAD_DETACH: u32 = 3;
     if reason == DLL_THREAD_DETACH {
-        let _ = THREAD_ID.try_with(|slot| {
-            let id = slot.replace(0);
-            if id != 0 {
-                notify_exit(id);
+        crate::runtime::ReentrancyGuard::mark_thread_exiting();
+        let _ = THREAD_NODE.try_with(|slot| {
+            let node = slot.replace(std::ptr::null_mut());
+            if node.is_null() {
+                return;
+            }
+            use std::sync::atomic::Ordering;
+            let mut head = PENDING.load(Ordering::Relaxed);
+            loop {
+                // This node was allocated when arming, and is exclusively ours
+                // until the successful release CAS publishes it to a consumer.
+                unsafe {
+                    (*node).next = head;
+                }
+                match PENDING.compare_exchange_weak(
+                    head,
+                    node,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => head = current,
+                }
             }
         });
     }
@@ -52,6 +96,7 @@ struct ThreadExit(u64);
 #[cfg(not(windows))]
 impl Drop for ThreadExit {
     fn drop(&mut self) {
+        crate::runtime::ReentrancyGuard::mark_thread_exiting();
         notify_exit(self.0);
     }
 }
@@ -68,9 +113,12 @@ pub fn arm_current_thread(thread_id: u64) {
         return;
     }
     #[cfg(windows)]
-    let _ = THREAD_ID.try_with(|slot| {
-        if slot.get() == 0 {
-            slot.set(thread_id);
+    let _ = THREAD_NODE.try_with(|slot| {
+        if slot.get().is_null() {
+            slot.set(Box::into_raw(Box::new(ExitNode {
+                thread_id,
+                next: std::ptr::null_mut(),
+            })));
         }
     });
     #[cfg(not(windows))]
