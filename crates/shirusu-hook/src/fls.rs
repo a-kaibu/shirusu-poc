@@ -40,6 +40,7 @@ mod imp {
             return;
         }
         let thread_id = value as usize as u64;
+        crate::runtime::ReentrancyGuard::mark_thread_exiting();
         if let Some(handler) = HANDLER.get() {
             handler(thread_id);
         }

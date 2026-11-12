@@ -46,15 +46,17 @@ thread_local! {
 }
 
 pub fn current_parent_call() -> u64 {
-    CALL_STACK.with(|s| s.borrow().last().copied().unwrap_or(0))
+    CALL_STACK
+        .try_with(|s| s.borrow().last().copied().unwrap_or(0))
+        .unwrap_or(0)
 }
 pub fn push_call(call_id: u64) {
-    CALL_STACK.with(|s| s.borrow_mut().push(call_id));
+    let _ = CALL_STACK.try_with(|s| s.borrow_mut().push(call_id));
 }
 /// スタック最上位が自分の Call ID のときにだけ取り除く（異常な
 /// 対応ずれで他人のフレームを壊さない）。
 pub fn pop_call(call_id: u64) {
-    CALL_STACK.with(|s| {
+    let _ = CALL_STACK.try_with(|s| {
         let mut s = s.borrow_mut();
         if s.last() == Some(&call_id) {
             s.pop();
@@ -65,6 +67,7 @@ pub fn pop_call(call_id: u64) {
 thread_local! {
     /// Detour の再入ガードの深さ (G15)。0 = 記録経路の外、1 = 記録経路の実行中。
     static REENTRANCY_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static THREAD_EXITING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Detour の再入ガード (G15)。
@@ -92,14 +95,27 @@ pub struct ReentrancyGuard {
 impl ReentrancyGuard {
     /// Detour 入口で呼ぶ。再入中なら `None` を返す。
     pub fn try_enter() -> Option<Self> {
-        REENTRANCY_DEPTH.with(|d| {
-            if d.get() > 0 {
-                None
-            } else {
-                d.set(1);
-                Some(Self { suspended: false })
-            }
-        })
+        REENTRANCY_DEPTH
+            .try_with(|d| {
+                if d.get() > 0
+                    || THREAD_EXITING.try_with(Cell::get).unwrap_or(true)
+                    || CALL_STACK.try_with(|_| ()).is_err()
+                    || !shirusu_agent::current_thread_capture_available()
+                {
+                    None
+                } else {
+                    d.set(1);
+                    Some(Self { suspended: false })
+                }
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// FLS callbacks can run before or after Rust TLS destructors. Never resume
+    /// capture on this thread once exit cleanup has begun.
+    pub fn mark_thread_exiting() {
+        let _ = THREAD_EXITING.try_with(|exiting| exiting.set(true));
     }
 
     /// 記録経路の実行中か。
@@ -1939,4 +1955,31 @@ mod tests {
         );
         assert_eq!(batch.events[1].payload, b"winrt-leave");
     }
+}
+#[test]
+fn detours_stay_passthrough_after_capture_tls_destruction() {
+    struct ExitProbe(std::sync::mpsc::Sender<(bool, bool, u64)>);
+    impl Drop for ExitProbe {
+        fn drop(&mut self) {
+            let destroyed = CALL_STACK.try_with(|_| ()).is_err();
+            let passthrough = ReentrancyGuard::try_enter().is_none();
+            self.0
+                .send((destroyed, passthrough, current_parent_call()))
+                .unwrap();
+        }
+    }
+    thread_local! {
+        static PROBE: RefCell<Option<ExitProbe>> = const { RefCell::new(None) };
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Registered first, so its destructor probes the already destroyed
+        // capture TLS while the thread is still executing cleanup code.
+        PROBE.with(|probe| *probe.borrow_mut() = Some(ExitProbe(tx)));
+        push_call(42);
+        assert!(ReentrancyGuard::try_enter().is_some());
+    })
+    .join()
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), (true, true, 0));
 }

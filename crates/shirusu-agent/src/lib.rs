@@ -162,6 +162,12 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Capture must not re-enter the Agent after its thread-local writer cache has
+/// started destruction (for example through an intercepted HeapFree).
+pub fn current_thread_capture_available() -> bool {
+    TLS_STATE.try_with(|_| ()).is_ok()
+}
+
 impl Agent {
     pub fn new(pool: Arc<SlotPool>, config: RingConfig, host_monitor: Arc<HostMonitor>) -> Self {
         Self {
@@ -272,26 +278,30 @@ impl Agent {
     /// なし)、低速経路は登録表の読みロック (取得の間だけ)、どちらにも
     /// 無ければ管理パスで Slot と Ring を作る。Slot が取れなければ None。
     fn state_for(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
-        let cached = TLS_STATE.with(|c| {
-            let c = c.borrow();
-            match &*c {
-                Some((agent, tid, state))
-                    if *agent == self.id
-                        && *tid == thread_id
-                        && !state.retired.load(Ordering::Acquire) =>
-                {
-                    Some(Arc::clone(state))
+        let cached = TLS_STATE
+            .try_with(|c| {
+                let c = c.borrow();
+                match &*c {
+                    Some((agent, tid, state))
+                        if *agent == self.id
+                            && *tid == thread_id
+                            && !state.retired.load(Ordering::Acquire) =>
+                    {
+                        Some(Arc::clone(state))
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        });
+            })
+            .ok()?;
         if let Some(s) = cached {
             return Some(s);
         }
         let state = self.state_for_slow(thread_id)?;
-        TLS_STATE.with(|c| {
-            *c.borrow_mut() = Some((self.id, thread_id, Arc::clone(&state)));
-        });
+        TLS_STATE
+            .try_with(|c| {
+                *c.borrow_mut() = Some((self.id, thread_id, Arc::clone(&state)));
+            })
+            .ok()?;
         Some(state)
     }
     fn state_for_slow(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
