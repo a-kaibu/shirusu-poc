@@ -16,7 +16,7 @@
 | 公開 Trace、解析、修復 | Writer/Reader/CLI、復旧と不正入力検査を実装 | 形式適合性・破損復旧・Linux/macOS の解析 CI |
 | 比較と再実行可能な Probe | オブジェクト相関と同期ファイル I/O 再生を実装。一般 API、非同期、コールバックは未対応 | Windows Capture → 差分 → Probe 実行の E2E、不足条件を拒否するテスト |
 | 性能と完全性 | ベンチマーク・損失通知を実装 | GUI 3倍／高負荷5倍を同一条件で測定し、未達時は数値と原因を記録 |
-| Windows x86/x64 の検証 | ローカル compile と CI を分離。前回レビュー修正の最新 CI は d8b6e11 | Windows 実行・Application Verifier・ABI・SEH・replay の通過 |
+| Windows x86/x64 の検証 | ローカル compile と CI を分離。Windows x86 と基本 Capture + Verifier は 7d4ca21 で通過 | Windows 実行・Application Verifier・ABI・SEH・replay の通過 |
 
 優先順は観測境界と透明性、Windows 実走の失敗解消、Metadata 全体の
 対応拡大、安全な COM Adapter、再生可能範囲の拡大。並行する CI を待つだけで
@@ -59,3 +59,9 @@ LastError 条件を Schema に追加し、成功時の残留値をエラーと�
 単一フィールドの構造体を無条件にスカラーへ変換しない。NativeTypedef 属性で
 別名型だと確認できるものだけを変換し、実構造体／未確認の別名型は未対応理由を残す。
 この保守的な判定で、生成可能と分類していた 322 メソッドを未対応へ修正した。
+
+`7d4ca21` の run `43266202012` では x86 が通過。x64 は Windows latest /
+Server 2022 の基本 Capture + Verifier が正常終了まで通過した。次の
+`--child-tree` はルートの注入初期化が `0xC0000005` で失敗する。
+初回 Verifier だけでなく後続 E2E の失敗にもダンプ、Trace、イベントログ、
+対応する DLL/EXE と PDB を保存するよう診断の範囲を広げた。
