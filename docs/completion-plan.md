@@ -7,7 +7,7 @@
 | --- | --- | --- |
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
-| 全 Win32 の L0/L1 | 現在147件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
+| 全 Win32 の L0/L1 | 現在149件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
 | COM の L1 と寿命追跡 | Factory と IID 名識別は実装。共有オブジェクトの通常メソッド追跡は未完成 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
 | 動的 API と既存プロセス Attach | Inline Hook は実装。新規スレッド競合・停止先ロックの制約が残る | 既存プロセスとスレッド生成中の透明性テスト、失敗時の安全な復元 |
@@ -48,7 +48,10 @@ cargo run -p shirusu-metadata-gen -- --inventory target/api-inventory.tsv
 手書き API も生成表の対象外なので `generatable` に含まれる場合がある。
 これはネイティブで記録できた API 数ではない。
 
-現在の 18,364 メソッドは selected 134、generatable 17,816、unsupported 414。
+現在の 18,364 メソッドは selected 136、generatable 17,814、unsupported 414。
 C 呼び出し規約の Wrapper は元関数にも `C-unwind` を使い、x86 でのスタックの
 後始末を保持する。LDAP 3 API と LastError 2 API の追加は ABI 回帰テスト付き。
 可変長引数と複合構造体などの残件を、この一覧で追跡する。
+
+GlobalFree / LocalFree も生成対象へ追加。NULL が成功となる解放 API の
+LastError 条件を Schema に追加し、成功時の残留値をエラーとして扱わない。

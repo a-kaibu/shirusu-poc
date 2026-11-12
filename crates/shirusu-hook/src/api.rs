@@ -604,7 +604,7 @@ mod tests {
         // （last_error は無い。Nt* は GetLastError を使わない）。
         assert_eq!(INTERNAL_API_TABLE.len(), INTERNAL_API_COUNT);
         assert_eq!(INTERNAL_API_ID_BASE, 79);
-        assert_eq!(API_COUNT, 147);
+        assert_eq!(API_COUNT, 149);
         for (i, api) in INTERNAL_API_TABLE.iter().enumerate() {
             assert_eq!(api.api_id, INTERNAL_API_ID_BASE + i as u32);
             assert_eq!(api.module, "ntdll.dll");

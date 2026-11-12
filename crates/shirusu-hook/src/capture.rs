@@ -1242,6 +1242,24 @@ mod tests {
     }
 
     #[test]
+    fn memory_release_marks_error_only_when_handle_is_returned() {
+        for name in ["GlobalFree", "LocalFree"] {
+            let api = crate::api::api_table()
+                .find(|api| api.function == name)
+                .unwrap();
+            assert_eq!(generic_leave(api, 0, 5)[1].capture, ValueCapture::Stale);
+            for handle in [1, 0x8000_0000, 0xffff_ffff_0000_0000] {
+                assert_eq!(generic_leave(api, handle, 5)[1], u32v(5));
+            }
+            let fields = api.leave_schema().fields;
+            assert_eq!(
+                LastErrorMeaning::from_flags(fields[1].flags),
+                LastErrorMeaning::WhenReturnIsNotNull
+            );
+        }
+    }
+
+    #[test]
     fn generic_leave_handles_null_return_and_void_return() {
         // L03: HANDLE 返し (WhenReturnIsNull) は NULL 時のみ意味あり。
         use shirusu_trace::schema::{CaptureTiming, LastErrorMeaning, ValueKind};

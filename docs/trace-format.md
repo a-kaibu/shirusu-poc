@@ -333,8 +333,11 @@ GetLastError の生値と、API 仕様上意味のあるエラー値を区別す
   だけ意味を持つ（WAIT_FAILED / SOCKET_ERROR 等の -1 返し。L03 の
   生成 API 用）。32bit 形（下位 32 ビットのみ 1）も失敗とみなす。
 
-互換性：値 7 は未使用で、未知の条件値は `Unspecified` として読む
-（前方互換）。値 4〜6 を知らない旧来の Reader は `Unspecified`
+- `WhenReturnIsNotNull`（7）: 戻り値が非 NULL の場合だけ意味を持つ。
+  GlobalFree / LocalFree は NULL が成功、ハンドルの返却が失敗を表す。
+
+互換性：未知の条件値は `Unspecified` として読む
+（前方互換）。値 4〜7 を知らない旧来の Reader は `Unspecified`
 として読むため、生値を意味のある値として扱う（緩い読み）。
 
 取得側は、条件を満たさない生値を `ValueCapture::Stale`（符号化 5）と

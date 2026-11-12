@@ -215,6 +215,8 @@ pub enum LastErrorMeaning {
     /// 32bit 形 (下位 32 ビットのみ 1) も失敗とみなす
     /// （WhenReturnIsInvalidHandle と同じ幅の扱い）。
     WhenReturnIsMinusOne,
+    /// Non-NULL is failure (GlobalFree / LocalFree return NULL on success).
+    WhenReturnIsNotNull,
 }
 
 /// LastErrorMeaning を格納するフラグビット範囲 (bit8..=10)。
@@ -230,6 +232,7 @@ impl LastErrorMeaning {
             4 => Self::WhenReturnIsNull,
             5 => Self::Never,
             6 => Self::WhenReturnIsMinusOne,
+            7 => Self::WhenReturnIsNotNull,
             _ => Self::Unspecified,
         }
     }
@@ -243,6 +246,7 @@ impl LastErrorMeaning {
             Self::WhenReturnIsNull => 4,
             Self::Never => 5,
             Self::WhenReturnIsMinusOne => 6,
+            Self::WhenReturnIsNotNull => 7,
         };
         v << LAST_ERROR_MEANING_SHIFT
     }
@@ -260,6 +264,7 @@ impl LastErrorMeaning {
                 return_value == u64::MAX || return_value == 0x0000_0000_ffff_ffff
             }
             Self::WhenReturnIsNull => return_value == 0,
+            Self::WhenReturnIsNotNull => return_value != 0,
             Self::Never => false,
             Self::WhenReturnIsMinusOne => {
                 return_value == u64::MAX || return_value == 0x0000_0000_ffff_ffff
@@ -609,17 +614,13 @@ mod tests {
             LastErrorMeaning::WhenReturnIsNull,
             LastErrorMeaning::Never,
             LastErrorMeaning::WhenReturnIsMinusOne,
+            LastErrorMeaning::WhenReturnIsNotNull,
         ] {
             assert_eq!(LastErrorMeaning::from_flags(meaning.flags()), meaning);
             // 意味条件は bit0..=7 (inout/省略可能・ValueKind・
             // CaptureTiming) に触れない
             assert_eq!(meaning.flags() & 0xff, 0);
         }
-        // 未知の条件値は Unspecified として読む (前方互換)
-        assert_eq!(
-            LastErrorMeaning::from_flags(7 << LAST_ERROR_MEANING_SHIFT),
-            LastErrorMeaning::Unspecified
-        );
         assert_eq!(
             LastErrorMeaning::from_flags(0),
             LastErrorMeaning::Unspecified

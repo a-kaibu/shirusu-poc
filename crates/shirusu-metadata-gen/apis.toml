@@ -10,7 +10,7 @@
 # BOOL -> false、HANDLE/ポインタ -> null、WIN32_ERROR/HRESULT/NTSTATUS/
 # その他の整数/void -> never。失敗条件が分かる API は明示する。
 # 値: false / null / invalid-handle / minus-one / never / always /
-# unspecified。
+# not-null / unspecified。
 
 first_api_id = 7
 reserved_api_ids = [79, 80, 81, 82, 83, 84, 85]
@@ -339,20 +339,6 @@ namespace = "Windows.Win32.Storage.FileSystem"
 module = "kernel32.dll"
 function = "SetFilePointerEx"
 
-# ---- 意図的な除外 ----
-# GlobalFree / LocalFree: 成功時に NULL を返す（失敗時はハンドル）。
-# NULL = 成功の反転した意味のため、WhenReturnIsNull の既定では扱えない。
-[[skip]]
-namespace = "Windows.Win32.System.Memory"
-module = "kernel32.dll"
-function = "GlobalFree"
-reason = "成功時に NULL を返す反転した意味のため、L1 の意味条件では扱えない"
-[[skip]]
-namespace = "Windows.Win32.System.Memory"
-module = "kernel32.dll"
-function = "LocalFree"
-reason = "成功時に NULL を返す反転した意味のため、L1 の意味条件では扱えない"
-
 [[api]]
 namespace = "Windows.Win32.UI.WindowsAndMessaging"
 module = "user32.dll"
@@ -652,3 +638,15 @@ namespace = "Windows.Win32.Foundation"
 module = "kernel32.dll"
 function = "SetLastError"
 last_error = "never"
+
+# NULL means success for these releases; a returned handle means failure.
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "GlobalFree"
+last_error = "not-null"
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "LocalFree"
+last_error = "not-null"

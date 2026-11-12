@@ -938,6 +938,20 @@ unsafe extern "system-unwind" fn detour_generated_kernel32_set_last_error(a0: u3
         0
     });
 }
+unsafe extern "system-unwind" fn detour_generated_kernel32_global_free(a0: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(148, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
+unsafe extern "system-unwind" fn detour_generated_kernel32_local_free(a0: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let result = generic_detour_with(149, &[a0 as u64], |original| {
+        let original: unsafe extern "system-unwind" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void = unsafe { std::mem::transmute(original) };
+        (unsafe { original(a0) }) as u64
+    });
+    result as *mut core::ffi::c_void
+}
 
 fn detour_for_generated(api_id: u32) -> usize {
     match api_id {
@@ -1075,6 +1089,8 @@ fn detour_for_generated(api_id: u32) -> usize {
         145 => detour_generated_wldap32_ldap_unbind as *const () as usize,
         146 => detour_generated_kernel32_get_last_error as *const () as usize,
         147 => detour_generated_kernel32_set_last_error as *const () as usize,
+        148 => detour_generated_kernel32_global_free as *const () as usize,
+        149 => detour_generated_kernel32_local_free as *const () as usize,
         _ => 0,
     }
 }

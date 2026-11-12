@@ -575,6 +575,7 @@ pub fn parse_last_error(s: &str) -> Result<LastErrorMeaning, String> {
     Ok(match s.trim().to_ascii_lowercase().as_str() {
         "false" => LastErrorMeaning::WhenReturnIsFalse,
         "null" => LastErrorMeaning::WhenReturnIsNull,
+        "not-null" => LastErrorMeaning::WhenReturnIsNotNull,
         "invalid-handle" => LastErrorMeaning::WhenReturnIsInvalidHandle,
         "minus-one" => LastErrorMeaning::WhenReturnIsMinusOne,
         "never" => LastErrorMeaning::Never,
@@ -847,6 +848,10 @@ mod tests {
 
     #[test]
     fn parse_last_error_accepts_all_spellings() {
+        assert_eq!(
+            parse_last_error("not-null").unwrap(),
+            LastErrorMeaning::WhenReturnIsNotNull
+        );
         assert_eq!(
             parse_last_error("false").unwrap(),
             LastErrorMeaning::WhenReturnIsFalse
