@@ -221,6 +221,9 @@ impl EventView {
         for f in &self.fields {
             let _ = write!(s, " {}", format_field(f));
         }
+        if let Some(names) = self.com_interface_names() {
+            let _ = write!(s, " interface={}", names.join("|"));
+        }
         if let Some(err) = &self.args_error {
             let _ = write!(s, " args_error={err:?}");
         }
@@ -231,6 +234,22 @@ impl EventView {
             capture_name(self.capture)
         );
         s
+    }
+
+    /// IID identification is descriptive; it says nothing about intercepted methods.
+    pub fn com_interface_names(&self) -> Option<&'static [&'static str]> {
+        if self.api_name.as_deref() != Some("com!method") {
+            return None;
+        }
+        let field = self.field("iid")?;
+        if field.capture != ValueCapture::Captured {
+            return None;
+        }
+        let TypedValue::Bytes(bytes) = &field.value else {
+            return None;
+        };
+        let iid: &[u8; 16] = bytes.as_slice().try_into().ok()?;
+        shirusu_trace::com_catalog::interface_by_iid(iid).map(|entry| entry.names)
     }
 
     pub fn to_json(&self) -> JsonValue {
@@ -304,6 +323,12 @@ impl EventView {
                 ),
                 ("payload", payload),
             ];
+            if let Some(names) = self.com_interface_names() {
+                entries.push((
+                    "com_interfaces",
+                    JsonValue::Array(names.iter().map(|n| JsonValue::Str((*n).into())).collect()),
+                ));
+            }
             // L11: 全体順序がある場合だけ出す（無い Trace の JSON は変わらない）。
             if let Some(g) = self.global_order {
                 entries.push(("global_order", JsonValue::U64(g)));

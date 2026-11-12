@@ -102,6 +102,7 @@ fn api(namespace: &str, module: &str, function: &str) -> ApiConfig {
 fn config_with(apis: Vec<ApiConfig>, max_params: usize) -> Config {
     Config {
         first_api_id: 7,
+        reserved_api_ids: vec![],
         max_params,
         winmd_version: "71.0.45-preview".to_string(),
         apis,
@@ -376,7 +377,7 @@ fn generate_skips_struct_by_value_arg() {
 }
 
 #[test]
-fn generate_skips_float_return() {
+fn generate_preserves_float_return() {
     // lib.rs 329: 戻り値の写像失敗をスキップへ。
     // D2D1ComputeMaximumScaleFactor は引数がポインタ 1 個だけで
     // 通り、戻り値 F32 で落ちる (cc=system)。
@@ -394,12 +395,8 @@ fn generate_skips_float_return() {
         ),
     )
     .expect("生成できる");
-    assert_single_skip(
-        &generated,
-        "d2d1.dll",
-        "D2D1ComputeMaximumScaleFactor",
-        "戻り値: 浮動小数点型 F32",
-    );
+    assert!(generated.skipped().is_empty());
+    assert_eq!(generated.emitted()[0].abi_return, "f32");
 }
 
 #[test]
@@ -444,6 +441,8 @@ fn emit_api_inc_escapes_quotes_and_backslashes() {
         api_id: 7,
         module: "we\"ird.dll".into(),
         function: "Na\\me".into(),
+        abi_params: vec![],
+        abi_return: "()",
         enter_fields: vec![],
         return_ty: None,
         last_error_meaning: LastErrorMeaning::Never,
@@ -455,4 +454,31 @@ fn emit_api_inc_escapes_quotes_and_backslashes() {
     let text = emit_api_inc(&generated, "71.0.45-preview");
     assert!(text.contains("module: \"we\\\"ird.dll\","), "text: {text}");
     assert!(text.contains("function: \"Na\\\\me\","), "text: {text}");
+}
+
+#[test]
+fn reserved_ids_preserve_handwritten_api_identity() {
+    require_winmd!();
+    let mut config = config_with(
+        vec![
+            api("Windows.Win32.System.Threading", "kernel32.dll", "Sleep"),
+            api(
+                "Windows.Win32.System.SystemInformation",
+                "kernel32.dll",
+                "GetTickCount64",
+            ),
+        ],
+        12,
+    );
+    config.first_api_id = 78;
+    config.reserved_api_ids = (79..=85).collect();
+    let generated = generate(&read_index(), &config).unwrap();
+    assert_eq!(
+        generated
+            .emitted()
+            .iter()
+            .map(|a| a.api_id)
+            .collect::<Vec<_>>(),
+        vec![78, 86]
+    );
 }

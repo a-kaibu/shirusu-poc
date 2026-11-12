@@ -7,6 +7,12 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[2]
 cases = [
+    ('wide_abi', 'crates/shirusu-hook/src/engine_generated.inc',
+     [('unsafe { original() }\n    })\n', '(unsafe { original() }) as u32 as u64\n    })\n')],
+     'shirusu-hook', 'generated_abi', 'generated_abi_preserves_wide'),
+    ('float_bits', 'crates/shirusu-hook/src/engine_generated.inc',
+     [('a4.to_bits() as u64', 'a4 as u64')],
+     'shirusu-hook', 'generated_abi', 'generated_abi_preserves_wide'),
     ('replay_offset', 'crates/shirusu-probe/src/replay.rs',
      [('if number(enter, "lpOverlapped")? != 0 {', 'if false {')],
      'shirusu-probe', 'replay', 'explicit_overlapped_offset'),

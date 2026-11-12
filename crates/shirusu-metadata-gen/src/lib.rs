@@ -7,15 +7,15 @@
 //!
 //! 対応の範囲（overview「観測レベル」）:
 //! - L1（型付き引数・戻り値・GetLastError の取得）までを生成する。
-//!   引数は整数・ポインタ型だけを扱い、文字列・バッファ・構造体の
+//!   整数・浮動小数点・ポインタ型を扱い、文字列・バッファ・構造体の
 //!   中身は取得しない（ポインタ値だけを記録する）。
 //! - L2 以上は SAL アノテーションと手書きの記録仕様で API ごとに拡張
 //!   する。生成表の API を手書き表へ昇格させる場合は、生成表から外し
 //!   （末尾への追加のみという ID 安定性の規則に注意）、手書きの
 //!   `ApiDef` と専用 Detour / 専用取得へ置き換える。
-//! - 汎用 Detour は x64 / x86 の整数・ポインタ引数だけを正しく中継
-//!   できる。浮動小数点引数・値渡し構造体・可変長引数を持つ API は
-//!   生成対象外（スキップ理由を報告する）。
+//! - x64 / x86 の元の引数・戻り値型で Detour を生成する。記録用の
+//!   u64 は転送だけに使い、浮動小数点はビット列を保存する。複合構造体の
+//!   値渡し・可変長引数は生成対象外（スキップ理由を報告する）。
 //!
 //! 型対応の要点:
 //! - WinMD のプリミティブは `Ty` へ写す（8/16bit 整数は 32bit へ拡大）。
@@ -23,8 +23,8 @@
 //!   はポインタ値、単一フィールド構造体はそのフィールドの型
 //!   （`HANDLE` / `HKEY` 等の `*mut c_void` 1 個だけの構造体はハンドル、
 //!   `PWSTR` 等の `*mut u16` はポインタ、`BOOL` は I32）。
-//! - 複数フィールドの値渡し構造体・COM インターフェイス・クラスは
-//!   対応外。
+//! - COM インターフェイス型はネイティブのポインタとして記録する。
+//!   これは COM メソッドの設置や参照先の取得を意味しない。
 
 use serde::Deserialize;
 use shirusu_trace::schema::{LastErrorMeaning, Ty, ValueKind};
@@ -37,6 +37,9 @@ pub struct Config {
     /// 生成 API に割り当てる最初の api_id。手書き表の件数 + 1。
     /// 手書き表が増えたらこの値も上げる（ID 安定性のため）。
     pub first_api_id: u32,
+    /// IDs owned by handwritten API families; never renumber them.
+    #[serde(default)]
+    pub reserved_api_ids: Vec<u32>,
     /// 汎用 Detour が中継できる最大引数個数（既定 12）。
     #[serde(default = "default_max_params")]
     pub max_params: usize,
@@ -85,14 +88,16 @@ pub struct SkipConfig {
 /// WinMD の型を shirusu の Schema 型へ写したもの。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedTy {
+    /// Native ABI type, independent of the serialized schema width.
+    pub abi: &'static str,
     pub ty: Ty,
     pub kind: ValueKind,
     /// 戻り値の GetLastError 意味条件の既定を決めるための分類。
     pub flavor: Flavor,
     /// x86 / x64 の両方で呼び出し規約上の 1 スロット（4 / 8 バイト）
     /// に収まるか。固定 64bit 型（I64 / U64）は x86 で 2 スロットを
-    /// 占めるため、汎用 Detour（引数 1 個 = usize 1 個）では中継
-    /// できない。ポインタ幅の型（ISize / USize / ポインタ / ハンドル）
+    /// 占める。ABI 型を保存した生成器はこの区別によらず中継できる。
+    /// ポインタ幅の型（ISize / USize / ポインタ / ハンドル）
     /// は両ターゲットで 1 スロットである。
     pub one_slot: bool,
 }
@@ -117,6 +122,8 @@ pub enum Flavor {
 /// 生成した API 1 件（`ApiDef` と Detour 生成の入力）。
 #[derive(Debug, Clone)]
 pub struct MappedApi {
+    pub abi_params: Vec<&'static str>,
+    pub abi_return: &'static str,
     pub api_id: u32,
     pub module: String,
     pub function: String,
@@ -201,6 +208,9 @@ pub fn generate(index: &TypeIndex, config: &Config) -> Result<Generated, String>
             ));
         }
         seen.push(key);
+        while config.reserved_api_ids.contains(&next_id) {
+            next_id = next_id.checked_add(1).ok_or("API ID overflow")?;
+        }
         match map_api(index, api, next_id, config.max_params)? {
             EntryOutcome::Emitted(mapped) => {
                 next_id += 1;
@@ -299,14 +309,11 @@ fn map_api(
         )));
     }
     let mut enter_fields = Vec::with_capacity(sig.types.len());
+    let mut abi_params = Vec::with_capacity(sig.types.len());
     for (name, ty) in names.iter().zip(sig.types.iter()) {
         match map_type(index, ty) {
             Ok(m) => {
-                if !m.one_slot {
-                    return Ok(skipped(format!(
-                        "引数 {name}: 64bit 固定型は x86 で 2 スロットを占めるため汎用 Detour の対象外"
-                    )));
-                }
+                abi_params.push(m.abi);
                 enter_fields.push((name.to_string(), m.ty, m.kind));
             }
             Err(reason) => {
@@ -314,18 +321,10 @@ fn map_api(
             }
         }
     }
-    let (return_ty, flavor) = match &sig.return_type {
-        Type::Void => (None, Flavor::Void),
+    let (return_ty, flavor, abi_return) = match &sig.return_type {
+        Type::Void => (None, Flavor::Void, "()"),
         ty => match map_type(index, ty) {
-            Ok(m) => {
-                if !m.one_slot {
-                    return Ok(skipped(
-                        "戻り値: 64bit 固定型は x86 で 2 スロットを占めるため汎用 Detour の対象外"
-                            .into(),
-                    ));
-                }
-                (Some((m.ty, m.kind)), m.flavor)
-            }
+            Ok(m) => (Some((m.ty, m.kind)), m.flavor, m.abi),
             Err(reason) => return Ok(skipped(format!("戻り値: {reason}"))),
         },
     };
@@ -335,6 +334,8 @@ fn map_api(
         None => default_meaning(flavor),
     };
     Ok(EntryOutcome::Emitted(MappedApi {
+        abi_params,
+        abi_return,
         api_id,
         module: api.module.clone(),
         function: api.function.clone(),
@@ -347,13 +348,15 @@ fn map_api(
 /// WinMD の型を shirusu の Schema 型へ写す。対応外の型は理由付きで
 /// `Err` を返す。
 pub fn map_type(index: &TypeIndex, ty: &Type) -> Result<MappedTy, String> {
-    let scalar = |ty: Ty, one_slot: bool| MappedTy {
+    let scalar = |ty: Ty, one_slot: bool, abi| MappedTy {
+        abi,
         ty,
         kind: ValueKind::Scalar,
         flavor: Flavor::Integer,
         one_slot,
     };
     let pointer = || MappedTy {
+        abi: "*mut core::ffi::c_void",
         ty: Ty::U64,
         kind: ValueKind::Pointer,
         flavor: Flavor::Pointer,
@@ -361,17 +364,19 @@ pub fn map_type(index: &TypeIndex, ty: &Type) -> Result<MappedTy, String> {
     };
     Ok(match ty {
         Type::Void => return Err("void 型は引数・戻り値以外では扱えない".into()),
-        Type::Bool | Type::Char | Type::I8 | Type::U8 | Type::I16 | Type::U16 => {
-            return Err("32bit 未満の整数 ABI は未対応".into());
-        }
-        Type::I32 => scalar(Ty::I32, true),
-        Type::U32 => scalar(Ty::U32, true),
-        Type::I64 => scalar(Ty::I64, false),
-        Type::U64 => scalar(Ty::U64, false),
-        Type::ISize => scalar(Ty::I64, true),
-        Type::USize => scalar(Ty::U64, true),
-        Type::F32 => return Err("浮動小数点型 F32 は汎用 Detour で中継できない".into()),
-        Type::F64 => return Err("浮動小数点型 F64 は汎用 Detour で中継できない".into()),
+        Type::Bool => scalar(Ty::Bool, true, "u8"),
+        Type::Char | Type::U16 => scalar(Ty::U32, true, "u16"),
+        Type::I8 => scalar(Ty::I32, true, "i8"),
+        Type::U8 => scalar(Ty::U32, true, "u8"),
+        Type::I16 => scalar(Ty::I32, true, "i16"),
+        Type::I32 => scalar(Ty::I32, true, "i32"),
+        Type::U32 => scalar(Ty::U32, true, "u32"),
+        Type::I64 => scalar(Ty::I64, false, "i64"),
+        Type::U64 => scalar(Ty::U64, false, "u64"),
+        Type::ISize => scalar(Ty::I64, true, "isize"),
+        Type::USize => scalar(Ty::U64, true, "usize"),
+        Type::F32 => scalar(Ty::F32, true, "f32"),
+        Type::F64 => scalar(Ty::F64, false, "f64"),
         Type::String => return Err("HSTRING/String 型は対象外".into()),
         Type::Object => return Err("Object 型は対象外".into()),
         Type::Array(_) => return Err("配列の値渡しは対象外".into()),
@@ -427,9 +432,11 @@ fn map_named_type(index: &TypeIndex, tn: &windows_metadata::TypeName) -> Result<
                 kind: ValueKind::Scalar,
                 flavor,
                 one_slot: inner.one_slot,
+                abi: inner.abi,
             })
         }
         TypeCategory::Delegate => Ok(MappedTy {
+            abi: "*mut core::ffi::c_void",
             ty: Ty::U64,
             kind: ValueKind::Pointer,
             flavor: Flavor::Pointer,
@@ -449,6 +456,7 @@ fn map_named_type(index: &TypeIndex, tn: &windows_metadata::TypeName) -> Result<
             // `*mut c_void` 1 個だけの構造体はハンドル (HANDLE / HKEY 等)。
             if matches!(field.ty(), Type::PtrMut(inner, _) if *inner == Type::Void) {
                 return Ok(MappedTy {
+                    abi: "*mut core::ffi::c_void",
                     ty: Ty::U64,
                     kind: ValueKind::Handle,
                     flavor: Flavor::Handle,
@@ -459,6 +467,7 @@ fn map_named_type(index: &TypeIndex, tn: &windows_metadata::TypeName) -> Result<
             // Flavor::Bool として区別する。
             if (tn.namespace.as_str(), tn.name.as_str()) == ("Windows.Win32.Foundation", "BOOL") {
                 return Ok(MappedTy {
+                    abi: "i32",
                     ty: Ty::I32,
                     kind: ValueKind::Scalar,
                     flavor: Flavor::Bool,
@@ -467,7 +476,14 @@ fn map_named_type(index: &TypeIndex, tn: &windows_metadata::TypeName) -> Result<
             }
             map_type(index, &field.ty())
         }
-        TypeCategory::Class | TypeCategory::Interface | TypeCategory::Attribute => Err(format!(
+        TypeCategory::Interface => Ok(MappedTy {
+            abi: "*mut core::ffi::c_void",
+            ty: Ty::U64,
+            kind: ValueKind::Pointer,
+            flavor: Flavor::Pointer,
+            one_slot: true,
+        }),
+        TypeCategory::Class | TypeCategory::Attribute => Err(format!(
             "COM/クラス/インターフェイス型 {}::{} は対象外 (L02 対象)",
             tn.namespace, tn.name
         )),
@@ -604,46 +620,26 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
         "// Source: Windows.Win32.winmd (Microsoft.Windows.SDK.Win32Metadata {winmd_version}).\n"
     ));
     out.push_str("// Regenerate: cargo run -p shirusu-metadata-gen -- --winmd <path> --config crates/shirusu-metadata-gen/apis.toml\n");
-    // Schema の I64/U64 は one_slot 検査済みなのでポインタ幅整数。
-    // 小整数は map_type で除外し、記録用の型への拡張を ABI に持ち込まない。
-    let abi = |ty: Ty, kind: ValueKind| -> &'static str {
-        if matches!(kind, ValueKind::Pointer | ValueKind::Handle) {
-            return "*mut core::ffi::c_void";
-        }
-        match ty {
-            Ty::I32 => "i32",
-            Ty::U32 => "u32",
-            Ty::I64 => "isize",
-            Ty::U64 => "usize",
-            _ => panic!("unsupported generated ABI: {ty:?}"),
-        }
-    };
     for api in generated.emitted() {
         let fname = detour_fn_name(api);
-        let types: Vec<_> = api
-            .enter_fields
-            .iter()
-            .map(|(_, ty, kind)| abi(*ty, *kind))
-            .collect();
+        let types = &api.abi_params;
         let params: Vec<_> = types
             .iter()
             .enumerate()
             .map(|(i, ty)| format!("a{i}: {ty}"))
             .collect();
         let args: Vec<_> = (0..types.len()).map(|i| format!("a{i}")).collect();
-        let raw: Vec<_> = (0..types.len())
-            .map(|i| {
-                if types[i] == "usize" {
-                    format!("a{i}")
-                } else {
-                    format!("a{i} as usize")
-                }
+        let raw: Vec<_> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| match *ty {
+                "f32" => format!("a{i}.to_bits() as u64"),
+                "f64" => format!("a{i}.to_bits()"),
+                "u64" => format!("a{i}"),
+                _ => format!("a{i} as u64"),
             })
             .collect();
-        let ret = api
-            .return_ty
-            .map(|(ty, kind)| abi(ty, kind))
-            .unwrap_or("()");
+        let ret = api.abi_return;
         let declaration_ret = if api.return_ty.is_some() {
             format!(" -> {ret}")
         } else {
@@ -653,33 +649,35 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             "unsafe extern \"system-unwind\" fn {fname}({}){declaration_ret} {{\n",
             params.join(", ")
         ));
-        let binding = if ret == "usize" || api.return_ty.is_none() {
-            ""
-        } else {
+        let binding = if api.return_ty.is_some() && ret != "u64" {
             "let result = "
+        } else {
+            ""
         };
         out.push_str(&format!(
             "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"system-unwind\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
             api.api_id, raw.join(", "), types.join(", ")
         ));
-        if api.return_ty.is_some() {
-            out.push_str(&format!(
-                "        (unsafe {{ original({}) }}) as usize\n",
-                args.join(", ")
-            ));
-        } else {
-            out.push_str(&format!(
-                "        unsafe {{ original({}) }};\n        0\n",
-                args.join(", ")
-            ));
-        }
-        if ret == "usize" {
-            out.push_str("    })\n");
-        } else {
-            out.push_str("    });\n");
-            if api.return_ty.is_some() {
-                out.push_str(&format!("    result as {ret}\n"));
-            }
+        let call = format!("unsafe {{ original({}) }}", args.join(", "));
+        let raw_return = match ret {
+            "()" => format!("{call};\n        0"),
+            "f32" => format!("({call}).to_bits() as u64"),
+            "f64" => format!("({call}).to_bits()"),
+            "u64" => call,
+            _ => format!("({call}) as u64"),
+        };
+        out.push_str(&format!(
+            "        {raw_return}\n    }}){}\n",
+            if ret == "u64" { "" } else { ";" }
+        ));
+        if api.return_ty.is_some() && ret != "u64" {
+            let returned = match ret {
+                "f32" => "f32::from_bits(result as u32)".into(),
+                "f64" => "f64::from_bits(result)".into(),
+                "u64" => "result".into(),
+                _ => format!("result as {ret}"),
+            };
+            out.push_str(&format!("    {returned}\n"));
         }
         out.push_str("}\n");
     }
@@ -696,6 +694,63 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
     out.push_str("    }\n");
     out.push_str("}\n");
     out
+}
+
+/// Generate IID identification metadata for all COM interfaces in WinMD.
+/// Names are descriptive only: this table does not license vtable mutation.
+pub fn emit_com_catalog(index: &TypeIndex, version: &str) -> Result<String, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use windows_metadata::{reader::HasAttributes, Value};
+    let mut catalog: BTreeMap<[u8; 16], BTreeSet<String>> = BTreeMap::new();
+    for (namespace, name, def) in index.iter() {
+        if def.category() != TypeCategory::Interface {
+            continue;
+        }
+        let Some(attr) = def.find_attribute("GuidAttribute") else {
+            continue;
+        };
+        let values: Vec<u32> = attr
+            .value()
+            .iter()
+            .map(|(_, value)| match value {
+                Value::U32(v) => Ok(*v),
+                Value::U16(v) => Ok(u32::from(*v)),
+                Value::U8(v) => Ok(u32::from(*v)),
+                _ => Err(format!(
+                    "{namespace}.{name}: unsupported GUID attribute value"
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        if values.len() != 11 {
+            return Err(format!("{namespace}.{name}: GUID needs 11 values"));
+        }
+        let mut iid = [0; 16];
+        iid[..4].copy_from_slice(&values[0].to_le_bytes());
+        for (n, offset) in [(1, 4), (2, 6)] {
+            let value = u16::try_from(values[n]).map_err(|_| "GUID component out of range")?;
+            iid[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (n, value) in values[3..].iter().enumerate() {
+            iid[n + 8] = u8::try_from(*value).map_err(|_| "GUID byte out of range")?;
+        }
+        catalog
+            .entry(iid)
+            .or_default()
+            .insert(format!("{namespace}.{name}"));
+    }
+    let mut out = format!("// @generated from Windows.Win32.winmd {version}; DO NOT EDIT.\n&[\n");
+    for (iid, names) in catalog {
+        let names = names
+            .iter()
+            .map(|s| rust_str(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "    ComInterfaceInfo {{ iid: {iid:?}, names: &[{names}] }},\n"
+        ));
+    }
+    out.push_str("]\n");
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -806,10 +861,10 @@ mod tests {
             Type::I16,
             Type::U16,
         ] {
-            assert!(map_type(&idx, &ty).is_err(), "{ty:?}");
+            assert!(map_type(&idx, &ty).is_ok(), "{ty:?}");
         }
-        assert!(map_type(&idx, &Type::F32).is_err());
-        assert!(map_type(&idx, &Type::F64).is_err());
+        assert!(map_type(&idx, &Type::F32).is_ok());
+        assert!(map_type(&idx, &Type::F64).is_ok());
         assert!(map_type(&idx, &Type::String).is_err());
         assert!(map_type(&idx, &Type::Object).is_err());
         assert!(map_type(&idx, &Type::Array(Box::new(Type::U8))).is_err());
@@ -833,6 +888,8 @@ mod tests {
             api_id: 7,
             module: "advapi32.dll".into(),
             function: "RegCloseKey".into(),
+            abi_params: vec!["*mut core::ffi::c_void"],
+            abi_return: "u32",
             enter_fields: vec![("hKey".into(), Ty::U64, ValueKind::Handle)],
             return_ty: Some((Ty::U32, ValueKind::Scalar)),
             last_error_meaning: LastErrorMeaning::Never,
@@ -861,6 +918,8 @@ mod tests {
             api_id: 8,
             module: "kernel32.dll".into(),
             function: "Sleep".into(),
+            abi_params: vec!["u32"],
+            abi_return: "()",
             enter_fields: vec![("dwMilliseconds".into(), Ty::U32, ValueKind::Scalar)],
             return_ty: None,
             last_error_meaning: LastErrorMeaning::Never,
@@ -880,6 +939,8 @@ mod tests {
             api_id: 7,
             module: "advapi32.dll".into(),
             function: "RegCloseKey".into(),
+            abi_params: vec!["*mut core::ffi::c_void"],
+            abi_return: "u32",
             enter_fields: vec![("hKey".into(), Ty::U64, ValueKind::Handle)],
             return_ty: Some((Ty::U32, ValueKind::Scalar)),
             last_error_meaning: LastErrorMeaning::Never,
@@ -888,6 +949,8 @@ mod tests {
             api_id: 8,
             module: "kernel32.dll".into(),
             function: "GetCurrentProcessId".into(),
+            abi_params: vec![],
+            abi_return: "u32",
             enter_fields: vec![],
             return_ty: Some((Ty::U32, ValueKind::Scalar)),
             last_error_meaning: LastErrorMeaning::Never,
@@ -900,7 +963,7 @@ mod tests {
         assert!(text.contains(
             "unsafe extern \"system-unwind\" fn detour_generated_advapi32_reg_close_key(a0: *mut core::ffi::c_void) -> u32"
         ));
-        assert!(text.contains("generic_detour_with(7, &[a0 as usize]"));
+        assert!(text.contains("generic_detour_with(7, &[a0 as u64]"));
         assert!(text.contains(
             "unsafe extern \"system-unwind\" fn detour_generated_kernel32_get_current_process_id() -> u32"
         ));
@@ -936,25 +999,9 @@ mod tests {
         let config = load_config(&config_path).expect("apis.toml を読める");
         let index = TypeIndex::read(&winmd).expect("winmd を読める");
         let generated = generate(&index, &config).expect("シード設定を生成できる");
-        // 想定どおりの 2 件だけが自動スキップされる：
-        // SetFilePointerEx は LARGE_INTEGER の値渡し、GetTickCount64 は
-        // U64 戻り（x86 で 2 スロット）。それ以外は全て生成される。
         let skipped = generated.skipped();
-        assert_eq!(skipped.len(), 2, "想定外のスキップがある: {skipped:?}");
-        let names: Vec<&str> = skipped.iter().map(|(_, f, _)| *f).collect();
-        assert!(names.contains(&"SetFilePointerEx"), "{skipped:?}");
-        assert!(names.contains(&"GetTickCount64"), "{skipped:?}");
-        for (_, _, reason) in &skipped {
-            assert!(
-                reason.contains("値渡し構造体") || reason.contains("2 スロット"),
-                "スキップ理由が想定の分類: {reason}"
-            );
-        }
-        assert_eq!(
-            generated.emitted().len(),
-            config.apis.len() - 2,
-            "シード設定の全 API が生成される（2 件の自動スキップを除く）"
-        );
+        assert!(skipped.is_empty(), "unexpected skip: {skipped:?}");
+        assert_eq!(generated.emitted().len(), config.apis.len());
         let emitted = generated.emitted();
         let reg_close = emitted
             .iter()

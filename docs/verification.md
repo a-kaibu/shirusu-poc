@@ -188,7 +188,7 @@ PBTとDSTで見つけたSeed、Fuzzの最小入力、loomの失敗スケジュ�
 | WindowsのネイティブE2E | `scripts/ci/exception-transparency.ps1` | C++のSEH捕捉がHookなし／ありで一致し、HeapAllocのCallAbortedも残る |
 | Windowsの寿命・割当検査 | `deleting_fiber_does_not_end_thread_capture`、Hook単体テストの`heap_watch` | Fiber削除をThread終了と誤認しない。停止区間のRust allocatorの確保・解放・再確保を検出する |
 | TLA+ / TLC | `OverlappedLifecycle.tla`、`scripts/ci/tla.sh` | OSへの発行前登録と、世代付き取消の不変条件。旧登録順のモデルでは反例を必須とする |
-| Mutation | `python3 scripts/ci/review-mutations.py` | UTF-16、プロセス分離、保存順、トリム、Blob数、hex解析、操作再利用、未取得値、閉鎖失敗、再実行の初期状態・明示位置の11変異を隔離コピーで実行。コンパイル失敗は検出成功に数えない |
+| Mutation | `python3 scripts/ci/review-mutations.py` | UTF-16、プロセス分離、保存順、トリム、Blob数、hex解析、操作再利用、未取得値、閉鎖失敗、再実行の初期状態・明示位置、64bit ABI、浮動小数点ビット列の13変異を隔離コピーで実行。コンパイル失敗は検出成功に数えない |
 | Coverage-guided fuzz / ASan | `cargo +nightly fuzz run blob_hex` / `trace_budgets` | 不正UTF-8境界、任意バイト列、構造を保つBlob更新列に対するpanicと予算超過 |
 
 短時間・長時間のfuzzスクリプトは、既存の`decode_compact`と
@@ -232,3 +232,18 @@ Linux 上の型検査だけでは代替できない。
 2 実行から ReadFile.data の差分を選び、ルールの左 pass / 右 fail を確認し、
 基準側の記録から生成した exe と JSON Runner をそれぞれ空のディレクトリで
 実行して読み書き結果を検証する。windows.ps1 の必須ステップとして実行する。
+
+
+API 拡張では、記録スキーマの幅とネイティブ ABI の型を別に保存する。
+`generated_abi` は、生成されたラッパーを実際の型を持つ original に接続し、
+void・ポインタ・i16・i64/u64・混在した f32/f64 の引数と戻り値を実行検証する。
+負のゼロと NaN のペイロードは数値キャストせず `to_bits` / `from_bits` で往復する。
+64bit 戻り値の上位 32bit を落とす変異、float を数値キャストする変異も
+mutation スイートで検出する。Windows x86 の実行結果は Windows CI が必要。
+
+IID カタログは Win32 Metadata 71.0.45-preview の全インターフェイスから
+決定的に生成する。7,797 IID を保持し、同じ IID の別名も残す。IID の名前解決は
+メソッドをフックできることを意味しない。通常の COM メソッド追跡は未対応であり、
+`shirusu capabilities --json` でも明示的に false として返す。
+再生成・検査には metadata-gen の
+`--com-catalog crates/shirusu-trace/src/com_catalog_generated.inc` を付ける。

@@ -1,5 +1,13 @@
 # shirusu-poc
 
+現在の対応範囲は `shirusu capabilities`（機械可読出力は `--json`）で確認できる。
+Win32／内部 API は 142 件（生成 L1: 129、手書き: 6、内部: 7）。
+32/64bit 整数・短整数・浮動小数点の元の ABI を保って中継する。
+COM は Factory の観測と 7,797 IID の名前解決に対応するが、共有オブジェクトの
+メソッドを安全に追跡する通常経路は未完成。全 Windows API・COM 対応が完成した
+リリースとしては扱わない。検証方法と実動確認の範囲は [docs/verification.md](docs/verification.md) を参照。
+
+
 shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC 実装。
 仕様の正は `docs/spec-transport.md`、全体設計は `docs/overview.md`、検証戦略は `docs/verification.md`。
 仕様条項・テスト項目と実装の対応は `docs/traceability.md`（網羅チェックリスト、進捗の分母）にあります。

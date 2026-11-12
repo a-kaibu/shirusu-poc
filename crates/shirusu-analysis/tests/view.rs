@@ -1037,3 +1037,47 @@ fn decode_fields_reports_schema_with_unknown_types() {
     let err = view.events[0].args_error.as_deref().unwrap();
     assert!(err.contains("has unknown types"), "{err}");
 }
+
+#[test]
+fn iid_identification_requires_captured_com_context_and_is_exported() {
+    use shirusu_analysis::{EventView, FieldView, PayloadView};
+    use shirusu_trace::schema::ValueCapture;
+    let mut event = EventView {
+        index: 0,
+        session_id: 1,
+        process_id: 1,
+        raw_pid: 1,
+        thread_id: 1,
+        qpc_frequency: 1,
+        kind: 1,
+        sequence: 1,
+        global_order: None,
+        timestamp_qpc: 1,
+        call_id: 1,
+        parent_call_id: 0,
+        api_id: 1000,
+        schema_id: 10001,
+        api_name: Some("com!method".into()),
+        schema_name: None,
+        capture: EventCapture::Captured,
+        args_error: None,
+        payload: PayloadView::None,
+        fields: vec![FieldView {
+            name: "iid".into(),
+            ty: Ty::Bytes,
+            kind: ValueKind::Scalar,
+            capture: ValueCapture::Captured,
+            value: TypedValue::Bytes(vec![12, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 70]),
+        }],
+    };
+    assert!(event
+        .to_json()
+        .render()
+        .contains("Windows.Win32.System.Com.IStream"));
+    assert!(event.line().contains("IStream"));
+    event.fields[0].capture = ValueCapture::Unreadable;
+    assert!(event.com_interface_names().is_none());
+    event.fields[0].capture = ValueCapture::Captured;
+    event.api_name = Some("application!not-com".into());
+    assert!(event.com_interface_names().is_none());
+}

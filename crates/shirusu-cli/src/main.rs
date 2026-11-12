@@ -73,6 +73,7 @@ fn usage() -> &'static str {
     "shirusu <command> <trace> [options]\n\
      \n\
      commands:\n\
+     \x20 capabilities [--json]           supported APIs and capture limits\n\
      \x20 inspect <trace> [--json]          metadata, integrity, per-API counts\n\
      \x20 dump <trace> [filters] [--json]   one line per event\n\
      \x20 export <trace> --format jsonl [--output <path>]\n\
@@ -111,6 +112,7 @@ fn run(args: &[String]) -> Result<(), ToolError> {
     };
     match cmd {
         "inspect" => cmd_inspect(rest),
+        "capabilities" => cmd_capabilities(rest),
         "dump" => cmd_dump(rest),
         "export" => cmd_export(rest),
         "repair" => cmd_repair(rest),
@@ -122,6 +124,82 @@ fn run(args: &[String]) -> Result<(), ToolError> {
         }
         other => Err(ToolError::Usage(format!("unknown command: {other}"))),
     }
+}
+
+fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
+    let json = match args {
+        [] => false,
+        [flag] if flag == "--json" => true,
+        _ => return Err(ToolError::Usage("capabilities accepts only --json".into())),
+    };
+    let mut apis: Vec<_> = shirusu_hook::api::api_table().collect();
+    apis.sort_by_key(|a| a.api_id);
+    if json {
+        let report = JsonValue::obj(vec![
+            (
+                "apis",
+                JsonValue::Array(
+                    apis.iter()
+                        .map(|a| {
+                            JsonValue::obj(vec![
+                                ("id", JsonValue::U64(u64::from(a.api_id))),
+                                ("module", JsonValue::Str(a.module.into())),
+                                ("function", JsonValue::Str(a.function.into())),
+                                ("level", JsonValue::U64(u64::from(a.level))),
+                                ("detail", JsonValue::Str(a.level_note.into())),
+                                (
+                                    "detailed_mode_only",
+                                    JsonValue::Bool(shirusu_hook::api::is_internal_api(a.api_id)),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "com",
+                JsonValue::obj(vec![
+                    (
+                        "known_iids",
+                        JsonValue::U64(shirusu_trace::com_catalog::COM_INTERFACES.len() as u64),
+                    ),
+                    (
+                        "factories",
+                        JsonValue::Array(vec![
+                            JsonValue::Str("CoCreateInstance".into()),
+                            JsonValue::Str("CoGetClassObject".into()),
+                        ]),
+                    ),
+                    ("standard_method_interception", JsonValue::Bool(false)),
+                    (
+                        "method_limit",
+                        JsonValue::Str("shared-object-safety-unproven".into()),
+                    ),
+                ]),
+            ),
+        ]);
+        println!("{}", report.render_pretty());
+    } else {
+        println!(
+            "{} supported Win32/internal APIs (L1: values; L2: captured data)",
+            apis.len()
+        );
+        for api in apis {
+            println!(
+                "L{} {}!{}{}",
+                api.level,
+                api.module,
+                api.function,
+                if shirusu_hook::api::is_internal_api(api.api_id) {
+                    " [detailed mode]"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!("COM: {} known IIDs; factory observation; standard method interception unavailable (shared-object-safety-unproven)", shirusu_trace::com_catalog::COM_INTERFACES.len());
+    }
+    Ok(())
 }
 
 /// 位置引数（Trace パス）と `--key value` / `--flag` を分ける。

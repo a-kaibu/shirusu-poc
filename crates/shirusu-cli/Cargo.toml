@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "shirusu 解析・記録 CLI: inspect（メタデータ・完全性・API 集計）/ dump（イベント表示・検索）/ export（JSONL）/ repair / capture・attach（Windows での記録）"
 
 [dependencies]
+shirusu-hook = { path = "../shirusu-hook" }
 shirusu-analysis = { path = "../shirusu-analysis" }
 shirusu-host = { path = "../shirusu-host" }
 shirusu-trace = { path = "../shirusu-trace" }

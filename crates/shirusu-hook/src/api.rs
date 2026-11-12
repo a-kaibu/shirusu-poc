@@ -553,7 +553,11 @@ mod tests {
         let generated: Vec<&ApiDef> = GENERATED_API_TABLE.iter().collect();
         assert!(!generated.is_empty(), "generated table must not be empty");
         assert_eq!(generated[0].api_id, 7);
-        assert_eq!(generated[generated.len() - 1].api_id, 78);
+        assert_eq!(generated[generated.len() - 1].api_id, API_COUNT as u32);
+        assert_eq!(
+            api_by_import("kernel32", "GetTickCount").unwrap().api_id,
+            78
+        );
         for api in &generated {
             assert_eq!(api.level, 1, "{} must be L1", api.function);
             assert!(
@@ -564,7 +568,10 @@ mod tests {
             );
             for &(name, ty, _, _) in api.enter_fields.iter() {
                 assert!(
-                    matches!(ty, Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool),
+                    matches!(
+                        ty,
+                        Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool | Ty::F32 | Ty::F64
+                    ),
                     "{} enter field {name} uses unsupported {ty:?}",
                     api.function
                 );
@@ -575,7 +582,10 @@ mod tests {
             for &(name, ty, _, _) in api.leave_fields.iter() {
                 if name == "return" {
                     assert!(
-                        matches!(ty, Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool),
+                        matches!(
+                            ty,
+                            Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool | Ty::F32 | Ty::F64
+                        ),
                         "{} return uses unsupported {ty:?}",
                         api.function
                     );
@@ -592,7 +602,7 @@ mod tests {
         // （last_error は無い。Nt* は GetLastError を使わない）。
         assert_eq!(INTERNAL_API_TABLE.len(), INTERNAL_API_COUNT);
         assert_eq!(INTERNAL_API_ID_BASE, 79);
-        assert_eq!(API_COUNT, 85);
+        assert_eq!(API_COUNT, 142);
         for (i, api) in INTERNAL_API_TABLE.iter().enumerate() {
             assert_eq!(api.api_id, INTERNAL_API_ID_BASE + i as u32);
             assert_eq!(api.module, "ntdll.dll");
@@ -606,7 +616,10 @@ mod tests {
             );
             for &(name, ty, _, _) in api.enter_fields.iter() {
                 assert!(
-                    matches!(ty, Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool),
+                    matches!(
+                        ty,
+                        Ty::U32 | Ty::I32 | Ty::U64 | Ty::I64 | Ty::Bool | Ty::F32 | Ty::F64
+                    ),
                     "{} enter field {name} uses unsupported {ty:?}",
                     api.function
                 );

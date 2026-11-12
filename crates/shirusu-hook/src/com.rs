@@ -354,6 +354,19 @@ pub fn interface_by_iid(iid: &Guid) -> Option<&'static ComInterfaceDef> {
         .or_else(|| crate::winrt::winrt_interface_by_iid(iid))
 }
 
+/// Identify interfaces beyond the small, explicitly supported interception table.
+/// Catalog membership never enables the unsafe exclusive-object interceptor.
+pub fn interface_name_for_iid(iid: &Guid) -> &'static str {
+    interface_by_iid(iid)
+        .map(|d| d.name)
+        .or_else(|| {
+            shirusu_trace::com_catalog::interface_by_iid(&iid.bytes)
+                .and_then(|entry| entry.names.first())
+                .and_then(|name| name.rsplit('.').next())
+        })
+        .unwrap_or("unknown")
+}
+
 impl ComInterfaceDef {
     pub fn method(&self, index: u32) -> Option<&ComMethodDef> {
         self.methods.iter().find(|m| m.index == index)
@@ -554,11 +567,10 @@ pub fn encode_com_leave(values: &[CapturedValue]) -> Result<Vec<u8>, CompactErro
 }
 
 /// 引数の生スロット値列を作る（native 幅の usize を LE で並べる）。
-/// スロット数が 4 を超える分は切り捨てる（既知インターフェイスの
-/// 最大 arity は 4 のため、到達しないはずの防御）。
+/// Factory の引数も含めて全て保存する（CoCreateInstance は 5 引数）。
 pub fn raw_arg_slots(args: &[usize]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(args.len().min(4) * std::mem::size_of::<usize>());
-    for a in args.iter().take(4) {
+    let mut out = Vec::with_capacity(std::mem::size_of_val(args));
+    for a in args {
         out.extend_from_slice(&a.to_le_bytes());
     }
     out
@@ -680,7 +692,7 @@ impl ComTracker {
         if let Some(o) = self.objects.get(&ptr) {
             return o.identity;
         }
-        let name = interface_by_iid(&iid).map(|d| d.name).unwrap_or("unknown");
+        let name = interface_name_for_iid(&iid);
         self.insert(ComObject {
             ptr,
             iid,
@@ -770,7 +782,7 @@ impl ComTracker {
         if self.objects.contains_key(&out) {
             return QueryInterfaceOutcome::NewInterface { ptr: out };
         }
-        let name = interface_by_iid(&iid).map(|d| d.name).unwrap_or("unknown");
+        let name = interface_name_for_iid(&iid);
         self.insert(ComObject {
             ptr: out,
             iid,
@@ -803,7 +815,7 @@ impl ComTracker {
         if ptr == 0 || self.objects.contains_key(&ptr) {
             return self.objects.get(&ptr).map(|o| o.identity);
         }
-        let name = interface_by_iid(&iid).map(|d| d.name).unwrap_or("unknown");
+        let name = interface_name_for_iid(&iid);
         Some(self.insert(ComObject {
             ptr,
             iid,
@@ -827,7 +839,7 @@ impl ComTracker {
         if let Some(o) = self.objects.get(&ptr) {
             return o.identity;
         }
-        let name = interface_by_iid(&iid).map(|d| d.name).unwrap_or("unknown");
+        let name = interface_name_for_iid(&iid);
         self.insert(ComObject {
             ptr,
             iid,
@@ -987,6 +999,17 @@ mod tests {
     use shirusu_trace::schema::{LastErrorMeaning, SchemaRegistry};
 
     #[test]
+    fn metadata_identifies_stream_without_enabling_unsafe_interception() {
+        let iid = Guid::new(12, 0, 0, [192, 0, 0, 0, 0, 0, 0, 70]);
+        assert_eq!(interface_name_for_iid(&iid), "IStream");
+        assert!(interface_by_iid(&iid).is_none());
+        let mut tracker = ComTracker::new();
+        tracker.note_factory_result(123, iid, "CoCreateInstance");
+        assert_eq!(tracker.lookup(123).unwrap().interface_name, "IStream");
+        assert!(!tracker.lookup(123).unwrap().intercepted);
+    }
+
+    #[test]
     fn guid_display_matches_canonical_form() {
         assert_eq!(
             IID_ISHELL_LINK_W.to_string(),
@@ -1131,9 +1154,10 @@ mod tests {
     }
 
     #[test]
-    fn raw_arg_slots_cap_at_four_and_use_native_width() {
+    fn raw_arg_slots_preserve_all_factory_arguments() {
         let slots = raw_arg_slots(&[1, 2, 3, 4, 5]);
-        assert_eq!(slots.len(), 4 * std::mem::size_of::<usize>());
+        assert_eq!(slots.len(), 5 * std::mem::size_of::<usize>());
+        assert!(slots.ends_with(&5usize.to_le_bytes()));
         assert_eq!(raw_arg_slots(&[]).len(), 0);
     }
 

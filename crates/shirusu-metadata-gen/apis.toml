@@ -13,6 +13,7 @@
 # unspecified。
 
 first_api_id = 7
+reserved_api_ids = [79, 80, 81, 82, 83, 84, 85]
 max_params = 12
 winmd_version = "71.0.45-preview"
 
@@ -229,10 +230,6 @@ last_error = "minus-one"
 [[api]]
 namespace = "Windows.Win32.Storage.FileSystem"
 module = "kernel32.dll"
-function = "SetFilePointerEx"
-[[api]]
-namespace = "Windows.Win32.Storage.FileSystem"
-module = "kernel32.dll"
 function = "FlushFileBuffers"
 [[api]]
 namespace = "Windows.Win32.Storage.FileSystem"
@@ -337,6 +334,11 @@ namespace = "Windows.Win32.System.SystemInformation"
 module = "kernel32.dll"
 function = "GetTickCount64"
 
+[[api]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "SetFilePointerEx"
+
 # ---- 意図的な除外 ----
 # GetLastError / SetLastError: Detour 自身が LastError を読む・戻すため、
 # フックすると自己参照になる。
@@ -362,3 +364,277 @@ namespace = "Windows.Win32.System.Memory"
 module = "kernel32.dll"
 function = "LocalFree"
 reason = "成功時に NULL を返す反転した意味のため、L1 の意味条件では扱えない"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetMessageW"
+last_error = "minus-one"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "PeekMessageW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "DispatchMessageW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "TranslateMessage"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "SendMessageW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "PostMessageW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "CreateWindowExW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "DestroyWindow"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "ShowWindow"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "SetWindowTextW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetWindowTextW"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetClientRect"
+
+[[api]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetWindowRect"
+
+[[api]]
+namespace = "Windows.Win32.UI.Input.KeyboardAndMouse"
+module = "user32.dll"
+function = "GetKeyState"
+
+[[api]]
+namespace = "Windows.Win32.UI.Input.KeyboardAndMouse"
+module = "user32.dll"
+function = "GetAsyncKeyState"
+
+[[api]]
+namespace = "Windows.Win32.UI.Input.KeyboardAndMouse"
+module = "user32.dll"
+function = "GetKeyboardState"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "CreateCompatibleDC"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "DeleteDC"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "CreateCompatibleBitmap"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "SelectObject"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "DeleteObject"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "BitBlt"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "StretchBlt"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "SetMiterLimit"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "AngleArc"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "gdi32.dll"
+function = "GetDeviceCaps"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "GetDC"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Gdi"
+module = "user32.dll"
+function = "ReleaseDC"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Direct2D"
+module = "d2d1.dll"
+function = "D2D1ComputeMaximumScaleFactor"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.Direct3D9"
+module = "d3d9.dll"
+function = "Direct3DCreate9"
+
+[[api]]
+namespace = "Windows.Win32.Media"
+module = "winmm.dll"
+function = "timeGetTime"
+
+[[api]]
+namespace = "Windows.Win32.Media"
+module = "winmm.dll"
+function = "timeBeginPeriod"
+
+[[api]]
+namespace = "Windows.Win32.Media"
+module = "winmm.dll"
+function = "timeEndPeriod"
+
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "oleaut32.dll"
+function = "SysAllocString"
+
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "oleaut32.dll"
+function = "SysFreeString"
+
+[[api]]
+namespace = "Windows.Win32.Foundation"
+module = "oleaut32.dll"
+function = "SysStringLen"
+
+[[api]]
+namespace = "Windows.Win32.System.Variant"
+module = "oleaut32.dll"
+function = "VariantInit"
+
+[[api]]
+namespace = "Windows.Win32.System.Variant"
+module = "oleaut32.dll"
+function = "VariantClear"
+
+[[api]]
+namespace = "Windows.Win32.System.Com"
+module = "ole32.dll"
+function = "CoInitializeEx"
+
+[[api]]
+namespace = "Windows.Win32.System.Com"
+module = "ole32.dll"
+function = "CoUninitialize"
+
+[[api]]
+namespace = "Windows.Win32.System.Com"
+module = "ole32.dll"
+function = "CoTaskMemAlloc"
+
+[[api]]
+namespace = "Windows.Win32.System.Com"
+module = "ole32.dll"
+function = "CoTaskMemFree"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "WSAStartup"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "WSACleanup"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "socket"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "closesocket"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "connect"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "bind"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "listen"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "accept"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "send"
+
+[[api]]
+namespace = "Windows.Win32.Networking.WinSock"
+module = "ws2_32.dll"
+function = "recv"
+
+[[api]]
+namespace = "Windows.Win32.Graphics.OpenGL"
+module = "opengl32.dll"
+function = "glClearDepth"
+[[api]]
+namespace = "Windows.Win32.Graphics.OpenGL"
+module = "opengl32.dll"
+function = "glDepthRange"
+[[api]]
+namespace = "Windows.Win32.Graphics.OpenGL"
+module = "opengl32.dll"
+function = "glClearColor"

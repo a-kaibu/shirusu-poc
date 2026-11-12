@@ -17,6 +17,7 @@
 //!   記録し、読める範囲を返す）。
 
 pub mod blob;
+pub mod com_catalog;
 pub mod compact;
 pub mod container;
 pub mod error;

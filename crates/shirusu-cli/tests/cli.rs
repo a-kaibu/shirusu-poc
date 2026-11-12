@@ -1163,3 +1163,22 @@ fn inspect_json_includes_profile_summary() {
     assert!(out.contains("\"total_events_seen\": 5"), "{out}");
     assert!(out.contains("kernel32!CreateFileW"), "{out}");
 }
+
+#[test]
+fn capabilities_reports_api_support_separately_from_com_identification() {
+    let result = Command::new(env!("CARGO_BIN_EXE_shirusu"))
+        .args(["capabilities", "--json"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let text = String::from_utf8(result.stdout).unwrap();
+    assert!(text.contains("\"function\": \"AngleArc\""));
+    assert!(text.contains("\"function\": \"GetTickCount64\""));
+    assert!(text.contains("\"known_iids\": 7797"));
+    assert!(text.contains("\"standard_method_interception\": false"));
+    let bad = Command::new(env!("CARGO_BIN_EXE_shirusu"))
+        .args(["capabilities", "--unknown"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+}

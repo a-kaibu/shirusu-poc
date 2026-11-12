@@ -725,6 +725,8 @@ fn raw_to_value(function: &str, name: &str, ty: Ty, raw: u64) -> CapturedValue {
         Ty::U64 => u64v(raw),
         Ty::I64 => i64v(raw as i64),
         Ty::Bool => boolv(raw != 0),
+        Ty::F32 => CapturedValue::captured(TypedValue::F32Bits(raw as u32)),
+        Ty::F64 => CapturedValue::captured(TypedValue::F64Bits(raw)),
         other => {
             panic!("{function}: field {name} uses unsupported Ty {other:?} for generic L1 capture")
         }

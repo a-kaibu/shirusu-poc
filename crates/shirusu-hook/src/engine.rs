@@ -1347,10 +1347,10 @@ use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, PIO_APC_ROUTINE};
 macro_rules! nt_detour {
     ($name:ident, $api:expr, ($($arg:ident: $ty:ty => $raw:expr),* $(,)?)) => {
         unsafe extern "system-unwind" fn $name($($arg: $ty),*) -> i32 {
-            generic_detour_with($api, &[$($raw),*], |original| {
+            generic_detour_with($api, &[$(($raw) as u64),*], |original| {
                 let original: unsafe extern "system-unwind" fn($($ty),*) -> i32 =
                     unsafe { std::mem::transmute(original) };
-                (unsafe { original($($arg),*) }) as usize
+                (unsafe { original($($arg),*) }) as u64
             }) as i32
         }
     };
@@ -1550,9 +1550,9 @@ unsafe fn call_original<const N: usize>(original: usize, args: &[usize; N]) -> u
 /// は全て NULL / FALSE が失敗値であるため 0 で足りる）。
 fn generic_detour_with<const N: usize>(
     api_id: u32,
-    args: &[usize; N],
-    invoke: impl FnOnce(usize) -> usize,
-) -> usize {
+    args: &[u64; N],
+    invoke: impl FnOnce(usize) -> u64,
+) -> u64 {
     let (rt, original, tid, api, _flight, mut guard, mut le) = match prepare(api_id) {
         Prepare::Record {
             rt,
@@ -1570,8 +1570,7 @@ fn generic_detour_with<const N: usize>(
         Prepare::Unavailable => return 0,
     };
     let call_id = rt.alloc_call_id();
-    let raw: Vec<u64> = args.iter().map(|a| *a as u64).collect();
-    let values = capture::generic_enter(api, &raw);
+    let values = capture::generic_enter(api, args);
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
@@ -1590,7 +1589,7 @@ fn generic_detour_with<const N: usize>(
     // 透明性: 他の処理より先に LastError を確定させる（overview）。
     let last_error = le.capture_after_original();
     pop_call(call_id);
-    let values = capture::generic_leave(api, ret as u64, last_error);
+    let values = capture::generic_leave(api, ret, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.record_leave(tid, api, call_id, &bytes);
     }

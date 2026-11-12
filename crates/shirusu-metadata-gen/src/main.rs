@@ -14,7 +14,9 @@
 //! `--winmd` は環境変数 `SHIRUSU_WINMD` か
 //! `target/winmd/Windows.Win32.winmd`。
 
-use shirusu_metadata_gen::{emit_api_inc, emit_engine_inc, generate, load_config};
+use shirusu_metadata_gen::{
+    emit_api_inc, emit_com_catalog, emit_engine_inc, generate, load_config,
+};
 use windows_metadata::reader::TypeIndex;
 
 const API_INC: &str = "api_generated.inc";
@@ -22,7 +24,7 @@ const ENGINE_INC: &str = "engine_generated.inc";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--check]"
+        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--check]"
     );
     std::process::exit(2);
 }
@@ -32,6 +34,7 @@ fn main() {
     let mut config_path = "crates/shirusu-metadata-gen/apis.toml".to_string();
     let mut out_dir = "crates/shirusu-hook/src".to_string();
     let mut check = false;
+    let mut catalog: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -39,22 +42,39 @@ fn main() {
             "--config" => config_path = args.next().unwrap_or_else(|| usage()),
             "--out-dir" => out_dir = args.next().unwrap_or_else(|| usage()),
             "--check" => check = true,
+            "--com-catalog" => catalog = Some(args.next().unwrap_or_else(|| usage())),
             _ => usage(),
         }
     }
     let winmd = winmd
         .or_else(|| std::env::var("SHIRUSU_WINMD").ok())
         .unwrap_or_else(|| "target/winmd/Windows.Win32.winmd".to_string());
-    if let Err(e) = run(&winmd, &config_path, &out_dir, check) {
+    if let Err(e) = run(&winmd, &config_path, &out_dir, check, catalog.as_deref()) {
         eprintln!("win32-metadata-gen: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(winmd: &str, config_path: &str, out_dir: &str, check: bool) -> Result<(), String> {
+fn run(
+    winmd: &str,
+    config_path: &str,
+    out_dir: &str,
+    check: bool,
+    catalog: Option<&str>,
+) -> Result<(), String> {
     let config = load_config(config_path)?;
     let index = TypeIndex::read(winmd)
         .ok_or_else(|| format!("{winmd} を読めない（fetch-winmd.sh で取得する）"))?;
+    if let Some(path) = catalog {
+        let content = emit_com_catalog(&index, &config.winmd_version)?;
+        if check {
+            if !matches!(std::fs::read_to_string(path), Ok(have) if have == content) {
+                return Err(format!("COM catalog {path} is stale"));
+            }
+        } else {
+            std::fs::write(path, content).map_err(|e| e.to_string())?;
+        }
+    }
     let generated = generate(&index, &config)?;
     let api_inc = emit_api_inc(&generated, &config.winmd_version);
     let engine_inc = emit_engine_inc(&generated, &config.winmd_version);
@@ -92,7 +112,7 @@ fn run(winmd: &str, config_path: &str, out_dir: &str, check: bool) -> Result<(),
         "generated {} APIs (ids {}..={}) from {} (winmd {})",
         emitted.len(),
         config.first_api_id,
-        config.first_api_id + emitted.len() as u32 - 1,
+        emitted.last().map(|a| a.api_id).unwrap_or(0),
         winmd,
         config.winmd_version
     );
