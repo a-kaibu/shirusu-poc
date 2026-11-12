@@ -199,8 +199,8 @@ fn return_address_outside_module(self_base: usize) -> Option<usize> {
             std::ptr::null_mut(),
         )
     };
-    for i in 0..captured as usize {
-        let addr = frames[i] as usize;
+    for frame in frames.iter().take(captured as usize) {
+        let addr = *frame as usize;
         if addr == 0 {
             continue;
         }

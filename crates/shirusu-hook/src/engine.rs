@@ -333,15 +333,6 @@ enum InlineOriginalSlot {
 }
 
 impl InlineOriginalSlot {
-    fn original(&self, rt: &HookRuntime) -> usize {
-        match *self {
-            Self::Api(id) => rt.original(id),
-            Self::ComFactory(i) => rt.com_original(i),
-            Self::WinRtActivation(i) => rt.winrt_original(i),
-            Self::Callback(i) => rt.callback_original(i),
-        }
-    }
-
     fn set_original(&self, rt: &HookRuntime, address: usize) {
         match *self {
             Self::Api(id) => rt.set_original(id, address),
@@ -608,6 +599,10 @@ fn alloc_near(target: usize, size: usize) -> Option<usize> {
 /// 対象アドレスへパッチバイト列を書き込む（保護属性を一時変更し、
 /// 命令キャッシュを捨てる）。
 fn patch_target(target: usize, patch: &[u8]) -> Result<(), ()> {
+    patch_target_with(target, patch, || {})
+}
+
+fn patch_target_with(target: usize, patch: &[u8], before_write: impl FnOnce()) -> Result<(), ()> {
     let mut old: u32 = 0;
     // SAFETY: 呼び出し側が有効な対象アドレスを渡す。
     let ok = unsafe {
@@ -621,6 +616,7 @@ fn patch_target(target: usize, patch: &[u8]) -> Result<(), ()> {
     if ok == 0 {
         return Err(());
     }
+    before_write();
     // SAFETY: 同上。書き込み後は元の保護属性へ戻す。
     unsafe {
         std::ptr::copy_nonoverlapping(patch.as_ptr(), target as *mut u8, patch.len());
@@ -631,24 +627,61 @@ fn patch_target(target: usize, patch: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+// Published trampolines survive uninstall for late passthrough callers.
+// Unpublished reservations are owned and reclaimed, including their budget.
+static TRAMPOLINE_ALLOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct TrampolineAllocation {
+    address: usize,
+    published: bool,
+}
+
+impl TrampolineAllocation {
+    fn reserve() -> Result<Self, &'static str> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut count = TRAMPOLINE_ALLOCATIONS.load(Relaxed);
+        loop {
+            if count >= 4096 {
+                return Err("retained-trampoline-limit");
+            }
+            match TRAMPOLINE_ALLOCATIONS.compare_exchange_weak(count, count + 1, Relaxed, Relaxed) {
+                Ok(_) => {
+                    return Ok(Self {
+                        address: 0,
+                        published: false,
+                    })
+                }
+                Err(actual) => count = actual,
+            }
+        }
+    }
+}
+
+impl Drop for TrampolineAllocation {
+    fn drop(&mut self) {
+        if !self.published {
+            if self.address != 0 {
+                // SAFETY: no original slot or patched entry has exposed this
+                // allocation; prepared owners are dropped after thread resume.
+                if unsafe { VirtualFree(self.address as *mut c_void, 0, MEM_RELEASE) } == 0 {
+                    // Keep the reservation charged if release was not confirmed.
+                    return;
+                }
+            }
+            TRAMPOLINE_ALLOCATIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Prepare the trampoline and patch bytes before suspending any thread.
-fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8>), &'static str> {
+fn prepare_inline(
+    p: &PlannedInline,
+    bitness: u32,
+) -> Result<(InlineHook, Vec<u8>, TrampolineAllocation), &'static str> {
     const TRAMPOLINE_SIZE: usize = 0x1000;
     const RELAY_OFFSET: usize = 0xf00;
-    // Retired trampolines remain executable until process exit (P0-1).
-    // Bound cumulative allocation attempts across reattachments. Failed attempts
-    // also consume budget so no error path can permit unbounded retained memory.
-    static ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if ALLOCATIONS
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |n| (n < 4096).then_some(n + 1),
-        )
-        .is_err()
-    {
-        return Err("retained-trampoline-limit");
-    }
+    let mut allocation = TrampolineAllocation::reserve()?;
     let trampoline = match alloc_near(p.target, TRAMPOLINE_SIZE) {
         Some(t) => t,
         None => {
@@ -667,10 +700,10 @@ fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8
             t as usize
         }
     };
+    allocation.address = trampoline;
     let code = match build_trampoline(&p.plan, trampoline as u64) {
         Ok(c) => c,
         Err(e) => {
-            unsafe { VirtualFree(trampoline as *mut c_void, 0, MEM_RELEASE) };
             return Err(e.reason());
         }
     };
@@ -679,7 +712,6 @@ fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8
         let relay = trampoline + RELAY_OFFSET;
         let entry = build_patch(p.target as u64, relay as u64, bitness);
         if bitness != 64 || entry.len() > p.plan.patch_len || code.len() > RELAY_OFFSET {
-            unsafe { VirtualFree(trampoline as *mut c_void, 0, MEM_RELEASE) };
             return Err("near-relay-unavailable");
         }
         let relay_code = build_patch(relay as u64, p.detour as u64, bitness);
@@ -691,7 +723,6 @@ fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8
         direct_patch
     };
     if code.len() > RELAY_OFFSET {
-        unsafe { VirtualFree(trampoline as *mut c_void, 0, MEM_RELEASE) };
         return Err("trampoline-too-large");
     }
     // SAFETY: 確保したての実行可能領域へ書き込む。
@@ -713,6 +744,7 @@ fn prepare_inline(p: &PlannedInline, bitness: u32) -> Result<(InlineHook, Vec<u8
             original_bytes: p.original_bytes.clone(),
         },
         patch,
+        allocation,
     ))
 }
 
@@ -730,16 +762,23 @@ fn install_planned(
     let mut prepared: Vec<_> = plans.iter().map(|p| prepare_inline(p, bitness)).collect();
     let mut status = vec![Ok(()); plans.len()];
     if let Ok(suspender) = SuspendedThreads::suspend_all() {
-        for ((p, ready), result) in plans.iter().zip(&prepared).zip(&mut status) {
-            let Ok((hook, patch)) = ready else { continue };
+        for ((p, ready), result) in plans.iter().zip(&mut prepared).zip(&mut status) {
+            let Ok((hook, patch, allocation)) = ready else {
+                continue;
+            };
             if suspender.any_ip_in_range(p.target, p.target + p.plan.patch_len) {
                 *result = Err("thread-in-target");
                 continue;
             }
-            let previous = p.slot.original(rt);
-            p.slot.set_original(rt, hook.trampoline);
-            if patch_target(p.target, patch).is_err() {
-                p.slot.set_original(rt, previous);
+            if patch_target_with(p.target, patch, || {
+                // VirtualProtect has succeeded, so the only remaining steps
+                // publish the original and copy the patch. Once visible, retain
+                // the trampoline even if a later operation cannot complete.
+                allocation.published = true;
+                p.slot.set_original(rt, hook.trampoline);
+            })
+            .is_err()
+            {
                 *result = Err("protect-failed");
             }
         }
@@ -751,8 +790,9 @@ fn install_planned(
         .drain(..)
         .zip(status)
         .map(|(p, status)| {
-            let (hook, _) = p?;
+            let (hook, _, allocation) = p?;
             status?;
+            debug_assert!(allocation.published);
             Ok(hook)
         })
         .collect()
@@ -4127,6 +4167,93 @@ mod tests {
         assert!(unsafe { uninstall_inline_hooks(&result.installed) }.is_empty());
         assert!(clear_runtime(&rt));
         assert_eq!(unsafe { GetCurrentProcess() } as usize, usize::MAX);
+    }
+
+    #[test]
+    fn unpublished_trampolines_release_memory_and_budget() {
+        // Isolate SuspendThread from the parallel test harness and its locks.
+        const CHILD: &str = "SHIRUSU_UNPUBLISHED_TRAMPOLINE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::unpublished_trampolines_release_memory_and_budget",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("trampoline reclamation regression timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE,
+        };
+        let bitness = usize::BITS;
+        // More failures than the retained budget must remain recoverable.
+        for _ in 0..4100 {
+            drop(TrampolineAllocation::reserve().unwrap());
+        }
+        assert_eq!(
+            TRAMPOLINE_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let target = alloc_filled_page(0x90) as usize;
+        let bytes = [0x90u8; 32];
+        let plan =
+            plan_with_near_relay(&bytes, target as u64, (target + 256) as u64, bitness).unwrap();
+        let original_bytes = bytes[..plan.stolen_len].to_vec();
+        let planned = PlannedInline {
+            slot: InlineOriginalSlot::Api(17),
+            target,
+            detour: target + 256,
+            plan,
+            original_bytes,
+        };
+        for _ in 0..32 {
+            let prepared = prepare_inline(&planned, bitness).unwrap();
+            let address = prepared.0.trampoline;
+            drop(prepared);
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(
+                unsafe {
+                    VirtualQuery(
+                        address as *const c_void,
+                        &mut info,
+                        std::mem::size_of_val(&info),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                info.State, MEM_FREE,
+                "unpublished executable allocation was retained"
+            );
+            assert_eq!(
+                TRAMPOLINE_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+        unsafe { VirtualFree(target as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn failed_page_protection_does_not_publish_a_trampoline() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        let published = std::cell::Cell::new(false);
+        assert!(patch_target_with(0, &[0x90], || published.set(true)).is_err());
+        assert!(!published.get());
     }
 
     #[test]
