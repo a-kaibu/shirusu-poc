@@ -414,6 +414,7 @@ pub fn plan_steps(steps: &[Step]) -> Result<Vec<PlannedCall>, String> {
                 value,
             });
         }
+        check_io_storage(sig.function, &args, None)?;
         if let Some(expect) = &step.expect {
             check_expect(i, expect, &args)?;
         }
@@ -429,6 +430,61 @@ pub fn plan_steps(steps: &[Step]) -> Result<Vec<PlannedCall>, String> {
         });
     }
     Ok(planned)
+}
+
+// Managed buffers live only for this call. The runner has no async completion
+// owner, so it cannot safely lend them to an OVERLAPPED operation.
+fn check_io_storage(
+    function: &str,
+    args: &[PlannedArg],
+    resolved: Option<&[usize]>,
+) -> Result<(), String> {
+    if !matches!(function, "ReadFile" | "WriteFile") {
+        return Ok(());
+    }
+    if !matches!(args[4].value, ArgValue::Null | ArgValue::Int(0)) {
+        return Err("runner does not support asynchronous I/O: lpOverlapped must be null".into());
+    }
+    let capacity = match &args[1].value {
+        ArgValue::Buffer { size, .. } => Some(*size as u64),
+        ArgValue::Text(text) => Some(text.len() as u64),
+        _ => None,
+    };
+    let requested = resolved
+        .map(|values| values[2] as u64)
+        .or(match args[2].value {
+            ArgValue::Int(value) => Some(value),
+            ArgValue::Null => Some(0),
+            _ => None,
+        });
+    if let (Some(capacity), Some(requested)) = (capacity, requested) {
+        if requested > capacity {
+            return Err(format!(
+                "{function} requests {requested} bytes from a {capacity}-byte buffer"
+            ));
+        }
+    }
+    if matches!(args[3].value, ArgValue::Buffer { size, .. } if size < 4) {
+        return Err(format!(
+            "{function} byte-count output needs at least 4 bytes"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn checked_slot(value: u64, kind: ParamKind) -> Result<usize, String> {
+    let maximum = match kind {
+        ParamKind::U32 => u32::MAX as u64,
+        ParamKind::Bool => 1,
+        _ => usize::MAX as u64,
+    };
+    if value > maximum {
+        return Err(format!(
+            "value {value} does not fit {kind:?} on this target"
+        ));
+    }
+    Ok(value as usize)
 }
 
 fn check_value_kind(
@@ -1032,6 +1088,9 @@ fn execute_one(
             ArgSlot::OutU64(slot) => storage.out64.as_ptr() as usize + slot * 8,
         })
         .collect();
+    if let Err(error) = check_io_storage(call.function, &call.args, Some(&values)) {
+        return fail(error);
+    }
     let Some(returned) = (unsafe { call_raw(addr, call.function, &values) }) else {
         return fail(format!("unsupported call signature: {}", call.function));
     };
@@ -1209,10 +1268,10 @@ fn materialize(
             })
         }
         (_, ArgValue::Null) => Ok(immediate(0)),
-        (_, ArgValue::Int(v)) => Ok(immediate(*v as usize)),
+        (_, ArgValue::Int(v)) => Ok(immediate(checked_slot(*v, arg.kind)?)),
         (_, ArgValue::Bool(b)) => Ok(immediate(if *b { 1 } else { 0 })),
         (_, ArgValue::Ref(r)) => match stored.get(r) {
-            Some(v) => Ok(immediate(*v as usize)),
+            Some(v) => Ok(immediate(checked_slot(*v, arg.kind)?)),
             None => Err(format!(
                 "reference ${r:?} is not stored (plan should have caught this)"
             )),
@@ -1368,6 +1427,33 @@ mod tests {
         assert_eq!(planned[0].store.as_deref(), Some("hFile"));
         assert_eq!(planned[1].args[1].kind, ParamKind::Bytes);
         assert_eq!(planned[2].args[0].kind, ParamKind::Handle);
+    }
+
+    #[test]
+    fn rejects_io_that_outlives_or_exceeds_managed_storage() {
+        let mut steps = file_flow();
+        steps[1].args[2].1 = ArgValue::Int(MAX_BUFFER_SIZE as u64);
+        assert!(plan_steps(&steps).unwrap_err().contains("buffer"));
+        let mut steps = file_flow();
+        steps[1].args[4].1 = ArgValue::Buffer {
+            size: 32,
+            fill: vec![],
+        };
+        assert!(plan_steps(&steps).unwrap_err().contains("asynchronous"));
+        let mut calls = plan_steps(&file_flow()).unwrap();
+        calls[1].args[2].value = ArgValue::Ref("hFile".into());
+        assert!(check_io_storage(
+            calls[1].function,
+            &calls[1].args,
+            Some(&[0, 0, MAX_BUFFER_SIZE, 0, 0])
+        )
+        .is_err());
+        assert!(checked_slot(u32::MAX as u64 + 1, ParamKind::U32).is_err());
+        assert!(checked_slot(2, ParamKind::Bool).is_err());
+        assert_eq!(
+            checked_slot(u32::MAX as u64, ParamKind::U32).unwrap(),
+            u32::MAX as usize
+        );
     }
 
     #[test]
