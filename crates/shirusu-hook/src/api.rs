@@ -458,8 +458,33 @@ pub fn is_internal_api(api_id: u32) -> bool {
     (INTERNAL_API_ID_BASE..INTERNAL_API_ID_BASE + INTERNAL_API_COUNT as u32).contains(&api_id)
 }
 
+// Detour entry must not scan a growing generated table on every API call.
+// Build this at compile time: no lazy initialization, allocation or TLS lifetime.
+static API_BY_ID: [Option<&ApiDef>; API_COUNT + 1] = {
+    let tables = [
+        HANDWRITTEN_API_TABLE,
+        GENERATED_API_TABLE,
+        INTERNAL_API_TABLE,
+    ];
+    let mut indexed = [None; API_COUNT + 1];
+    let mut table = 0;
+    while table < tables.len() {
+        let mut entry = 0;
+        while entry < tables[table].len() {
+            let api = &tables[table][entry];
+            let id = api.api_id as usize;
+            assert!(id > 0 && id <= API_COUNT);
+            assert!(indexed[id].is_none());
+            indexed[id] = Some(api);
+            entry += 1;
+        }
+        table += 1;
+    }
+    indexed
+};
+
 pub fn api_by_id(api_id: u32) -> Option<&'static ApiDef> {
-    api_table().find(|a| a.api_id == api_id)
+    API_BY_ID.get(api_id as usize).copied().flatten()
 }
 
 /// インポート名からの照合。DLL 名は大文字小文字と拡張子 ".dll" の有無を
@@ -532,6 +557,20 @@ pub fn is_hook_schema(schema_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexed_api_lookup_matches_all_tables_and_rejects_unknown_ids() {
+        for expected in super::api_table() {
+            let actual = super::api_by_id(expected.api_id).unwrap();
+            assert_eq!(actual.enter_schema(), expected.enter_schema());
+            assert_eq!(actual.leave_schema(), expected.leave_schema());
+            assert_eq!(actual.module, expected.module);
+            assert_eq!(actual.function, expected.function);
+        }
+        for id in [0, super::API_COUNT as u32 + 1, u32::MAX] {
+            assert!(super::api_by_id(id).is_none());
+        }
+    }
+
     use super::*;
     use shirusu_trace::schema::SchemaRegistry;
 

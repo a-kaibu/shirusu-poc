@@ -79,6 +79,11 @@ fn main() {
     rt.ensure_thread(1);
     let api = api_by_import("kernel32.dll", "HeapAlloc").unwrap();
     let args = [0x1234, 0, 64];
+    for id in [api.api_id, shirusu_hook::api::API_COUNT as u32] {
+        measure(&format!("api_lookup_id_{id}"), || {
+            black_box(shirusu_hook::api::api_by_id(black_box(id)));
+        });
+    }
     measure("runtime_rwlock_arc", || {
         drop(black_box(slot.for_detour()));
     });
