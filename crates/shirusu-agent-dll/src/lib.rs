@@ -143,6 +143,9 @@ mod win {
         callbacks: Vec<InlineHook>,
     }
     static STATE: Mutex<Option<DllState>> = Mutex::new(None);
+    // Serialize complete lifecycle operations, including initialization before
+    // STATE is populated and restoration retries after recording is disabled.
+    static CONTROL: Mutex<()> = Mutex::new(());
 
     pub fn init(bootstrap: *const AgentBootstrap) -> u32 {
         if bootstrap.is_null() {
@@ -163,6 +166,7 @@ mod win {
             Ok(c) => c,
             Err(_) => return STATUS_BAD_BOOTSTRAP,
         };
+        let _control = CONTROL.lock().unwrap();
         if STATE.lock().unwrap().is_some() {
             return STATUS_ALREADY_INITIALIZED;
         }
@@ -189,11 +193,11 @@ mod win {
                 // L11: Host が Bootstrap v4 で指定した --order=global を Agent へ渡す。
                 .with_order_global(b.order_global != 0),
         );
-        for i in 0..b.ring_count as usize {
+        for &mapping in b.mapping_handles.iter().take(b.ring_count as usize) {
             let delivery = ExpansionDelivery {
                 len: config.required_len(),
                 base: None,
-                handle_value: Some(b.mapping_handles[i] as usize),
+                handle_value: Some(mapping as usize),
                 generation: EXPANDED_SLOT_GENERATION,
             };
             if agent.register_slot_mapping(delivery).is_none() {
@@ -211,8 +215,7 @@ mod win {
             None
         };
         let mut space_notifies = Vec::with_capacity(b.ring_count as usize);
-        for i in 0..b.ring_count as usize {
-            let h = b.space_handles[i];
+        for &h in b.space_handles.iter().take(b.ring_count as usize) {
             let notify = if h != 0 {
                 RingNotify {
                     // SAFETY: 同上（auto-reset イベント）。
@@ -465,88 +468,141 @@ mod win {
     }
 
     pub fn shutdown() -> u32 {
+        shutdown_with_timeout(std::time::Duration::from_secs(5))
+    }
+
+    fn shutdown_with_timeout(timeout: std::time::Duration) -> u32 {
         let _shutdown_guard = shirusu_hook::runtime::ReentrancyGuard::try_enter();
+        let _control = CONTROL.lock().unwrap();
         shirusu_hook::fls::drain_pending_exits();
-        // 順序（レビュー #4 の #9 + 第5回 #6/#7 + #6 の P1-6 + L01 + L02）:
-        // (1) 新規記録を無効化し、以後の Detour は元関数を素通しで
-        // 呼ぶ。(2) 進行中の Detour が完了するまで待つ。(3) COM Factory
-        // と Inline のプロローグを復元する。(4) IAT を復元する。(5) 復元が全件
-        // できた場合にだけ、ランタイム登録を解除して再初期化を受け入れる。
-        // Host はこの後に Ring の最終回収と Trace の確定を行う。
-        //
-        // 戻り値は状態を区別する（レビュー第5回 #6）: 完了待ちが
-        // タイムアウトした場合と、IAT 復元に失敗したスロットが
-        // 残った場合 (P1-6) は SHUTDOWN_INCOMPLETE を返し、Host が
-        // Event Integrity を劣化させられるようにする。セッションが
-        // 無ければ SHUTDOWN_NOT_INITIALIZED。
-        let state = STATE.lock().unwrap().take();
-        let Some(state) = state else {
+        let mut state_slot = STATE.lock().unwrap();
+        let Some(state) = state_slot.as_mut() else {
             return shutdown_status(false, false, 0);
         };
-        let drained;
-        let mut unrestored: Vec<u32> = Vec::new();
-        match engine::runtime() {
-            Some(rt) => {
-                rt.shutdown_recording();
-                // 待ち上限を超えても復元は試みる（対象プロセスの終了を
-                // 妨げるより、復元を優先する）。その場合に書き込み途中
-                // だった Detour のイベントは不完全なまま Ring に残り、
-                // Host 側の完全性評価で扱われる。
-                drained = rt.wait_in_flight_drained(std::time::Duration::from_secs(5));
-                // L02: COM Factory のプロローグ復元を Inline と同じく
-                // IAT 復元より先に行う。
-                // SAFETY: 設置時に保存した Inline Hook 情報。対象モジュールは
-                // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.com_factories) });
-                // L14: WinRT アクティベーションのプロローグ復元も同じく
-                // IAT 復元より先に行う。
-                // SAFETY: 同上。
-                unrestored
-                    .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
-                // L15: 内部 API (Nt*) のプロローグ復元も同じく
-                // IAT 復元より先に行う。
-                // SAFETY: 同上。
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.internal_hooks) });
-                // L16: コールバック検出フックのプロローグ復元も同じく
-                // IAT 復元より先に行う。
-                // SAFETY: 同上。
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.callbacks) });
-                // L01: Inline プロローグの復元を IAT 復元より先に行う。
-                // SAFETY: 設置時に保存した Inline Hook 情報。対象モジュールは
-                // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.inline) });
-                // SAFETY: 設置時に保存したスロット情報。対象モジュールは
-                // まだロードされている前提（DLL のアンロード直前に呼ばれる）。
-                unrestored.extend(unsafe { engine::uninstall_hooks(&state.installed) });
-                if unrestored.is_empty() {
-                    // 登録解除は IAT 復元の後（RuntimeSlot の安全性契約）。
-                    engine::clear_runtime(&rt);
-                }
-                // 復元できなかったスロットが残る間は登録を解除しない
-                // (P1-6): IAT がまだ Detour を指しており、登録が無いと
-                // 到達した Detour が元関数を引けず、対象 API が失敗値
-                // を返してアプリの挙動が変わる。記録は無効化済みの
-                // ため、以後の Detour は元関数へ素通しし挙動は保た
-                // れる。副作用として、この状態で再初期化すると
-                // ALREADY_INITIALIZED になる (Detour 残存下で新しい
-                // 設置が現在の IAT 値を「元の値」と誤認するため、
-                // 安全側の帰結である)。
+        let rt = engine::runtime();
+        let drained = rt.as_ref().is_some_and(|rt| {
+            rt.shutdown_recording();
+            rt.wait_in_flight_drained(timeout)
+        });
+        // Restore even after a flight timeout, but do not retire the session
+        // until both restoration and flight draining are confirmed. Removing
+        // successful entries prevents retries from rewriting unrelated changes.
+        // SAFETY: lifecycle operations are serialized and descriptors are kept
+        // only for installed hooks in their original, still-loaded modules.
+        let unrestored = unsafe {
+            engine::uninstall_pending_inline_hooks(&mut state.com_factories)
+                + engine::uninstall_pending_inline_hooks(&mut state.winrt_activations)
+                + engine::uninstall_pending_inline_hooks(&mut state.internal_hooks)
+                + engine::uninstall_pending_inline_hooks(&mut state.callbacks)
+                + engine::uninstall_pending_inline_hooks(&mut state.inline)
+                + engine::uninstall_pending_hooks(&mut state.installed)
+        };
+        if drained && unrestored == 0 {
+            if let Some(rt) = &rt {
+                engine::clear_runtime(rt);
             }
-            None => {
-                // 設置状態はあるのにランタイム登録が無い異常系。
-                // 復元だけは行い、完了確認はできないため未完了とする。
-                // SAFETY: 同上。
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.com_factories) });
-                unrestored
-                    .extend(unsafe { engine::uninstall_inline_hooks(&state.winrt_activations) });
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.internal_hooks) });
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.callbacks) });
-                unrestored.extend(unsafe { engine::uninstall_inline_hooks(&state.inline) });
-                unrestored.extend(unsafe { engine::uninstall_hooks(&state.installed) });
-                drained = false;
+            *state_slot = None;
+        }
+        // On failure STATE and the disabled runtime survive. Another shutdown
+        // can retry; another init remains rejected until cleanup is confirmed.
+        shutdown_status(true, drained, unrestored)
+    }
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+        use shirusu_hook::bootstrap::{SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK};
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+
+        fn runtime() -> Arc<HookRuntime> {
+            Arc::new(HookRuntime::new(
+                Arc::new(Agent::new(
+                    Arc::new(SlotPool::new(1)),
+                    shirusu_transport::RingConfig::new(64, 4096),
+                    Arc::new(HostMonitor::always_alive()),
+                )),
+                Vec::new(),
+                None,
+            ))
+        }
+        fn state(installed: InstalledHooks) -> DllState {
+            DllState {
+                installed,
+                inline: Vec::new(),
+                com_factories: Vec::new(),
+                winrt_activations: Vec::new(),
+                internal_hooks: Vec::new(),
+                callbacks: Vec::new(),
             }
         }
-        shutdown_status(true, drained, unrestored.len())
+
+        #[test]
+        fn shutdown_retries_only_failed_slots_and_waits_for_old_flights() {
+            // Reserve two pages, but commit only the first. Protection changes
+            // on the uncommitted second page deterministically fail.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!base.is_null());
+            assert_eq!(
+                unsafe { VirtualAlloc(base, 4096, MEM_COMMIT, PAGE_READWRITE) },
+                base
+            );
+            let first = base.cast::<usize>();
+            let second = unsafe { base.cast::<u8>().add(4096) }.cast::<usize>();
+            unsafe { first.write(0xaaaa) };
+            let rt = runtime();
+            assert!(engine::set_runtime(rt.clone()).is_ok());
+            *STATE.lock().unwrap() = Some(state(InstalledHooks {
+                module_base: base as usize,
+                slots: vec![(0, 0x1111), (4096, 0x2222)],
+                plan: Default::default(),
+            }));
+            assert_eq!(shutdown(), SHUTDOWN_INCOMPLETE);
+            let bootstrap =
+                AgentBootstrap::new(11, shirusu_transport::RingConfig::new(64, 4096), &[(1, 2)]);
+            assert_eq!(init(&bootstrap), STATUS_ALREADY_INITIALIZED);
+            assert!(!rt.recording_active());
+            assert!(engine::runtime().is_some());
+            assert_eq!(
+                STATE.lock().unwrap().as_ref().unwrap().installed.slots,
+                vec![(4096, 0x2222)]
+            );
+            assert_eq!(unsafe { first.read() }, 0x1111);
+            // Simulate an application changing an already restored slot.
+            unsafe { first.write(0x3333) };
+            assert_eq!(
+                unsafe { VirtualAlloc(second.cast(), 4096, MEM_COMMIT, PAGE_READWRITE) },
+                second.cast()
+            );
+            unsafe { second.write(0xbbbb) };
+            assert_eq!(shutdown(), SHUTDOWN_OK);
+            assert_eq!(unsafe { first.read() }, 0x3333);
+            assert_eq!(unsafe { second.read() }, 0x2222);
+            assert!(STATE.lock().unwrap().is_none());
+            assert!(engine::runtime().is_none());
+            assert_eq!(shutdown(), SHUTDOWN_NOT_INITIALIZED);
+            assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+
+            // Successful restoration alone cannot complete a timed-out shutdown.
+            let next = runtime();
+            assert!(engine::set_runtime(next.clone()).is_ok());
+            *STATE.lock().unwrap() = Some(state(InstalledHooks {
+                module_base: 0,
+                slots: Vec::new(),
+                plan: Default::default(),
+            }));
+            let flight = shirusu_hook::runtime::DetourFlight::begin(&next).unwrap();
+            assert_eq!(
+                shutdown_with_timeout(std::time::Duration::ZERO),
+                SHUTDOWN_INCOMPLETE
+            );
+            assert!(STATE.lock().unwrap().is_some());
+            assert!(engine::runtime().is_some());
+            drop(flight);
+            assert_eq!(shutdown(), SHUTDOWN_OK);
+            assert!(STATE.lock().unwrap().is_none());
+            assert!(engine::runtime().is_none());
+        }
     }
 }
 

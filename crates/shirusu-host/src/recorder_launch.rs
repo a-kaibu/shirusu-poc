@@ -227,7 +227,7 @@ impl LaunchedCapture {
         let outcome = if self.target_exited()? {
             ShutdownOutcome::NotRequired
         } else if let Some(addr) = self.shutdown_addr {
-            shutdown_outcome_from_call(win::remote_call(self.process, addr, 0))
+            shutdown_with_retry(|| win::remote_call(self.process, addr, 0))
         } else {
             ShutdownOutcome::ExportUnavailable
         };
@@ -270,7 +270,7 @@ fn rollback_initialized_agent(
         Ok(true) => ShutdownOutcome::NotRequired,
         Err(e) => ShutdownOutcome::CallFailed(format!("checking attached target: {e}")),
         Ok(false) => match shutdown_addr {
-            Some(addr) => shutdown_outcome_from_call(win::remote_call(process, addr, 0)),
+            Some(addr) => shutdown_with_retry(|| win::remote_call(process, addr, 0)),
             None => ShutdownOutcome::ExportUnavailable,
         },
     }
@@ -527,163 +527,6 @@ impl TreeCapture {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(windows)]
-    #[test]
-    fn prepared_session_retains_the_agent_notification_event() {
-        let path =
-            std::env::temp_dir().join(format!("shirusu-notify-{}.trace", std::process::id()));
-        let data_ready = win::ProcessNotify::new().unwrap();
-        data_ready.notify_data_ready().unwrap();
-        let config = CaptureSessionConfig {
-            session_id: 41,
-            ring_config: shirusu_transport::RingConfig::new(64, 4096),
-            environment: shirusu_trace::proto::CaptureEnvironment {
-                session: shirusu_trace::proto::SessionMetadata {
-                    session_id: 41,
-                    qpc_frequency: 10_000_000,
-                    created_by: "notification regression".into(),
-                },
-                ..Default::default()
-            },
-            qpc_frequency: 10_000_000,
-            durability: shirusu_trace::writer::Durability::Buffered,
-            order_global: false,
-            record_runtime_apis: false,
-            diagnostic_query_interface: false,
-            record_mode: crate::trace_convert::RecordMode::Full,
-        };
-        let (session, _, notification) = finalize_session(
-            &path,
-            InjectedTarget {
-                data_ready,
-                session_cfg: config,
-                rings: Vec::new(),
-                hook_coverage: None,
-                com_factory_count: None,
-                winrt_activation_count: None,
-                internal_hook_count: None,
-                callback_hook_count: None,
-                shutdown_addr: None,
-            },
-        )
-        .unwrap();
-        assert!(notification.data_ready.wait_timeout(Duration::ZERO));
-        assert!(!notification.data_ready.wait_timeout(Duration::ZERO));
-        session.stop().unwrap();
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// 最小の PE ヘッダー (nt_headers が読める形) を合成する。
-    fn synthetic_pe(magic: u16, opt_size: u16) -> Vec<u8> {
-        let mut b = vec![0u8; 0x200];
-        b[0..2].copy_from_slice(b"MZ");
-        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        b[0x80..0x84].copy_from_slice(b"PE\0\0");
-        let coff = 0x84;
-        b[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
-        let opt = coff + 20;
-        b[opt..opt + 2].copy_from_slice(&magic.to_le_bytes());
-        b
-    }
-
-    #[test]
-    fn dll_pointer_width_follows_pe_bitness() {
-        // レビュー第5回 #5 の記録側: pointer_width は DLL の PE が正。
-        assert_eq!(dll_pointer_width(&synthetic_pe(0x20B, 240)), Some(64));
-        assert_eq!(dll_pointer_width(&synthetic_pe(0x10B, 224)), Some(32));
-        assert_eq!(dll_pointer_width(b"not a pe"), None);
-        assert_eq!(dll_pointer_width(&[]), None);
-    }
-
-    #[test]
-    fn shutdown_call_classification_distinguishes_failure_kinds() {
-        // レビュー第5回 #6: 「呼べなかった」と「Agent が止め切れ
-        // なかった」を区別する。
-        use shirusu_transport_win::WinError;
-        assert_eq!(
-            shutdown_outcome_from_call(Ok(SHUTDOWN_OK)),
-            ShutdownOutcome::Confirmed
-        );
-        assert_eq!(
-            shutdown_outcome_from_call(Ok(SHUTDOWN_INCOMPLETE)),
-            ShutdownOutcome::AgentIncomplete
-        );
-        assert_eq!(
-            shutdown_outcome_from_call(Ok(SHUTDOWN_NOT_INITIALIZED)),
-            ShutdownOutcome::AgentNotInitialized
-        );
-        assert_eq!(
-            shutdown_outcome_from_call(Ok(99)),
-            ShutdownOutcome::UnexpectedStatus(99)
-        );
-        assert!(matches!(
-            shutdown_outcome_from_call(Err(WinError::Unsupported)),
-            ShutdownOutcome::CallFailed(_)
-        ));
-    }
-
-    /// テスト用の最小セッション設定（実記録はしない）。
-    fn test_session_config() -> CaptureSessionConfig {
-        use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
-        use shirusu_trace::writer::Durability;
-        use shirusu_transport::RingConfig;
-        CaptureSessionConfig {
-            session_id: 4242,
-            ring_config: RingConfig::new(64, 4096),
-            environment: CaptureEnvironment {
-                session: SessionMetadata {
-                    session_id: 4242,
-                    created_by: "shirusu-host test (recorder_launch)".into(),
-                    qpc_frequency: 10_000_000,
-                },
-                ..Default::default()
-            },
-            qpc_frequency: 10_000_000,
-            durability: Durability::Buffered,
-            order_global: false,
-            record_runtime_apis: false,
-            diagnostic_query_interface: false,
-            record_mode: crate::trace_convert::RecordMode::Full,
-        }
-    }
-
-    #[test]
-    fn child_launch_config_derives_distinct_session_ids() {
-        // L05: 子の session_id はルートのものから pid で派生させ、
-        // Environment の session_id と来歴も合わせて更新する。
-        let base = LaunchConfig::new(test_session_config(), PathBuf::from("agent.dll"));
-        let c1 = child_launch_config(&base, 111, 100);
-        let c2 = child_launch_config(&base, 222, 100);
-        assert_ne!(c1.session.session_id, base.session.session_id);
-        assert_ne!(c1.session.session_id, c2.session.session_id);
-        assert_eq!(
-            c1.session.environment.session.session_id,
-            c1.session.session_id
-        );
-        assert!(c1
-            .session
-            .environment
-            .capture_config
-            .contains("child process pid=111 of root pid=100"));
-    }
-
-    #[test]
-    fn tree_capture_launch_with_bad_exe_fails() {
-        // L05: 存在しない exe の起動は失敗する（Windows 実働の入口）。
-        let cfg = LaunchConfig::new(test_session_config(), PathBuf::from("no-such-agent.dll"));
-        let r = TreeCapture::launch(
-            "no-such-target.exe",
-            std::env::temp_dir().join("shirusu-tree-test.trace"),
-            cfg,
-        );
-        assert!(r.is_err());
-    }
-}
-
 /// Bootstrap の初期化結果（設置数・欠落数・復元失敗数・COM Factory 設置数）。
 struct BootstrapResult {
     hook_evidence: Vec<shirusu_trace::proto::HookEvidence>,
@@ -767,6 +610,13 @@ fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<Boo
 /// `shirusu_agent_shutdown` の呼び出し結果を終了結果へ分類する
 /// （純粋関数。レビュー第5回 #6）。「呼べなかった」ことと「Agent が
 /// 完全停止できなかった」ことを区別する。
+/// Retry only a completed call that explicitly reported incomplete cleanup.
+/// A failed/timed-out remote call may still be executing, so never overlap it
+/// with a second cleanup attempt or reinterpret its failure as success.
+fn shutdown_with_retry(mut call: impl FnMut() -> Result<u32, win::WinError>) -> ShutdownOutcome {
+    crate::recorder::retry_incomplete_shutdown(|| shutdown_outcome_from_call(call()))
+}
+
 fn shutdown_outcome_from_call(
     result: Result<u32, shirusu_transport_win::WinError>,
 ) -> ShutdownOutcome {
@@ -1018,4 +868,161 @@ fn finalize_session(
     }
     session.start()?;
     Ok((session, injected.shutdown_addr, injected.data_ready))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_session_retains_the_agent_notification_event() {
+        let path =
+            std::env::temp_dir().join(format!("shirusu-notify-{}.trace", std::process::id()));
+        let data_ready = win::ProcessNotify::new().unwrap();
+        data_ready.notify_data_ready().unwrap();
+        let config = CaptureSessionConfig {
+            session_id: 41,
+            ring_config: shirusu_transport::RingConfig::new(64, 4096),
+            environment: shirusu_trace::proto::CaptureEnvironment {
+                session: shirusu_trace::proto::SessionMetadata {
+                    session_id: 41,
+                    qpc_frequency: 10_000_000,
+                    created_by: "notification regression".into(),
+                },
+                ..Default::default()
+            },
+            qpc_frequency: 10_000_000,
+            durability: shirusu_trace::writer::Durability::Buffered,
+            order_global: false,
+            record_runtime_apis: false,
+            diagnostic_query_interface: false,
+            record_mode: crate::trace_convert::RecordMode::Full,
+        };
+        let (session, _, notification) = finalize_session(
+            &path,
+            InjectedTarget {
+                data_ready,
+                session_cfg: config,
+                rings: Vec::new(),
+                hook_coverage: None,
+                com_factory_count: None,
+                winrt_activation_count: None,
+                internal_hook_count: None,
+                callback_hook_count: None,
+                shutdown_addr: None,
+            },
+        )
+        .unwrap();
+        assert!(notification.data_ready.wait_timeout(Duration::ZERO));
+        assert!(!notification.data_ready.wait_timeout(Duration::ZERO));
+        session.stop().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// 最小の PE ヘッダー (nt_headers が読める形) を合成する。
+    fn synthetic_pe(magic: u16, opt_size: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 0x200];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        b[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+        let opt = coff + 20;
+        b[opt..opt + 2].copy_from_slice(&magic.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn dll_pointer_width_follows_pe_bitness() {
+        // レビュー第5回 #5 の記録側: pointer_width は DLL の PE が正。
+        assert_eq!(dll_pointer_width(&synthetic_pe(0x20B, 240)), Some(64));
+        assert_eq!(dll_pointer_width(&synthetic_pe(0x10B, 224)), Some(32));
+        assert_eq!(dll_pointer_width(b"not a pe"), None);
+        assert_eq!(dll_pointer_width(&[]), None);
+    }
+
+    #[test]
+    fn shutdown_call_classification_distinguishes_failure_kinds() {
+        // レビュー第5回 #6: 「呼べなかった」と「Agent が止め切れ
+        // なかった」を区別する。
+        use shirusu_transport_win::WinError;
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(SHUTDOWN_OK)),
+            ShutdownOutcome::Confirmed
+        );
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(SHUTDOWN_INCOMPLETE)),
+            ShutdownOutcome::AgentIncomplete
+        );
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(SHUTDOWN_NOT_INITIALIZED)),
+            ShutdownOutcome::AgentNotInitialized
+        );
+        assert_eq!(
+            shutdown_outcome_from_call(Ok(99)),
+            ShutdownOutcome::UnexpectedStatus(99)
+        );
+        assert!(matches!(
+            shutdown_outcome_from_call(Err(WinError::Unsupported)),
+            ShutdownOutcome::CallFailed(_)
+        ));
+    }
+
+    /// テスト用の最小セッション設定（実記録はしない）。
+    fn test_session_config() -> CaptureSessionConfig {
+        use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
+        use shirusu_trace::writer::Durability;
+        use shirusu_transport::RingConfig;
+        CaptureSessionConfig {
+            session_id: 4242,
+            ring_config: RingConfig::new(64, 4096),
+            environment: CaptureEnvironment {
+                session: SessionMetadata {
+                    session_id: 4242,
+                    created_by: "shirusu-host test (recorder_launch)".into(),
+                    qpc_frequency: 10_000_000,
+                },
+                ..Default::default()
+            },
+            qpc_frequency: 10_000_000,
+            durability: Durability::Buffered,
+            order_global: false,
+            record_runtime_apis: false,
+            diagnostic_query_interface: false,
+            record_mode: crate::trace_convert::RecordMode::Full,
+        }
+    }
+
+    #[test]
+    fn child_launch_config_derives_distinct_session_ids() {
+        // L05: 子の session_id はルートのものから pid で派生させ、
+        // Environment の session_id と来歴も合わせて更新する。
+        let base = LaunchConfig::new(test_session_config(), PathBuf::from("agent.dll"));
+        let c1 = child_launch_config(&base, 111, 100);
+        let c2 = child_launch_config(&base, 222, 100);
+        assert_ne!(c1.session.session_id, base.session.session_id);
+        assert_ne!(c1.session.session_id, c2.session.session_id);
+        assert_eq!(
+            c1.session.environment.session.session_id,
+            c1.session.session_id
+        );
+        assert!(c1
+            .session
+            .environment
+            .capture_config
+            .contains("child process pid=111 of root pid=100"));
+    }
+
+    #[test]
+    fn tree_capture_launch_with_bad_exe_fails() {
+        // L05: 存在しない exe の起動は失敗する（Windows 実働の入口）。
+        let cfg = LaunchConfig::new(test_session_config(), PathBuf::from("no-such-agent.dll"));
+        let r = TreeCapture::launch(
+            "no-such-target.exe",
+            std::env::temp_dir().join("shirusu-tree-test.trace"),
+            cfg,
+        );
+        assert!(r.is_err());
+    }
 }

@@ -270,16 +270,47 @@ pub unsafe fn install_hooks(
 /// # Safety
 /// `installed` は install_hooks が返したものであり、対象モジュールが
 /// まだロードされていること。
-pub unsafe fn uninstall_hooks(installed: &InstalledHooks) -> Vec<u32> {
-    let failed = crate::plan::restore_all(installed.slots.len(), |i| {
+unsafe fn uninstall_iat_indices(installed: &InstalledHooks) -> Vec<usize> {
+    crate::plan::restore_all(installed.slots.len(), |i| {
         let (iat_rva, original) = installed.slots[i];
         // SAFETY: 呼び出し側の契約に従う。
         let slot =
             unsafe { (installed.module_base as *mut u8).add(iat_rva as usize) } as *mut usize;
         // SAFETY: 同上。
         unsafe { write_slot(slot, original) }
+    })
+}
+
+/// Restore IAT slots and report RVAs that could not be restored.
+///
+/// # Safety
+/// Same installed-module lifetime contract as `uninstall_pending_hooks`.
+pub unsafe fn uninstall_hooks(installed: &InstalledHooks) -> Vec<u32> {
+    unsafe { uninstall_iat_indices(installed) }
+        .into_iter()
+        .map(|i| installed.slots[i].0)
+        .collect()
+}
+
+/// Retain only IAT slots whose restoration failed, so retries never overwrite
+/// slots already restored (and possibly changed by the application afterwards).
+///
+/// # Safety
+/// The installed module and remaining slots must still be mapped at their
+/// original addresses; only a lifecycle owner may modify this installation.
+pub unsafe fn uninstall_pending_hooks(installed: &mut InstalledHooks) -> usize {
+    let failed = unsafe { uninstall_iat_indices(installed) };
+    retain_failed_indices(&mut installed.slots, &failed);
+    installed.slots.len()
+}
+
+fn retain_failed_indices<T>(items: &mut Vec<T>, failed: &[usize]) {
+    let mut index = 0;
+    items.retain(|_| {
+        let keep = failed.contains(&index);
+        index += 1;
+        keep
     });
-    failed.iter().map(|&i| installed.slots[i].0).collect()
 }
 
 // ---- L01: Inline Hook ----
@@ -953,7 +984,7 @@ unsafe fn install_inline_hooks_for(
 /// # Safety
 /// `installed` は install_inline_hooks が返したものであり、対象モジュール
 /// がまだロードされていること。
-pub unsafe fn uninstall_inline_hooks(installed: &[InlineHook]) -> Vec<u32> {
+unsafe fn uninstall_inline_indices(installed: &[InlineHook]) -> Vec<usize> {
     if installed.is_empty() {
         return Vec::new();
     }
@@ -961,20 +992,44 @@ pub unsafe fn uninstall_inline_hooks(installed: &[InlineHook]) -> Vec<u32> {
     let mut unrestored = Vec::with_capacity(installed.len());
     // スレッドを止められない場合は何も復元しない（全件を未復元として報告）。
     let Ok(suspender) = SuspendedThreads::suspend_all() else {
-        return installed.iter().map(|h| h.api_id).collect();
+        return (0..installed.len()).collect();
     };
-    for h in installed {
+    for (index, h) in installed.iter().enumerate() {
         if suspender.any_ip_in_range(h.target, h.target + h.original_bytes.len()) {
-            unrestored.push(h.api_id);
+            unrestored.push(index);
             continue;
         }
         match patch_target(h.target, &h.original_bytes) {
             Ok(()) => {}
-            Err(()) => unrestored.push(h.api_id),
+            Err(()) => unrestored.push(index),
         }
     }
     suspender.resume();
     unrestored
+}
+
+/// Restore Inline hooks and report API IDs that could not be restored.
+///
+/// # Safety
+/// Installed target modules must still be loaded, as for `uninstall_pending_inline_hooks`.
+pub unsafe fn uninstall_inline_hooks(installed: &[InlineHook]) -> Vec<u32> {
+    unsafe { uninstall_inline_indices(installed) }
+        .into_iter()
+        .map(|i| installed[i].api_id)
+        .collect()
+}
+
+/// Retain only failed Inline restores. Published trampolines stay alive; only
+/// restoration descriptors for successful hooks are discarded after resuming
+/// all stopped threads. Index tracking also handles repeated API IDs correctly.
+///
+/// # Safety
+/// All remaining targets must belong to the original loaded modules and this
+/// caller must exclusively own hook installation and restoration.
+pub unsafe fn uninstall_pending_inline_hooks(installed: &mut Vec<InlineHook>) -> usize {
+    let failed = unsafe { uninstall_inline_indices(installed) };
+    retain_failed_indices(installed, &failed);
+    installed.len()
 }
 
 // ---- L02: COM Interception ----
@@ -3793,6 +3848,13 @@ mod tests {
         VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
     };
 
+    #[test]
+    fn pending_restore_retention_uses_entry_indices_not_api_ids() {
+        let mut hooks = vec![(17, "restored"), (17, "failed"), (18, "restored")];
+        retain_failed_indices(&mut hooks, &[1]);
+        assert_eq!(hooks, vec![(17, "failed")]);
+    }
+
     static TEST_RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_runtime() -> HookRuntime {
@@ -4445,6 +4507,31 @@ mod tests {
 
     #[test]
     fn uninstall_refuses_to_rewrite_a_stopped_instruction_pointer() {
+        const CHILD: &str = "SHIRUSU_UNINSTALL_RETRY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::tests::uninstall_refuses_to_rewrite_a_stopped_instruction_pointer",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("uninstall retry timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
         use std::sync::atomic::{AtomicU8, Ordering};
         // Signal entry through flag[1], then spin until flag[0] is set. Keep
@@ -4487,14 +4574,23 @@ mod tests {
             trampoline: 0,
             trampoline_size: 0,
             stolen_len: code.len(),
-            original_bytes: code.to_vec(),
+            original_bytes: vec![0x90; code.len()],
         };
-        let unrestored = unsafe { uninstall_inline_hooks(&[hook]) };
+        let mut pending = vec![hook];
+        let unrestored = unsafe { uninstall_pending_inline_hooks(&mut pending) };
+        assert_eq!(pending.len(), 1);
         flags[0].store(1, Ordering::Release);
         worker.join().unwrap();
-        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
         assert!(entered, "worker did not enter its native loop");
-        assert_eq!(unrestored, vec![17]);
+        assert_eq!(unrestored, 1);
+        assert_eq!(unsafe { uninstall_pending_inline_hooks(&mut pending) }, 0);
+        assert!(pending.is_empty());
+        assert!(
+            unsafe { std::slice::from_raw_parts(page.cast::<u8>(), code.len()) }
+                .iter()
+                .all(|&byte| byte == 0x90)
+        );
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
     }
 
     #[cfg(target_arch = "x86_64")]

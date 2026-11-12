@@ -288,14 +288,29 @@ pub enum ShutdownOutcome {
     Confirmed,
     /// 終了エントリの呼び出し自体に失敗した（理由付き）。
     CallFailed(String),
-    /// Agent は応答したが、進行中 Detour の完了待ちがタイムアウトし
-    /// 完全停止にならなかった。
+    /// Agent は応答したが、進行中 Detour の完了待ちまたは Hook の
+    /// 復元が完了していない。
     AgentIncomplete,
     /// Agent は「アクティブなセッションが無い」と報告した
     /// （Host 側の見立てと食い違う異常系）。
     AgentNotInitialized,
     /// 未知の状態コードが返った。
     UnexpectedStatus(u32),
+}
+
+/// A completed incomplete cleanup can be retried once. Other outcomes may
+/// have an executing remote worker or a different lifecycle state; do not retry.
+#[cfg(any(windows, test))]
+pub(crate) fn retry_incomplete_shutdown(
+    mut call: impl FnMut() -> ShutdownOutcome,
+) -> ShutdownOutcome {
+    let first = call();
+    if first == ShutdownOutcome::AgentIncomplete {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        call()
+    } else {
+        first
+    }
 }
 
 /// 終了結果 → Event Integrity への影響（純粋関数）。
@@ -904,5 +919,51 @@ impl CaptureSession {
             profile_summary,
             integrity: report,
         })
+    }
+}
+
+#[cfg(test)]
+mod shutdown_retry_tests {
+    use super::*;
+    #[test]
+    fn cleanup_retry_is_bounded_and_requires_explicit_incomplete() {
+        let mut calls = 0;
+        assert_eq!(
+            retry_incomplete_shutdown(|| {
+                calls += 1;
+                if calls == 1 {
+                    ShutdownOutcome::AgentIncomplete
+                } else {
+                    ShutdownOutcome::Confirmed
+                }
+            }),
+            ShutdownOutcome::Confirmed
+        );
+        assert_eq!(calls, 2);
+        calls = 0;
+        assert_eq!(
+            retry_incomplete_shutdown(|| {
+                calls += 1;
+                ShutdownOutcome::AgentIncomplete
+            }),
+            ShutdownOutcome::AgentIncomplete
+        );
+        assert_eq!(calls, 2);
+        for outcome in [
+            ShutdownOutcome::Confirmed,
+            ShutdownOutcome::AgentNotInitialized,
+            ShutdownOutcome::UnexpectedStatus(99),
+            ShutdownOutcome::CallFailed("timeout".into()),
+            ShutdownOutcome::NotRequired,
+            ShutdownOutcome::ExportUnavailable,
+        ] {
+            calls = 0;
+            let result = retry_incomplete_shutdown(|| {
+                calls += 1;
+                outcome.clone()
+            });
+            assert_eq!(result, outcome);
+            assert_eq!(calls, 1);
+        }
     }
 }
