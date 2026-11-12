@@ -21,7 +21,9 @@ foreach ($side in @("left", "right")) {
     $value = if ($side -eq "left") { 42 } else { 43 }
     $exe = Join-Path $dir "fixture.exe"
     $compile = "`"$dev`" -arch=x64 && cl /nologo /W4 /O2 /GS- /DTEST_BYTE=$value /Fe:`"$exe`" /Fo:`"$dir\fixture.obj`" `"$source`" /link /ENTRY:entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib"
-    Invoke-Native { cmd /s /c "`"$compile`"" } "native replay fixture ($side)"
+    $buildScript = Join-Path $work "build.cmd"
+    @("@echo off", "call $compile") | Set-Content -Encoding ascii $buildScript
+    Invoke-Native { cmd /d /c $buildScript } "native replay fixture ($side)"
     Push-Location $dir
     try {
         & $cli capture --dll $dll --output (Join-Path $work "$side.trace") -- $exe

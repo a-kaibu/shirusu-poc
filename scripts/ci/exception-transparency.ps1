@@ -10,7 +10,9 @@ $source = Join-Path $PWD "e2e\native\exception-transparency.cpp"
 $exe = Join-Path $work "exception-transparency.exe"
 $dev = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
 $compile = "`"$dev`" -arch=x64 && cl /nologo /W4 /O2 /Fe:`"$exe`" /Fo:`"$work\fixture.obj`" `"$source`""
-Invoke-Native { cmd /s /c "`"$compile`"" } "native SEH fixture build"
+$buildScript = Join-Path $work "build.cmd"
+@("@echo off", "call $compile") | Set-Content -Encoding ascii $buildScript
+Invoke-Native { cmd /d /c $buildScript } "native SEH fixture build"
 $baseline = Join-Path $work "baseline.txt"
 $captured = Join-Path $work "captured.txt"
 Remove-Item $baseline,$captured -ErrorAction SilentlyContinue

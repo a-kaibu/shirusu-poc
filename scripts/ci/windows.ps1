@@ -123,7 +123,7 @@ try {
     try {
         $diagnostics = Join-Path (Get-Location) "target\ci-diagnostics"
         New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
-        foreach ($pattern in @("shirusu-capture-e2e-*.trace", "shirusu-verify-*.trace")) {
+        foreach ($pattern in @("shirusu-capture-e2e-*.trace", "shirusu-verify-*.trace", "shirusu-modules-*.trace")) {
             Get-ChildItem ([System.IO.Path]::GetTempPath()) -Filter $pattern |
                 Copy-Item -Destination $diagnostics -ErrorAction Continue
         }

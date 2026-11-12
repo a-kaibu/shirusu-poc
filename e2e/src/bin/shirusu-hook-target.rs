@@ -61,6 +61,13 @@ mod win {
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     }
 
+    // Keep advapi32 loaded before injection so the dynamic-export fixture
+    // tests an installed Inline Hook, not late module discovery.
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCloseKey(key: *mut c_void) -> i32;
+    }
+
     // CRT のファイル I/O（ucrtbase.dll）。`fopen` は内部で `CreateFileW`
     // を呼ぶが、その呼び出しは ucrtbase.dll 自身の IAT 経由のため、
     // 現行のメインモジュール限定 IAT では Detour に届かない。
@@ -270,6 +277,7 @@ mod win {
     /// 解決し、通常のファイル操作とレジストリ 1 件を行う。成功すれば
     /// `GETPROCADDRESS_DONE ok` を出し終了 0。
     pub fn run_getprocaddress() -> i32 {
+        std::hint::black_box(RegCloseKey as unsafe extern "system" fn(*mut c_void) -> i32);
         type CreateFileWFn = unsafe extern "system" fn(
             *const u16,
             u32,

@@ -717,7 +717,12 @@ fn install_planned(
 /// `install_inline_hooks_for` と同じ前提。
 pub unsafe fn install_inline_hooks(rt: &HookRuntime) -> InlineInstallOutcome {
     // SAFETY: install_inline_hooks_for と同じ前提。
-    unsafe { install_inline_hooks_for(rt, api_table()) }
+    unsafe {
+        install_inline_hooks_for(
+            rt,
+            api_table().filter(|api| !crate::api::is_internal_api(api.api_id)),
+        )
+    }
 }
 
 /// L15: 内部 API (Nt*) へ Inline Hook を設置する（詳細調査モード専用）。

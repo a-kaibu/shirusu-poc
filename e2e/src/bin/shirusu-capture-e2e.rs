@@ -393,8 +393,8 @@ mod win {
         } else {
             c.check(false, "child summary present");
         }
-        let _ = std::fs::remove_file(&trace_path);
         if c.failures.is_empty() {
+            let _ = std::fs::remove_file(&trace_path);
             println!("PASS shirusu-capture-e2e --child-tree");
             0
         } else {
@@ -531,8 +531,8 @@ mod win {
         }
         let _ = std::fs::remove_file(&base_out);
         let _ = std::fs::remove_file(&hooked_out);
-        let _ = std::fs::remove_file(&trace_path);
         if c.failures.is_empty() {
+            let _ = std::fs::remove_file(&trace_path);
             println!("PASS shirusu-capture-e2e --abi");
             0
         } else {
@@ -573,7 +573,9 @@ mod win {
             let trace_path = std::env::temp_dir().join(format!("shirusu-verify-{app}-{pid}.trace"));
             let _ = std::fs::remove_file(&base_out);
             let _ = std::fs::remove_file(&hooked_out);
-            let _ = std::fs::remove_file(&trace_path);
+            if c.failures.is_empty() {
+                let _ = std::fs::remove_file(&trace_path);
+            }
 
             // 1. Hook なし（baseline）：対象を直接実行する。
             let base_ok = match std::process::Command::new(&target)
@@ -1081,11 +1083,15 @@ mod win {
                     }
                 }
                 let _ = std::fs::remove_file(&detailed_out);
-                let _ = std::fs::remove_file(&detailed_trace_path);
+                if c.failures.is_empty() {
+                    let _ = std::fs::remove_file(&detailed_trace_path);
+                }
             }
             let _ = std::fs::remove_file(&base_out);
             let _ = std::fs::remove_file(&hooked_out);
-            let _ = std::fs::remove_file(&trace_path);
+            if c.failures.is_empty() {
+                let _ = std::fs::remove_file(&trace_path);
+            }
         }
 
         // 5. カバレッジ評価（INFO。未記録は将来の L 項目待ちのため失敗にしない）。
@@ -1096,7 +1102,7 @@ mod win {
         println!("coverage evaluation (L17):");
         println!("  recorded: file I/O (CreateFileW/WriteFile/ReadFile/CloseHandle)");
         println!("  recorded: COM factory results; method interception skipped (shared-object-safety-unproven)");
-        println!("  recorded: WinRT (RoActivateInstance/RoGetActivationFactory + IInspectable/IUriRuntimeClass vtable methods, L14)");
+        println!("  recorded: WinRT activations; shared interface methods skipped (shared-object-safety-unproven)");
         for (group, names, note) in [
             (
                 "registry",
@@ -1225,6 +1231,7 @@ mod win {
                     continue;
                 }
             };
+            let target_pid = capture.pid();
             let summary = match capture.run_to_completion(Duration::from_millis(2)) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1240,13 +1247,15 @@ mod win {
             match std::fs::read(&trace_path) {
                 Ok(bytes) => match shirusu_trace::read_trace(&bytes) {
                     Ok(trace) => {
-                        check_modules_trace(&mut c, &trace, tag, &summary, &workdir, pid);
+                        check_modules_trace(&mut c, &trace, tag, &summary, &workdir, target_pid);
                     }
                     Err(e) => c.check(false, &format!("{tag} trace parses ({e})")),
                 },
                 Err(e) => c.check(false, &format!("{tag} trace readable ({e})")),
             }
-            let _ = std::fs::remove_file(&trace_path);
+            if c.failures.is_empty() {
+                let _ = std::fs::remove_file(&trace_path);
+            }
         }
         let _ = std::fs::remove_dir_all(&workdir);
         if c.failures.is_empty() {
@@ -1510,8 +1519,8 @@ mod win {
             find(&events, reg_close.enter_schema_id()).is_some(),
             "regclosekey enter present",
         );
-        let _ = std::fs::remove_file(&trace_path);
         if c.failures.is_empty() {
+            let _ = std::fs::remove_file(&trace_path);
             println!("PASS shirusu-capture-e2e --inline");
             0
         } else {
