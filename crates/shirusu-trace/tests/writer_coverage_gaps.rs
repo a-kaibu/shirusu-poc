@@ -27,7 +27,7 @@
 //!   への帰属の癖（分岐自体は既存テストで通っている）。
 
 use shirusu_trace::blob::BlobId;
-use shirusu_trace::compact::{encode_event_fields, encode_values};
+use shirusu_trace::compact::encode_values;
 use shirusu_trace::model::{EventBatch, PayloadRef, TraceEvent};
 use shirusu_trace::proto::{CaptureEnvironment, LossRecord, ProfileSummary, SessionMetadata};
 use shirusu_trace::schema::{make_schema, CapturedValue, EventCapture, Ty, TypedValue};
@@ -466,23 +466,4 @@ fn flush_blobs_split_write_error_propagates() {
         .add_payload(&[1u8; 100])
         .expect_err("split BlobChunk write must fail");
     assert!(matches!(err, shirusu_trace::TraceError::Io(_)));
-}
-
-#[test]
-fn estimate_event_len_matches_encoding() {
-    let e = event(1, PayloadRef::None);
-    let mut v = Vec::new();
-    encode_event_fields(&mut v, &e, 0, 0, e.global_order);
-    assert_eq!(shirusu_trace::writer::estimate_event_len(&e), v.len());
-
-    let mut with_args = event(2, PayloadRef::Inline(vec![1, 2, 3]));
-    with_args.args =
-        Some(encode_values(&[Ty::U64], &[CapturedValue::captured(TypedValue::U64(9))]).unwrap());
-    with_args.global_order = Some(42);
-    let mut v2 = Vec::new();
-    encode_event_fields(&mut v2, &with_args, 0, 0, with_args.global_order);
-    assert_eq!(
-        shirusu_trace::writer::estimate_event_len(&with_args),
-        v2.len()
-    );
 }

@@ -37,7 +37,7 @@ use crate::container::{
     MAX_RAW_LEN, MAX_STORED_LEN,
 };
 use crate::error::{Result, TraceError};
-use crate::model::{EventBatch, PayloadRef, TraceEvent};
+use crate::model::{EventBatch, PayloadRef};
 use crate::proto::{
     BlockIndex, CaptureEnvironment, Finalization, IndexEntry, LossRecord, ProfileSummary,
     SchemaDef, SchemaSet,
@@ -627,14 +627,4 @@ impl<W: DurableWrite> TraceWriter<W> {
         }
         Ok(())
     }
-}
-
-/// チャンク分割の見積もりで使う、イベント 1 件の符号化長。
-/// 差分を 0 として見積もるため実長とは数バイトずれる（目安用途）。
-/// global_order がある場合は絶対値を差分とみなして見積もる
-/// （差分は絶対値以下なので過大見積もりになり安全側）。
-pub fn estimate_event_len(e: &TraceEvent) -> usize {
-    let mut v = Vec::new();
-    compact::encode_event_fields(&mut v, e, 0, 0, e.global_order);
-    v.len()
 }

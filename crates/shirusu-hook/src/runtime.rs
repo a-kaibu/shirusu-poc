@@ -338,7 +338,13 @@ impl Drop for ComCallGuard {
             self.leave_schema_id,
         );
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rt.record_aborted_for(thread_id, call_id, api_id, leave_schema_id);
+            if api_id == COM_METHOD_API_ID && leave_schema_id == COM_METHOD_LEAVE_SCHEMA_ID {
+                // COM メソッドは専用の入口を使う（L02）。WinRT・コールバックは
+                // 汎用の record_aborted_for で api_id を直接指定する。
+                rt.record_com_aborted(thread_id, call_id);
+            } else {
+                rt.record_aborted_for(thread_id, call_id, api_id, leave_schema_id);
+            }
         }));
     }
 }
@@ -878,7 +884,7 @@ impl HookRuntime {
     }
 
     /// 中断した呼び出しを api_id / leave Schema を直接指定して記録する
-    /// （L14：WinRT アクティベーションイベント用。COM は上の
+    /// （L14：WinRT アクティベーションイベント・L16：コールバック用。COM は上の
     /// `record_com_aborted` 経由）。`ComCallGuard` の Drop から呼ぶ。
     pub fn record_aborted_for(
         &self,
@@ -1835,6 +1841,43 @@ mod tests {
         assert_eq!(
             batch.events[0].descriptor.schema_id,
             COM_METHOD_LEAVE_SCHEMA_ID
+        );
+        assert_eq!(batch.events[0].descriptor.parent_call_id, 0);
+    }
+
+    #[test]
+    fn com_call_guard_drop_for_winrt_records_aborted_with_winrt_ids() {
+        use shirusu_transport::descriptor::EventKind;
+        let (agent, rt) = runtime();
+        let rt = Arc::new(rt);
+        let tid = 4254u64;
+        rt.ensure_thread(tid);
+        let call_id = rt.alloc_call_id();
+        push_call(call_id);
+        {
+            // WinRT 用ガードは new_for で別 api_id を持ち、Drop は汎用の
+            // record_aborted_for 経由で中断を記録する（COM 専用入口は使わない）。
+            let _guard = ComCallGuard::new_for(
+                &rt,
+                tid,
+                call_id,
+                WINRT_ACTIVATION_API_ID,
+                WINRT_ACTIVATION_LEAVE_SCHEMA_ID,
+            );
+        }
+        assert_eq!(current_parent_call(), 0, "aborted call pops the stack");
+        let base = unsafe { agent.thread_region_base(tid) }.expect("region");
+        let mut reader = unsafe { RingReader::new(base, RingConfig::new(64, 4096)) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(
+            batch.events[0].descriptor.kind_enum(),
+            Some(EventKind::CallAborted)
+        );
+        assert_eq!(batch.events[0].descriptor.call_id, call_id);
+        assert_eq!(
+            batch.events[0].descriptor.schema_id,
+            WINRT_ACTIVATION_LEAVE_SCHEMA_ID
         );
         assert_eq!(batch.events[0].descriptor.parent_call_id, 0);
     }
