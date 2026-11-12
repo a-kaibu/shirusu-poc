@@ -160,3 +160,46 @@ fn dropped_payload_stays_dropped_in_args_mode() {
     ));
     assert!(e.args.is_none());
 }
+
+#[test]
+fn owned_and_borrowed_batches_preserve_args_fallbacks_and_modes() {
+    use shirusu_host::trace_convert::RecordMode;
+    let schema = api_by_id(API_CREATE_FILE_W).unwrap().enter_schema_id();
+    let mut dropped = event(5, EventKind::CallEnter, schema, Vec::new());
+    dropped.descriptor.flags = CaptureState::DroppedByBackpressure.to_flags()
+        | shirusu_transport::descriptor::flags::PAYLOAD_DROPPED;
+    dropped.descriptor.payload_len = 1234;
+    let events = vec![
+        event(1, EventKind::CallEnter, schema, create_file_enter_payload()),
+        event(2, EventKind::CallEnter, schema, vec![0xff]),
+        event(3, EventKind::CallEnter, 0, b"raw".to_vec()),
+        event(4, EventKind::CallEnter, schema, Vec::new()),
+        dropped,
+    ];
+    for mode in [
+        RecordMode::Full,
+        RecordMode::Detailed,
+        RecordMode::Profile,
+        RecordMode::Filtered {
+            apis: [API_CREATE_FILE_W].into_iter().collect(),
+        },
+        RecordMode::Filtered {
+            apis: Default::default(),
+        },
+    ] {
+        let mut borrowed = recorder();
+        let mut owned = recorder();
+        borrowed.set_record_mode(mode.clone());
+        owned.set_record_mode(mode);
+        let a = borrowed.record_batch_with_args(&ctx(), &events).unwrap();
+        let b = owned
+            .record_owned_batch_with_args(&ctx(), events.clone())
+            .unwrap();
+        assert_eq!(a.args_attached, b.args_attached);
+        assert_eq!(a.args_fallback_blob, b.args_fallback_blob);
+        let a = borrowed.finish(&IntegrityReport::default()).unwrap();
+        let b = owned.finish(&IntegrityReport::default()).unwrap();
+        assert_eq!(a, b, "ownership must not change the Trace bytes");
+        shirusu_trace::read_trace(&b).unwrap();
+    }
+}

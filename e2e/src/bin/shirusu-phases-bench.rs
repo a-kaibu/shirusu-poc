@@ -117,7 +117,15 @@ fn main() {
     // only this thread produces and this worker consumes it.
     let base = unsafe { agent.thread_region_base(1) }.unwrap();
     let mut worker = unsafe { DrainWorker::new(base, cfg, 1) };
-    for calls in [64usize, 512, 1536] {
+    for (owned, calls) in [false, true]
+        .into_iter()
+        .flat_map(|owned| [64usize, 512, 1536].map(|calls| (owned, calls)))
+    {
+        println!(
+            "payload_ownership={} batch_events={}",
+            if owned { "transferred" } else { "borrowed" },
+            2 * calls
+        );
         let mut produce = Vec::new();
         let mut drain = Vec::new();
         let mut convert = Vec::new();
@@ -154,15 +162,18 @@ fn main() {
             }
             produce.push(start.elapsed().as_nanos() as f64 / (2 * calls) as f64);
             let start = Instant::now();
-            let batch = worker.drain_all();
+            let mut batch = worker.drain_all();
             drain.push(start.elapsed().as_nanos() as f64 / (2 * calls) as f64);
             assert_eq!(batch.events.len(), 2 * calls);
             assert!(!worker.integrity_lost);
             assert!(worker.loss_events.is_empty());
             let start = Instant::now();
-            let stats = recorder
-                .record_batch_with_args(&ctx, &batch.events)
-                .unwrap();
+            let stats = if owned {
+                recorder.record_owned_batch_with_args(&ctx, std::mem::take(&mut batch.events))
+            } else {
+                recorder.record_batch_with_args(&ctx, &batch.events)
+            }
+            .unwrap();
             convert.push(start.elapsed().as_nanos() as f64 / (2 * calls) as f64);
             assert_eq!(stats.args_attached, 2 * calls);
             assert_eq!(stats.args_fallback_blob, 0);

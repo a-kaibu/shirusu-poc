@@ -756,11 +756,14 @@ impl CaptureSession {
                     thread_id: ring.trace_thread_id,
                     qpc_frequency: self.config.qpc_frequency,
                 };
-                let s = self.recorder.record_batch_with_args(&ctx, &batch.events)?;
+                let event_count = batch.events.len();
+                let s = self
+                    .recorder
+                    .record_owned_batch_with_args(&ctx, batch.events)?;
                 self.args_stats.args_attached += s.args_attached;
                 self.args_stats.args_fallback_blob += s.args_fallback_blob;
-                ring.events += batch.events.len() as u64;
-                stats.events += batch.events.len();
+                ring.events += event_count as u64;
+                stats.events += event_count;
             }
             if ring.worker.as_ref().is_some_and(|w| !w.is_stopped()) {
                 stats.active_rings += 1;

@@ -154,3 +154,10 @@ Host 回収が約 102 ns/event、変換・圧縮が約 320 ns/event だった。
 変換・圧縮が約 902 ns/event に上がった。Host が回収と変換を直列実行する間に
 producer が Ring を埋め得るため、符号化を速くするだけでは欠落を解消しない。
 Windows での比較は CI 結果を待つ。共有 VM の単発結果だけで最適化方針を確定しない。
+
+Host の通常 Capture は、回収済み引数バッファの所有権を Trace 変換へ移す経路に変更した。
+引数として検証できた payload の再確保・コピーと、変換前の参照一覧確保を省く。
+既存の借用 API も維持する。部品ベンチは borrowed / transferred を両方測り、
+所有権移転ではバッファ解放も変換区間内に含むため、別表示の release と合わせて読む。
+正常・不正・空・欠落 payload と Full / Detailed / Profile / Filtered の比較で、
+出力 Trace 全体のバイト一致を検査する。これは欠落解消や性能目標達成を意味しない。

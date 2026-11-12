@@ -29,6 +29,7 @@ use shirusu_trace::schema::EventCapture;
 use shirusu_trace::writer::{DurableWrite, FinalizationInfo, TraceWriter, WriterOptions};
 use shirusu_transport::descriptor::{CaptureState, EventKind};
 use shirusu_transport::ring::ReceivedEvent;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Batch 変換の文脈。転送 Descriptor が持たない Session / Process /
@@ -338,7 +339,8 @@ impl<W: DurableWrite> TraceRecorder<W> {
         ctx: &TraceBatchContext,
         events: &[ReceivedEvent],
     ) -> TraceResult<()> {
-        self.record_batch_inner(ctx, events, false).map(|_| ())
+        self.record_batch_inner(ctx, events.iter().map(Cow::Borrowed), false)
+            .map(|_| ())
     }
 
     /// フック由来のイベント列を記録する。Writer に登録済みの Schema を
@@ -352,58 +354,59 @@ impl<W: DurableWrite> TraceRecorder<W> {
         ctx: &TraceBatchContext,
         events: &[ReceivedEvent],
     ) -> TraceResult<ArgsConversionStats> {
-        self.record_batch_inner(ctx, events, true)
+        self.record_batch_inner(ctx, events.iter().map(Cow::Borrowed), true)
     }
 
-    fn record_batch_inner(
+    /// Consume a drained batch, transferring validated argument buffers into
+    /// the Trace batch instead of allocating and copying them again.
+    pub fn record_owned_batch_with_args(
         &mut self,
         ctx: &TraceBatchContext,
-        events: &[ReceivedEvent],
+        events: Vec<ReceivedEvent>,
+    ) -> TraceResult<ArgsConversionStats> {
+        self.record_batch_inner(ctx, events.into_iter().map(Cow::Owned), true)
+    }
+
+    fn record_batch_inner<'a>(
+        &mut self,
+        ctx: &TraceBatchContext,
+        events: impl ExactSizeIterator<Item = Cow<'a, ReceivedEvent>>,
         args_mode: bool,
     ) -> TraceResult<ArgsConversionStats> {
         let mut stats = ArgsConversionStats::default();
-        if events.is_empty() {
+        if events.len() == 0 {
             return Ok(stats);
         }
-        // L09: 記録モードで振り分ける。
-        // - `Profile`: 個別イベントは保存せず、集計だけを進める。
-        // - `Filtered`: 指定 API 以外のイベントをここで落とす（Blob 化
-        //   の前に落とすため、不要な Blob は書かれない）。落とした後
-        //   空になれば書かない（`write_batch` は空を拒否する）。
-        // - `Full` / `Detailed`: 全て保存する。`Detailed` は Agent 側で
-        //   内部呼び出しも記録する点だけが異なり、Host 側の扱いは同じ。
-        let kept: Vec<&ReceivedEvent> = match &self.mode {
-            RecordMode::Profile => {
-                for event in events {
-                    self.profile.observe(ctx.thread_id, event);
-                }
-                return Ok(stats);
+        if matches!(self.mode, RecordMode::Profile) {
+            for event in events {
+                self.profile.observe(ctx.thread_id, &event);
             }
-            RecordMode::Filtered { apis } => events
-                .iter()
-                .filter(|e| apis.contains(&e.descriptor.api_id))
-                .collect(),
-            RecordMode::Full | RecordMode::Detailed => events.iter().collect(),
-        };
-        if kept.is_empty() {
             return Ok(stats);
         }
-        let mut converted = Vec::with_capacity(kept.len());
-        for event in kept {
-            let d = &event.descriptor;
+        let mut converted = Vec::with_capacity(events.len());
+        for event in events {
+            let d = event.descriptor;
+            if let RecordMode::Filtered { apis } = &self.mode {
+                if !apis.contains(&d.api_id) {
+                    continue;
+                }
+            }
             let mut args = None;
             let payload = if d.payload_dropped() {
                 // A72：欠落 Payload にはキーを作らず、理由だけを残す。
                 PayloadRef::Dropped {
                     original_len: d.payload_len as u64,
-                    reason: payload_loss_reason(event),
+                    reason: payload_loss_reason(&event),
                 }
             } else if event.payload.is_empty() {
                 PayloadRef::None
             } else if args_mode && d.schema_id != 0 {
                 match self.writer.schema_types_ref(d.schema_id) {
                     Some(types) if validate_values(types, &event.payload).is_ok() => {
-                        args = Some(event.payload.clone());
+                        args = Some(match event {
+                            Cow::Borrowed(event) => event.payload.clone(),
+                            Cow::Owned(event) => event.payload,
+                        });
                         stats.args_attached += 1;
                         PayloadRef::None
                     }
@@ -427,7 +430,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
                 parent_call_id: d.parent_call_id,
                 api_id: d.api_id,
                 schema_id: d.schema_id,
-                capture: convert_capture(event.capture_state()),
+                capture: convert_capture(d.capture_state()),
                 payload,
                 args,
                 // L11: 0 は未割当として None にする（--order=global 無効時）。
@@ -437,6 +440,9 @@ impl<W: DurableWrite> TraceRecorder<W> {
                     Some(d.global_order)
                 },
             });
+        }
+        if converted.is_empty() {
+            return Ok(stats);
         }
         let batch = EventBatch {
             session_id: ctx.session_id,
