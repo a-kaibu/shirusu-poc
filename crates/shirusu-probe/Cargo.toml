@@ -20,3 +20,6 @@ shirusu-emit = { path = "../shirusu-emit" }
 [[bin]]
 name = "shirusu-probe"
 path = "src/bin/shirusu-probe.rs"
+
+[lints]
+workspace = true

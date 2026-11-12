@@ -17,3 +17,6 @@ toml = "0.9"
 windows-metadata = "0.60"
 
 [dev-dependencies]
+
+[lints]
+workspace = true

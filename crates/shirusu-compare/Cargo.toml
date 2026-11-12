@@ -16,3 +16,6 @@ proptest = "1"
 [[bin]]
 name = "shirusu-compare"
 path = "src/bin/shirusu-compare.rs"
+
+[lints]
+workspace = true

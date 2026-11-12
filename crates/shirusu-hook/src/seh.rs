@@ -10,29 +10,32 @@ extern "C-unwind" {
     ) -> u64;
 }
 
-struct Invocation<F, S> {
+struct Invocation<F, S, R> {
     invoke: F,
     original: usize,
     state: Option<S>,
+    result: Option<R>,
 }
 
 /// `invoke` must contain only Copy arguments: a foreign SEH unwind may skip
 /// the Rust callback's destructors. Owned state stays in the outer context,
 /// where the native finally block takes it exactly once before unwinding out.
-pub(crate) fn invoke<F: FnOnce(usize) -> u64 + Copy, S>(
+pub(crate) fn invoke<F: FnOnce(usize) -> R + Copy, S, R: Copy>(
     original: usize,
     invoke: F,
     state: S,
-) -> (u64, S) {
-    unsafe extern "C-unwind" fn call<F: FnOnce(usize) -> u64 + Copy, S>(
+) -> (R, S) {
+    unsafe extern "C-unwind" fn call<F: FnOnce(usize) -> R + Copy, S, R: Copy>(
         context: *mut c_void,
     ) -> u64 {
-        let context = unsafe { &*context.cast::<Invocation<F, S>>() };
-        (context.invoke)(context.original)
+        let context = unsafe { &mut *context.cast::<Invocation<F, S, R>>() };
+        context.result = Some((context.invoke)(context.original));
+        0
     }
-    unsafe extern "C" fn cleanup<F, S>(context: *mut c_void) {
-        let context = unsafe { &mut *context.cast::<Invocation<F, S>>() };
+    unsafe extern "C" fn cleanup<F, S, R>(context: *mut c_void) {
+        let context = unsafe { &mut *context.cast::<Invocation<F, S, R>>() };
         let last_error = crate::last_error::get();
+        let _guard = crate::runtime::ReentrancyGuard::try_enter();
         drop(context.state.take());
         crate::last_error::set(last_error);
     }
@@ -40,16 +43,17 @@ pub(crate) fn invoke<F: FnOnce(usize) -> u64 + Copy, S>(
         invoke,
         original,
         state: Some(state),
+        result: None,
     };
-    let result = unsafe {
+    unsafe {
         shirusu_invoke_with_finally(
-            call::<F, S>,
-            (&mut context as *mut Invocation<F, S>).cast(),
-            cleanup::<F, S>,
+            call::<F, S, R>,
+            (&mut context as *mut Invocation<F, S, R>).cast(),
+            cleanup::<F, S, R>,
         )
     };
     (
-        result,
+        context.result.expect("normal return writes its result"),
         context
             .state
             .take()
@@ -87,7 +91,11 @@ mod tests {
     fn rust_panic_cleans_state_exactly_once_and_keeps_payload() {
         let drops = AtomicUsize::new(0);
         let result = std::panic::catch_unwind(|| {
-            invoke(0, |_| panic!("native-finally-payload"), CountDrop(&drops));
+            invoke(
+                0,
+                |_| -> u64 { panic!("native-finally-payload") },
+                CountDrop(&drops),
+            );
         });
         assert_eq!(
             result.unwrap_err().downcast_ref::<&str>(),

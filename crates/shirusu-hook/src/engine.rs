@@ -49,9 +49,9 @@ use crate::winrt::{
 };
 use std::ffi::c_void;
 use std::sync::Arc;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, INVALID_HANDLE_VALUE,
-};
+#[cfg(test)]
+use windows_sys::Win32::Foundation::SetLastError;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
 /// スレッドコンテキストの制御レジスタだけを取得するフラグ。
 /// x64: CONTEXT_CONTROL_AMD64 (0x100001) / x86: CONTEXT_CONTROL_X86 (0x10001)。
 #[cfg(target_arch = "x86_64")]
@@ -1867,10 +1867,11 @@ unsafe extern "system-unwind" fn detour_co_create_instance(
     if let Ok(bytes) = crate::com::encode_com_factory_enter(&values) {
         rt.record_com_factory_enter(tid, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = ComCallGuard::new_for(
+    let call_guard = ComCallGuard::new_for(
         &rt,
         tid,
         call_id,
@@ -1880,10 +1881,14 @@ unsafe extern "system-unwind" fn detour_co_create_instance(
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let hr = unsafe { orig(clsid, unk_outer, cls_context, iid, ppv) };
-    guard.resume();
-    call_guard.complete();
+    let (hr, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(clsid, unk_outer, cls_context, iid, ppv) },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     let _ = last_error; // COM は HRESULT が誤りの経路。LastError は復元だけ行う。
     pop_call(call_id);
     let mut returned_object = 0u64;
@@ -1946,10 +1951,11 @@ unsafe extern "system-unwind" fn detour_co_get_class_object(
     if let Ok(bytes) = crate::com::encode_com_factory_enter(&values) {
         rt.record_com_factory_enter(tid, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = ComCallGuard::new_for(
+    let call_guard = ComCallGuard::new_for(
         &rt,
         tid,
         call_id,
@@ -1959,10 +1965,14 @@ unsafe extern "system-unwind" fn detour_co_get_class_object(
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let hr = unsafe { orig(clsid, cls_context, server_info, iid, ppv) };
-    guard.resume();
-    call_guard.complete();
+    let (hr, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(clsid, cls_context, server_info, iid, ppv) },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     let _ = last_error; // COM は HRESULT が誤りの経路。LastError は復元だけ行う。
     pop_call(call_id);
     let mut returned_object = 0u64;
@@ -2052,7 +2062,7 @@ fn detour_winrt_activation(
     class_id: usize,
     iid: Option<*const Guid>,
     out: *mut *mut c_void,
-    invoke: impl FnOnce(usize) -> i32,
+    invoke: impl FnOnce(usize) -> i32 + Copy,
 ) -> i32 {
     let (rt, original, tid, _flight, mut guard, mut le) = match prepare_winrt(activation_index) {
         WinRtPrepare::Record {
@@ -2089,10 +2099,12 @@ fn detour_winrt_activation(
     if let Ok(bytes) = crate::winrt::encode_winrt_activation_enter(&values) {
         rt.record_winrt_activation_enter(tid, call_id, &bytes);
     }
+    drop(values);
+    drop(class_name);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = ComCallGuard::new_for(
+    let call_guard = ComCallGuard::new_for(
         &rt,
         tid,
         call_id,
@@ -2102,10 +2114,14 @@ fn detour_winrt_activation(
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let hr = invoke(original);
-    guard.resume();
-    call_guard.complete();
+    let (hr, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| invoke(original),
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     let _ = last_error; // WinRT は HRESULT が誤りの経路。LastError は復元だけ行う。
     pop_call(call_id);
     let mut returned_object = 0u64;
@@ -2393,18 +2409,23 @@ unsafe fn wnd_proc_dispatch(
     if let Ok(bytes) = crate::callback::encode_callback_enter(&values) {
         rt.record_callback_enter(tid, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元のプロシージャが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard =
+    let call_guard =
         ComCallGuard::new_for(&rt, tid, call_id, CALLBACK_API_ID, CALLBACK_LEAVE_SCHEMA_ID);
     le.restore_before_original();
     guard.suspend();
     // SAFETY: スロット表から引いた元のプロシージャ。
-    let result = unsafe { orig(hwnd, msg, wparam, lparam) };
-    guard.resume();
-    call_guard.complete();
+    let (result, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(hwnd, msg, wparam, lparam) },
+        (call_guard, rt, _flight, guard),
+    );
     let _ = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     let values = crate::callback::callback_leave_values(result as i64);
     if let Ok(bytes) = crate::callback::encode_callback_leave(&values) {
@@ -2477,9 +2498,14 @@ unsafe fn detour_register_class_ex(hook_index: usize, wc: *const c_void) -> u16 
     le.restore_before_original();
     guard.suspend();
     // SAFETY: コピーした構造体（または元の構造体）を渡す。
-    let result = unsafe { orig(call_with) };
-    guard.resume();
+    let (result, (_rt, _flight, mut guard, replaced)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(call_with) },
+        (_rt, _flight, guard, replaced),
+    );
     let _ = le.capture_after_original();
+    guard.resume();
+    drop(replaced);
     le.restore_for_return();
     result
 }
@@ -2542,9 +2568,13 @@ unsafe fn detour_set_window_long_ptr(
     le.restore_before_original();
     guard.suspend();
     // SAFETY: ラップ済みまたは元の値を渡す。
-    let prev = unsafe { orig(hwnd, n_index, call_with) };
-    guard.resume();
+    let (prev, (_rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(hwnd, n_index, call_with) },
+        (_rt, _flight, guard),
+    );
     let _ = le.capture_after_original();
+    guard.resume();
     // Only GWLP_WNDPROC contains a procedure. User data and other fields must
     // remain bit-for-bit identical even if they happen to equal a wrapper.
     let prev = resolve_window_long(n_index, prev);
@@ -2586,9 +2616,9 @@ unsafe fn detour_get_long_ptr(
         le.restore_before_original();
         guard.suspend();
     }
-    let value = unsafe { original(hwnd, field) };
+    let (value, mut state) = crate::seh::invoke(0, |_| unsafe { original(hwnd, field) }, state);
     // LastError must be captured before table lookups or synchronization.
-    let saved_error = unsafe { GetLastError() };
+    let saved_error = crate::last_error::get();
     if let Some((_, _, guard, _)) = state.as_mut() {
         guard.resume();
     }
@@ -2597,9 +2627,7 @@ unsafe fn detour_get_long_ptr(
     } else {
         value
     };
-    unsafe {
-        SetLastError(saved_error);
-    }
+    crate::last_error::set(saved_error);
     value
 }
 unsafe extern "system-unwind" fn detour_get_window_long_ptr_w(
@@ -2824,17 +2852,24 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
     if let Ok(bytes) = crate::com::encode_com_enter(&values) {
         rt.record_com_enter(tid, call_id, &bytes);
     }
+    drop(values);
+    drop(target_iid);
+    drop(method_display);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで ComCallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = ComCallGuard::new(&rt, tid, call_id);
+    let call_guard = ComCallGuard::new(&rt, tid, call_id);
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: original はこの引数個数の COM メソッド。
-    let ret = unsafe { call_com_original(original, this, args) };
-    guard.resume();
-    call_guard.complete();
+    let (ret, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { call_com_original(original, this, args) },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     let _ = last_error; // COM は HRESULT が誤りの経路。LastError は復元だけ行う。
     pop_call(call_id);
     let (returned_object, refcount) = com_method_post_call(&rt, this, method_index, args, ret);
@@ -3177,30 +3212,34 @@ unsafe extern "system-unwind" fn detour_create_file_w(
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す。元の呼び出しの中で
     // アプリ由来の入れ子呼び出しが起きた場合は記録される (A43)。
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe {
-        orig(
-            file_name,
-            desired_access,
-            share_mode,
-            security_attributes,
-            creation_disposition,
-            flags_and_attributes,
-            template_file,
-        )
-    };
-    guard.resume();
-    call_guard.complete();
-    // 透明性: 他の処理より先に LastError を確定させる（overview）。
+    let (ret, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe {
+            orig(
+                file_name,
+                desired_access,
+                share_mode,
+                security_attributes,
+                creation_disposition,
+                flags_and_attributes,
+                template_file,
+            )
+        },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     let values = capture::create_file_w_leave(ret as u64, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
@@ -3243,10 +3282,11 @@ unsafe extern "system-unwind" fn detour_read_file(
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
     let pending_submission = rt.begin_pending_overlapped(
         overlapped as u64,
@@ -3263,10 +3303,14 @@ unsafe extern "system-unwind" fn detour_read_file(
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe { orig(file, buffer, bytes_to_read, bytes_read, overlapped) };
-    guard.resume();
-    call_guard.complete();
+    let (ret, (mut call_guard, pending_submission, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(file, buffer, bytes_to_read, bytes_read, overlapped) },
+        (call_guard, pending_submission, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     let is_overlapped = !overlapped.is_null();
     // F27: 同期完了した OVERLAPPED 操作は leave 時点で既に完了して
@@ -3351,10 +3395,11 @@ unsafe extern "system-unwind" fn detour_write_file(
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
     let pending_submission = rt.begin_pending_overlapped(
         overlapped as u64,
@@ -3371,10 +3416,14 @@ unsafe extern "system-unwind" fn detour_write_file(
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe { orig(file, buffer, bytes_to_write, bytes_written, overlapped) };
-    guard.resume();
-    call_guard.complete();
+    let (ret, (mut call_guard, pending_submission, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(file, buffer, bytes_to_write, bytes_written, overlapped) },
+        (call_guard, pending_submission, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     let is_overlapped = !overlapped.is_null();
     // F27: ReadFile と同じく、同期完了は leave 時点で値を取り、未完了
@@ -3437,18 +3486,23 @@ unsafe extern "system-unwind" fn detour_close_handle(object: Handle) -> i32 {
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
     // CallAborted を記録する（例外は捕捉しない）。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe { orig(object) };
-    guard.resume();
-    call_guard.complete();
+    let (ret, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(object) },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     let values = capture::close_handle_leave(ret, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
@@ -3495,17 +3549,22 @@ unsafe extern "system-unwind" fn detour_get_overlapped_result(
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら CallGuard が CallAborted を記録する。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe { orig(file, overlapped, bytes_transferred, wait) };
-    guard.resume();
-    call_guard.complete();
+    let (ret, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe { orig(file, overlapped, bytes_transferred, wait) },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     // 完了の観測：元の呼び出しが返した後に転送バイト数を読み、
     // 保留中の操作を解決する。読めなければ完了は記録できない。
@@ -3584,25 +3643,30 @@ unsafe extern "system-unwind" fn detour_get_queued_completion_status(
     if let Ok(bytes) = capture::encode_enter(api, &values) {
         rt.record_enter(tid, api, call_id, &bytes);
     }
+    drop(values);
     push_call(call_id);
     // L08: 元の呼び出しが例外で中断したら CallGuard が CallAborted を記録する。
-    let mut call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    let ret = unsafe {
-        orig(
-            port,
-            bytes_transferred,
-            completion_key,
-            overlapped,
-            milliseconds,
-        )
-    };
-    guard.resume();
-    call_guard.complete();
+    let (ret, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+        original,
+        |_| unsafe {
+            orig(
+                port,
+                bytes_transferred,
+                completion_key,
+                overlapped,
+                milliseconds,
+            )
+        },
+        (call_guard, rt, _flight, guard),
+    );
     let last_error = le.capture_after_original();
+    call_guard.complete();
+    guard.resume();
     pop_call(call_id);
     // 取り出した OVERLAPPED ポインタは元の呼び出しが書いたもの。
     // SAFETY: overlapped が指す領域は元の呼び出しが書き込んだ有効な領域。
@@ -3716,6 +3780,52 @@ mod tests {
             unsafe { shirusu_test_catch_seh(invoke, std::ptr::null_mut()) },
             0xe0424242
         );
+        assert_eq!(rt.in_flight(), 0);
+        assert_eq!(Arc::strong_count(&rt), references);
+        assert_eq!(crate::runtime::current_parent_call(), 0);
+        assert!(!ReentrancyGuard::is_active());
+        assert!(clear_runtime(&rt));
+    }
+
+    #[test]
+    fn read_file_seh_cancels_provisional_overlapped_and_releases_state() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        extern "C-unwind" {
+            fn shirusu_test_raise_seh() -> u64;
+            fn shirusu_test_catch_seh(
+                invoke: unsafe extern "C-unwind" fn(*mut c_void) -> u64,
+                context: *mut c_void,
+            ) -> u32;
+        }
+        unsafe extern "system-unwind" fn fail(
+            _: Handle,
+            _: *mut u8,
+            _: u32,
+            _: *mut u32,
+            _: *mut c_void,
+        ) -> i32 {
+            unsafe { shirusu_test_raise_seh() as i32 }
+        }
+        unsafe extern "C-unwind" fn invoke(_: *mut c_void) -> u64 {
+            unsafe {
+                detour_read_file(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    1,
+                    std::ptr::null_mut(),
+                    0x1234usize as *mut c_void,
+                ) as u64
+            }
+        }
+        let rt = Arc::new(test_runtime());
+        rt.set_original(API_READ_FILE, fail as ReadFileFn as usize);
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        let references = Arc::strong_count(&rt);
+        assert_eq!(
+            unsafe { shirusu_test_catch_seh(invoke, std::ptr::null_mut()) },
+            0xe0424242
+        );
+        assert_eq!(rt.pending_overlapped_count(), 0);
         assert_eq!(rt.in_flight(), 0);
         assert_eq!(Arc::strong_count(&rt), references);
         assert_eq!(crate::runtime::current_parent_call(), 0);

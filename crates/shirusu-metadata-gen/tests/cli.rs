@@ -12,34 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// テスト対象のバイナリ。解決順序：
-/// 1. `CARGO_BIN_EXE_win32_metadata_gen`（Cargo が設定する場合）
-/// 2. 実行中のテストバイナリと同じ `<target-dir>/debug/` 直下
-///    （`current_exe()` は `<target-dir>/debug/deps/cli-<hash>`）。
-///    llvm-cov 実行時（`target/llvm-cov-target` 配下）も同じ配置に
-///    なるため、計測対象のバイナリが子プロセスとして走り、main.rs
-///    のカバレッジが付く。
-/// 3. 既定の target dir の直下（最後のフォールバック）。
-///
-/// なお `env!("CARGO_BIN_EXE_win32_metadata_gen")` はこのパッケージ
-/// （lib＋bin の両方を持つ）ではコンパイル時に設定されず、実行時も
-/// 未設定だった（`cargo test` で確認）。bin 専用の shirusu-cli では
-/// `env!` が通るのと対照的である。
+/// Cargo supplies the exact artifact path, including cross-target and
+/// instrumented builds. The key uses the binary's hyphenated name verbatim.
 fn bin() -> PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_win32_metadata_gen") {
-        return PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(debug) = exe.parent().and_then(|p| p.parent()) {
-            for name in ["win32-metadata-gen", "win32-metadata-gen.exe"] {
-                let candidate = debug.join(name);
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    repo_root().join("target/debug/win32-metadata-gen")
+    PathBuf::from(env!("CARGO_BIN_EXE_win32-metadata-gen"))
 }
 
 /// リポジトリルート（`CARGO_MANIFEST_DIR` は

@@ -13,3 +13,6 @@ shirusu-trace = { path = "../shirusu-trace" }
 [[bin]]
 name = "shirusu-conformance"
 path = "src/bin/shirusu-conformance.rs"
+
+[lints]
+workspace = true

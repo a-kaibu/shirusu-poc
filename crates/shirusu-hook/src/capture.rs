@@ -505,26 +505,26 @@ pub struct PendingOverlapped {
 /// のアドレス。同じ構造体で完了前に再登録された場合は古い方を上書き
 /// する（Win32 は完了前の構造体再利用を禁じているため、古い操作の
 /// 完了は以後対応付けできない）。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OverlappedRegistry {
-    pending: std::sync::Mutex<std::collections::HashMap<u64, PendingOverlapped>>,
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, PendingOverlapped>>>,
 }
 
 /// A provisional registration is cancelled on unwind as well as synchronous
 /// failure. Cancellation is generation checked so an early completion may reuse
 /// the address while the original submitter is still unwinding/returning.
-pub struct PendingSubmission<'a> {
-    registry: &'a OverlappedRegistry,
+pub struct PendingSubmission {
+    registry: OverlappedRegistry,
     address: u64,
     call_id: u64,
     keep: bool,
 }
-impl PendingSubmission<'_> {
+impl PendingSubmission {
     pub fn finish(mut self, pending: bool) {
         self.keep = pending;
     }
 }
-impl Drop for PendingSubmission<'_> {
+impl Drop for PendingSubmission {
     fn drop(&mut self) {
         if !self.keep {
             self.registry.cancel(self.address, self.call_id);
@@ -536,10 +536,10 @@ impl OverlappedRegistry {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn submit(&self, address: u64, pending: PendingOverlapped) -> PendingSubmission<'_> {
+    pub fn submit(&self, address: u64, pending: PendingOverlapped) -> PendingSubmission {
         self.register(address, pending);
         PendingSubmission {
-            registry: self,
+            registry: self.clone(),
             address,
             call_id: pending.call_id,
             keep: false,

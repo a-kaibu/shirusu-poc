@@ -8,3 +8,6 @@ description = "shirusu 公開 Trace の解析用ビュー: イベント復号・
 
 [dependencies]
 shirusu-trace = { path = "../shirusu-trace" }
+
+[lints]
+workspace = true

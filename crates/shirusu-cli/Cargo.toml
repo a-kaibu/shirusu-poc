@@ -16,3 +16,6 @@ shirusu-transport = { path = "../shirusu-transport" }
 [[bin]]
 name = "shirusu"
 path = "src/main.rs"
+
+[lints]
+workspace = true

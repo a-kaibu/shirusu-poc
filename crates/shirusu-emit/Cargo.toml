@@ -12,3 +12,6 @@ shirusu-trace = { path = "../shirusu-trace" }
 [dev-dependencies]
 shirusu-analysis = { path = "../shirusu-analysis" }
 shirusu-hook = { path = "../shirusu-hook" }
+
+[lints]
+workspace = true

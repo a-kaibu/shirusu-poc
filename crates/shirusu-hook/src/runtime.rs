@@ -1132,7 +1132,7 @@ impl HookRuntime {
         &self,
         address: u64,
         pending: PendingOverlapped,
-    ) -> crate::capture::PendingSubmission<'_> {
+    ) -> crate::capture::PendingSubmission {
         self.pending_overlapped.submit(address, pending)
     }
 
