@@ -2459,7 +2459,11 @@ unsafe fn detour_set_window_long_ptr(
         CallbackPrepare::Passthrough { original } => {
             // SAFETY: ランタイムの別表から引いた元の関数。
             let orig: SetWindowLongPtrFn = unsafe { std::mem::transmute(original) };
-            return unsafe { orig(hwnd, n_index, new_long) };
+            let prev = unsafe { orig(hwnd, n_index, new_long) };
+            let last_error = crate::last_error::get();
+            let prev = resolve_window_long(n_index, prev);
+            crate::last_error::set(last_error);
+            return prev;
         }
         CallbackPrepare::Unavailable => return 0,
     };
@@ -2483,9 +2487,19 @@ unsafe fn detour_set_window_long_ptr(
     let prev = unsafe { orig(hwnd, n_index, call_with) };
     guard.resume();
     let _ = le.capture_after_original();
+    // Only GWLP_WNDPROC contains a procedure. User data and other fields must
+    // remain bit-for-bit identical even if they happen to equal a wrapper.
+    let prev = resolve_window_long(n_index, prev);
     le.restore_for_return();
-    // 戻り値（以前のプロシージャ）がラッパーなら元へ解決して返す。
-    resolve_prev_proc(prev, original_for_wrapper)
+    prev
+}
+
+fn resolve_window_long(field: i32, value: usize) -> usize {
+    if field == crate::callback::GWLP_WNDPROC {
+        resolve_prev_proc(value, original_for_wrapper)
+    } else {
+        value
+    }
 }
 
 type GetLongPtrFn = unsafe extern "system-unwind" fn(*mut c_void, i32) -> usize;
@@ -3618,6 +3632,47 @@ mod tests {
         assert_eq!(rt.in_flight(), 0);
         assert_eq!(Arc::strong_count(&rt), references);
         crate::fls::drain_pending_exits();
+        assert!(clear_runtime(&rt));
+    }
+
+    #[test]
+    fn set_window_long_preserves_non_procedure_values() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        unsafe extern "system-unwind" fn procedure(
+            _: *mut c_void,
+            _: u32,
+            _: usize,
+            _: isize,
+        ) -> isize {
+            0
+        }
+        unsafe extern "system-unwind" fn setter(hwnd: *mut c_void, _: i32, _: usize) -> usize {
+            unsafe {
+                SetLastError(0x8000_0002);
+            }
+            hwnd as usize
+        }
+        let procedure = procedure as WndProcFn as usize;
+        let slot = callback_procs().wrap(procedure).unwrap();
+        let wrapper = wrapper_for_slot(slot).unwrap();
+        let rt = Arc::new(test_runtime());
+        rt.set_callback_original(
+            CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W,
+            setter as SetWindowLongPtrFn as usize,
+        );
+        assert!(set_runtime(Arc::clone(&rt)).is_ok());
+        for recording in [true, false] {
+            if !recording {
+                rt.shutdown_recording();
+            }
+            for (field, expected) in [(-21, wrapper), (0, wrapper), (-4, procedure)] {
+                assert_eq!(
+                    unsafe { detour_set_window_long_ptr_w(wrapper as *mut c_void, field, 0) },
+                    expected
+                );
+                assert_eq!(unsafe { GetLastError() }, 0x8000_0002);
+            }
+        }
         assert!(clear_runtime(&rt));
     }
 

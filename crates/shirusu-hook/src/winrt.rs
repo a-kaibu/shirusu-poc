@@ -4,9 +4,9 @@
 //! `IInspectable`（`IUnknown` + GetIids / GetRuntimeClassName /
 //! GetTrustLevel）から派生し、ランタイムクラスはアクティベーション関数
 //! `RoActivateInstance` / `RoGetActivationFactory`（combase.dll）経由で
-//! 取得する。返されたオブジェクトは L02 の COM Interception と同じ
-//! 「オブジェクト単位の vtable 複製」で追跡する（`crate::com` の追跡表・
-//! Detour を流用する）。WinRT 固有の部分はこのファイルが持つ：
+//! 取得する。返されたポインタと IID は `crate::com` の追跡表へ記録する。
+//! 共有オブジェクトの vtable 差し替えは安全性未確認のため見送り、
+//! Coverage に理由を残す。WinRT 固有の部分はこのファイルが持つ：
 //!
 //! - **定義**：既知の WinRT インターフェイス表（IID と vtable のメソッド表）
 //!   と、ランタイムクラス名から既定インターフェイスを引く表。
@@ -27,10 +27,10 @@
 //! 置き換えることが将来の拡張（生成器は shirusu-metadata-gen）。
 //!
 //! 制限：
-//! - 表に無いランタイムクラスは `IInspectable` として追跡する
-//!   （GetIids / GetRuntimeClassName / GetTrustLevel のみ記録される）。
-//!   クラス名自体はアクティベーションイベントに残るため、後から表へ
-//!   追加できる。
+//! - `RoActivateInstance` の返却 IID は `IInspectable`、
+//!   `RoGetActivationFactory` は呼び出し側が要求した IID として追跡する。
+//!   クラス名から返却インターフェイスを推測しない。
+//!   クラス名自体はアクティベーションイベントに残る。
 //! - メソッドが返すインターフェイスの追跡は、表に載せた返却メソッド
 //!   （`winrt_method_return`）に限る。それ以外のメソッドが返す
 //!   インターフェイスは、アプリが `QueryInterface` で取り直さない限り
