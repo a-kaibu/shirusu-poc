@@ -171,6 +171,47 @@ fn full_capture_in_process_produces_decodable_trace() {
 }
 
 #[test]
+fn idle_host_waiting_flag_wakes_on_first_publication_only() {
+    use shirusu_transport::notify::NotifySignal;
+    use shirusu_transport::ring::WriteOutcome;
+    let path = temp_trace("host-waiting");
+    let (agent, generation, base) = agent_and_region(12);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(
+                base,
+                RingConfig::new(64, 4096).required_len(),
+                spec(generation),
+            )
+            .unwrap();
+    }
+    session.start().unwrap();
+    assert_eq!(session.poll_once().unwrap().events, 0);
+    let waiting = || layout::load(base, layout::OFF_HOST_WAITING, Ordering::Relaxed);
+    // Idle Ring: the flag goes up and nothing is pending, so the Host may sleep.
+    assert!(!session.arm_host_waiting());
+    assert_eq!(waiting(), 1);
+    let notify_of = |r: RecordResult| match r {
+        RecordResult::Written(WriteOutcome::Published { notify, .. }) => notify,
+        other => panic!("unexpected {other:?}"),
+    };
+    // The first publication consumes the flag and signals once.
+    let first = agent.record_enter(12, 1, 1, 1, 0, b"");
+    assert_eq!(notify_of(first), NotifySignal::HostWaiting);
+    assert_eq!(waiting(), 0);
+    let second = agent.record_leave(12, 1, 2, 1, 0, b"");
+    assert_eq!(notify_of(second), NotifySignal::None);
+    // Re-arming with committed events pending tells the Host to collect.
+    assert!(session.arm_host_waiting());
+    session.disarm_host_waiting();
+    assert_eq!(waiting(), 0);
+    assert_eq!(session.poll_once().unwrap().events, 2);
+    session.stop().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn uninitialized_ring_is_pending_not_an_error() {
     let path = temp_trace("pending");
     let cfg = RingConfig::new(64, 4096);

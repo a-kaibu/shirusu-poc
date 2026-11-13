@@ -1414,6 +1414,33 @@ pub fn set_current_thread_priority(priority: ThreadPriority) -> bool {
     }
 }
 
+/// Owner side of an asymmetric Dekker handshake: orders the owner's flag
+/// store before its following load of the remote flag. On Windows the remote
+/// side's [`asymmetric_fence_heavy`] serializes every processor, so the
+/// owner only needs to stop compiler reordering and pays no fence or atomic
+/// read-modify-write per operation. Elsewhere it is a full fence.
+#[inline(always)]
+pub fn asymmetric_fence_light() {
+    #[cfg(windows)]
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(windows))]
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Remote side of the asymmetric handshake (rare, management path). After
+/// it returns, every owner's store issued before its light fence is visible
+/// to the caller, or the owner will observe the caller's earlier store.
+pub fn asymmetric_fence_heavy() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::FlushProcessWriteBuffers;
+        // SAFETY: no arguments; flushes write buffers of every processor
+        // running a thread of this process.
+        unsafe { FlushProcessWriteBuffers() };
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(windows)]
 fn qpc_frequency() -> u64 {
     use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;

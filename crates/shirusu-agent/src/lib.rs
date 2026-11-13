@@ -12,6 +12,8 @@
 //! 管理スレッドが担う。記録経路は登録も待機もしない。
 
 pub mod expansion;
+mod writer_cell;
+use writer_cell::WriterCell;
 
 pub use expansion::{ExpansionManager, ExpansionManagerHandle, ExpansionStats};
 
@@ -148,9 +150,11 @@ struct ThreadSlotState {
     handle: SlotHandle,
     // SharedRegion は writer より長生きさせるためここに保持する。
     region: RegionBacking,
-    /// 書き手は Ring ごとに 1 つだけ。競合するのは同じ論理スレッドの
-    /// 記録同士だけであり、それは SPSC の単一書き手を保証するために必要。
-    writer: Mutex<RingWriter>,
+    /// 書き手は Ring ごとに 1 つだけ。記録する OS スレッドは原子的な
+    /// 読み書き更新なしの高速経路で使い、他のスレッド (管理パスや同じ
+    /// 論理スレッドを名乗る別スレッド) は排他経路で使う。SPSC の単一
+    /// 書き手はこの排他で保証する (`writer_cell`)。
+    writer: WriterCell,
     /// thread_forget で引退済みにされたか。TLS キャッシュや取得途中の
     /// 状態が、引退後の領域へ書き続けないための印。
     retired: AtomicBool,
@@ -245,9 +249,7 @@ impl Agent {
             if !state.retired.load(Ordering::Acquire) {
                 state
                     .writer
-                    .lock()
-                    .unwrap()
-                    .set_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+                    .exclusive(|w| w.set_clock(Arc::clone(&clock) as Arc<dyn Clock>));
             }
         }
         Some(clock)
@@ -431,7 +433,7 @@ impl Agent {
         let state = Arc::new(ThreadSlotState {
             handle,
             region,
-            writer: Mutex::new(writer),
+            writer: WriterCell::new(writer),
             retired: AtomicBool::new(false),
         });
         map.insert(thread_id, Arc::clone(&state));
@@ -498,12 +500,9 @@ impl Agent {
     }
 
     fn write_to(&self, state: &ThreadSlotState, input: EventInput) -> RecordResult {
-        let outcome = {
-            let mut writer = state.writer.lock().unwrap();
+        let outcome = state.writer.with(|writer| {
             if writer.is_detached() {
-                drop(writer);
-                self.pool.note_call_after_detach(&state.handle);
-                return RecordResult::AfterDetach;
+                return None;
             }
             let _guard = PublishGuard::enter(); // 公開区間だけのガード
                                                 // L11: 書き込みが確定する直前に全体順序を採番する。
@@ -513,7 +512,11 @@ impl Agent {
             if self.order_global {
                 input.global_order = self.next_global_order.fetch_add(1, Ordering::Relaxed);
             }
-            writer.write(input)
+            Some(writer.write(input))
+        });
+        let Some(outcome) = outcome else {
+            self.pool.note_call_after_detach(&state.handle);
+            return RecordResult::AfterDetach;
         };
         // 容量不足などの異常経路でのみ Host 生存確認する。通常経路では確認しない。
         if matches!(
@@ -638,7 +641,7 @@ impl Agent {
     pub fn thread_detach(&self, thread_id: u64) -> bool {
         let state = self.threads.read().unwrap().get(&thread_id).map(Arc::clone);
         if let Some(s) = state {
-            s.writer.lock().unwrap().mark_detached();
+            s.writer.exclusive(|w| w.mark_detached());
             return self.pool.begin_detach(&s.handle);
         }
         false
@@ -652,7 +655,8 @@ impl Agent {
         let removed = self.threads.write().unwrap().remove(&thread_id);
         if let Some(state) = removed {
             state.retired.store(true, Ordering::Release);
-            let _in_flight_done = state.writer.lock().unwrap();
+            // Exclusive access waits for an in-flight record to finish.
+            state.writer.exclusive(|_| ());
         }
     }
 
@@ -680,9 +684,8 @@ impl Agent {
         };
         state.retired.store(true, Ordering::Release);
         {
-            // 書き手ロックの取得自体が、進行中の記録の完了待ちになる。
-            let mut writer = state.writer.lock().unwrap();
-            writer.mark_detached();
+            // 排他取得自体が、進行中の記録の完了待ちになる。
+            state.writer.exclusive(|writer| writer.mark_detached());
         }
         // この Ring への space_available 結線はこの incarnation の
         // ものであるため外す (再利用時は ensure 経路が結び直す)。
@@ -1050,13 +1053,14 @@ mod tests {
                     let _ = a.record_enter(tid, 1, 1, call, 0, b"x");
                 }
                 let state = a.state_for(tid).unwrap();
-                let writer = state.writer.lock().unwrap();
-                assert_eq!(writer.loader_lock_state(), loader_lock);
-                if loader_lock == LoaderLockState::Unknown {
-                    assert_eq!(writer.wait_count, 0);
-                } else {
-                    assert!(writer.wait_count > 0);
-                }
+                state.writer.exclusive(|writer| {
+                    assert_eq!(writer.loader_lock_state(), loader_lock);
+                    if loader_lock == LoaderLockState::Unknown {
+                        assert_eq!(writer.wait_count, 0);
+                    } else {
+                        assert!(writer.wait_count > 0);
+                    }
+                });
             }
             if loader_lock == LoaderLockState::Unknown {
                 assert_eq!(clock.now_ticks(), 0);

@@ -221,7 +221,17 @@ impl LaunchedCapture {
             // its threshold notification (or the poll interval) instead of
             // spinning, which on a small machine takes CPU from the target
             // and from conversion.
-            if stats.events < collection_low_water(self.session().ring_config()) {
+            //
+            // Only a fully idle poll raises the Host waiting flag, so the next
+            // publication wakes it at once. After a small but nonempty
+            // collection, wait for the threshold signal instead: waking on
+            // every publication would collect one event per wakeup.
+            if stats.events == 0 {
+                if !self.session().arm_host_waiting() {
+                    self.data_ready.data_ready.wait_timeout(poll_interval);
+                }
+                self.session().disarm_host_waiting();
+            } else if stats.events < collection_low_water(self.session().ring_config()) {
                 self.data_ready.data_ready.wait_timeout(poll_interval);
             }
         }

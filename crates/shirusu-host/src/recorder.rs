@@ -564,6 +564,54 @@ impl CaptureSession {
     pub fn ring_count(&self) -> usize {
         self.rings.len()
     }
+
+    /// Announce that the Host is about to sleep on `data_ready` (spec: the
+    /// Host raises the waiting flag, then re-checks before it waits). Raises
+    /// `OFF_HOST_WAITING` on every collecting Ring, then re-checks each for
+    /// committed events published meanwhile. Returns `true` when one has
+    /// data, so the caller collects instead of sleeping.
+    ///
+    /// The writer consumes the flag on its next publication and signals
+    /// once. Its read is not fenced, so a publication racing this re-check
+    /// can still miss the flag; the bounded wait (`ReCheckPolicy`) collects
+    /// it. Call only when a poll found every Ring idle: raising the flag
+    /// after a partial collection would wake the Host per event under load.
+    pub fn arm_host_waiting(&mut self) -> bool {
+        let active = |ring: &RingEndpoint| {
+            ring.collector.as_ref().is_some_and(|c| !c.is_stopped())
+                && ring.mapping.agent_initialized()
+        };
+        for ring in self.rings.iter().filter(|r| active(r)) {
+            layout::store(
+                ring.mapping.base(),
+                layout::OFF_HOST_WAITING,
+                1,
+                Ordering::Relaxed,
+            );
+        }
+        // Order the flag stores before the cursor loads (Dekker with the
+        // writer's cursor store and flag load).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.rings.iter().filter(|r| active(r)).any(|ring| {
+            let base = ring.mapping.base();
+            layout::load(base, layout::OFF_WRITE_CURSOR, Ordering::Acquire)
+                != layout::load(base, layout::OFF_READ_CURSOR, Ordering::Relaxed)
+        })
+    }
+
+    /// Lower the waiting flag after the Host woke (by signal or timeout).
+    pub fn disarm_host_waiting(&mut self) {
+        for ring in &self.rings {
+            if ring.mapping.agent_initialized() {
+                layout::store(
+                    ring.mapping.base(),
+                    layout::OFF_HOST_WAITING,
+                    0,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
     /// 同一プロセス記録で判明している Slot 不足数を知らせる
     /// （Capture Coverage の劣化として Finalization に写す）。
     pub fn set_coverage_missing_calls(&mut self, n: u64) {

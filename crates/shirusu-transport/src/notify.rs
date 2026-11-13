@@ -29,6 +29,24 @@ fn usage_at_least(used: u64, capacity: u64, threshold: u64) -> bool {
         .is_some_and(|minimum| used.saturating_mul(100) >= minimum)
 }
 
+/// Smallest `used` for which `usage_at_least(used, capacity, threshold)`
+/// holds, so a hot path can compare instead of multiply. `u64::MAX` stands
+/// for "never" (an overflowing threshold product, or a threshold above 100%
+/// of a zero capacity).
+pub fn threshold_min_used(capacity: u64, threshold_percent: u64) -> u64 {
+    if capacity == 0 {
+        return if threshold_percent <= 100 {
+            0
+        } else {
+            u64::MAX
+        };
+    }
+    match threshold_percent.checked_mul(capacity) {
+        Some(minimum) => minimum.div_ceil(100),
+        None => u64::MAX,
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PublishNotifyTracker {
     above_threshold: bool,
@@ -61,6 +79,12 @@ impl PublishNotifyTracker {
         } else {
             NotifySignal::None
         }
+    }
+    /// The caller knows occupancy stays below the threshold after this
+    /// publication: no edge, and the next crossing must signal again.
+    #[inline]
+    pub fn note_below_threshold(&mut self) {
+        self.above_threshold = false;
     }
     /// 読み手が回収して使用率が下がったことを反映する。
     pub fn observe_used(&mut self, used: u64, capacity: u64, threshold_percent: u64) {
@@ -100,6 +124,28 @@ impl ReCheckPolicy {
 mod tests {
     use super::*;
     proptest::proptest! {
+        #[test]
+        fn threshold_min_used_matches_watermark(
+            used in proptest::prelude::any::<u64>(),
+            capacity in proptest::prelude::any::<u64>(),
+            threshold in 0u64..=200,
+        ) {
+            let min = threshold_min_used(capacity, threshold);
+            // u64::MAX means "never": no occupancy below it may count.
+            let fast = used >= min && (min != u64::MAX || usage_at_least(used, capacity, threshold));
+            proptest::prop_assert_eq!(fast, usage_at_least(used, capacity, threshold));
+        }
+        #[test]
+        fn small_threshold_min_used_matches_watermark(
+            used in 0u64..100_000,
+            capacity in 0u64..100_000,
+            threshold in 0u64..=200,
+        ) {
+            proptest::prop_assert_eq!(
+                used >= threshold_min_used(capacity, threshold),
+                usage_at_least(used, capacity, threshold)
+            );
+        }
         #[test]
         fn division_free_watermark_matches_saturated_percentage(
             used in proptest::prelude::any::<u64>(),

@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::clock::{system_timestamp_source, Clock, TimestampSource};
 use crate::descriptor::{flags, CaptureState, EventDescriptor, EventKind};
 use crate::layout::*;
-use crate::notify::{NotifySignal, PublishNotifyTracker};
+use crate::notify::{threshold_min_used, NotifySignal, PublishNotifyTracker};
 use crate::tsc::EventTimestamper;
 use crate::validate::{IntegrityError, MAX_DROPPED_ORIGINAL_LEN};
 
@@ -263,6 +263,14 @@ pub struct RingWriter {
     dropped_enter_calls: HashSet<u64>,
     notify_tracker: PublishNotifyTracker,
     payload_notify_tracker: PublishNotifyTracker,
+    /// Host read positions loaded at the start of the current write. The
+    /// Host only advances them, so this view can only overestimate usage.
+    cached_read_cursor: u64,
+    cached_payload_read_position: u64,
+    /// Smallest occupancy that `usage_at_least` counts as at or above the
+    /// notify threshold, per capacity (see `notify::threshold_min_used`).
+    descriptor_notify_min: u64,
+    payload_notify_min: u64,
     pub last_wait_ns: u64,
     pub total_wait_ns: u64,
     pub wait_count: u64,
@@ -297,6 +305,12 @@ impl RingWriter {
         clock: Arc<dyn Clock>,
         timestamps: Arc<dyn TimestampSource>,
     ) -> Self {
+        let descriptor_notify_min = threshold_min_used(
+            cfg.descriptor_capacity as u64,
+            policy.notify_threshold_percent,
+        );
+        let payload_notify_min =
+            threshold_min_used(cfg.payload_capacity as u64, policy.notify_threshold_percent);
         Self {
             base,
             cfg,
@@ -309,6 +323,10 @@ impl RingWriter {
             dropped_enter_calls: HashSet::new(),
             notify_tracker: PublishNotifyTracker::new(),
             payload_notify_tracker: PublishNotifyTracker::new(),
+            cached_read_cursor: load(base, OFF_READ_CURSOR, Ordering::Acquire),
+            cached_payload_read_position: load(base, OFF_PAYLOAD_READ_POSITION, Ordering::Acquire),
+            descriptor_notify_min,
+            payload_notify_min,
             last_wait_ns: 0,
             total_wait_ns: 0,
             wait_count: 0,
@@ -361,6 +379,29 @@ impl RingWriter {
     fn payload_read_position(&self) -> u64 {
         load(self.base, OFF_PAYLOAD_READ_POSITION, Ordering::Acquire)
     }
+    /// Reload both Host read positions (Acquire) into the cache.
+    fn refresh_read_positions(&mut self) {
+        self.cached_read_cursor = self.read_cursor();
+        self.cached_payload_read_position = self.payload_read_position();
+    }
+    /// Capacity check. Loads the Host read positions once per write; the
+    /// publication's notify decision reuses them instead of loading again.
+    /// A regressed (corrupted) read cursor is seen here and drops the event.
+    fn fits_cached(&mut self, need_desc: u64, payload_len: u64) -> bool {
+        let fits = |w: &Self| {
+            let wc = w.write_cursor();
+            let desc_free =
+                descriptor_free(wc, w.cached_read_cursor, w.cfg.descriptor_capacity as u64)
+                    .unwrap_or(0);
+            let payload_used = w
+                .payload_write_position
+                .saturating_sub(w.cached_payload_read_position);
+            let payload_free = (w.cfg.payload_capacity as u64).saturating_sub(payload_used);
+            desc_free >= need_desc && (payload_len == 0 || payload_free >= payload_len)
+        };
+        self.refresh_read_positions();
+        fits(self)
+    }
     fn descriptor_free(&self) -> u64 {
         let wc = self.write_cursor();
         descriptor_free(wc, self.read_cursor(), self.cfg.descriptor_capacity as u64).unwrap_or(0)
@@ -390,15 +431,10 @@ impl RingWriter {
     /// 唯一の公開点。Payload コピー → Descriptor 書込 → write_cursor Release 更新。
     fn publish(&mut self, desc: EventDescriptor, payload: Option<&[u8]>) -> NotifySignal {
         let wc = self.write_cursor();
-        let used_before = wc.saturating_sub(self.read_cursor());
-        // Descriptor and payload capacities are independent. A large descriptor
-        // Ring can exhaust payload storage before its count watermark is reached.
-        let payload_usage = payload.filter(|p| !p.is_empty()).map(|p| {
-            let before = self
-                .payload_write_position
-                .saturating_sub(self.payload_read_position());
-            (before, before + p.len() as u64)
-        });
+        let payload_len = payload.map_or(0, |p| p.len() as u64);
+        let payload_before = self
+            .payload_write_position
+            .saturating_sub(self.cached_payload_read_position);
         if let Some(p) = payload {
             unsafe { copy_payload_write(self.base, self.cfg, desc.payload_position, p) };
             self.payload_write_position = desc.payload_position + p.len() as u64;
@@ -412,8 +448,33 @@ impl RingWriter {
         unsafe { write_descriptor_at(self.base, self.cfg, wc, &desc) };
         // 単一公開点: この Release store より前の書込みは、Acquire で読む読み手から見える。
         store(self.base, OFF_WRITE_CURSOR, wc + 1, Ordering::Release);
+        // The Host raises the flag before it sleeps on an idle Ring. The
+        // first publication after that consumes it, so one wait costs the
+        // writer one notification; while the flag is down (always under
+        // sustained load) this is a single plain load.
+        let host_waiting = load(self.base, OFF_HOST_WAITING, Ordering::Relaxed) != 0
+            && swap(self.base, OFF_HOST_WAITING, 0, Ordering::Relaxed) != 0;
+        // Below the notify threshold no edge can be crossed: skip the tracker's
+        // percentage arithmetic and only keep it disarmed. Near or above it,
+        // evaluate the edge exactly as before.
+        let cached_used_after = (wc + 1).saturating_sub(self.cached_read_cursor);
+        let payload_cached_after = payload_before + payload_len;
+        let payload_relevant = payload_len > 0;
+        let near_threshold = cached_used_after >= self.descriptor_notify_min
+            || (payload_relevant && payload_cached_after >= self.payload_notify_min);
+        if !near_threshold {
+            self.notify_tracker.note_below_threshold();
+            if payload_relevant {
+                self.payload_notify_tracker.note_below_threshold();
+            }
+            return if host_waiting {
+                NotifySignal::HostWaiting
+            } else {
+                NotifySignal::None
+            };
+        }
+        let used_before = wc.saturating_sub(self.cached_read_cursor);
         let used_after = used_before + 1;
-        let host_waiting = load(self.base, OFF_HOST_WAITING, Ordering::Relaxed) != 0;
         let descriptor_signal = self.notify_tracker.after_publish(
             used_before,
             used_after,
@@ -421,7 +482,11 @@ impl RingWriter {
             self.policy.notify_threshold_percent,
             host_waiting,
         );
-        let payload_signal = payload_usage.map(|(before, after)| {
+        let payload_signal = payload_relevant.then(|| {
+            let after = self
+                .payload_write_position
+                .saturating_sub(self.cached_payload_read_position);
+            let before = after.saturating_sub(payload_len);
             self.payload_notify_tracker.after_publish(
                 before,
                 after,
@@ -530,10 +595,6 @@ impl RingWriter {
             };
         }
         let need_desc = 1u64;
-        let fits = |w: &Self| {
-            w.descriptor_free() >= need_desc
-                && (payload_len == 0 || w.payload_free() >= payload_len)
-        };
         // Leave OVERFLOW only when both independent capacities have drained.
         // Checking descriptors alone sends a payload-starved writer back to
         // NORMAL on every event, so each call pays the full bounded wait.
@@ -544,14 +605,17 @@ impl RingWriter {
             self.set_state(OverflowState::Normal);
         }
         if self.state == OverflowState::Normal {
-            if fits(self) {
+            if self.fits_cached(need_desc, payload_len) {
                 return self.publish_normal(seq, &input);
             }
             // A payload larger than the whole Ring can never fit: waiting only
             // delays the caller before the same degradation.
             let can_ever_fit = payload_len <= self.cfg.payload_capacity as u64;
             // 容量不足 → BOUNDED_WAIT（危険経路/0ms では待たず OVERFLOW へ）
-            if can_ever_fit && self.bounded_wait(need_desc, payload_len) && fits(self) {
+            if can_ever_fit
+                && self.bounded_wait(need_desc, payload_len)
+                && self.fits_cached(need_desc, payload_len)
+            {
                 self.set_state(OverflowState::Normal);
                 return self.publish_normal(seq, &input);
             }
@@ -592,6 +656,7 @@ impl RingWriter {
         let payload_len = input.payload.len() as u64;
         // (1) Payload だけ落として Descriptor を残す
         if self.descriptor_free() >= 1 {
+            self.refresh_read_positions();
             fetch_add(self.base, OFF_DEGRADED_EVENTS, 1);
             fetch_add(self.base, OFF_DROPPED_PAYLOAD_BYTES, payload_len);
             let pos = self.payload_write_position;

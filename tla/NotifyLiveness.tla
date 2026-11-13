@@ -17,8 +17,10 @@
 (*  - TypeOK / Bounded: Cursor は後退せず、占有量は容量を超えない。         *)
 (*                                                                         *)
 (* UseTimeout = FALSE の変種では Drained が破れることを tla.sh で必須にする *)
-(* (期限付き待機が進行性を担っている証跡)。HostSetsWaiting は実装どおり     *)
-(* FALSE (2026-11-13 時点で Host は OFF_HOST_WAITING を立てていない)。      *)
+(* (期限付き待機が進行性を担っている証跡)。HostSetsWaiting = TRUE が実装:  *)
+(* Host は空を確認したときだけ OFF_HOST_WAITING を立て、書き手は最初の公開 *)
+(* でフラグを消費して1回だけ通知する。書き手のフラグ読みにはフェンスが無い *)
+(* ため、立っていても読み落とすことがある (seen は FALSE も取り得る)。     *)
 (***************************************************************************)
 EXTENDS Naturals
 CONSTANTS Cap, Threshold, MaxEvents, UseTimeout, HostSetsWaiting
@@ -44,10 +46,13 @@ Publish == /\ w + dropped < MaxEvents /\ Used < Cap
                   wasAbove == before > 0 /\ AtLeast(before)
                   armed == above /\ wasAbove
                   crossed == AtLeast(after) /\ ~armed /\ ~wasAbove
-              IN /\ w' = w + 1
+              IN \E seen \in (IF waitingFlag THEN BOOLEAN ELSE {FALSE}) :
+                 /\ w' = w + 1
                  /\ above' = AtLeast(after)
-                 /\ event' = (event \/ crossed \/ waitingFlag)
-           /\ UNCHANGED <<r, dropped, waitingFlag, host>>
+                 /\ event' = (event \/ crossed \/ seen)
+                 \* 見えたフラグは書き手が消費する (1待機につき1通知)。
+                 /\ waitingFlag' = (waitingFlag /\ ~seen)
+           /\ UNCHANGED <<r, dropped, host>>
 
 \* 満杯: BOUNDED_WAIT の後に欠落として前へ進む (待ち続けない)。
 Drop == /\ w + dropped < MaxEvents /\ Used = Cap

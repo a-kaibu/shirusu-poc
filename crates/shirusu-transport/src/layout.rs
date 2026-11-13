@@ -128,6 +128,10 @@ pub fn store(base: *mut u8, offset: usize, v: u64, order: Ordering) {
     unsafe { atomic_at(base, offset) }.store(v, order)
 }
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
+pub fn swap(base: *mut u8, offset: usize, v: u64, order: Ordering) -> u64 {
+    unsafe { atomic_at(base, offset) }.swap(v, order)
+}
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
 pub fn fetch_add(base: *mut u8, offset: usize, v: u64) -> u64 {
     unsafe { atomic_at(base, offset) }.fetch_add(v, Ordering::Relaxed)
 }
