@@ -228,14 +228,23 @@ pub fn compare_traces(left: &ReadTrace, right: &ReadTrace) -> DiffReport {
         }
     }
 
-    // --- オブジェクト非関与の呼び出し: スレッドごとの整列比較 ---
+    // Unpaired successful creators must also align with failed creation calls:
+    // a failed call has no produced object to join through object_calls.
+    // Keep creators already compared through an object out of this pass, so
+    // cross-thread object matching does not gain duplicate missing/extra calls.
+    let compared_left: HashSet<_> = compared_pairs.iter().map(|(l, _)| *l).collect();
+    let compared_right: HashSet<_> = compared_pairs.iter().map(|(_, r)| *r).collect();
+    // --- オブジェクト非関与と未対応の生成呼び出し: スレッドごとの整列比較 ---
     let plain_left: Vec<Vec<usize>> = nl
         .threads
         .iter()
         .map(|t| {
             t.iter()
                 .copied()
-                .filter(|&i| !nl.calls[i].involves_object())
+                .filter(|&i| {
+                    !nl.calls[i].involves_object()
+                        || (nl.calls[i].created.is_some() && !compared_left.contains(&i))
+                })
                 .collect()
         })
         .collect();
@@ -245,7 +254,10 @@ pub fn compare_traces(left: &ReadTrace, right: &ReadTrace) -> DiffReport {
         .map(|t| {
             t.iter()
                 .copied()
-                .filter(|&i| !nr.calls[i].involves_object())
+                .filter(|&i| {
+                    !nr.calls[i].involves_object()
+                        || (nr.calls[i].created.is_some() && !compared_right.contains(&i))
+                })
                 .collect()
         })
         .collect();

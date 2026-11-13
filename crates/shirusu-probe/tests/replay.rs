@@ -621,15 +621,17 @@ fn native_runner_pair_does_not_invent_a_difference_between_windows_runs() {
     assert!(left.environment.is_some());
     assert_eq!(left.environment, right.environment);
     let source_steps: Vec<_> = (0..spec.steps.len()).collect();
-    let trial = Trial {
-        spec: &spec,
-        source_steps: &source_steps,
-        target_replay_step: 4,
-    };
-    assert_eq!(
-        DifferenceFingerprint::establish(&trial, &left, &right),
-        Err(TrialOutcome::DifferenceAbsent)
-    );
+    for target_replay_step in [0, 4] {
+        let trial = Trial {
+            spec: &spec,
+            source_steps: &source_steps,
+            target_replay_step,
+        };
+        assert_eq!(
+            DifferenceFingerprint::establish(&trial, &left, &right),
+            Err(TrialOutcome::DifferenceAbsent)
+        );
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1085,4 +1087,186 @@ fn trace_fingerprint_normalizes_negative_bool_without_inventing_a_difference() {
             assert_eq!(fingerprint.candidate.data.as_deref(), Some("2b"));
         }
     }
+}
+
+fn creation_trace(returned: u64, error: u32, width: u32) -> shirusu_trace::reader::ReadTrace {
+    let mut cfg = SessionConfig::new(1, "creation-replay-test");
+    cfg.pointer_width = width;
+    let mut emitter = Emitter::new(Vec::new(), file_io_api_set(), cfg).unwrap();
+    let captured = |values: Vec<V>| {
+        values
+            .into_iter()
+            .map(CapturedValue::captured)
+            .collect::<Vec<_>>()
+    };
+    let token = emitter
+        .begin_call(
+            1,
+            "kernel32!CreateFileW",
+            &captured(vec![
+                V::Str16("C:\\scratch\\created.bin".encode_utf16().collect()),
+                V::U32(0xc0000000),
+                V::U32(0),
+                V::U64(0),
+                V::U32(1),
+                V::U32(128),
+                V::U64(0),
+            ]),
+            1,
+            EventMeta::default(),
+        )
+        .unwrap();
+    emitter
+        .end_call(
+            token,
+            &captured(vec![V::U64(returned), V::U32(error)]),
+            2,
+            EventMeta::default(),
+        )
+        .unwrap();
+    let invalid = if width == 32 {
+        u32::MAX as u64
+    } else {
+        u64::MAX
+    };
+    if returned != 0 && returned != invalid {
+        let token = emitter
+            .begin_call(
+                1,
+                "kernel32!CloseHandle",
+                &captured(vec![V::U64(returned)]),
+                3,
+                EventMeta::default(),
+            )
+            .unwrap();
+        emitter
+            .end_call(
+                token,
+                &captured(vec![V::I32(1), V::U32(0)]),
+                4,
+                EventMeta::default(),
+            )
+            .unwrap();
+    }
+    shirusu_trace::read_trace(&emitter.finish(FinalizationInfo::default()).unwrap()).unwrap()
+}
+
+#[test]
+fn creation_failure_fingerprint_binds_trace_and_runner_for_both_pointer_widths() {
+    use shirusu_probe::{
+        oracle::DifferenceFingerprint,
+        reduce::{Trial, TrialOutcome},
+        trace_oracle::fingerprint_from_traces,
+    };
+    use shirusu_test::runner_exec::{dry_run_report, RunEnvironment};
+    for width in [32, 64] {
+        let invalid = if width == 32 {
+            u32::MAX as u64
+        } else {
+            u64::MAX
+        };
+        let mut left = creation_trace(100, 999, width);
+        // Real successful CREATE_NEW marks last-error Stale; it is not a missing prerequisite.
+        let leave = &mut left.batches[0].events[1];
+        let types = [
+            shirusu_trace::schema::Ty::U64,
+            shirusu_trace::schema::Ty::U32,
+        ];
+        let mut values =
+            shirusu_trace::compact::decode_values(&types, leave.args.as_ref().unwrap()).unwrap();
+        values[1].capture = shirusu_trace::schema::ValueCapture::Stale;
+        leave.args = Some(shirusu_trace::compact::encode_values(&types, &values).unwrap());
+        // The failed program stops after CreateFileW; no invented cleanup calls.
+        let right = creation_trace(invalid, 5, width);
+        let diff = shirusu_compare::compare_traces(&left, &right);
+        let candidate = diff
+            .candidates
+            .iter()
+            .find(|c| {
+                c.kind == shirusu_compare::CandidateKind::ReturnDifference
+                    && c.left_event
+                        .as_ref()
+                        .is_some_and(|e| e.api == "kernel32!CreateFileW")
+            })
+            .unwrap_or_else(|| panic!("{width}: {:?}", diff.candidates));
+        let (replay, expected) = fingerprint_from_traces(&left, &right, candidate).unwrap();
+        assert_eq!(replay.target_source_step, 0);
+        assert!(expected.baseline.succeeded);
+        assert_eq!(expected.baseline.failure_error, None);
+        assert!(!expected.candidate.succeeded);
+        assert_eq!(expected.candidate.failure_error, Some(5));
+        let trial = Trial {
+            spec: &replay.spec,
+            source_steps: &replay.kept_steps,
+            target_replay_step: replay.target_replay_step,
+        };
+        let mut baseline =
+            dry_run_report(&trial.spec.name, &plan_steps(&trial.spec.steps).unwrap());
+        baseline.executed = true;
+        baseline.environment = Some(RunEnvironment {
+            target_os: "windows".into(),
+            process_arch: if width == 32 { "x86" } else { "x86_64" }.into(),
+            pointer_width: width,
+            windows_version: Some("10.0".into()),
+            windows_build: Some(26100),
+            version_source: Some("RtlGetVersion".into()),
+        });
+        for step in &mut baseline.steps {
+            step.executed = true;
+            step.returned = Some(if step.index == 0 { 200 } else { 1 });
+            step.last_error = Some(123); // stale on successful CREATE_NEW
+        }
+        let mut failed = baseline.clone();
+        failed.all_ok = false;
+        for step in &mut failed.steps {
+            step.ok = false;
+            step.error = Some("creation failed / skipped dependent call".into());
+            step.executed = step.index == 0;
+            step.returned = (step.index == 0).then_some(invalid);
+            step.last_error = (step.index == 0).then_some(5);
+        }
+        assert_eq!(
+            expected.evaluate(&trial, &baseline, &failed),
+            TrialOutcome::SameTargetDifference
+        );
+        let established = DifferenceFingerprint::establish(&trial, &baseline, &failed).unwrap();
+        assert_eq!(established, expected);
+        let mut changed = failed.clone();
+        changed.steps[0].last_error = Some(2);
+        assert_eq!(
+            expected.evaluate(&trial, &baseline, &changed),
+            TrialOutcome::DifferenceAbsent
+        );
+        changed.steps[0].returned = Some(0);
+        assert_eq!(
+            expected.evaluate(&trial, &baseline, &changed),
+            TrialOutcome::Inconclusive
+        );
+        changed = failed.clone();
+        changed.environment = None;
+        assert_eq!(
+            expected.evaluate(&trial, &baseline, &changed),
+            TrialOutcome::Inconclusive
+        );
+        if width == 32 {
+            changed = failed.clone();
+            changed.steps[0].returned = Some(u64::MAX);
+            assert_eq!(
+                expected.evaluate(&trial, &baseline, &changed),
+                TrialOutcome::Inconclusive
+            );
+        }
+    }
+}
+
+#[test]
+fn replay_handle_validity_uses_recorded_pointer_width() {
+    assert!(generate_replay(&creation_trace(u32::MAX as u64, 0, 64)).is_ok());
+    assert!(generate_replay(&creation_trace(u32::MAX as u64, 5, 32)).is_err());
+    assert!(generate_replay(&creation_trace(u32::MAX as u64 + 1, 0, 32)).is_err());
+    let mut unknown = creation_trace(100, 0, 64);
+    unknown.environment.as_mut().unwrap().pointer_width = 0;
+    assert!(generate_replay(&unknown)
+        .unwrap_err()
+        .contains("pointer width"));
 }

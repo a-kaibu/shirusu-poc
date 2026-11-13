@@ -225,3 +225,51 @@ fn x64_invalid_handle_argument_normalizes_to_invalid() {
     let enter = norm.calls[0].enter.as_ref().expect("enter");
     assert_eq!(enter.fields[0].value, NormValue::Invalid);
 }
+
+#[test]
+fn failed_creation_does_not_shift_later_object_correspondence() {
+    use shirusu_compare::CandidateKind;
+    for width in [32, 64] {
+        let invalid = if width == 32 {
+            X86_INVALID
+        } else {
+            X64_INVALID
+        };
+        let mut left = B::new(width);
+        left.create_file(1, 100, 0);
+        left.create_file(2, 200, 0);
+        left.use_handle(3, 200);
+        let left = left.finish();
+        let mut right = B::new(width);
+        right.create_file(1, invalid, 5);
+        right.create_file(2, 300, 0);
+        right.use_handle(3, 300);
+        let right = right.finish();
+        let normalized = NormTrace::build(&right);
+        assert_eq!(normalized.objects.len(), 1);
+        assert_eq!(normalized.objects[0].key.ordinal, 1);
+        for (a, b) in [(&left, &right), (&right, &left)] {
+            let report = compare_traces(a, b);
+            assert_eq!(report.paired_objects, 1);
+            let returns: Vec<_> = report
+                .candidates
+                .iter()
+                .filter(|c| {
+                    c.kind == CandidateKind::ReturnDifference
+                        && c.field.as_deref() == Some("return")
+                })
+                .collect();
+            assert_eq!(returns.len(), 1, "{:?}", report.candidates);
+            assert_eq!(returns[0].left_event.as_ref().unwrap().sequence, 1);
+            assert_eq!(returns[0].right_event.as_ref().unwrap().sequence, 1);
+            assert!(
+                !report.candidates.iter().any(|c| matches!(
+                    c.kind,
+                    CandidateKind::ExtraCall | CandidateKind::MissingCall
+                )),
+                "{:?}",
+                report.candidates
+            );
+        }
+    }
+}

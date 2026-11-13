@@ -10,8 +10,9 @@
 //!    `ValueKind::CreatedObject` と宣言したフィールド（取得成功、
 //!    0 でも INVALID_HANDLE_VALUE でもない）を「オブジェクトの
 //!    生成」とみなす。生成された生値は
-//!    `(生成 API 名, その API による生成の序数)` という ObjectKey に
+//!    `(生成 API 名, その API の取得済み生成結果の序数)` という ObjectKey に
 //!    置き換わり、後続イベントで同じ生値が現れたら同じキーに解決する。
+//!    失敗した取得済み結果も序数へ含め、以後の成功結果がずれないようにする。
 //!    これにより Trace 全体のハンドル再番号付けは差分にならない。
 //!    生値が再利用された場合（Close 後の再生成）は、参照位置より前に
 //!    起きた最新の生成へ解決する。
@@ -52,7 +53,7 @@ use std::collections::HashMap;
 pub struct ObjectKey {
     /// 生成した API 名（例 `kernel32!CreateFileW`）。
     pub creator_api: String,
-    /// その API が生成したオブジェクトの中での序数（0 始まり）。
+    /// その API の取得済み生成結果の序数（0 始まり、失敗した結果も数える）。
     pub ordinal: u32,
 }
 
@@ -302,15 +303,18 @@ impl NormTrace {
                 let TypedValue::U64(raw) = f.value else {
                     continue;
                 };
-                if raw == 0 || raw == invalid_handle {
-                    continue;
-                }
+                // Count captured creation results, including failure. Otherwise
+                // one failed creation shifts every later successful object's
+                // identity and pairs unrelated lifetimes across the two traces.
                 let ordinal = {
                     let n = creator_counts.entry(api.clone()).or_default();
                     let cur = *n;
                     *n += 1;
                     cur
                 };
+                if raw == 0 || raw == invalid_handle {
+                    continue;
+                }
                 let key = ObjectKey {
                     creator_api: api.clone(),
                     ordinal,

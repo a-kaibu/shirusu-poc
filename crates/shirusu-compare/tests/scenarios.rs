@@ -333,8 +333,8 @@ fn async_read_without_completion_differs_from_sync() {
 #[test]
 fn aborted_creator_call_reports_missing_object() {
     // L08: オブジェクトを生成するはずの呼び出しが中断すると、生成物が
-    // 無いことが差分になる（生成する側と対にできず、呼び出しの欠落と
-    // オブジェクトの状態差分の 2 候補が出る）。
+    // 無いことが差分になる。両側に呼び出し自体はあるので、欠落ではなく
+    // 中断／正常終了の形と、オブジェクト状態の 2 候補になる。
     let mut l = Builder::new(Env::default());
     l.abort_create_file(1, 0, "C:\\game\\save.dat");
     let left = l.finish(FinalizationInfo::default(), &[]);
@@ -343,7 +343,12 @@ fn aborted_creator_call_reports_missing_object() {
     let right = r.finish(FinalizationInfo::default(), &[]);
     let report = compare_traces(&left, &right);
     assert_eq!(report.candidates.len(), 2, "{:?}", report.candidates);
-    assert_eq!(report.candidates[0].kind, CandidateKind::MissingCall);
+    assert_eq!(
+        report.candidates[0].kind,
+        CandidateKind::CallShapeDifference
+    );
+    assert!(report.candidates[0].left_event.is_some());
+    assert!(report.candidates[0].right_event.is_some());
     assert_eq!(
         report.candidates[1].kind,
         CandidateKind::ObjectStateDifference

@@ -6,7 +6,7 @@ use shirusu_test::runner_exec::{ArgValue, OutputValue, RunReportData, Step, Step
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetObservation {
-    /// BOOL semantics: successful nonzero results are normalized to 1.
+    /// BOOL success or a valid CreateFileW handle, independent of its raw value.
     pub succeeded: bool,
     /// Last-error is meaningful here only after failure.
     pub failure_error: Option<u32>,
@@ -105,8 +105,8 @@ fn observations<'a>(
     Some((
         source,
         step,
-        observe(step, baseline.steps.get(target)?)?,
-        observe(step, candidate.steps.get(target)?)?,
+        observe_report_target(step, baseline.steps.get(target)?, baseline)?,
+        observe_report_target(step, candidate.steps.get(target)?, candidate)?,
     ))
 }
 
@@ -127,6 +127,59 @@ fn shape(trial: &Trial<'_>, report: &RunReportData) -> bool {
 
 fn complete(step: &StepOutcome) -> bool {
     step.executed && step.returned.is_some() && step.outputs_truncated.is_empty()
+}
+
+fn observe_report_target(
+    step: &Step,
+    result: &StepOutcome,
+    report: &RunReportData,
+) -> Option<TargetObservation> {
+    if step.call != "kernel32!CreateFileW" {
+        return observe(step, result);
+    }
+    if !complete(result) {
+        return None;
+    }
+    let disposition = step.args.iter().find_map(|(name, arg)| match arg {
+        ArgValue::Int(value) if name == "dwCreationDisposition" => Some(*value),
+        _ => None,
+    })?;
+    create_file_observation(
+        result.returned?,
+        result.last_error,
+        report.environment.as_ref()?.pointer_width,
+        disposition,
+    )
+}
+
+/// Only CREATE_NEW / OPEN_EXISTING are reconstructed by the replay model.
+/// A numeric handle difference is not itself a semantic difference. Unknown
+/// pointer width, out-of-range values and the undocumented NULL result are
+/// inconclusive rather than guessed as INVALID_HANDLE_VALUE.
+pub(crate) fn create_file_observation(
+    returned: u64,
+    last_error: Option<u32>,
+    pointer_width: u32,
+    disposition: u64,
+) -> Option<TargetObservation> {
+    if !matches!(disposition, 1 | 3) || returned == 0 {
+        return None;
+    }
+    let invalid = match pointer_width {
+        32 => u32::MAX as u64,
+        64 => u64::MAX,
+        _ => return None,
+    };
+    if returned > invalid {
+        return None;
+    }
+    let succeeded = returned != invalid;
+    Some(TargetObservation {
+        succeeded,
+        failure_error: if succeeded { None } else { Some(last_error?) },
+        transferred: None,
+        data: None,
+    })
 }
 
 pub(crate) fn observe(step: &Step, result: &StepOutcome) -> Option<TargetObservation> {

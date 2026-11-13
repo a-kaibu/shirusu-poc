@@ -43,6 +43,11 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
     if events.len() % 2 != 0 || events.windows(2).any(|w| w[0].sequence == w[1].sequence) {
         return Err("unpaired or duplicate events".into());
     }
+    let invalid_handle = match trace.environment.as_ref().map(|env| env.pointer_width) {
+        Some(32) => u32::MAX as u64,
+        Some(64) => u64::MAX,
+        _ => return Err("replay requires a known 32/64-bit process pointer width".into()),
+    };
     let mut seen = BTreeSet::new();
     let mut files: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
     // raw handle -> (stored variable, original filename, cursor, access)
@@ -87,11 +92,7 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
                 let disposition = number(enter, "dwCreationDisposition")?;
                 let access = number(enter, "dwDesiredAccess")?;
                 let flags = number(enter, "dwFlagsAndAttributes")?;
-                if ret == 0
-                    || ret == u64::MAX
-                    || ret == u32::MAX as u64
-                    || handles.contains_key(&ret)
-                {
+                if ret == 0 || ret >= invalid_handle || handles.contains_key(&ret) {
                     return Err("failed creation or reused live handle".into());
                 }
                 if access == 0

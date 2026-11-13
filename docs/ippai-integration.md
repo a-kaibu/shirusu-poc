@@ -275,16 +275,19 @@ oracle は各試行を **両環境の新しい隔離ディレクトリ** で実�
 
 `shirusu_probe::oracle::DifferenceFingerprint` は既存 Runner の `RunReportData` を
 削減の判定へ接続する。基準側全体の成功、比較側の対象以前の成功、実行済み・取得完了、
-呼び出し位置・名前の一致を確認する。対象は ReadFile / WriteFile / CloseHandle に限定し、
+呼び出し位置・名前の一致を確認する。対象は CreateFileW / ReadFile / WriteFile / CloseHandle に限定し、
 成功可否、転送バイト数、有効な読み取りデータ、失敗時だけの last-error を照合する。
 成功時の残留 last-error と未使用バッファ末尾、別実行で変わる生 HANDLE は根拠にしない。
-CreateFileW 対象は現段階では判定不能。別の戻り値やデータへの変化は同じ差分としない。
+CreateFileW は再構成済みの CREATE_NEW / OPEN_EXISTING に限り、有効ハンドルの成功と
+INVALID_HANDLE_VALUE の失敗・last-error を照合する。Trace と Runner のポインタ幅が
+不明、範囲外の HANDLE、未規定の NULL 戻り値は判定不能。別の失敗理由や出力値へ
+変わった試行は同じ差分としない。基準側の未知のファイル初期状態は引き続き拒否する。
 
 最初の実行ペアから確立した fingerprint は、その後の削減で差分を維持するためのもの。
 元 Trace の候補との値の対応付けには `trace_oracle::fingerprint_from_traces` を使う。
 この関数は現在の比較で実際に現れる値差分を確認し、両 Trace が単一スレッド・同期・
 欠落なしで、対象以前の操作と対象への入力が正規化後に一致する場合だけ照合値を返す。
-対応範囲は ReadFile / WriteFile / CloseHandle の出力差分。先行差分がある場合は拒否する。
+対応範囲は上記 4 API の出力差分。先行差分がある場合は拒否する。
 バンドルの `replay.expected_difference` に元の呼び出し位置と両側の値を残し、対応できない
 場合は `missing` に理由を残す。これは記録された期待値であり、バンドル生成だけでは実行検証済みとは扱わない。
 Runner は下記の環境情報を自動取得するが、実 OS の独立した認証は行わない。Windows CI には隔離した 2 回の実 API 実行で同じ結果が得られた

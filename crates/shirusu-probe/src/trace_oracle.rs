@@ -124,6 +124,32 @@ fn ordered_calls<'a>(view: &TraceView, norm: &'a NormTrace) -> Result<Vec<&'a No
 fn observation(view: &TraceView, call: &NormCall) -> Result<TargetObservation, String> {
     let enter = &view.events[call.enter.as_ref().unwrap().source_index];
     let leave = &view.events[call.leave.as_ref().unwrap().source_index];
+    if call.api == "kernel32!CreateFileW" {
+        let pointer_width = view
+            .trace
+            .environment
+            .as_ref()
+            .ok_or("missing pointer width for file handle")?
+            .pointer_width;
+        let returned = number(leave, "return")?;
+        let failed = (pointer_width == 32 && returned == u32::MAX as u64)
+            || (pointer_width == 64 && returned == u64::MAX);
+        let last_error = if failed {
+            Some(
+                u32::try_from(number(leave, "last_error")?)
+                    .map_err(|_| "last-error exceeds u32")?,
+            )
+        } else {
+            None // Successful CREATE_NEW / OPEN_EXISTING may have Stale last-error.
+        };
+        return crate::oracle::create_file_observation(
+            returned,
+            last_error,
+            pointer_width,
+            number(enter, "dwCreationDisposition")?,
+        )
+        .ok_or_else(|| "unsupported CreateFileW result, pointer width or disposition".into());
+    }
     if !matches!(
         call.api.as_str(),
         "kernel32!ReadFile" | "kernel32!WriteFile" | "kernel32!CloseHandle"
