@@ -548,6 +548,23 @@ Coverage には `noncanonical-import-preserved` を記録し、一部スロッ�
 
 ネイティブ Attach fixture は事前に GetCurrentProcessId の IAT ラッパーを設置し、
 失敗時 rollback、Drop/unwind、再 Attach の後にも 100 回の呼び出しがすべて
-ラッパーを通ることと、Inline 経由の記録を確認する。今回追加した fixture の
-Windows 実行結果は次の CI で確認する。並行する第三者の IAT 書き換えとの
+ラッパーを通ることと、Inline 経由の記録を確認する。`41dd0a6` の
+[CI 43426765835](https://github.com/a-kaibu/shirusu-poc/actions/runs/43426765835) で
+x86 WoW64 / x64 latest / x64 Server 2022 の全ネイティブジョブが通過した。並行する第三者の IAT 書き換えとの
 競合解決はこの変更の保証に含めない。
+
+### IAT 更新のアラインメント
+
+Attach 中に対象スレッドが IAT を読み取るため、設置・復元のポインタ更新は
+整列した AtomicUsize の Release store で行う。不正な未整列スロットは保護属性を
+変える前に拒否する。元の値の保存・公開順序は維持する。
+未整列スロットで周囲のバイトが変化しない Windows 回帰テストを追加し、
+x86/x64 Clippy と MSRV 1.87 の x86 compile を確認した。ネイティブ実行は次の CI。
+
+### 採用しなかった Host 符号化の最適化
+
+EventChunk のサイズ見積もりを Vec の予約容量へ流用し、分割間でバッファを
+再利用する案を試した。Trace / Host 全テストは通ったが、同じ release 設定で
+変更前後のバイナリを交互に 10 回測定したところ、変換・圧縮の中央値は
+改善せず一部で遅くなったため、コードを元に戻した。変更前後の実験値を
+実アプリの速度改善としては扱わない。

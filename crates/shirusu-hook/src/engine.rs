@@ -171,6 +171,11 @@ pub struct InstalledHooks {
 /// # Safety
 /// `slot` は対象モジュールの IAT 内の有効なスロットであること。
 unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), EngineError> {
+    // Attach can run while application threads read the IAT. Publish one
+    // aligned pointer atomically; never tear a malformed, unaligned slot.
+    if (slot as usize) & (std::mem::align_of::<std::sync::atomic::AtomicUsize>() - 1) != 0 {
+        return Err(EngineError::ProtectFailed { iat_rva: 0 });
+    }
     let mut old: u32 = 0;
     // SAFETY: 呼び出し側の契約に従う。
     let ok = unsafe {
@@ -186,7 +191,8 @@ unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), EngineError> 
     }
     // SAFETY: 同上。書き込み後は元の保護属性へ戻す。
     unsafe {
-        slot.write_unaligned(value);
+        std::sync::atomic::AtomicUsize::from_ptr(slot)
+            .store(value, std::sync::atomic::Ordering::Release);
         let mut tmp: u32 = 0;
         VirtualProtect(
             slot as *const c_void,
@@ -4731,6 +4737,14 @@ mod tests {
             );
         }
         unsafe { VirtualFree(target as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn iat_write_rejects_unaligned_slots_without_touching_memory() {
+        let mut storage = [0x55usize; 2];
+        let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<usize>() };
+        assert!(unsafe { write_slot(slot, 0x1234) }.is_err());
+        assert_eq!(storage, [0x55; 2]);
     }
 
     #[test]
