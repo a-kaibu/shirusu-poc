@@ -28,6 +28,7 @@ pub mod reduce;
 pub mod replay;
 pub mod rules;
 pub mod select;
+pub mod trace_oracle;
 pub mod trim;
 
 pub use bundle::{build_bundle, write_bundle, BundleOptions, ProbeBundle, ProbeError};

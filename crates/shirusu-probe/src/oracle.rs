@@ -24,6 +24,28 @@ pub struct DifferenceFingerprint {
 }
 
 impl DifferenceFingerprint {
+    /// Stable values to retain beside the source step in a probe manifest.
+    pub fn to_json(&self) -> shirusu_analysis::JsonValue {
+        use shirusu_analysis::JsonValue as J;
+        let observation = |o: &TargetObservation| {
+            J::obj(vec![
+                ("succeeded", J::Bool(o.succeeded)),
+                (
+                    "failure_error",
+                    o.failure_error.map(|n| J::U64(n as u64)).unwrap_or(J::Null),
+                ),
+                ("transferred", o.transferred.map(J::U64).unwrap_or(J::Null)),
+                ("data", o.data.clone().map(J::Str).unwrap_or(J::Null)),
+            ])
+        };
+        J::obj(vec![
+            ("source_step", J::U64(self.source_step as u64)),
+            ("call", J::Str(self.call.clone())),
+            ("baseline", observation(&self.baseline)),
+            ("candidate", observation(&self.candidate)),
+        ])
+    }
+
     /// Establish a target difference from executions of the original replay.
     /// Callers must additionally match this to the originating Trace candidate
     /// before claiming that the original application difference was reproduced.

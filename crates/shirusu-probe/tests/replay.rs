@@ -147,6 +147,8 @@ fn serialized_trace_generates_plannable_replay_without_original_paths_or_handles
         .contains("\"execution_verified\": false"));
     assert!(bundle.manifest_json.contains("\"minimal\": false"));
     assert!(bundle.manifest_json.contains("kept_source_steps"));
+    assert!(bundle.manifest_json.contains("expected_difference"));
+    assert!(bundle.manifest_json.contains("\"data\": \"2b\""));
 }
 
 #[test]
@@ -410,16 +412,25 @@ fn oracle_reports(
         step.returned = Some(1);
         step.last_error = Some(0);
     }
+    let capacity = trial.spec.steps[trial.target_replay_step]
+        .args
+        .iter()
+        .find_map(|(name, arg)| match arg {
+            ArgValue::Buffer { size, .. } if name == "lpBuffer" => Some(*size),
+            _ => None,
+        })
+        .unwrap();
+    let tail = "00".repeat(capacity - 1);
     baseline.steps[trial.target_replay_step].outputs = vec![
         ("lpNumberOfBytesRead".into(), OutputValue::U64(1)),
-        ("lpBuffer".into(), OutputValue::Hex("2a00".into())),
+        ("lpBuffer".into(), OutputValue::Hex(format!("2a{tail}"))),
     ];
     let mut candidate = baseline.clone();
     candidate.all_ok = false;
     let target = &mut candidate.steps[trial.target_replay_step];
     target.ok = false;
     target.error = Some("output expectation mismatch".into());
-    target.outputs[1].1 = OutputValue::Hex("2b00".into());
+    target.outputs[1].1 = OutputValue::Hex(format!("2b{tail}"));
     (baseline, candidate)
 }
 
@@ -590,4 +601,91 @@ fn native_runner_pair_does_not_invent_a_difference_between_windows_runs() {
         Err(TrialOutcome::DifferenceAbsent)
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn trace_fingerprint_binds_reexecution_to_original_output_difference() {
+    use shirusu_probe::{
+        reduce::{Trial, TrialOutcome},
+        trace_oracle::fingerprint_from_traces,
+    };
+    let left = record(1, 42);
+    let right = record(1, 43);
+    let diff = shirusu_compare::compare_traces(&left, &right);
+    let candidate = diff
+        .candidates
+        .iter()
+        .find(|c| {
+            c.left_event
+                .as_ref()
+                .is_some_and(|e| e.api == "kernel32!ReadFile")
+        })
+        .unwrap();
+    let (replay, expected) = fingerprint_from_traces(&left, &right, candidate).unwrap();
+    assert_eq!(expected.baseline.data.as_deref(), Some("2a"));
+    assert_eq!(expected.candidate.data.as_deref(), Some("2b"));
+    let trial = Trial {
+        spec: &replay.spec,
+        source_steps: &replay.kept_steps,
+        target_replay_step: replay.target_replay_step,
+    };
+    let (baseline, comparison) = oracle_reports(&trial);
+    assert_eq!(
+        expected.evaluate(&trial, &baseline, &comparison),
+        TrialOutcome::SameTargetDifference
+    );
+    let mut forged = candidate.clone();
+    forged.right_value = Some("different evidence".into());
+    assert!(fingerprint_from_traces(&left, &right, &forged).is_err());
+    let mut lost = right;
+    lost.finalization.as_mut().unwrap().event_integrity = 1;
+    assert!(fingerprint_from_traces(&left, &lost, candidate)
+        .unwrap_err()
+        .contains("incomplete"));
+}
+
+#[test]
+fn trace_fingerprint_rejects_changed_inputs_and_prerequisites() {
+    use shirusu_trace::{
+        compact::{decode_values, encode_values},
+        schema::Ty,
+    };
+    let left = record(1, 42);
+    for earlier in [true, false] {
+        let mut right = record(1, 43);
+        let (event, types, field, value) = if earlier {
+            (
+                2,
+                vec![Ty::U64, Ty::Bytes, Ty::U32, Ty::U64],
+                1,
+                V::Bytes(vec![99]),
+            )
+        } else {
+            (8, vec![Ty::U64, Ty::U64, Ty::U32, Ty::U64], 2, V::U32(2))
+        };
+        let args = right.batches[0].events[event].args.as_mut().unwrap();
+        let mut values = decode_values(&types, args).unwrap();
+        values[field].value = value;
+        *args = encode_values(&types, &values).unwrap();
+        let diff = shirusu_compare::compare_traces(&left, &right);
+        let candidate = diff
+            .candidates
+            .iter()
+            .find(|c| {
+                c.left_event
+                    .as_ref()
+                    .is_some_and(|e| e.api == "kernel32!ReadFile")
+            })
+            .unwrap();
+        let error = shirusu_probe::trace_oracle::fingerprint_from_traces(&left, &right, candidate)
+            .unwrap_err();
+        assert!(
+            error.contains(if earlier {
+                "prerequisites differ"
+            } else {
+                "target inputs differ"
+            }),
+            "{error}"
+        );
+    }
 }

@@ -179,7 +179,14 @@ pub fn build_bundle(
             trim_outcome: Some(trim_outcome),
         },
     );
-    let replay_slice = crate::replay::generate_candidate_replay(left, cand);
+    let (replay_slice, expected_difference) =
+        match crate::trace_oracle::fingerprint_from_traces(left, right, cand) {
+            Ok((slice, fingerprint)) => (Ok(slice), Ok(fingerprint)),
+            Err(reason) => (
+                crate::replay::generate_candidate_replay(left, cand),
+                Err(reason),
+            ),
+        };
     let mut manifest = manifest(opts, cand, &rule_generation, Some(trim_outcome));
     if let JsonValue::Object(ref mut fields) = manifest {
         fields.push((
@@ -197,6 +204,10 @@ pub fn build_bundle(
                     ("kept_source_steps", JsonValue::Array(slice.kept_steps.iter().map(|i| JsonValue::U64(*i as u64)).collect())),
                     ("target_source_step", JsonValue::U64(slice.target_source_step as u64)),
                     ("target_replay_step", JsonValue::U64(slice.target_replay_step as u64)),
+                    ("expected_difference", match &expected_difference {
+                        Ok(fingerprint) => fingerprint.to_json(),
+                        Err(reason) => JsonValue::obj(vec![("missing", JsonValue::Str(reason.clone()))]),
+                    }),
                     ("execution_verified", JsonValue::Bool(false)),
                     ("minimal", JsonValue::Bool(false)),
                     ("file", JsonValue::Str("replay.json".into())),
