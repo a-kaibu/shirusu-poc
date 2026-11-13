@@ -24,6 +24,8 @@
 /// API 定義表は `shirusu-api-catalog` に置く（Host と共有する契約）。
 /// 既存の `shirusu_hook::api` の経路は互換のために残す。
 pub use shirusu_api_catalog::api;
+/// このバイナリの API Catalog Fingerprint（Bootstrap v13 の照合に使う）。
+pub use shirusu_api_catalog::fingerprint::catalog_fingerprint as api_catalog_fingerprint;
 pub mod bootstrap;
 pub mod callback;
 pub mod caller;

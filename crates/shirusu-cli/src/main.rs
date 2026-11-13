@@ -165,11 +165,15 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                                 ("detail", JsonValue::Str(a.level_note.into())),
                                 (
                                     "detailed_mode_only",
-                                    JsonValue::Bool(shirusu_api_catalog::api::is_internal_api(a.api_id)),
+                                    JsonValue::Bool(shirusu_api_catalog::api::is_internal_api(
+                                        a.api_id,
+                                    )),
                                 ),
                                 (
                                     "iat_only",
-                                    JsonValue::Bool(shirusu_hook::api::is_iat_only_api(a.api_id)),
+                                    JsonValue::Bool(shirusu_api_catalog::api::is_iat_only_api(
+                                        a.api_id,
+                                    )),
                                 ),
                             ])
                         })
@@ -212,7 +216,7 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                 api.function,
                 if shirusu_api_catalog::api::is_internal_api(api.api_id) {
                     " [detailed mode]"
-                } else if shirusu_hook::api::is_iat_only_api(api.api_id) {
+                } else if shirusu_api_catalog::api::is_iat_only_api(api.api_id) {
                     " [main-module IAT only]"
                 } else {
                     ""

@@ -59,10 +59,25 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// capacity of a separate record area ([`HookEvidenceRecord`]); Agent writes
 /// one record per reported API and the record count. The structure size no
 /// longer depends on the number of APIs.
-pub const BOOTSTRAP_VERSION: u32 = 14;
+/// v15: API Catalog Fingerprint の照合欄と Capture Policy（Agent 側で
+/// 記録する API の選択）を v14 の末尾に追加した。
+pub const BOOTSTRAP_VERSION: u32 = 15;
 /// Initialization published hooks but could not complete installation. Only
 /// this failure status authorizes Host to retry this attempt's shutdown.
 pub const INIT_HOOK_FAILED: u32 = 3;
+/// Agent DLL の API Catalog Fingerprint が Host のものと一致しない。
+/// フックを設置する前に拒否するため、Host は後片付けなしで失敗にしてよい。
+pub const INIT_CATALOG_MISMATCH: u32 = 7;
+/// Capture Policy の API 一覧を読めない、または不正な値を含む。
+pub const INIT_BAD_CAPTURE_POLICY: u32 = 8;
+
+/// Capture Policy: 全 API を記録する（`full` / `profile` / `detailed`）。
+pub const CAPTURE_POLICY_ALL: u32 = 0;
+/// Capture Policy: `capture_api_ids` に並べた API だけを記録する
+/// （`filtered`）。範囲外の API は Agent が素通しにし、観測しない。
+pub const CAPTURE_POLICY_SELECTED: u32 = 1;
+/// Capture Policy の API 一覧の上限（対象プロセスから読む量の上限）。
+pub const MAX_CAPTURE_API_IDS: u32 = 1 << 16;
 /// `result_evidence_ready`: Agent wrote every record it had.
 pub const EVIDENCE_COMPLETE: u32 = 1;
 /// `result_evidence_ready`: the record area was too small or absent; Host must
@@ -208,6 +223,26 @@ pub struct AgentBootstrap {
     pub evidence_capacity: u32,
     /// Number of records Agent wrote (at most `evidence_capacity`).
     pub result_evidence_count: u32,
+    /// Capture Policy (v15): [`CAPTURE_POLICY_ALL`] または
+    /// [`CAPTURE_POLICY_SELECTED`]。Agent が記録する API の範囲を決める
+    /// （Trace の保存形式を決める Trace Output Policy とは別）。
+    pub capture_policy: u32,
+    /// `capture_api_ids` の要素数（0 なら API 表の API を 1 つも記録しない）。
+    pub capture_api_count: u32,
+    /// Capture Policy の API 一覧（対象プロセス内の `u32` 配列のアドレス）。
+    /// `CAPTURE_POLICY_SELECTED` のときだけ使う。
+    pub capture_api_ids: u64,
+    /// 初期化結果 (v15): Agent が実際に記録対象とした API 表の API 数。
+    pub result_capture_api_count: u32,
+    /// 予約（0）。後続の配列を 8 バイト境界に揃え、暗黙の詰め物を作らない。
+    pub reserved_v15: u32,
+    /// Host が期待する API Catalog Fingerprint (v15)。Agent は自分の
+    /// Fingerprint と比べ、一致しなければフックを設置せずに
+    /// [`INIT_CATALOG_MISMATCH`] を返す。
+    pub api_catalog_fingerprint: [u8; 32],
+    /// 初期化結果 (v15): Agent 自身の API Catalog Fingerprint。照合の
+    /// 成否に関係なく書き戻す（不一致の報告に使う）。
+    pub result_api_catalog_fingerprint: [u8; 32],
 }
 
 impl Default for AgentBootstrap {
@@ -234,10 +269,17 @@ impl Default for AgentBootstrap {
             detailed_mode: 0,
             result_internal_hook_count: 0,
             result_callback_hook_count: 0,
+            capture_policy: CAPTURE_POLICY_ALL,
+            capture_api_ids: 0,
+            capture_api_count: 0,
+            result_capture_api_count: 0,
+            api_catalog_fingerprint: [0; 32],
             result_evidence_ready: 0,
             evidence_address: 0,
             evidence_capacity: 0,
             result_evidence_count: 0,
+            reserved_v15: 0,
+            result_api_catalog_fingerprint: [0; 32],
         }
     }
 }
@@ -249,6 +291,7 @@ pub enum BootstrapError {
     TooManyRings(u32),
     BadRingConfig,
     MissingMappingHandle(u32),
+    BadCapturePolicy,
 }
 
 impl AgentBootstrap {
@@ -354,6 +397,7 @@ impl AgentBootstrap {
     /// ハンドル値ペア（対象プロセス内で有効な値）。
     pub fn new(session_id: u64, config: RingConfig, rings: &[(u64, u64)]) -> Self {
         let mut b = Self {
+            api_catalog_fingerprint: shirusu_api_catalog::fingerprint::catalog_fingerprint(),
             session_id,
             descriptor_capacity: config.descriptor_capacity as u64,
             payload_capacity: config.payload_capacity as u64,
@@ -387,6 +431,13 @@ impl AgentBootstrap {
             if *handle == 0 {
                 return Err(BootstrapError::MissingMappingHandle(i as u32));
             }
+        }
+        match self.capture_policy {
+            CAPTURE_POLICY_ALL if self.capture_api_count == 0 && self.capture_api_ids == 0 => {}
+            CAPTURE_POLICY_SELECTED
+                if self.capture_api_count <= MAX_CAPTURE_API_IDS
+                    && (self.capture_api_count == 0 || self.capture_api_ids != 0) => {}
+            _ => return Err(BootstrapError::BadCapturePolicy),
         }
         let (d, p) = (self.descriptor_capacity, self.payload_capacity);
         if d < 2 || p < 16 || d > (1 << 24) || p > (1 << 32) {
@@ -721,14 +772,65 @@ mod tests {
 
     #[test]
     fn layout_is_fixed_size_and_independent_of_api_count() {
-        assert_eq!(std::mem::size_of::<AgentBootstrap>(), 632);
+        assert_eq!(std::mem::size_of::<AgentBootstrap>(), 720);
         assert_eq!(
             std::mem::offset_of!(AgentBootstrap, result_evidence_ready),
             612
         );
         assert_eq!(std::mem::offset_of!(AgentBootstrap, evidence_address), 616);
+        // v15 の欄は v14 の末尾 (632) に置き、暗黙のパディングを作らない
+        // （Host は構造体をバイト列として書き込むため、未初期化の詰め物を渡さない）。
+        assert_eq!(std::mem::offset_of!(AgentBootstrap, capture_policy), 632);
+        assert_eq!(std::mem::offset_of!(AgentBootstrap, capture_api_count), 636);
+        assert_eq!(std::mem::offset_of!(AgentBootstrap, capture_api_ids), 640);
+        assert_eq!(
+            std::mem::offset_of!(AgentBootstrap, result_capture_api_count),
+            648
+        );
+        assert_eq!(
+            std::mem::offset_of!(AgentBootstrap, api_catalog_fingerprint),
+            656
+        );
+        assert_eq!(
+            std::mem::offset_of!(AgentBootstrap, result_api_catalog_fingerprint),
+            688
+        );
         assert_eq!(std::mem::size_of::<HookEvidenceRecord>(), 8);
         assert_eq!(std::mem::align_of::<HookEvidenceRecord>(), 4);
+    }
+
+    #[test]
+    fn new_carries_the_host_catalog_fingerprint_and_full_capture() {
+        let b = AgentBootstrap::new(1, RingConfig::new(64, 4096), &[(1, 2)]);
+        assert_eq!(
+            b.api_catalog_fingerprint,
+            shirusu_api_catalog::fingerprint::catalog_fingerprint()
+        );
+        assert_eq!(b.capture_policy, CAPTURE_POLICY_ALL);
+        assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_inconsistent_capture_policies() {
+        let base = AgentBootstrap::new(1, RingConfig::new(64, 4096), &[(1, 2)]);
+        let mut b = base;
+        b.capture_api_count = 1;
+        assert_eq!(b.validate(), Err(BootstrapError::BadCapturePolicy));
+        let mut b = base;
+        b.capture_policy = 9;
+        assert_eq!(b.validate(), Err(BootstrapError::BadCapturePolicy));
+        let mut b = base;
+        b.capture_policy = CAPTURE_POLICY_SELECTED;
+        b.capture_api_count = 2;
+        assert_eq!(b.validate(), Err(BootstrapError::BadCapturePolicy));
+        b.capture_api_ids = 0x1000;
+        assert!(b.validate().is_ok());
+        b.capture_api_count = MAX_CAPTURE_API_IDS + 1;
+        assert_eq!(b.validate(), Err(BootstrapError::BadCapturePolicy));
+        // 空の選択は「API 表の API を記録しない」として有効。
+        let mut b = base;
+        b.capture_policy = CAPTURE_POLICY_SELECTED;
+        assert!(b.validate().is_ok());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! shirusu-host: 読み手側。Ring 毎に単一 Drain Worker 前提の取出し、検証、Loss Event 生成、
 //! Enter/Leave 対応付けと終了不明判定、スレッド終了確認後の Slot 解放、完全性報告。
 
+pub mod capture_policy;
 pub mod child_tree;
 pub mod expansion;
 pub mod modules;

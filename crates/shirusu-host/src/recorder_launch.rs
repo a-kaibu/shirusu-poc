@@ -605,6 +605,10 @@ impl TreeCapture {
 
 /// Bootstrap の初期化結果（設置数・欠落数・復元失敗数・COM Factory 設置数）。
 struct BootstrapResult {
+    /// Agent が書き戻した自分の API Catalog Fingerprint（v15）。
+    catalog_fingerprint: [u8; 32],
+    /// Agent が実際に記録対象とした API 表の API 数（v15）。
+    captured_api_count: usize,
     hook_evidence: Vec<shirusu_trace::proto::HookEvidence>,
     hooked: usize,
     missing: usize,
@@ -690,7 +694,12 @@ fn read_bootstrap_result(
             AgentBootstrap::hook_evidence(&records)
         })
         .unwrap_or_default();
+    if buf.result_capture_api_count as usize > API_COUNT {
+        return None;
+    }
     Some(BootstrapResult {
+        catalog_fingerprint: buf.result_api_catalog_fingerprint,
+        captured_api_count: buf.result_capture_api_count as usize,
         hook_evidence,
         hooked: hooked as usize,
         missing: missing as usize,
@@ -869,6 +878,27 @@ fn inject_and_init(
         crate::trace_convert::RecordMode::Detailed
     ));
 
+    // v15: Capture Policy。filtered では選択 API の一覧を Hook 証跡領域の後ろに
+    // 置き、Agent が範囲外の API を記録しないようにする。
+    let selected_ids = crate::capture_policy::selected_api_ids(&cfg.session.record_mode);
+    let policy_bytes = selected_ids
+        .as_deref()
+        .map(crate::capture_policy::encode_ids)
+        .unwrap_or_default();
+    if let Some(ids) = &selected_ids {
+        bootstrap.capture_policy = shirusu_hook::bootstrap::CAPTURE_POLICY_SELECTED;
+        bootstrap.capture_api_count = u32::try_from(ids.len())
+            .map_err(|_| SessionError::Config("too many APIs in capture policy".into()))?;
+    }
+    let host_catalog = bootstrap.api_catalog_fingerprint;
+    session_cfg
+        .environment
+        .capture_config
+        .push_str(&crate::capture_policy::config_text(
+            &cfg.session.record_mode,
+            &host_catalog,
+        ));
+
     win::remote_load_library(process, &dll_path_str)?;
     // Match the loaded module by full path, not by file name.
     let base = win::module_base(pid, &dll_path_str)?;
@@ -883,18 +913,22 @@ fn inject_and_init(
         .find_map(|name| pe::find_export(&image, name))
         .map(|r| base + r as usize);
 
-    // One region: the control Bootstrap followed by the Hook evidence record
-    // area. Its capacity follows this build's API table at run time (each API
-    // reports at most once), so adding APIs never changes the Bootstrap ABI.
-    // Sharing the region keeps the existing lifetime rule: it is freed with
-    // the Bootstrap, and left alone when the remote call is still pending.
+    // One region: the control Bootstrap, the Hook evidence record area, and
+    // (filtered only) the Capture Policy API ID list. The evidence capacity
+    // follows this build's API table at run time (each API reports at most
+    // once), so adding APIs never changes the Bootstrap ABI. Sharing the
+    // region keeps the existing lifetime rule: it is freed with the
+    // Bootstrap, and left alone when the remote call is still pending.
     let evidence_capacity = u32::try_from(API_COUNT)
         .map_err(|_| SessionError::Injection("API table exceeds evidence capacity".into()))?;
-    let region_len = std::mem::size_of::<AgentBootstrap>()
-        + API_COUNT * std::mem::size_of::<HookEvidenceRecord>();
-    let remote = win::remote_alloc(process, region_len)?;
-    bootstrap.evidence_address = (remote + std::mem::size_of::<AgentBootstrap>()) as u64;
+    let bootstrap_len = std::mem::size_of::<AgentBootstrap>();
+    let policy_offset = bootstrap_len + API_COUNT * std::mem::size_of::<HookEvidenceRecord>();
+    let remote = win::remote_alloc(process, policy_offset + policy_bytes.len())?;
+    bootstrap.evidence_address = (remote + bootstrap_len) as u64;
     bootstrap.evidence_capacity = evidence_capacity;
+    if !policy_bytes.is_empty() {
+        bootstrap.capture_api_ids = (remote + policy_offset) as u64;
+    }
     let write_result = (|| -> Result<(), SessionError> {
         // SAFETY: AgentBootstrap は repr(C) の値型。バイト列として書き込む。
         let bytes = unsafe {
@@ -904,6 +938,14 @@ fn inject_and_init(
             )
         };
         win::write_process_memory(process, remote, bytes.as_ptr(), bytes.len())?;
+        if !policy_bytes.is_empty() {
+            win::write_process_memory(
+                process,
+                remote + policy_offset,
+                policy_bytes.as_ptr(),
+                policy_bytes.len(),
+            )?;
+        }
         Ok(())
     })();
     if let Err(e) = write_result {
@@ -924,6 +966,20 @@ fn inject_and_init(
         win::remote_free(process, remote);
     }
     let status = status?;
+    if status == shirusu_hook::bootstrap::INIT_CATALOG_MISMATCH {
+        // フック設置前に拒否されている。対象は再開しない（呼び出し側が終了させる）。
+        let detail = match &outcome {
+            Some(result) => {
+                crate::capture_policy::check_catalog(&host_catalog, &result.catalog_fingerprint)
+                    .err()
+                    .unwrap_or_else(|| "agent reported a catalog mismatch".into())
+            }
+            None => "agent API catalog does not match host API catalog".into(),
+        };
+        return Err(SessionError::Injection(format!(
+            "shirusu_agent_init returned status {status}: {detail}"
+        )));
+    }
     if status != 0 {
         let message = match outcome.filter(|r| r.unrestored > 0) {
             Some(result) => format!(
@@ -950,10 +1006,46 @@ fn inject_and_init(
             rollback: rollback_initialized_agent(process, shutdown_addr),
         });
     }
+    // v15: 成功を返した Agent の Fingerprint と記録範囲も確かめる。食い違う
+    // 場合は、誤った Schema で解釈する Trace を作らない。
+    let verified = match &outcome {
+        Some(result) => {
+            crate::capture_policy::check_catalog(&host_catalog, &result.catalog_fingerprint)
+                .and_then(|()| {
+                    let expected = selected_ids
+                        .as_ref()
+                        .map(|ids| ids.len())
+                        .unwrap_or_else(|| shirusu_hook::api::api_table().count());
+                    if result.captured_api_count == expected {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "agent applied a capture policy of {} API(s), expected {expected}",
+                            result.captured_api_count
+                        ))
+                    }
+                })
+        }
+        // 読み戻せない場合は従来どおり Coverage を不明のままにする。照合自体は
+        // Agent が Host の Fingerprint で済ませている（不一致なら status 7）。
+        None => Ok(()),
+    };
+    if let Err(message) = verified {
+        return Err(SessionError::PostInitialization {
+            source: Box::new(SessionError::Injection(message)),
+            rollback: rollback_initialized_agent(process, shutdown_addr),
+        });
+    }
     session_cfg.environment.hook_evidence = outcome
         .as_ref()
         .map(|r| r.hook_evidence.clone())
         .unwrap_or_default();
+    if let crate::trace_convert::RecordMode::Filtered { apis } = &cfg.session.record_mode {
+        session_cfg
+            .environment
+            .hook_evidence
+            .extend(crate::capture_policy::excluded_evidence(apis));
+    }
     let hook_coverage = outcome
         .as_ref()
         .map(|result| (result.hooked, result.missing));

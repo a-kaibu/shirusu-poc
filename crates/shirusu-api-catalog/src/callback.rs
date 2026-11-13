@@ -95,3 +95,84 @@ pub fn callback_leave_schema() -> SchemaDef {
 pub fn callback_schemas() -> Vec<SchemaDef> {
     vec![callback_enter_schema(), callback_leave_schema()]
 }
+
+/// コールバック検出フックの数（RegisterClassExW/A + SetWindowLongPtrW/A）。
+pub const CALLBACK_HOOK_COUNT: usize = 8;
+
+// ---- 検出フックの定義表 ----
+
+/// コールバック検出フックの Detour のスロット番号。
+pub const CALLBACK_HOOK_REGISTER_CLASS_EX_W: usize = 0;
+pub const CALLBACK_HOOK_REGISTER_CLASS_EX_A: usize = 1;
+pub const CALLBACK_HOOK_SET_WINDOW_LONG_PTR_W: usize = 2;
+pub const CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A: usize = 3;
+pub const CALLBACK_HOOK_GET_WINDOW_LONG_PTR_W: usize = 4;
+pub const CALLBACK_HOOK_GET_WINDOW_LONG_PTR_A: usize = 5;
+pub const CALLBACK_HOOK_GET_CLASS_LONG_PTR_W: usize = 6;
+pub const CALLBACK_HOOK_GET_CLASS_LONG_PTR_A: usize = 7;
+
+/// コールバック検出フック 1 件の定義。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallbackHookDef {
+    pub module: &'static str,
+    pub function: &'static str,
+}
+
+pub const CALLBACK_HOOKS: &[CallbackHookDef] = &[
+    CallbackHookDef {
+        module: "user32.dll",
+        function: "RegisterClassExW",
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: "RegisterClassExA",
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "SetWindowLongW"
+        } else {
+            "SetWindowLongPtrW"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "SetWindowLongA"
+        } else {
+            "SetWindowLongPtrA"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetWindowLongW"
+        } else {
+            "GetWindowLongPtrW"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetWindowLongA"
+        } else {
+            "GetWindowLongPtrA"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetClassLongW"
+        } else {
+            "GetClassLongPtrW"
+        },
+    },
+    CallbackHookDef {
+        module: "user32.dll",
+        function: if cfg!(target_pointer_width = "32") {
+            "GetClassLongA"
+        } else {
+            "GetClassLongPtrA"
+        },
+    },
+];

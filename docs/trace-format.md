@@ -941,9 +941,49 @@ overview「記録モードと性能目標」節に対応する。記録モード
   は API によらず残る。`--api` は `--mode filtered` のときだけ意味があり、
   それ以外での指定は使い方エラー。`filtered` に `--api` が無いのも
   使い方エラー（空の集合は何も記録しない罠になるため）。
-- Agent 側での間引きはしない。`filtered` / `profile` でも Agent は
-  全イベントを Ring へ書き、Host 側で落とす・集計する。Agent 側の間引きは
-  Ring の圧迫を減らす将来の最適化であり、現行の対象外とする。
+- Capture Policy と Trace Output Policy を分ける（2026-11-13）。上の 3 モードは
+  Trace Output Policy（取得済みイベントの保存・集計の仕方）であり、
+  Agent がどの API を記録するかは Capture Policy が決める。Host は
+  Bootstrap v15 の `capture_policy` / `capture_api_ids` / `capture_api_count`
+  で Agent へ渡す。
+  - `filtered`：Capture Policy も「選択した API だけ」にする。範囲外の
+    API 表の API は Agent の Detour 入口で素通しになり、引数取得・Ring
+    書き込み・Host 回収が起きない（Detour 自体は設置したまま。入口の判定は
+    Runtime 独自 API の除外と合成した 1 回の配列参照）。範囲外の API は
+    `CaptureEnvironment.hook_evidence` に `method=capture-policy`、
+    `outcome=not-observed`、`reason=excluded-by-capture-policy`、
+    `scope=session` の行として明示する。保存件数が減ったことを完全な記録の
+    成功と混同しないためであり、`shirusu coverage` にもこの行が出る。
+    COM / WinRT / コールバックのイベントは API 表に無いため Agent 側の選択の
+    対象外で、従来どおり Host の保存段階で落とす。
+  - `full` / `profile` / `detailed`：Capture Policy は全 API。`full` は意図的な
+    間引きをしない。`profile` の集計は Host 側のままで、Agent の負荷は
+    `full` と同じ（スレッド別のローカル集計は未実装）。
+  - `capture_config` に `capture_policy=agent-all` または
+    `capture_policy=agent-selected(<件数>)` を追記する。Agent は実際に
+    記録対象にした API 数を書き戻し、Host は期待と食い違えば初期化失敗にする。
+
+## API Catalog の照合（Bootstrap v15）
+
+Host は自分のバイナリの API Catalog（`shirusu-api-catalog`）から Trace の
+Schema を登録し、Agent DLL は自分のバイナリの Catalog で値を符号化する。
+`--dll` で別ビルドの Agent を指定すると、Bootstrap の版が同じでも表の
+中身が違い得るため、初期化時に API Catalog Fingerprint を照合する。
+
+- Fingerprint は BLAKE3（32 バイト）。入力は形式の版、内部転送 Codec の版、
+  公開 Schema 形式の版、API 表の各行（api_id・module・function・観測レベル・
+  enter / leave の Schema ID・内部 API か否か）、全 Schema（API 表・COM・
+  WinRT・コールバック）の schema_id・名前・各フィールドの名前・型タグ・
+  flags（意味種別・取得タイミング・LastError の意味条件）。説明文
+  （`level_note` / `annotation`）は記録の意味を変えないため含めない。
+- Host は Bootstrap の `api_catalog_fingerprint` に自分の値を入れる。Agent は
+  自分の値を `result_api_catalog_fingerprint` へ書き戻し、一致しなければ
+  フックを設置する前に状態 7（`INIT_CATALOG_MISMATCH`）を返す。Host は両方の
+  値を含むエラーで初期化を失敗にし、対象を再開しない。成功を返した場合も
+  Host は書き戻された値を照合する。
+- `capture_config` に `api_catalog=<16 進>` を記録する。部分的に互換な Agent を
+  許す交渉（Schema ごとの対応確認）は将来の拡張とし、現行は完全一致だけを
+  受け付ける。
 
 ## 例外の透過と CallAborted（L08）
 

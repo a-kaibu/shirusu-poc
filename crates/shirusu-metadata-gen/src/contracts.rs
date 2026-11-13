@@ -394,7 +394,8 @@ mod tests {
     fn checked_in_contracts_are_current() {
         assert_eq!(
             emit_file_io_contracts(SOURCE).unwrap(),
-            include_str!("../../shirusu-api-catalog/src/api_file_io_generated.inc").replace("\r\n", "\n")
+            include_str!("../../shirusu-api-catalog/src/api_file_io_generated.inc")
+                .replace("\r\n", "\n")
         );
         assert_eq!(
             emit_file_io_capture(SOURCE).unwrap(),

@@ -35,6 +35,11 @@ pub const STATUS_UNSUPPORTED: u32 = 5;
 /// Initialization panicked. The panic was contained inside the DLL so it did
 /// not unwind across `extern "system"` (which aborts the target process).
 pub const STATUS_PANICKED: u32 = 6;
+/// Agent DLL の API Catalog が Host と異なる（Bootstrap v15）。フックを
+/// 設置する前に拒否する。
+pub const STATUS_CATALOG_MISMATCH: u32 = shirusu_hook::bootstrap::INIT_CATALOG_MISMATCH;
+/// Capture Policy の API 一覧が不正（Bootstrap v15）。フック設置前に拒否する。
+pub const STATUS_BAD_CAPTURE_POLICY: u32 = shirusu_hook::bootstrap::INIT_BAD_CAPTURE_POLICY;
 /// Shutdown panicked. The Host must not treat this as a confirmed shutdown.
 pub const SHUTDOWN_PANICKED: u32 = 3;
 
@@ -43,6 +48,16 @@ pub const SHUTDOWN_PANICKED: u32 = 3;
 #[cfg_attr(not(windows), allow(dead_code))]
 fn contain_panic(on_panic: u32, f: impl FnOnce() -> u32) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(on_panic)
+}
+
+/// Capture Policy の API 一覧を検証して記録対象の集合にする（純粋関数）。
+/// 未知の api_id を 1 つでも含めば None（Host と Agent の表の食い違いを
+/// 記録範囲の黙った縮小にしない）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn capture_selection(ids: &[u32]) -> Option<std::collections::HashSet<u32>> {
+    ids.iter()
+        .map(|&id| shirusu_hook::api::api_by_id(id).map(|api| api.api_id))
+        .collect()
 }
 
 /// 終了手順の状態コード決定（純粋関数。レビュー第5回 #6）。
@@ -197,6 +212,49 @@ mod win {
             Ok(c) => c,
             Err(_) => return STATUS_BAD_BOOTSTRAP,
         };
+        // v15: API Catalog の照合。自分の Fingerprint は照合の成否に関係なく
+        // 書き戻し、一致しなければフックを設置する前に拒否する（別ビルドの
+        // 表で符号化したイベントを Host が別の Schema で解釈しないため）。
+        let own_catalog = shirusu_hook::api_catalog_fingerprint();
+        // SAFETY: bootstrap は Host が書き込み可能に確保した領域で、
+        // 初期化が戻るまで有効 (呼び出し側の契約)。
+        unsafe {
+            (*(bootstrap as *mut AgentBootstrap)).result_api_catalog_fingerprint = own_catalog;
+        }
+        if b.api_catalog_fingerprint != own_catalog {
+            return STATUS_CATALOG_MISMATCH;
+        }
+        // v15: Capture Policy。選択モードでは Host が対象プロセス内に置いた
+        // api_id 配列を読み、範囲外の API を記録せず素通しにする。
+        let selection = if b.capture_policy == shirusu_hook::bootstrap::CAPTURE_POLICY_SELECTED {
+            let ids: &[u32] = if b.capture_api_count == 0 {
+                &[]
+            } else {
+                // SAFETY: Host が capture_api_count 個の u32 を書き込んだ領域で、
+                // 初期化が戻るまで解放しない（Bootstrap と同じ寿命）。件数は
+                // validate() が上限内であることを確認済み。
+                unsafe {
+                    std::slice::from_raw_parts(
+                        b.capture_api_ids as usize as *const u32,
+                        b.capture_api_count as usize,
+                    )
+                }
+            };
+            match capture_selection(ids) {
+                Some(set) => Some(set),
+                None => return STATUS_BAD_CAPTURE_POLICY,
+            }
+        } else {
+            None
+        };
+        let captured_api_count = match &selection {
+            Some(set) => set.len(),
+            None => api_table().count(),
+        } as u32;
+        // SAFETY: 上と同じ。
+        unsafe {
+            (*(bootstrap as *mut AgentBootstrap)).result_capture_api_count = captured_api_count;
+        }
         let _control = CONTROL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -287,7 +345,9 @@ mod win {
                 .with_diagnostic_query_interface(b.com_options & 1 != 0)
                 // L15: Bootstrap v8 で Host から渡された詳細調査モードを
                 // ランタイムへ渡す（既定は無効。内部 API を記録しない）。
-                .with_detailed_mode(b.detailed_mode != 0),
+                .with_detailed_mode(b.detailed_mode != 0)
+                // v15: Capture Policy（filtered）を Agent 側で適用する。
+                .with_capture_selection(selection.as_ref()),
         );
         // L23: 呼び出し元分類のためのモジュール一覧を初期化時に作る。
         // 列挙に失敗しても一覧が空のままになるだけで、呼び出し元不明
@@ -711,6 +771,34 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_selection_rejects_unknown_api_ids() {
+        use shirusu_hook::api::{API_CLOSE_HANDLE, API_CREATE_FILE_W};
+        let set = capture_selection(&[API_CREATE_FILE_W, API_CLOSE_HANDLE, API_CREATE_FILE_W])
+            .expect("known ids");
+        assert_eq!(set.len(), 2);
+        assert!(capture_selection(&[]).expect("empty").is_empty());
+        assert!(capture_selection(&[API_CREATE_FILE_W, 0]).is_none());
+        assert!(capture_selection(&[u32::MAX]).is_none());
+    }
+
+    #[test]
+    fn init_status_codes_are_distinct() {
+        let codes = [
+            STATUS_OK,
+            STATUS_BAD_BOOTSTRAP,
+            STATUS_MAPPING_FAILED,
+            STATUS_HOOK_FAILED,
+            STATUS_ALREADY_INITIALIZED,
+            STATUS_UNSUPPORTED,
+            STATUS_PANICKED,
+            STATUS_CATALOG_MISMATCH,
+            STATUS_BAD_CAPTURE_POLICY,
+        ];
+        let unique: std::collections::HashSet<_> = codes.iter().collect();
+        assert_eq!(unique.len(), codes.len());
+    }
     use shirusu_hook::bootstrap::{SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK};
 
     #[cfg(windows)]

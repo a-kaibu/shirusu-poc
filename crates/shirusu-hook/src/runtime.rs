@@ -737,6 +737,12 @@ pub struct HookRuntime {
     originals: Box<[AtomicUsize]>,
     /// Immutable target classification, computed before publishing this runtime.
     runtime_targets: Box<[bool]>,
+    /// Capture Policy で記録対象から外した API（Bootstrap v15）。
+    /// API ID で引く。既定は全 API が記録対象（false）。
+    capture_excluded: Box<[bool]>,
+    /// Detour 入口の判定表: Runtime 独自 API の除外と Capture Policy の
+    /// 除外を合成したもの。入口では 1 回の配列参照だけで決める。
+    suppressed: Box<[bool]>,
     next_call_id: AtomicU64,
     seen_threads: Mutex<HashSet<u64>>,
     /// 記録の有効/無効 (終了手順のゲート。レビュー #4 の #9)。
@@ -796,6 +802,8 @@ impl HookRuntime {
                         .is_some_and(|api| shirusu_trace::module::is_runtime_module(api.module))
                 })
                 .collect(),
+            capture_excluded: vec![false; MAX_API_ID + 1].into_boxed_slice(),
+            suppressed: vec![false; MAX_API_ID + 1].into_boxed_slice(),
             next_call_id: AtomicU64::new(NEXT_CALL_ID_SEED.fetch_add(1 << 32, Ordering::Relaxed)),
             seen_threads: Mutex::new(HashSet::new()),
             recording_enabled: AtomicBool::new(true),
@@ -809,6 +817,38 @@ impl HookRuntime {
             winrt_activation_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
             callback_hook_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
+        .with_recomputed_suppression()
+    }
+
+    fn with_recomputed_suppression(mut self) -> Self {
+        for id in 0..self.suppressed.len() {
+            self.suppressed[id] = (!self.record_runtime_apis && self.runtime_targets[id])
+                || self.capture_excluded[id];
+        }
+        self
+    }
+
+    /// Capture Policy（Bootstrap v15）を設定する。`selected` が Some の
+    /// ときは、そこに含まれない API 表の API を記録せず素通しにする
+    /// （引数取得・Ring 書き込み・Host の回収が起きない）。None は全 API を
+    /// 記録する。構築時に 1 回だけ呼ぶ（`Arc` 化する前）。COM / WinRT /
+    /// コールバックのイベントは API 表に無いため、この選択の対象外。
+    pub fn with_capture_selection(mut self, selected: Option<&HashSet<u32>>) -> Self {
+        for id in 0..self.capture_excluded.len() {
+            self.capture_excluded[id] = match selected {
+                Some(set) => id != 0 && !set.contains(&(id as u32)),
+                None => false,
+            };
+        }
+        self.with_recomputed_suppression()
+    }
+
+    /// Capture Policy で記録対象から外した API か。
+    pub fn excluded_by_capture_policy(&self, api_id: u32) -> bool {
+        self.capture_excluded
+            .get(api_id as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// COM の診断用オプション（L02）を設定する。構築時に 1 回だけ
@@ -879,7 +919,7 @@ impl HookRuntime {
     /// 1 回だけ呼ぶ（`Arc` 化する前）。既定は false（記録しない）。
     pub fn with_record_runtime_apis(mut self, enabled: bool) -> Self {
         self.record_runtime_apis = enabled;
-        self
+        self.with_recomputed_suppression()
     }
 
     /// Runtime 独自の API も記録するか。
@@ -922,16 +962,15 @@ impl HookRuntime {
         crate::caller::should_suppress_target(target, self.record_runtime_apis)
     }
 
-    /// Apply the same Runtime-target policy using the immutable API index.
+    /// Apply the same Runtime-target policy using the immutable API index,
+    /// combined with the Agent-side Capture Policy (Bootstrap v15).
     /// Unknown IDs remain fail-open; no caller module classification is implied.
     #[inline]
     pub fn should_suppress_api_id(&self, api_id: u32) -> bool {
-        !self.record_runtime_apis
-            && self
-                .runtime_targets
-                .get(api_id as usize)
-                .copied()
-                .unwrap_or(false)
+        self.suppressed
+            .get(api_id as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// 記録が有効か。終了手順 (shutdown_recording) が始まると false。
@@ -2389,6 +2428,43 @@ mod tests {
             assert!(!rt.should_suppress_api_id(0));
             assert!(!rt.should_suppress_api_id(u32::MAX));
         }
+    }
+
+    #[test]
+    fn capture_selection_suppresses_only_unselected_table_apis() {
+        let (agent, _) = runtime();
+        let selected: HashSet<u32> = [crate::api::API_CREATE_FILE_W, crate::api::API_CLOSE_HANDLE]
+            .into_iter()
+            .collect();
+        let rt = HookRuntime::new(agent.clone(), Vec::new(), None)
+            .with_capture_selection(Some(&selected));
+        assert!(!rt.should_suppress_api_id(crate::api::API_CREATE_FILE_W));
+        assert!(!rt.should_suppress_api_id(crate::api::API_CLOSE_HANDLE));
+        assert!(rt.should_suppress_api_id(crate::api::API_READ_FILE));
+        assert!(rt.excluded_by_capture_policy(crate::api::API_READ_FILE));
+        // 範囲外の ID は従来どおり fail-open。
+        assert!(!rt.should_suppress_api_id(0));
+        assert!(!rt.should_suppress_api_id(u32::MAX));
+        // Runtime 独自 API の除外は選択と合成され、後から設定しても失われない。
+        let runtime_api = crate::api::api_table()
+            .find(|a| shirusu_trace::module::is_runtime_module(a.module))
+            .map(|a| a.api_id);
+        let rt = HookRuntime::new(agent.clone(), Vec::new(), None)
+            .with_capture_selection(None)
+            .with_record_runtime_apis(false);
+        if let Some(id) = runtime_api {
+            assert!(rt.should_suppress_api_id(id));
+            let mut with_runtime = selected.clone();
+            with_runtime.insert(id);
+            let rt = HookRuntime::new(agent.clone(), Vec::new(), None)
+                .with_capture_selection(Some(&with_runtime))
+                .with_record_runtime_apis(true);
+            assert!(!rt.should_suppress_api_id(id));
+            assert!(rt.should_suppress_api_id(crate::api::API_READ_FILE));
+        }
+        // 既定（選択なし）は何も外さない。
+        let rt = HookRuntime::new(agent, Vec::new(), None).with_record_runtime_apis(true);
+        assert!(crate::api::api_table().all(|a| !rt.should_suppress_api_id(a.api_id)));
     }
 
     #[test]
