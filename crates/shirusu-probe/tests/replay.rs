@@ -13,6 +13,19 @@ fn record_with_unrelated(
     read_byte: u8,
     unrelated: bool,
 ) -> shirusu_trace::reader::ReadTrace {
+    shirusu_trace::read_trace(&record_bytes(initial_disposition, read_byte, unrelated)).unwrap()
+}
+
+fn record_bytes(initial_disposition: u32, read_byte: u8, unrelated: bool) -> Vec<u8> {
+    record_bytes_extended(initial_disposition, read_byte, unrelated, false)
+}
+
+fn record_bytes_extended(
+    initial_disposition: u32,
+    read_byte: u8,
+    unrelated: bool,
+    duplicate_write: bool,
+) -> Vec<u8> {
     let mut em = Emitter::new(
         Vec::new(),
         file_io_api_set(),
@@ -96,6 +109,13 @@ fn record_with_unrelated(
                 vec![V::U64(handle), V::Bytes(vec![42]), V::U32(1), V::U64(0)],
                 vec![V::I32(1), V::U32(1), V::U32(0)],
             );
+            if duplicate_write {
+                call(
+                    "kernel32!WriteFile",
+                    vec![V::U64(handle), V::Bytes(vec![42]), V::U32(1), V::U64(0)],
+                    vec![V::I32(1), V::U32(1), V::U32(0)],
+                );
+            }
         } else {
             call(
                 "kernel32!ReadFile",
@@ -109,7 +129,7 @@ fn record_with_unrelated(
             vec![V::I32(1), V::U32(0)],
         );
     }
-    shirusu_trace::read_trace(&em.finish(FinalizationInfo::default()).unwrap()).unwrap()
+    em.finish(FinalizationInfo::default()).unwrap()
 }
 
 #[test]
@@ -688,4 +708,135 @@ fn trace_fingerprint_rejects_changed_inputs_and_prerequisites() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn external_runner_cli_retains_verified_evidence_and_aborts_bad_processes() {
+    use shirusu_probe::external::{run_external, RunnerCommand};
+    use std::{
+        fs,
+        process::Command,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    let root = std::env::temp_dir().join(format!(
+        "shirusu external-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let executable = |mode: &str| root.join(format!("{mode}{}", std::env::consts::EXE_SUFFIX));
+    let compiled = executable("baseline");
+    let status = Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_runner.rs"))
+        .arg("-o")
+        .arg(&compiled)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for mode in [
+        "candidate",
+        "timeout",
+        "overflow",
+        "malformed",
+        "dry",
+        "badexit",
+    ] {
+        fs::copy(&compiled, executable(mode)).unwrap();
+    }
+    let spec = generate_replay(&record(1, 42)).unwrap();
+    for (mode, message) in [
+        ("timeout", "timed out"),
+        ("overflow", "exceeded"),
+        ("malformed", ""),
+        ("dry", "unexecuted"),
+        ("badexit", "exit status"),
+    ] {
+        let runner = RunnerCommand::new(&executable(mode)).unwrap();
+        let directory = root.join(format!("failure-{mode}"));
+        let timeout = if mode == "timeout" {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(10)
+        };
+        let error = run_external(&runner, &spec, &directory, timeout).unwrap_err();
+        assert!(error.contains(message), "{mode}: {error}");
+        assert!(directory.join("execution.json").is_file());
+        assert!(directory.join("stdout.json").is_file());
+        assert!(
+            run_external(&runner, &spec, &directory, timeout).is_err(),
+            "must not reuse a directory"
+        );
+    }
+    let left = root.join("left.trace");
+    let right = root.join("right.trace");
+    fs::write(&left, record_bytes_extended(1, 42, false, true)).unwrap();
+    fs::write(&right, record_bytes_extended(1, 43, false, true)).unwrap();
+    let out = root.join("reduction");
+    let cli = || {
+        Command::new(env!("CARGO_BIN_EXE_shirusu-probe"))
+            .arg("reduce")
+            .arg(&left)
+            .arg(&right)
+            .arg("--out")
+            .arg(&out)
+            .arg("--left-runner")
+            .arg(&compiled)
+            .arg("--right-runner")
+            .arg(executable("candidate"))
+            .args(["--max-trials", "12", "--timeout-ms", "10000"])
+            .output()
+            .unwrap()
+    };
+    let output = cli();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(out.join("result.json")).unwrap();
+    assert!(result.contains("\"execution_verified\": true"));
+    assert!(result.contains("verification_trials"));
+    let reduced =
+        shirusu_test::TestSpec::parse(&fs::read_to_string(out.join("reduced.json")).unwrap())
+            .unwrap();
+    assert_eq!(reduced.steps.len(), 6);
+    assert!(result.contains("\"source_steps\": 7"));
+    let summary = shirusu_test::json_parse::parse_json(&result).unwrap();
+    assert_eq!(
+        shirusu_test::json_parse::get(&summary, "verification_trials"),
+        Some(&shirusu_analysis::JsonValue::Array(vec![
+            shirusu_analysis::JsonValue::U64(3),
+            shirusu_analysis::JsonValue::U64(4)
+        ]))
+    );
+    assert!(out.join("trial-00001/baseline/work/seen.marker").is_file());
+    assert!(out.join("trial-00002/candidate/stdout.json").is_file());
+    assert!(out.join("trial-00003/decision.json").is_file());
+    assert!(!cli().status.success());
+    assert_eq!(fs::read_to_string(out.join("result.json")).unwrap(), result);
+    let failure = root.join("aborted-reduction");
+    let config = shirusu_probe::reduction_run::ReductionConfig {
+        baseline: RunnerCommand::new(&compiled).unwrap(),
+        candidate: RunnerCommand::new(&executable("dry")).unwrap(),
+        max_trials: 12,
+        timeout: Duration::from_secs(10),
+    };
+    assert!(shirusu_probe::reduction_run::reduce_with_runners(
+        &fs::read(&left).unwrap(),
+        &fs::read(&right).unwrap(),
+        0,
+        &config,
+        &failure
+    )
+    .is_err());
+    assert!(fs::read_to_string(failure.join("result.json"))
+        .unwrap()
+        .contains("\"execution_verified\": false"));
+    assert!(!failure.join("reduced.json").exists());
+    assert!(!failure.join("trial-00002").exists());
+    fs::remove_dir_all(root).unwrap();
 }

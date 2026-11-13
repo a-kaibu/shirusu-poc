@@ -23,8 +23,10 @@
 
 pub mod brief;
 pub mod bundle;
+pub mod external;
 pub mod oracle;
 pub mod reduce;
+pub mod reduction_run;
 pub mod replay;
 pub mod rules;
 pub mod select;

@@ -2,6 +2,10 @@
 
 API 別の観測証拠は `shirusu coverage <trace> [--json]` で確認できます。範囲と制限は [Coverage 台帳](docs/coverage-ledger.md) を参照してください。
 
+同期ファイル I/O の差分は `shirusu-probe reduce --help` から、指定した 2 つの Runner で
+再現を確認しながら不要な読み書きを削減できます。実行器の契約、証拠の保存場所と対応範囲は
+[ippai 連携仕様](docs/ippai-integration.md#外部-runner-による実行検証付き削減) を参照してください。
+
 Trace は `shirusu export capture.trace --format parquet --output events.parquet` で
 Parquet に出力できる。DuckDB からの検索とデータの扱いは
 [Parquet 出力仕様](docs/parquet-export.md) を参照。

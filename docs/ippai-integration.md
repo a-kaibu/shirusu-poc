@@ -262,7 +262,7 @@ oracle は各試行を **両環境の新しい隔離ディレクトリ** で実�
 `SameTargetDifference` を返してはいけない。`Trial` は元の呼び出し位置と、削減後の
 対象位置を渡す。証拠となる結果と環境情報の保存は実行側の責務。
 
-この API は実行器を起動せず、CLI と Windows／互換実装の実行器の接続は未実装。
+この API 自体は実行器を起動しない。外部実行器との接続は後述の `reduce` CLI が担う。
 `single_deletion_fixed_point` は追加の単一削除が採用されなかったという意味で、
 大域的な最小性やフレーク不在の証明ではない。後の削除で依存が変化した場合は再走査する。
 
@@ -280,8 +280,8 @@ CreateFileW 対象は現段階では判定不能。別の戻り値やデータ�
 欠落なしで、対象以前の操作と対象への入力が正規化後に一致する場合だけ照合値を返す。
 対応範囲は ReadFile / WriteFile / CloseHandle の出力差分。先行差分がある場合は拒否する。
 バンドルの `replay.expected_difference` に元の呼び出し位置と両側の値を残し、対応できない
-場合は `missing` に理由を残す。これは記録された期待値であり、実行検証済みとは扱わない。外部実行器の起動・OS/architecture の来歴保存・CLI
-接続も引き続き未実装。Windows CI には隔離した 2 回の実 API 実行で同じ結果が得られた
+場合は `missing` に理由を残す。これは記録された期待値であり、バンドル生成だけでは実行検証済みとは扱わない。
+OS/build/architecture の自動取得・検証は引き続き未実装。Windows CI には隔離した 2 回の実 API 実行で同じ結果が得られた
 場合、差分を捏造しないテストを追加している。
 
 
@@ -292,3 +292,46 @@ Runner の JSON は `shirusu_test::parse_runner_report_json` で `RunReportData`
 標準出力へ混ざったログも JSON として受け付けない。dry-run は読み戻せるが、実行した
 証拠ではなく、対象差分の oracle は判定不能にする。外部プロセスからの収集時にも
 読み込み上限とタイムアウトを設ける必要があり、パーサだけでは収集を安全に制限しない。
+
+
+### 外部 Runner による実行検証付き削減
+
+```text
+shirusu-probe reduce windows.trace compat.trace --out reduction-001 --left-runner baseline-runner.exe --right-runner compat-runner.exe --candidate 0 --max-trials 64 --timeout-ms 30000
+```
+
+`--out` は新しいディレクトリにする。既存ディレクトリは上書き・再利用しない。
+両 Runner は実行可能ファイルへのパスで、シェル経由ではなく、それぞれ
+`run <仕様の絶対パス> --json` という引数で呼ばれる。`shirusu-test` と同じ契約で、
+標準出力には Runner JSON だけを返し、全期待値成立なら 0、期待値不成立なら 1 を返す。
+終了コードと JSON が食い違えば中断する。`--max-trials` は実行ペアの回数
+（2〜10000、既定 64）、`--timeout-ms` は各プロセスの制限（1〜3600000、既定 30000）。
+
+基準側と比較側は毎回別の新しい `work` ディレクトリを使う。これは作業ディレクトリの
+分離であり、任意プログラムへの OS サンドボックスではない。設定する Runner は信頼する
+プログラムとし、リモート実行や互換環境のラッパーでは、その内部でも同じ試行の仕様と
+新しい作業領域を使い、全処理を待って結果を返す。ラッパーが作る子・リモートプロセスの
+寿命管理はラッパーの責務。タイムアウト時には直接起動したプロセスを終了し、削減全体を
+中断する。未確定の試行の次を勝手に開始しない。
+
+標準出力・標準エラーは各 8 MiB を超えたら拒否する。ファイルサイズを実行中に監視し、
+読み戻しも上限付きにするが、監視間隔内のディスク増加を防ぐ OS クォータではない。
+プロセス異常終了・出力不正・dry-run は削減を中断し、`reduced.json` を生成しない。
+有効な実行でも対象差分が一致しなければ削除を採用しない。
+
+成功時は `reduced.json` と `result.json` を保存する。`result.json` の
+`verification_trials` は、最終仕様で同じ対象差分を確認した 2 試行の番号。
+`execution_verified=true` は指定 Runner の観測が元 Trace の対応範囲内で一致した意味で、
+指定された実行ファイルが Windows の特定ビルドであることは証明しない。`minimal=false`
+は維持する。作成・クローズ・対象呼び出しは削らず、入力値の簡約や大域的な最小化もしない。
+
+調査用に次を残す。失敗時も削除しない。
+
+- `source-left.trace` / `source-right.trace`、`expected-difference.json`、`config.json`
+- `trial-NNNNN/trial.json`：元呼び出し位置と対象位置
+- 各試行の `baseline` / `candidate`：`spec.json`、`stdout.json`、`stderr.txt`、`execution.json`、`work`
+- `decision.json`：同じ対象差分／差分なし／判定不能
+
+CLI の回帰テストは制御用の模擬 Runner を実プロセスとして起動し、7 呼び出しから 6 への
+削減、最終仕様に対応する 2 試行の証拠、タイムアウト・不正 JSON・過大出力・dry-run・
+終了コード不一致・既存出力の保護を検査する。これは実際の互換実装の検証結果ではない。
