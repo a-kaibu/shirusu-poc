@@ -159,7 +159,7 @@ fn default_name(cand: &shirusu_compare::Candidate) -> String {
 }
 
 fn run_reduction(args: &[String]) -> Result<u8, (u8, String)> {
-    const USAGE: &str = "usage: shirusu-probe reduce <left.trace> <right.trace> --out <new-dir> --left-runner <executable> --right-runner <executable> [--candidate N] [--max-trials N] [--timeout-ms N]";
+    const USAGE: &str = "usage: shirusu-probe reduce <left.trace> <right.trace> --out <new-dir> --left-runner <executable> --right-runner <executable> [--candidate N|auto] [--max-trials N] [--timeout-ms N]";
     let mut options = std::collections::BTreeMap::new();
     let mut paths = Vec::new();
     let mut i = 0;
@@ -203,7 +203,12 @@ fn run_reduction(args: &[String]) -> Result<u8, (u8, String)> {
             })
             .unwrap_or(Ok(default))
     };
-    let candidate = number("--candidate", 0)?;
+    let auto_candidate = options.get("--candidate") == Some(&"auto");
+    let explicit_candidate = if auto_candidate {
+        0
+    } else {
+        number("--candidate", 0)?
+    };
     let max_trials = number("--max-trials", 64)?;
     let timeout_ms = number("--timeout-ms", 30_000)?;
     if !(2..=10_000).contains(&max_trials) || !(1..=3_600_000).contains(&timeout_ms) {
@@ -224,6 +229,22 @@ fn run_reduction(args: &[String]) -> Result<u8, (u8, String)> {
     let load = |path: &str| std::fs::read(path).map_err(|e| (2, format!("read {path}: {e}")));
     let left = load(paths[0])?;
     let right = load(paths[1])?;
+    let candidate = if auto_candidate {
+        let baseline = shirusu_trace::read_trace(&left).map_err(|e| (1, e.to_string()))?;
+        let comparison = shirusu_trace::read_trace(&right).map_err(|e| (1, e.to_string()))?;
+        let index = shirusu_probe::trace_oracle::select_first_replayable_candidate(
+            &baseline,
+            &comparison,
+            64,
+        )
+        .map_err(|e| (1, e))?;
+        eprintln!(
+            "automatically selected candidate {index}; execution verification is still required"
+        );
+        index
+    } else {
+        explicit_candidate
+    };
     let result = shirusu_probe::reduction_run::reduce_with_runners(
         &left,
         &right,

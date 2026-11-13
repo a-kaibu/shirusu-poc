@@ -677,6 +677,37 @@ fn trace_fingerprint_binds_reexecution_to_original_output_difference() {
 }
 
 #[test]
+fn automatic_selection_requires_supported_evidence_and_preserves_recorded_order() {
+    use shirusu_probe::trace_oracle::{fingerprint_from_traces, select_first_replayable_candidate};
+    use shirusu_trace::{
+        compact::{decode_values, encode_values},
+        schema::Ty,
+    };
+    let left = record(1, 42);
+    let mut right = record(1, 43);
+    // Add a later CloseHandle failure; the earlier ReadFile output wins.
+    let leave = right.batches[0].events.last_mut().unwrap();
+    let types = [Ty::I32, Ty::U32];
+    let mut values = decode_values(&types, leave.args.as_ref().unwrap()).unwrap();
+    values[0] = CapturedValue::captured(V::I32(0));
+    values[1] = CapturedValue::captured(V::U32(5));
+    leave.args = Some(encode_values(&types, &values).unwrap());
+    let index = select_first_replayable_candidate(&left, &right, 64).unwrap();
+    let diff = shirusu_compare::compare_traces(&left, &right);
+    let (_, fingerprint) = fingerprint_from_traces(&left, &right, &diff.candidates[index]).unwrap();
+    assert_eq!(fingerprint.call, "kernel32!ReadFile");
+    assert_eq!(fingerprint.candidate.data.as_deref(), Some("2b"));
+    assert!(select_first_replayable_candidate(&left, &right, 0).is_err());
+    assert!(select_first_replayable_candidate(&left, &left, 64).is_err());
+    let unknown_initial_state = record(3, 42);
+    assert!(
+        select_first_replayable_candidate(&unknown_initial_state, &right, 64)
+            .unwrap_err()
+            .contains("initial file state")
+    );
+}
+
+#[test]
 fn trace_fingerprint_rejects_changed_inputs_and_prerequisites() {
     use shirusu_trace::{
         compact::{decode_values, encode_values},
@@ -800,7 +831,14 @@ fn external_runner_cli_retains_verified_evidence_and_aborts_bad_processes() {
             .arg(&compiled)
             .arg("--right-runner")
             .arg(executable("candidate"))
-            .args(["--max-trials", "12", "--timeout-ms", "10000"])
+            .args([
+                "--candidate",
+                "auto",
+                "--max-trials",
+                "12",
+                "--timeout-ms",
+                "10000",
+            ])
             .output()
             .unwrap()
     };
@@ -1078,6 +1116,10 @@ fn trace_fingerprint_normalizes_negative_bool_without_inventing_a_difference() {
         let fingerprint =
             shirusu_probe::trace_oracle::fingerprint_from_traces(&left, &right, candidate);
         if read_byte == 42 {
+            assert!(
+                shirusu_probe::trace_oracle::select_first_replayable_candidate(&left, &right, 64)
+                    .is_err()
+            );
             assert!(fingerprint
                 .unwrap_err()
                 .contains("no supported semantic output difference"));

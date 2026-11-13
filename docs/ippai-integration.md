@@ -309,6 +309,13 @@ Runner の JSON は `shirusu_test::parse_runner_report_json` で `RunReportData`
 shirusu-probe reduce windows.trace compat.trace --out reduction-001 --left-runner baseline-runner.exe --right-runner compat-runner.exe --candidate 0 --max-trials 64 --timeout-ms 30000
 ```
 
+候補番号を選ばずに開始する場合は `--candidate auto` を使う。基準 Trace の
+記録順で値の差分候補を最大64件調べ、対応する出力 fingerprint と再生前提を
+満たす最初の候補を選ぶ。選んだ番号は標準エラーに表示し、通常と同じ
+`config.json` / `result.json` に保存する。未指定時は従来どおり候補0。
+選択できなければ拒否理由と検査件数を返し、Runner は起動しない。
+自動選択は実行による再現確認ではなく、選択後も以下の検証を必要とする。
+
 `--out` は新しいディレクトリにする。既存ディレクトリは上書き・再利用しない。
 両 Runner は実行可能ファイルへのパスで、シェル経由ではなく、それぞれ
 `run <仕様の絶対パス> --json` という引数で呼ばれる。`shirusu-test` と同じ契約で、

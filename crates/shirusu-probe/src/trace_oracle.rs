@@ -21,6 +21,64 @@ pub fn fingerprint_from_traces(
     {
         return Err("candidate is not a current recorded value difference".into());
     }
+    fingerprint_for_recorded_candidate(left, right, candidate)
+}
+
+/// Select the earliest supported recorded output difference without executing
+/// any Runner. The returned index belongs to compare_traces' candidate list.
+/// Selection is bounded and does not establish execution reproducibility.
+pub fn select_first_replayable_candidate(
+    left: &ReadTrace,
+    right: &ReadTrace,
+    max_candidates: usize,
+) -> Result<usize, String> {
+    if max_candidates == 0 {
+        return Err("candidate selection needs a positive budget".into());
+    }
+    // Unsupported baseline side effects cannot be discarded for any candidate.
+    crate::replay::generate_replay(left)?;
+    let report = shirusu_compare::compare_traces(left, right);
+    let mut candidates: Vec<_> = report
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            matches!(
+                c.kind,
+                CandidateKind::ArgumentDifference | CandidateKind::ReturnDifference
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|(index, c)| {
+        (
+            c.left_event
+                .as_ref()
+                .map(|e| e.sequence)
+                .unwrap_or(u64::MAX),
+            *index,
+        )
+    });
+    let total = candidates.len();
+    let mut reasons = Vec::new();
+    for (index, candidate) in candidates.into_iter().take(max_candidates) {
+        match fingerprint_for_recorded_candidate(left, right, candidate) {
+            Ok(_) => return Ok(index),
+            Err(reason) => reasons.push(format!("candidate {index}: {reason}")),
+        }
+    }
+    Err(format!(
+        "no replayable semantic output candidate within selection budget ({}/{total} checked): {}",
+        reasons.len(),
+        reasons.join("; ")
+    ))
+}
+
+/// Callers must obtain this candidate from compare_traces(left, right).
+fn fingerprint_for_recorded_candidate(
+    left: &ReadTrace,
+    right: &ReadTrace,
+    candidate: &Candidate,
+) -> Result<(ReplaySlice, DifferenceFingerprint), String> {
     let replay = generate_candidate_replay(left, candidate)?;
     let lv = TraceView::build(left);
     let rv = TraceView::build(right);
