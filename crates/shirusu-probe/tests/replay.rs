@@ -230,6 +230,14 @@ fn generated_replay_executes_and_refuses_to_overwrite() {
             .unwrap();
     assert!(report.executed && report.all_ok);
     assert_eq!(report.spec_name, spec.name);
+    let env = report
+        .environment
+        .as_ref()
+        .expect("native runner environment");
+    assert_eq!(env.pointer_width, usize::BITS);
+    assert_eq!(env.process_arch, std::env::consts::ARCH);
+    assert!(env.windows_build.is_some_and(|build| build > 0));
+    assert_eq!(env.version_source.as_deref(), Some("RtlGetVersion"));
     std::fs::write(dir.join("shirusu-replay-1.bin"), b"keep").unwrap();
     assert!(!run().status.success());
     assert_eq!(
@@ -610,6 +618,8 @@ fn native_runner_pair_does_not_invent_a_difference_between_windows_runs() {
     let left = execute("left");
     let right = execute("right");
     assert!(left.all_ok && right.all_ok, "{left:?} / {right:?}");
+    assert!(left.environment.is_some());
+    assert_eq!(left.environment, right.environment);
     let source_steps: Vec<_> = (0..spec.steps.len()).collect();
     let trial = Trial {
         spec: &spec,
@@ -739,6 +749,7 @@ fn external_runner_cli_retains_verified_evidence_and_aborts_bad_processes() {
     assert!(status.success());
     for mode in [
         "candidate",
+        "drift",
         "timeout",
         "overflow",
         "malformed",
@@ -838,5 +849,23 @@ fn external_runner_cli_retains_verified_evidence_and_aborts_bad_processes() {
         .contains("\"execution_verified\": false"));
     assert!(!failure.join("reduced.json").exists());
     assert!(!failure.join("trial-00002").exists());
+    assert!(result.contains("\"windows_build\": 19045"));
+    assert!(result.contains("\"baseline_environment\": null"));
+    let drift = root.join("environment-drift");
+    let config = shirusu_probe::reduction_run::ReductionConfig {
+        candidate: RunnerCommand::new(&executable("drift")).unwrap(),
+        ..config
+    };
+    let error = shirusu_probe::reduction_run::reduce_with_runners(
+        &fs::read(&left).unwrap(),
+        &fs::read(&right).unwrap(),
+        0,
+        &config,
+        &drift,
+    )
+    .unwrap_err();
+    assert!(error.contains("environment changed"), "{error}");
+    assert!(!drift.join("reduced.json").exists());
+    assert!(!drift.join("trial-00003").exists());
     fs::remove_dir_all(root).unwrap();
 }

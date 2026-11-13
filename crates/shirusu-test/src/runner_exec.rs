@@ -609,9 +609,77 @@ pub enum OutputValue {
     Hex(String),
 }
 
+/// Identity reported by the running executable/API, not OS attestation. A
+/// compatibility implementation can report a Windows version too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEnvironment {
+    pub target_os: String,
+    pub process_arch: String,
+    pub pointer_width: u32,
+    pub windows_version: Option<String>,
+    pub windows_build: Option<u32>,
+    pub version_source: Option<String>,
+}
+
+pub fn environment_to_json(env: &RunEnvironment) -> String {
+    format!("{{\"target_os\":{},\"process_arch\":{},\"pointer_width\":{},\"windows_version\":{},\"windows_build\":{},\"version_source\":{}}}",
+        json_string(&env.target_os), json_string(&env.process_arch), env.pointer_width,
+        env.windows_version.as_ref().map(|v| json_string(v)).unwrap_or_else(|| "null".into()),
+        env.windows_build.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+        env.version_source.as_ref().map(|v| json_string(v)).unwrap_or_else(|| "null".into()))
+}
+
+#[cfg(windows)]
+fn execution_environment() -> RunEnvironment {
+    #[repr(C)]
+    struct OsVersion {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    let mut env = RunEnvironment {
+        target_os: std::env::consts::OS.into(),
+        process_arch: std::env::consts::ARCH.into(),
+        pointer_width: usize::BITS,
+        windows_version: None,
+        windows_build: None,
+        version_source: None,
+    };
+    let name: Vec<u16> = "ntdll.dll".encode_utf16().chain([0]).collect();
+    let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+    if module != 0 {
+        let address = unsafe { GetProcAddress(module, c"RtlGetVersion".as_ptr().cast()) };
+        if address != 0 {
+            let query: unsafe extern "system" fn(*mut OsVersion) -> i32 =
+                unsafe { std::mem::transmute(address) };
+            let mut version = OsVersion {
+                size: std::mem::size_of::<OsVersion>() as u32,
+                major: 0,
+                minor: 0,
+                build: 0,
+                platform: 0,
+                service_pack: [0; 128],
+            };
+            if unsafe { query(&mut version) } == 0 {
+                env.windows_version = Some(format!(
+                    "{}.{}.{}",
+                    version.major, version.minor, version.build
+                ));
+                env.windows_build = Some(version.build);
+                env.version_source = Some("RtlGetVersion".into());
+            }
+        }
+    }
+    env
+}
+
 /// 実行（または dry-run）の報告全体。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunReportData {
+    pub environment: Option<RunEnvironment>,
     pub spec_name: String,
     pub executed: bool,
     pub all_ok: bool,
@@ -623,6 +691,7 @@ pub fn dry_run_report(spec_name: &str, planned: &[PlannedCall]) -> RunReportData
     RunReportData {
         spec_name: spec_name.to_string(),
         executed: false,
+        environment: None,
         all_ok: true,
         steps: planned
             .iter()
@@ -702,7 +771,12 @@ pub fn report_to_json(report: &RunReportData) -> String {
         }
         out.push('}');
     }
-    out.push_str("]}");
+    out.push(']');
+    if let Some(env) = &report.environment {
+        out.push_str(",\"environment\":");
+        out.push_str(&environment_to_json(env));
+    }
+    out.push('}');
     out
 }
 
@@ -837,6 +911,7 @@ pub(crate) fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryW(lp_lib_file_name: *const u16) -> usize;
+    fn GetModuleHandleW(lp_module_name: *const u16) -> usize;
     fn GetProcAddress(h_module: usize, lp_proc_name: *const u8) -> usize;
     fn GetLastError() -> u32;
 }
@@ -1029,6 +1104,7 @@ pub fn execute_planned(spec_name: &str, planned: &[PlannedCall]) -> RunReportDat
     RunReportData {
         spec_name: spec_name.to_string(),
         executed: true,
+        environment: Some(execution_environment()),
         all_ok,
         steps: outcomes,
     }
@@ -1290,6 +1366,7 @@ pub fn execute_planned(spec_name: &str, planned: &[PlannedCall]) -> RunReportDat
     RunReportData {
         spec_name: spec_name.to_string(),
         executed: false,
+        environment: None,
         all_ok: false,
         steps: planned
             .iter()

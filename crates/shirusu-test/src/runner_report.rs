@@ -13,7 +13,16 @@ pub fn parse_runner_report_json(text: &str) -> Result<RunReportData, String> {
         return Err("runner report exceeds 8 MiB".into());
     }
     let root = parse_json(text)?;
-    object(&root, &["spec", "executed", "all_ok", "steps"])?;
+    let environment = if let Some(value) = get(&root, "environment") {
+        object(
+            &root,
+            &["spec", "executed", "all_ok", "steps", "environment"],
+        )?;
+        Some(parse_environment(value)?)
+    } else {
+        object(&root, &["spec", "executed", "all_ok", "steps"])?;
+        None
+    };
     let values = array(field(&root, "steps")?)?;
     if values.len() > MAX_REPORT_STEPS {
         return Err("too many runner steps".into());
@@ -105,10 +114,66 @@ pub fn parse_runner_report_json(text: &str) -> Result<RunReportData, String> {
         return Err("runner execution flags disagree".into());
     }
     Ok(RunReportData {
+        environment,
         spec_name: string(field(&root, "spec")?)?.to_owned(),
         executed,
         all_ok,
         steps,
+    })
+}
+
+fn parse_environment(value: &J) -> Result<crate::runner_exec::RunEnvironment, String> {
+    object(
+        value,
+        &[
+            "target_os",
+            "process_arch",
+            "pointer_width",
+            "windows_version",
+            "windows_build",
+            "version_source",
+        ],
+    )?;
+    let optional_text = |name| -> Result<Option<String>, String> {
+        match field(value, name)? {
+            J::Null => Ok(None),
+            v => {
+                let text = string(v)?;
+                if text.is_empty() {
+                    return Err("empty environment value".into());
+                }
+                Ok(Some(text.to_owned()))
+            }
+        }
+    };
+    let target_os = string(field(value, "target_os")?)?.to_owned();
+    let process_arch = string(field(value, "process_arch")?)?.to_owned();
+    let width = unsigned(field(value, "pointer_width")?)?;
+    if target_os.is_empty()
+        || process_arch.is_empty()
+        || ![32, 64].contains(&width)
+        || (process_arch == "x86" && width != 32)
+        || (["x86_64", "aarch64"].contains(&process_arch.as_str()) && width != 64)
+    {
+        return Err("invalid reported process architecture/width".into());
+    }
+    let windows_version = optional_text("windows_version")?;
+    let windows_build = optional_unsigned(field(value, "windows_build")?)?
+        .map(|v| u32::try_from(v).map_err(|_| "Windows build exceeds u32".to_owned()))
+        .transpose()?;
+    let version_source = optional_text("version_source")?;
+    if windows_version.is_some() != windows_build.is_some()
+        || windows_version.is_some() != version_source.is_some()
+    {
+        return Err("incomplete reported version provenance".into());
+    }
+    Ok(crate::runner_exec::RunEnvironment {
+        target_os,
+        process_arch,
+        pointer_width: width as u32,
+        windows_version,
+        windows_build,
+        version_source,
     })
 }
 
@@ -166,6 +231,7 @@ mod tests {
 
     fn report() -> RunReportData {
         RunReportData {
+            environment: None,
             spec_name: "escaped\"name\\日本語".into(),
             executed: true,
             all_ok: true,
@@ -194,6 +260,7 @@ mod tests {
             data
         );
         let frontend = crate::runner::RunReport {
+            environment: data.environment.clone(),
             spec_name: data.spec_name.clone(),
             executed: data.executed,
             all_ok: data.all_ok,
@@ -222,6 +289,55 @@ mod tests {
             parse_runner_report_json(&report_to_json(&failed)).unwrap(),
             failed
         );
+    }
+
+    #[test]
+    fn optional_environment_preserves_legacy_reports_and_rejects_invalid_metadata() {
+        use crate::runner_exec::RunEnvironment;
+        let mut data = report();
+        let legacy = report_to_json(&data);
+        assert!(!legacy.contains("environment"));
+        assert_eq!(parse_runner_report_json(&legacy).unwrap().environment, None);
+        for (arch, width) in [("x86", 32), ("x86_64", 64)] {
+            data.environment = Some(RunEnvironment {
+                target_os: "windows".into(),
+                process_arch: arch.into(),
+                pointer_width: width,
+                windows_version: Some("10.0.26100".into()),
+                windows_build: Some(26100),
+                version_source: Some("RtlGetVersion".into()),
+            });
+            let json = report_to_json(&data);
+            assert_eq!(parse_runner_report_json(&json).unwrap(), data);
+            let frontend = crate::runner::RunReport {
+                environment: data.environment.clone(),
+                spec_name: data.spec_name.clone(),
+                executed: data.executed,
+                all_ok: data.all_ok,
+                outcomes: data.steps.clone(),
+            };
+            assert_eq!(parse_json(&json).unwrap(), frontend.to_json());
+            for bad in [
+                json.replace("\"windows_build\":26100", "\"windows_build\":4294967296"),
+                json.replace(
+                    "\"version_source\":\"RtlGetVersion\"",
+                    "\"version_source\":null",
+                ),
+                json.replace(&format!("\"pointer_width\":{width}"), "\"pointer_width\":0"),
+            ] {
+                assert!(parse_runner_report_json(&bad).is_err());
+            }
+        }
+        let env = data.environment.as_mut().unwrap();
+        env.windows_version = None;
+        env.windows_build = None;
+        env.version_source = None;
+        assert_eq!(
+            parse_runner_report_json(&report_to_json(&data)).unwrap(),
+            data
+        );
+        data.environment.as_mut().unwrap().pointer_width = 32;
+        assert!(parse_runner_report_json(&report_to_json(&data)).is_err());
     }
 
     #[test]

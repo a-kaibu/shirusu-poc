@@ -68,6 +68,7 @@ pub fn reduce_with_runners(
     let mut number = 0;
     let mut pending: Option<(Vec<usize>, usize)> = None;
     let mut verified: Option<(Vec<usize>, [usize; 2])> = None;
+    let mut environments = None;
     let result = reduce_file_io(replay, config.max_trials, |trial| {
         number += 1;
         let directory = out.join(format!("trial-{number:05}"));
@@ -93,6 +94,14 @@ pub fn reduce_with_runners(
             &directory.join("candidate"),
             config.timeout,
         )?;
+        let reported = (baseline.environment.clone(), candidate.environment.clone());
+        match &environments {
+            Some(previous) if previous != &reported => {
+                return Err("runner environment changed between trials".into())
+            }
+            None => environments = Some(reported),
+            _ => {}
+        }
         let outcome = fingerprint.evaluate(&trial, &baseline, &candidate);
         let label = match outcome {
             TrialOutcome::SameTargetDifference => "same-target-difference",
@@ -140,9 +149,25 @@ pub fn reduce_with_runners(
         reduction.replay.spec.to_json().render_pretty(),
     )
     .map_err(|e| e.to_string())?;
+    let environment_json =
+        |value: &Option<shirusu_test::runner_exec::RunEnvironment>| -> Result<J, String> {
+            value
+                .as_ref()
+                .map(|env| {
+                    shirusu_test::json_parse::parse_json(
+                        &shirusu_test::runner_exec::environment_to_json(env),
+                    )
+                })
+                .transpose()
+                .map(|v| v.unwrap_or(J::Null))
+        };
+    let (baseline_environment, candidate_environment) =
+        environments.ok_or("missing runner environment records")?;
     let summary = J::obj(vec![
         ("execution_verified", J::Bool(true)),
         ("minimal", J::Bool(false)),
+        ("baseline_environment", environment_json(&baseline_environment)?),
+        ("candidate_environment", environment_json(&candidate_environment)?),
         ("scope", J::Str("supported target observation in configured runners; no global minimality or OS attestation".into())),
         ("candidate_index", J::U64(candidate_index as u64)),
         ("trials", J::U64(reduction.trials as u64)),

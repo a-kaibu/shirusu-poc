@@ -31,6 +31,7 @@ pub enum RunMode {
 /// Runner の報告。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunReport {
+    pub environment: Option<crate::runner_exec::RunEnvironment>,
     pub spec_name: String,
     pub executed: bool,
     pub all_ok: bool,
@@ -41,6 +42,7 @@ impl RunReport {
     /// `runner_exec::report_to_json` と同じ形の JSON にする。
     pub fn to_json(&self) -> JsonValue {
         let data = RunReportData {
+            environment: self.environment.clone(),
             spec_name: self.spec_name.clone(),
             executed: self.executed,
             all_ok: self.all_ok,
@@ -52,6 +54,7 @@ impl RunReport {
     /// 人間向けの表示（`runner_exec::report_to_text` と同じ）。
     pub fn render_human(&self) -> String {
         let data = RunReportData {
+            environment: self.environment.clone(),
             spec_name: self.spec_name.clone(),
             executed: self.executed,
             all_ok: self.all_ok,
@@ -114,12 +117,20 @@ fn report_data_to_json(data: &RunReportData) -> JsonValue {
             ])
         })
         .collect();
-    JsonValue::obj(vec![
+    let mut fields = vec![
         ("spec", JsonValue::Str(data.spec_name.clone())),
         ("executed", JsonValue::Bool(data.executed)),
         ("all_ok", JsonValue::Bool(data.all_ok)),
         ("steps", JsonValue::Array(steps)),
-    ])
+    ];
+    if let Some(env) = &data.environment {
+        fields.push((
+            "environment",
+            crate::json_parse::parse_json(&crate::runner_exec::environment_to_json(env))
+                .expect("Runner environment serializer emits valid JSON"),
+        ));
+    }
+    JsonValue::obj(fields)
 }
 
 /// 仕様を実行する。計画の誤り（呼び出し名・引数・`$ref`・期待値）は
@@ -130,6 +141,7 @@ pub fn run_spec(spec: &TestSpec, mode: RunMode) -> Result<RunReport, String> {
         RunMode::DryRun => {
             let data = dry_run_report(&spec.name, &planned);
             Ok(RunReport {
+                environment: data.environment,
                 spec_name: data.spec_name,
                 executed: data.executed,
                 all_ok: data.all_ok,
@@ -147,6 +159,7 @@ pub fn run_spec(spec: &TestSpec, mode: RunMode) -> Result<RunReport, String> {
             {
                 let data = execute_planned(&spec.name, &planned);
                 Ok(RunReport {
+                    environment: data.environment,
                     spec_name: data.spec_name,
                     executed: data.executed,
                     all_ok: data.all_ok,
@@ -210,6 +223,7 @@ mod tests {
         let report = run_spec(&spec(), RunMode::DryRun).unwrap();
         let via_value = report.to_json().render();
         let data = RunReportData {
+            environment: report.environment.clone(),
             spec_name: report.spec_name.clone(),
             executed: report.executed,
             all_ok: report.all_ok,

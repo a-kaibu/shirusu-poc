@@ -121,6 +121,17 @@ pub fn run_external(
     // wrapper remains responsible for any detached/remote work it started.
     drop(child);
     use shirusu_analysis::JsonValue as J;
+    let reported_environment = result
+        .as_ref()
+        .ok()
+        .and_then(|report| report.environment.as_ref())
+        .map(|env| {
+            shirusu_test::json_parse::parse_json(&shirusu_test::runner_exec::environment_to_json(
+                env,
+            ))
+        })
+        .transpose()?
+        .unwrap_or(J::Null);
     let evidence = J::obj(vec![
         (
             "program",
@@ -140,6 +151,7 @@ pub fn run_external(
             exit_description.map(J::Str).unwrap_or(J::Null),
         ),
         ("report_accepted", J::Bool(result.is_ok())),
+        ("runner_environment", reported_environment),
         (
             "error",
             result
@@ -151,7 +163,7 @@ pub fn run_external(
         ),
         (
             "environment_provenance",
-            J::Str("configured executable; OS/build/architecture not attested".into()),
+            J::Str("runner-reported API identity when present; not OS attestation".into()),
         ),
     ]);
     fs::write(directory.join("execution.json"), evidence.render_pretty())

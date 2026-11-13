@@ -18,22 +18,27 @@ fn main() {
     let calls: Vec<_> = spec.lines().filter(|l| l.trim_start().starts_with("\"call\":")).map(field).collect();
     let has_write = calls.iter().any(|c| c.ends_with("WriteFile"));
     let dry = mode == "dry";
+    let mismatch = mode == "candidate" || mode == "drift";
     let mut failed = false;
     let mut rows = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         let executed = !dry && !failed;
         let read = call.ends_with("ReadFile");
-        let ok = !failed && (!read || (has_write && mode != "candidate") || dry);
+        let ok = !failed && (!read || (has_write && !mismatch) || dry);
         let returned = if executed { "1" } else { "null" };
         let last_error = if executed { "0" } else { "null" };
         let outputs = if executed && read {
-            let hex = if mode == "candidate" { "2b" } else { "2a" };
+            let hex = if mismatch { "2b" } else { "2a" };
             format!("{{\"lpNumberOfBytesRead\":{},\"lpBuffer\":\"{hex}\"}}", usize::from(has_write))
         } else { "{}".into() };
         let error = if ok { "null" } else { "\"controlled mismatch or skipped\"" };
         rows.push(format!("{{\"index\":{index},\"call\":\"{call}\",\"ok\":{ok},\"executed\":{executed},\"returned\":{returned},\"last_error\":{last_error},\"outputs\":{outputs},\"outputs_truncated\":[],\"error\":{error}}}"));
         failed |= !ok;
     }
-    println!("{{\"spec\":\"{name}\",\"executed\":{},\"all_ok\":{},\"steps\":[{}]}}", !dry, !failed, rows.join(","));
+    let environment = if mismatch {
+        let build = if mode == "drift" && env::current_dir().unwrap().to_string_lossy().contains("trial-00002") { 22621 } else { 19045 };
+        format!(",\"environment\":{{\"target_os\":\"{}\",\"process_arch\":\"{}\",\"pointer_width\":{},\"windows_version\":\"10.0.{build}\",\"windows_build\":{build},\"version_source\":\"mock-runner\"}}", env::consts::OS, env::consts::ARCH, usize::BITS)
+    } else { String::new() };
+    println!("{{\"spec\":\"{name}\",\"executed\":{},\"all_ok\":{},\"steps\":[{}]{environment}}}", !dry, !failed, rows.join(","));
     process::exit(if mode == "badexit" { 2 } else { i32::from(failed) });
 }

@@ -281,7 +281,7 @@ CreateFileW 対象は現段階では判定不能。別の戻り値やデータ�
 対応範囲は ReadFile / WriteFile / CloseHandle の出力差分。先行差分がある場合は拒否する。
 バンドルの `replay.expected_difference` に元の呼び出し位置と両側の値を残し、対応できない
 場合は `missing` に理由を残す。これは記録された期待値であり、バンドル生成だけでは実行検証済みとは扱わない。
-OS/build/architecture の自動取得・検証は引き続き未実装。Windows CI には隔離した 2 回の実 API 実行で同じ結果が得られた
+Runner は下記の環境情報を自動取得するが、実 OS の独立した認証は行わない。Windows CI には隔離した 2 回の実 API 実行で同じ結果が得られた
 場合、差分を捏造しないテストを追加している。
 
 
@@ -335,3 +335,25 @@ shirusu-probe reduce windows.trace compat.trace --out reduction-001 --left-runne
 CLI の回帰テストは制御用の模擬 Runner を実プロセスとして起動し、7 呼び出しから 6 への
 削減、最終仕様に対応する 2 試行の証拠、タイムアウト・不正 JSON・過大出力・dry-run・
 終了コード不一致・既存出力の保護を検査する。これは実際の互換実装の検証結果ではない。
+
+
+### Runner の環境情報
+
+Windows Runner と生成 exe は、実行結果の任意フィールド `environment` に次を保存する。
+
+- `target_os` / `process_arch` / `pointer_width`：実行ファイルの対象 OS、プロセスのアーキテクチャとポインタ幅
+- `windows_version` / `windows_build` / `version_source`：`RtlGetVersion` が返したバージョン・ビルドと取得元
+
+バージョン取得に失敗した場合、バージョン・ビルド・取得元は null にする。値を推測して
+埋めない。dry-run はこの実行環境情報を生成しない。情報を持たない旧報告も読み込める。
+新しい項目を理解しない厳密な旧パーサを使う場合は、パーサも更新すること。
+アーキテクチャはプロセスのもので、WoW64 のホスト側アーキテクチャとは区別する。
+
+この情報は実行ファイルと API の自己申告で、互換実装が返す Windows バージョンも含む。
+実 Windows であることや特定ビルドの真正性を保証しない。外部 Runner の結果は各
+`execution.json.runner_environment` と最終結果の `baseline_environment` /
+`candidate_environment` に保存する。旧報告なら null のまま残す。
+
+削減中は各側の環境情報を初回と照合し、値の変化や有無の変化があれば削減全体を中断する。
+異なる環境の 2 回を同一条件での再現確認として混ぜないための検査であり、自己申告のない
+旧 Runner の環境が同じであることまで保証するものではない。
