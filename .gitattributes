@@ -4,3 +4,5 @@
 crates/shirusu-cli/tests/golden/*.txt text eol=lf
 crates/shirusu-hook/tests/golden/*.txt text eol=lf
 crates/shirusu-hook/src/api_file_io_generated.inc text eol=lf
+crates/shirusu-hook/src/capture_file_io_generated.inc text eol=lf
+crates/shirusu-hook/tests/file_io_boundaries_generated.inc text eol=lf

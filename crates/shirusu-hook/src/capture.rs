@@ -25,11 +25,6 @@ use shirusu_trace::compact::encode_values_iter;
 use shirusu_trace::schema::{CapturedValue, LastErrorMeaning, Ty, TypedValue, ValueCapture};
 use shirusu_trace::CompactError;
 
-/// UTF-16 文字列の取得上限（終端 NUL を除く単位数）。
-pub const MAX_STRING_UNITS: usize = 1024;
-/// バッファ内容の取得上限（バイト数）。超過は Truncated。
-pub const MAX_BUFFER_BYTES: usize = 4096;
-
 /// 対象プロセスのメモリを読む抽象。実装は「addr から buf を満たす
 /// 全バイトが読めた場合にだけ true」を返すこと。部分的に読めた場合の
 /// 扱いは取得側がブロック単位で制御する。
@@ -206,155 +201,42 @@ pub fn last_error_value(meaning: LastErrorMeaning, return_value: u64, raw: u32) 
     }
 }
 
-// ---- API ごとの取得（フィールド順は api.rs の定義と一致させる） ----
-
-#[allow(clippy::too_many_arguments)]
-pub fn create_file_w_enter(
-    mem: &dyn MemoryReader,
-    file_name_addr: u64,
-    desired_access: u32,
-    share_mode: u32,
-    security_attributes: u64,
-    creation_disposition: u32,
-    flags_and_attributes: u32,
-    template_file: u64,
-) -> Vec<CapturedValue> {
-    vec![
-        read_utf16_string(mem, file_name_addr),
-        u32v(desired_access),
-        u32v(share_mode),
-        u64v(security_attributes),
-        u32v(creation_disposition),
-        u32v(flags_and_attributes),
-        u64v(template_file),
-    ]
-}
-
-pub fn create_file_w_leave(return_handle: u64, last_error: u32) -> Vec<CapturedValue> {
-    vec![
-        u64v(return_handle),
-        last_error_value(
-            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_CREATE_FILE_W - 1) as usize]
-                .last_error_meaning,
-            return_handle,
-            last_error,
-        ),
-    ]
-}
-
-pub fn read_file_enter(
-    handle: u64,
-    buffer: u64,
-    bytes_to_read: u32,
-    overlapped: u64,
-) -> Vec<CapturedValue> {
-    vec![
-        u64v(handle),
-        u64v(buffer),
-        u32v(bytes_to_read),
-        u64v(overlapped),
-    ]
-}
-
-/// ReadFile の leave。`bytes_read_addr` は lpNumberOfBytesRead の
-/// アドレス（0 なら NULL が渡された）。OVERLAPPED 指定時は完了が
-/// 非同期のため、読取バイト数とバッファ内容は Unsupported。
-/// `requested_len` は API 入口の nNumberOfBytesToRead。戻り値の長さが
-/// これを超える場合、隣接メモリを取得せず data を Unsupported とする。
-pub fn read_file_leave(
-    mem: &dyn MemoryReader,
-    success: i32,
-    buffer: u64,
-    requested_len: u32,
-    bytes_read_addr: u64,
-    overlapped: bool,
-    last_error: u32,
-) -> Vec<CapturedValue> {
-    if overlapped {
-        return vec![
-            i32v(success),
-            unsupported_u32(),
-            unsupported_bytes(),
-            last_error_value(
-                crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_READ_FILE - 1) as usize]
-                    .last_error_meaning,
-                success as u64,
-                last_error,
-            ),
-        ];
+// The finite capture operations below are selected by the semantic contract.
+// Keep raw memory access behind MemoryReader and existing bounded readers.
+fn read_io_count(mem: &dyn MemoryReader, address: u64, asynchronous: bool) -> CapturedValue {
+    if asynchronous || address == 0 {
+        return unsupported_u32();
     }
-    let bytes_read = if bytes_read_addr == 0 {
-        None
-    } else {
-        mem.read_u32(bytes_read_addr)
-    };
-    let (count_value, data) = match bytes_read {
-        Some(n) => {
-            let data = if success == 0 {
-                // 失敗時は出力バッファに有効なデータが無い
-                CapturedValue::captured(TypedValue::Bytes(Vec::new()))
-            } else {
-                read_output_buffer(mem, buffer, requested_len, n)
-            };
-            (u32v(n), data)
-        }
-        None => (unsupported_u32(), unsupported_bytes()),
-    };
-    vec![
-        i32v(success),
-        count_value,
-        data,
-        last_error_value(
-            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_READ_FILE - 1) as usize]
-                .last_error_meaning,
-            success as u64,
-            last_error,
-        ),
-    ]
+    mem.read_u32(address)
+        .map(u32v)
+        .unwrap_or_else(unsupported_u32)
 }
 
-pub fn write_file_enter(
-    mem: &dyn MemoryReader,
-    handle: u64,
-    buffer: u64,
-    bytes_to_write: u32,
-    overlapped: u64,
-) -> Vec<CapturedValue> {
-    vec![
-        u64v(handle),
-        read_buffer(mem, buffer, bytes_to_write as usize),
-        u32v(bytes_to_write),
-        u64v(overlapped),
-    ]
-}
-
-pub fn write_file_leave(
+fn read_io_output(
     mem: &dyn MemoryReader,
     success: i32,
-    bytes_written_addr: u64,
-    overlapped: bool,
-    last_error: u32,
-) -> Vec<CapturedValue> {
-    let written = if overlapped || bytes_written_addr == 0 {
-        None
-    } else {
-        mem.read_u32(bytes_written_addr)
+    buffer: u64,
+    capacity: u32,
+    count: &CapturedValue,
+    asynchronous: bool,
+) -> CapturedValue {
+    if asynchronous {
+        return unsupported_bytes();
+    }
+    let CapturedValue {
+        capture: ValueCapture::Captured,
+        value: TypedValue::U32(count),
+    } = count
+    else {
+        return unsupported_bytes();
     };
-    let count = match written {
-        Some(n) => u32v(n),
-        None => unsupported_u32(),
-    };
-    vec![
-        i32v(success),
-        count,
-        last_error_value(
-            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_WRITE_FILE - 1) as usize]
-                .last_error_meaning,
-            success as u64,
-            last_error,
-        ),
-    ]
+    if success == 0 {
+        return CapturedValue::captured(TypedValue::Bytes(Vec::new()));
+    }
+    read_output_buffer(mem, buffer, capacity, *count)
 }
+
+include!("capture_file_io_generated.inc");
 
 /// OVERLAPPED 操作の転送バイト数を、完了を観測した時点で読む
 /// （F27）。`bytes_addr`（lpNumberOfBytesTransferred 等）が非 NULL
@@ -442,22 +324,6 @@ pub fn get_queued_completion_status_leave(
         },
         last_error_value(
             LastErrorMeaning::WhenReturnIsFalse,
-            success as u64,
-            last_error,
-        ),
-    ]
-}
-
-pub fn close_handle_enter(handle: u64) -> Vec<CapturedValue> {
-    vec![u64v(handle)]
-}
-
-pub fn close_handle_leave(success: i32, last_error: u32) -> Vec<CapturedValue> {
-    vec![
-        i32v(success),
-        last_error_value(
-            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_CLOSE_HANDLE - 1) as usize]
-                .last_error_meaning,
             success as u64,
             last_error,
         ),

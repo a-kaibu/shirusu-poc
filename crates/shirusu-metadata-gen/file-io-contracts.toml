@@ -1,5 +1,7 @@
-# File I/O semantic contracts v1. Field order and annotations are wire compatibility.
-version = 1
+# File I/O semantic contracts v2. Field order and annotations are wire compatibility.
+version = 2
+max_buffer_bytes = 4096
+max_string_units = 1024
 
 [[api]]
 id = 1
@@ -9,50 +11,62 @@ level = 2
 note = "パス文字列 (Str16) を復元する。lpSecurityAttributes と hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で 後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)"
 last_error = "WhenReturnIsInvalidHandle"
 
+enter_arguments = ["u64", "u32", "u32", "u64", "u32", "u32", "u64"]
+leave_arguments = ["u64", "u32"]
+
 [[api.enter]]
 name = "lpFileName"
 ty = "Str16"
 kind = "Scalar"
+capture = { op = "utf16", arg = 0 }
 
 [[api.enter]]
 name = "dwDesiredAccess"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 1 }
 
 [[api.enter]]
 name = "dwShareMode"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 2 }
 
 [[api.enter]]
 name = "lpSecurityAttributes"
 ty = "U64"
 kind = "Pointer"
+capture = { op = "scalar", arg = 3 }
 
 [[api.enter]]
 name = "dwCreationDisposition"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 4 }
 
 [[api.enter]]
 name = "dwFlagsAndAttributes"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 5 }
 
 [[api.enter]]
 name = "hTemplateFile"
 ty = "U64"
 kind = "Handle"
+capture = { op = "scalar", arg = 6 }
 
 [[api.leave]]
 name = "return"
 ty = "U64"
 kind = "CreatedObject"
+capture = { op = "scalar", arg = 0 }
 
 [[api.leave]]
 name = "last_error"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "last_error", arg = 1, returns = 0 }
 
 [[api]]
 id = 2
@@ -62,45 +76,56 @@ level = 2
 note = "同期完了時の出力バッファ内容を上限付きで復元する (上限超過は Truncated)。OVERLAPPED 指定時は完了が非同期の ためバッファ内容と読取バイト数は Unsupported として記録する"
 last_error = "WhenReturnIsFalse"
 
+enter_arguments = ["u64", "u64", "u32", "u64"]
+leave_arguments = ["i32", "u64", "u32", "u64", "bool", "u32"]
+
 [[api.enter]]
 name = "hFile"
 ty = "U64"
 kind = "Handle"
+capture = { op = "scalar", arg = 0 }
 
 [[api.enter]]
 name = "lpBuffer"
 ty = "U64"
 kind = "Pointer"
+capture = { op = "scalar", arg = 1 }
 
 [[api.enter]]
 name = "nNumberOfBytesToRead"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 2 }
 
 [[api.enter]]
 name = "lpOverlapped"
 ty = "U64"
 kind = "Pointer"
+capture = { op = "scalar", arg = 3 }
 
 [[api.leave]]
 name = "return"
 ty = "I32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 0 }
 
 [[api.leave]]
 name = "lpNumberOfBytesRead"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "output_count", address = 3, asynchronous = 4 }
 
 [[api.leave]]
 name = "data"
 ty = "Bytes"
 kind = "Scalar"
+capture = { op = "output_buffer", address = 1, capacity = 2, count_field = 1, success = 0, asynchronous = 4 }
 
 [[api.leave]]
 name = "last_error"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "last_error", arg = 5, returns = 0 }
 
 [[api]]
 id = 3
@@ -110,40 +135,50 @@ level = 2
 note = "入力バッファ内容を呼び出し前に上限付きで復元する (上限超過は Truncated)"
 last_error = "WhenReturnIsFalse"
 
+enter_arguments = ["u64", "u64", "u32", "u64"]
+leave_arguments = ["i32", "u64", "bool", "u32"]
+
 [[api.enter]]
 name = "hFile"
 ty = "U64"
 kind = "Handle"
+capture = { op = "scalar", arg = 0 }
 
 [[api.enter]]
 name = "data"
 ty = "Bytes"
 kind = "Scalar"
+capture = { op = "input_buffer", address = 1, length = 2 }
 
 [[api.enter]]
 name = "nNumberOfBytesToWrite"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 2 }
 
 [[api.enter]]
 name = "lpOverlapped"
 ty = "U64"
 kind = "Pointer"
+capture = { op = "scalar", arg = 3 }
 
 [[api.leave]]
 name = "return"
 ty = "I32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 0 }
 
 [[api.leave]]
 name = "lpNumberOfBytesWritten"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "output_count", address = 1, asynchronous = 2 }
 
 [[api.leave]]
 name = "last_error"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "last_error", arg = 3, returns = 0 }
 
 [[api]]
 id = 4
@@ -153,17 +188,23 @@ level = 1
 note = "型付き引数・戻り値のみ。対象 HANDLE の生値で生成側 イベントと相関可能 (Object ID は未割当)"
 last_error = "WhenReturnIsFalse"
 
+enter_arguments = ["u64"]
+leave_arguments = ["i32", "u32"]
+
 [[api.enter]]
 name = "hObject"
 ty = "U64"
 kind = "Handle"
+capture = { op = "scalar", arg = 0 }
 
 [[api.leave]]
 name = "return"
 ty = "I32"
 kind = "Scalar"
+capture = { op = "scalar", arg = 0 }
 
 [[api.leave]]
 name = "last_error"
 ty = "U32"
 kind = "Scalar"
+capture = { op = "last_error", arg = 1, returns = 0 }

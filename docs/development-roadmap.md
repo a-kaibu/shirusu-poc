@@ -24,8 +24,9 @@
 4. **宣言的な意味契約**：CreateFileW / ReadFile / WriteFile / CloseHandle の成功条件、
    入出力、長さ、所有権を契約にまとめ、既存 Golden と一致させる。SAL は副作用・
    非同期完了の完全な仕様とは扱わない。初段として Schema と LastError 条件を
-   [宣言から生成](semantic-contracts.md)し、取得側も同じ条件を参照する。8 Schema の
-   移行前 Golden と一致。メモリ取得・長さ式・所有権・非同期完了の生成は未実装。
+   [宣言から生成](semantic-contracts.md)し、取得側も同じ条件を参照する。さらに4 APIの
+   enter / leave の取得、バッファ容量と出力カウントの関係、境界値を生成する。
+   8 Schema と23取得ケースの移行前 Golden に一致。所有権・非同期完了の生成は未実装。
 5. **Windows 参照コーパス**：同じ Probe の OS build / architecture / 前提条件 / 結果を
    保存し、単一の Windows 実行を唯一の正解にしない。Runner に API が返した OS build と
    実行アーキテクチャの保存、削減時の環境変更の拒否を実装。自己申告として扱い、OS を

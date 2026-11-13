@@ -167,17 +167,32 @@ fn file_io_contracts_run() -> Result<(), String> {
     let source = std::fs::read_to_string("crates/shirusu-metadata-gen/file-io-contracts.toml")
         .map_err(|e| e.to_string())?;
     let generated = shirusu_metadata_gen::contracts::emit_file_io_contracts(&source)?;
-    let path = "crates/shirusu-hook/src/api_file_io_generated.inc";
-    if args.is_empty() {
-        std::fs::write(path, generated).map_err(|e| e.to_string())
-    } else if std::fs::read_to_string(path)
-        .map(|s| s.replace("\r\n", "\n"))
-        .ok()
-        .as_deref()
-        == Some(&generated)
-    {
-        Ok(())
-    } else {
-        Err(format!("{path} is stale"))
+    let capture = shirusu_metadata_gen::contracts::emit_file_io_capture(&source)?;
+    let boundaries = shirusu_metadata_gen::contracts::emit_file_io_boundaries(&source)?;
+    for (path, content) in [
+        (
+            "crates/shirusu-hook/tests/file_io_boundaries_generated.inc",
+            boundaries,
+        ),
+        (
+            "crates/shirusu-hook/src/api_file_io_generated.inc",
+            generated,
+        ),
+        (
+            "crates/shirusu-hook/src/capture_file_io_generated.inc",
+            capture,
+        ),
+    ] {
+        if args.is_empty() {
+            std::fs::write(path, content).map_err(|e| e.to_string())?;
+        } else if std::fs::read_to_string(path)
+            .map(|s| s.replace("\r\n", "\n"))
+            .ok()
+            .as_deref()
+            != Some(&content)
+        {
+            return Err(format!("{path} is stale"));
+        }
     }
+    Ok(())
 }
