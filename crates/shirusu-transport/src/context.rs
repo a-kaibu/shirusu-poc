@@ -49,13 +49,21 @@ pub struct HostMonitor {
     alive_probe: Box<dyn Fn() -> bool + Send + Sync>,
     recording_disabled: AtomicBool,
     pub probe_count: std::sync::atomic::AtomicU64,
+    abnormal_count: std::sync::atomic::AtomicU64,
 }
+
+/// Abnormal-path events between Host liveness probes. A probe is a system
+/// call (about a microsecond); probing on every dropped event during a burst
+/// made overflow itself the dominant cost. The first abnormal event always
+/// probes, so a stopped Host is still detected at the start of an overflow.
+pub const ABNORMAL_EVENTS_PER_PROBE: u64 = 256;
 impl HostMonitor {
     pub fn new(probe: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         Self {
             alive_probe: Box::new(probe),
             recording_disabled: AtomicBool::new(false),
             probe_count: std::sync::atomic::AtomicU64::new(0),
+            abnormal_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
     pub fn always_alive() -> Self {
@@ -67,6 +75,11 @@ impl HostMonitor {
     /// 容量不足などの異常経路でのみ呼ぶ。通常経路では呼ばない。
     /// Host 停止を確認したら記録を無効化し、以後は素通しにする。再接続は初版対象外。
     pub fn check_on_abnormal_path(&self) -> bool {
+        let n = self.abnormal_count.fetch_add(1, Ordering::Relaxed);
+        if !n.is_multiple_of(ABNORMAL_EVENTS_PER_PROBE) {
+            // Between probes the last verdict stands.
+            return self.recording_enabled();
+        }
         self.probe_count.fetch_add(1, Ordering::Relaxed);
         if (self.alive_probe)() {
             true
@@ -113,6 +126,21 @@ mod tests {
         assert!(m.recording_enabled());
         m.force_dead();
         assert!(!m.recording_enabled());
+    }
+    #[test]
+    fn abnormal_path_probes_are_rate_limited() {
+        let m = HostMonitor::always_alive();
+        for _ in 0..ABNORMAL_EVENTS_PER_PROBE * 3 {
+            assert!(m.check_on_abnormal_path());
+        }
+        assert_eq!(m.probe_count.load(Ordering::Relaxed), 3);
+        let dead = HostMonitor::new(|| false);
+        assert!(!dead.check_on_abnormal_path());
+        assert!(
+            !dead.check_on_abnormal_path(),
+            "stays stopped between probes"
+        );
+        assert_eq!(dead.probe_count.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn host_alive_keeps_recording() {

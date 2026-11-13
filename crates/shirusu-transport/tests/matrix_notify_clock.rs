@@ -8,7 +8,9 @@
 //! - PublishGuard / HostMonitor: 入れ子深さと probe 結果による記録可否。
 
 use shirusu_transport::clock::ManualClock;
-use shirusu_transport::context::{should_record, CallOrigin, HostMonitor, PublishGuard};
+use shirusu_transport::context::{
+    should_record, CallOrigin, HostMonitor, PublishGuard, ABNORMAL_EVENTS_PER_PROBE,
+};
 use shirusu_transport::notify::{NotifySignal, PublishNotifyTracker, ReCheckPolicy};
 use shirusu_transport::Clock;
 use std::sync::atomic::Ordering;
@@ -363,8 +365,11 @@ fn guard_fully_released_records_again() {
 #[test]
 fn monitor_counts_each_probe() {
     let m = HostMonitor::always_alive();
+    // One probe per ABNORMAL_EVENTS_PER_PROBE abnormal events, the first included.
     for i in 1..=3 {
-        assert!(m.check_on_abnormal_path());
+        for _ in 0..ABNORMAL_EVENTS_PER_PROBE {
+            assert!(m.check_on_abnormal_path());
+        }
         assert_eq!(m.probe_count.load(Ordering::Relaxed), i);
     }
     assert!(m.recording_enabled());
@@ -375,7 +380,9 @@ fn monitor_dead_probe_disables_and_stays_disabled() {
     assert!(!m.check_on_abnormal_path());
     assert!(!m.recording_enabled());
     // 再確認しても有効には戻らない (再接続は初版対象外)
-    assert!(!m.check_on_abnormal_path());
+    for _ in 0..ABNORMAL_EVENTS_PER_PROBE {
+        assert!(!m.check_on_abnormal_path());
+    }
     assert!(!m.recording_enabled());
     assert_eq!(m.probe_count.load(Ordering::Relaxed), 2);
 }
