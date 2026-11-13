@@ -29,7 +29,7 @@ mod diagnostics;
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_BAD_BOOTSTRAP: u32 = 1;
 pub const STATUS_MAPPING_FAILED: u32 = 2;
-pub const STATUS_HOOK_FAILED: u32 = 3;
+pub const STATUS_HOOK_FAILED: u32 = shirusu_hook::bootstrap::INIT_HOOK_FAILED;
 pub const STATUS_ALREADY_INITIALIZED: u32 = 4;
 pub const STATUS_UNSUPPORTED: u32 = 5;
 
@@ -146,6 +146,23 @@ mod win {
     // Serialize complete lifecycle operations, including initialization before
     // STATE is populated and restoration retries after recording is disabled.
     static CONTROL: Mutex<()> = Mutex::new(());
+
+    fn retain_failed_installation(rt: &Arc<HookRuntime>, pending: InstalledHooks) {
+        rt.shutdown_recording();
+        if pending.slots.is_empty() && rt.in_flight() == 0 {
+            engine::clear_runtime(rt);
+        } else {
+            // Recovery includes old flights even when all pointer restores won.
+            *STATE.lock().unwrap() = Some(DllState {
+                installed: pending,
+                inline: Vec::new(),
+                com_factories: Vec::new(),
+                winrt_activations: Vec::new(),
+                internal_hooks: Vec::new(),
+                callbacks: Vec::new(),
+            });
+        }
+    }
 
     pub fn init(bootstrap: *const AgentBootstrap) -> u32 {
         if bootstrap.is_null() {
@@ -290,7 +307,11 @@ mod win {
             // ある場合はその件数を Bootstrap へ書き戻し、Host が
             // 「対象に Detour が残存する初期化失敗」として扱えるように
             // する (書き戻し欄の前提は write_hook_outcome と同じ)。
-            Err(EngineError::InstallFailed { unrestored, .. }) => {
+            Err(EngineError::InstallFailed {
+                unrestored,
+                pending,
+                ..
+            }) => {
                 // SAFETY: bootstrap は Host が書き込み可能に確保した
                 // 領域で、初期化が戻るまで有効 (呼び出し側の契約)。
                 unsafe {
@@ -299,7 +320,7 @@ mod win {
                         unrestored.len() as u32,
                     );
                 }
-                engine::clear_runtime(&rt);
+                retain_failed_installation(&rt, *pending);
                 return STATUS_HOOK_FAILED;
             }
             Err(_) => {
@@ -541,17 +562,6 @@ mod win {
                 None,
             ))
         }
-        fn state(installed: InstalledHooks) -> DllState {
-            DllState {
-                installed,
-                inline: Vec::new(),
-                com_factories: Vec::new(),
-                winrt_activations: Vec::new(),
-                internal_hooks: Vec::new(),
-                callbacks: Vec::new(),
-            }
-        }
-
         #[test]
         fn shutdown_retries_only_failed_slots_and_waits_for_old_flights() {
             // Reserve two pages, but commit only the first. Protection changes
@@ -567,11 +577,18 @@ mod win {
             unsafe { first.write(0xaaaa) };
             let rt = runtime();
             assert!(engine::set_runtime(rt.clone()).is_ok());
-            *STATE.lock().unwrap() = Some(state(InstalledHooks {
-                module_base: base as usize,
-                slots: vec![(0, 0x1111), (4096, 0x2222)],
-                plan: Default::default(),
-            }));
+            retain_failed_installation(
+                &rt,
+                InstalledHooks {
+                    module_base: base as usize,
+                    slots: vec![
+                        engine::IatSlot::installed(0, 0x1111, 0xaaaa),
+                        engine::IatSlot::installed(4096, 0x2222, 0xbbbb),
+                    ],
+                    plan: Default::default(),
+                },
+            );
+            assert!(!rt.recording_active());
             assert_eq!(shutdown(), SHUTDOWN_INCOMPLETE);
             let bootstrap =
                 AgentBootstrap::new(11, shirusu_transport::RingConfig::new(64, 4096), &[(1, 2)]);
@@ -579,7 +596,16 @@ mod win {
             assert!(!rt.recording_active());
             assert!(engine::runtime().is_some());
             assert_eq!(
-                STATE.lock().unwrap().as_ref().unwrap().installed.slots,
+                STATE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .installed
+                    .slots
+                    .iter()
+                    .map(|s| (s.rva, s.original))
+                    .collect::<Vec<_>>(),
                 vec![(4096, 0x2222)]
             );
             assert_eq!(unsafe { first.read() }, 0x1111);
@@ -601,12 +627,15 @@ mod win {
             // Successful restoration alone cannot complete a timed-out shutdown.
             let next = runtime();
             assert!(engine::set_runtime(next.clone()).is_ok());
-            *STATE.lock().unwrap() = Some(state(InstalledHooks {
-                module_base: 0,
-                slots: Vec::new(),
-                plan: Default::default(),
-            }));
             let flight = shirusu_hook::runtime::DetourFlight::begin(&next).unwrap();
+            retain_failed_installation(
+                &next,
+                InstalledHooks {
+                    module_base: 0,
+                    slots: Vec::new(),
+                    plan: Default::default(),
+                },
+            );
             assert_eq!(
                 shutdown_with_timeout(std::time::Duration::ZERO),
                 SHUTDOWN_INCOMPLETE

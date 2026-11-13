@@ -54,6 +54,9 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v11: freeze evidence capacity independently of API_COUNT.
 /// v12: distinguish COM method return kinds from factory HRESULT payloads.
 pub const BOOTSTRAP_VERSION: u32 = 12;
+/// Initialization published hooks but could not complete installation. Only
+/// this failure status authorizes Host to retry this attempt's shutdown.
+pub const INIT_HOOK_FAILED: u32 = 3;
 // Fixed protocol capacity: adding an API must not silently enlarge the native
 // structure while keeping the same Bootstrap version.
 pub const HOOK_EVIDENCE_COUNT: usize = 256;

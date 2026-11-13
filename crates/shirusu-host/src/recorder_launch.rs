@@ -830,16 +830,22 @@ fn inject_and_init(
     }
     let status = status?;
     if status != 0 {
-        if let Some(result) = outcome.filter(|r| r.unrestored > 0) {
-            return Err(SessionError::Injection(format!(
-                "shirusu_agent_init returned status {status}; {} IAT slot(s) \
-                 could not be restored and remain detoured in the target process",
-                result.unrestored
-            )));
+        let message = match outcome.filter(|r| r.unrestored > 0) {
+            Some(result) => format!(
+                "shirusu_agent_init returned status {status}; {} IAT slot(s) had pending pointer or page-protection restoration",
+                result.unrestored),
+            None => format!("shirusu_agent_init returned status {status}"),
+        };
+        let source = SessionError::Injection(message);
+        // Never shut down an existing session after ALREADY_INITIALIZED or a
+        // rejected Bootstrap. Only this attempt's hook failure owns recovery.
+        if status == shirusu_hook::bootstrap::INIT_HOOK_FAILED {
+            return Err(SessionError::PostInitialization {
+                source: Box::new(source),
+                rollback: rollback_initialized_agent(process, shutdown_addr),
+            });
         }
-        return Err(SessionError::Injection(format!(
-            "shirusu_agent_init returned status {status}"
-        )));
+        return Err(source);
     }
     if !init_done.wait_timeout(cfg.init_timeout) {
         return Err(SessionError::PostInitialization {

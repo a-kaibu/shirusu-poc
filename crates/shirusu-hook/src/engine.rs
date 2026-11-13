@@ -93,7 +93,7 @@ pub fn clear_runtime(rt: &Arc<HookRuntime>) -> bool {
     crate::runtime::runtime_slot().unregister(rt)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum EngineError {
     /// モジュールイメージが PE として読めない
     NotPe,
@@ -105,8 +105,11 @@ pub enum EngineError {
     NoTargets(HookPlan),
     /// ポインタ幅のアトミック更新に必要なアラインメントを満たさない
     UnalignedIatSlot,
+    IatChanged,
     /// IAT スロットの保護属性変更に失敗した
-    ProtectFailed { iat_rva: u32 },
+    ProtectFailed {
+        iat_rva: u32,
+    },
     /// 設置途中の失敗（レビュー第5回 #8）。既にパッチしたスロットは
     /// 逆順に復元を試みた後で返る。`unrestored` が空でなければ、
     /// 対象プロセスに Detour が残存する重大な状態であり、呼び出し
@@ -116,6 +119,8 @@ pub enum EngineError {
         failed_iat_rva: u32,
         /// 復元も失敗したスロットの IAT RVA。
         unrestored: Vec<u32>,
+        /// Owned recovery state, including post-publication protection failures.
+        pending: Box<InstalledHooks>,
     },
 }
 
@@ -160,50 +165,98 @@ impl MemoryReader for ProcessMemory {
     }
 }
 
-/// 設置済みフック。解除時に IAT を元へ戻すために保持する。
+/// One owned IAT publication and any outstanding page-protection restoration.
+#[derive(Debug)]
+pub struct IatSlot {
+    pub rva: u32,
+    pub original: usize,
+    pub detour: usize,
+    owned: std::sync::atomic::AtomicBool,
+    protection: std::sync::atomic::AtomicU32,
+}
+impl IatSlot {
+    pub fn installed(rva: u32, original: usize, detour: usize) -> Self {
+        Self {
+            rva,
+            original,
+            detour,
+            owned: std::sync::atomic::AtomicBool::new(true),
+            protection: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+/// Installation and retry state. Dropping it does not restore published hooks.
+#[derive(Debug)]
 pub struct InstalledHooks {
     pub module_base: usize,
-    /// (IAT RVA, 元の関数ポインタ)
-    pub slots: Vec<(u32, usize)>,
+    pub slots: Vec<IatSlot>,
     pub plan: HookPlan,
 }
 
-/// IAT スロットへ保護属性を変えて書き込む。
-///
 /// # Safety
-/// `slot` は対象モジュールの IAT 内の有効なスロットであること。
-unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), EngineError> {
-    // Attach can run while application threads read the IAT. Publish one
-    // aligned pointer atomically; never tear a malformed, unaligned slot.
-    if (slot as usize) & (std::mem::align_of::<std::sync::atomic::AtomicUsize>() - 1) != 0 {
+/// The aligned slot remains mapped in the original module. Lifecycle operations
+/// and page-protection changes are serialized; other pointer owners may replace
+/// our pointer and must not be overwritten during restoration.
+unsafe fn exchange_iat(
+    slot: *mut usize,
+    state: &IatSlot,
+    install: bool,
+) -> Result<(), EngineError> {
+    unsafe {
+        exchange_iat_with(slot, state, install, |address, size, protection, old| {
+            VirtualProtect(address, size, protection, old)
+        })
+    }
+}
+
+unsafe fn exchange_iat_with(
+    slot: *mut usize,
+    state: &IatSlot,
+    install: bool,
+    mut protect: impl FnMut(*const c_void, usize, u32, *mut u32) -> i32,
+) -> Result<(), EngineError> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if (slot as usize) & (std::mem::align_of::<AtomicUsize>() - 1) != 0 {
         return Err(EngineError::UnalignedIatSlot);
     }
-    let mut old: u32 = 0;
-    // SAFETY: 呼び出し側の契約に従う。
-    let ok = unsafe {
-        VirtualProtect(
-            slot as *const c_void,
-            std::mem::size_of::<usize>(),
-            PAGE_READWRITE,
-            &mut old,
-        )
-    };
-    if ok == 0 {
-        return Err(EngineError::ProtectFailed { iat_rva: 0 });
+    let address = slot as *const c_void;
+    let size = std::mem::size_of::<usize>();
+    let mut changed = true;
+    if install || state.owned.load(Ordering::Acquire) {
+        let mut old = 0;
+        if protect(address, size, PAGE_READWRITE, &mut old) == 0 {
+            return Err(EngineError::ProtectFailed { iat_rva: state.rva });
+        }
+        // Never replace an earlier outstanding restoration with PAGE_READWRITE.
+        let _ = state
+            .protection
+            .compare_exchange(0, old, Ordering::AcqRel, Ordering::Acquire);
+        let (expected, value) = if install {
+            (state.original, state.detour)
+        } else {
+            (state.detour, state.original)
+        };
+        changed = unsafe { AtomicUsize::from_ptr(slot) }
+            .compare_exchange(expected, value, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        // A foreign replacement ends our pointer ownership, but protection
+        // restoration still belongs to us and must be retried if it fails.
+        state.owned.store(install && changed, Ordering::Release);
     }
-    // SAFETY: 同上。書き込み後は元の保護属性へ戻す。
-    unsafe {
-        std::sync::atomic::AtomicUsize::from_ptr(slot)
-            .store(value, std::sync::atomic::Ordering::Release);
-        let mut tmp: u32 = 0;
-        VirtualProtect(
-            slot as *const c_void,
-            std::mem::size_of::<usize>(),
-            old,
-            &mut tmp,
-        );
+    let old = state.protection.load(Ordering::Acquire);
+    if old != 0 {
+        let mut ignored = 0;
+        if protect(address, size, old, &mut ignored) == 0 {
+            return Err(EngineError::ProtectFailed { iat_rva: state.rva });
+        }
+        state.protection.store(0, Ordering::Release);
     }
-    Ok(())
+    if install && !changed {
+        Err(EngineError::IatChanged)
+    } else {
+        Ok(())
+    }
 }
 
 /// モジュール（ロード済みイメージ）の IAT をパッチし、対象 API を
@@ -239,42 +292,41 @@ pub unsafe fn install_hooks(
     if plan.entries.is_empty() {
         return Err(EngineError::NoTargets(plan));
     }
-    // 設置はトランザクションとして実行する (レビュー第5回 #8):
-    // 途中の write_slot が失敗したら、既にパッチしたスロットを
-    // 逆順に復元してからエラーを返す。アタッチ先のプロセスは
-    // 生きたままなので、一部だけ Detour 化した状態を残さない。
-    let entries = &plan.entries;
-    let originals = crate::plan::patch_transactionally(
-        entries.len(),
-        |i| {
-            let entry = &entries[i];
-            // SAFETY: iat_rva はこのモジュールの IAT 内（plan の入力は同イメージの解析結果）。
-            let slot = unsafe { module_base.add(entry.iat_rva as usize) } as *mut usize;
-            // SAFETY: 同上。
-            let original = unsafe { slot.read_unaligned() };
-            rt.set_original(entry.api.api_id, original);
-            // SAFETY: 同上。
-            unsafe { write_slot(slot, detour_for(entry.api.api_id)) }?;
-            Ok(original)
-        },
-        |i, original| {
-            let entry = &entries[i];
-            // SAFETY: 設置時にパッチしたのと同じスロット。
-            let slot = unsafe { module_base.add(entry.iat_rva as usize) } as *mut usize;
-            // SAFETY: 同上。
-            unsafe { write_slot(slot, original) }
-        },
-    )
-    .map_err(|rb| EngineError::InstallFailed {
-        failed_iat_rva: entries[rb.failed_index].iat_rva,
-        unrestored: rb.unrestored.iter().map(|&i| entries[i].iat_rva).collect(),
-    })?;
-    let slots: Vec<(u32, usize)> = entries.iter().map(|e| e.iat_rva).zip(originals).collect();
-    Ok(InstalledHooks {
+    let mut installed = InstalledHooks {
         module_base: module_base as usize,
-        slots,
+        slots: Vec::with_capacity(plan.entries.len()),
         plan,
-    })
+    };
+    for index in 0..installed.plan.entries.len() {
+        let entry = &installed.plan.entries[index];
+        let rva = entry.iat_rva;
+        let slot = unsafe { module_base.add(rva as usize) }.cast::<usize>();
+        let original = unsafe { slot.read_unaligned() };
+        let canonical = resolve_export(&entry.dll_name, entry.api.function)
+            .is_some_and(|export| follow_import_thunks(original) == Some(export));
+        if canonical {
+            rt.set_original(entry.api.api_id, original);
+        }
+        let state = IatSlot::installed(rva, original, detour_for(entry.api.api_id));
+        state
+            .owned
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Save the descriptor BEFORE publication, including the failing entry.
+        installed.slots.push(state);
+        if !canonical
+            || unsafe { exchange_iat(slot, installed.slots.last().unwrap(), true) }.is_err()
+        {
+            unsafe {
+                uninstall_pending_hooks(&mut installed);
+            }
+            return Err(EngineError::InstallFailed {
+                failed_iat_rva: rva,
+                unrestored: installed.slots.iter().map(|s| s.rva).collect(),
+                pending: Box::new(installed),
+            });
+        }
+    }
+    Ok(installed)
 }
 
 /// IAT を元の値へ戻す（設置の巻き戻し）。復元できなかったスロットの
@@ -292,12 +344,12 @@ pub unsafe fn install_hooks(
 /// まだロードされていること。
 unsafe fn uninstall_iat_indices(installed: &InstalledHooks) -> Vec<usize> {
     crate::plan::restore_all(installed.slots.len(), |i| {
-        let (iat_rva, original) = installed.slots[i];
+        let state = &installed.slots[i];
         // SAFETY: 呼び出し側の契約に従う。
         let slot =
-            unsafe { (installed.module_base as *mut u8).add(iat_rva as usize) } as *mut usize;
+            unsafe { (installed.module_base as *mut u8).add(state.rva as usize) } as *mut usize;
         // SAFETY: 同上。
-        unsafe { write_slot(slot, original) }
+        unsafe { exchange_iat(slot, state, false) }
     })
 }
 
@@ -308,7 +360,7 @@ unsafe fn uninstall_iat_indices(installed: &InstalledHooks) -> Vec<usize> {
 pub unsafe fn uninstall_hooks(installed: &InstalledHooks) -> Vec<u32> {
     unsafe { uninstall_iat_indices(installed) }
         .into_iter()
-        .map(|i| installed.slots[i].0)
+        .map(|i| installed.slots[i].rva)
         .collect()
 }
 
@@ -4820,11 +4872,108 @@ mod tests {
     fn iat_write_rejects_unaligned_slots_without_touching_memory() {
         let mut storage = [0x55usize; 2];
         let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<usize>() };
-        assert_eq!(
-            unsafe { write_slot(slot, 0x1234) },
+        let state = IatSlot::installed(0, 0x55, 0x1234);
+        assert!(matches!(
+            unsafe { exchange_iat(slot, &state, true) },
             Err(EngineError::UnalignedIatSlot)
-        );
+        ));
         assert_eq!(storage, [0x55; 2]);
+    }
+
+    #[test]
+    fn iat_protection_failure_retains_recovery_and_preserves_foreign_pointer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Memory::{VirtualQuery, PAGE_READONLY};
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!page.is_null());
+        let slot = page.cast::<usize>();
+        unsafe {
+            slot.write(0x1111);
+        }
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect(page, 4096, PAGE_READONLY, &mut old) },
+            0
+        );
+        let state = IatSlot::installed(0, 0x1111, 0x2222);
+        state.owned.store(false, Ordering::Release);
+        let mut calls = 0;
+        let result = unsafe {
+            exchange_iat_with(slot, &state, true, |address, size, protection, old| {
+                calls += 1;
+                if calls == 2 {
+                    0
+                } else {
+                    VirtualProtect(address, size, protection, old)
+                }
+            })
+        };
+        assert!(matches!(result, Err(EngineError::ProtectFailed { .. })));
+        assert_eq!(unsafe { slot.read() }, 0x2222);
+        assert!(state.owned.load(Ordering::Acquire));
+        assert_eq!(state.protection.load(Ordering::Acquire), PAGE_READONLY);
+        // A foreign owner replaces our pointer while restoration is pending.
+        unsafe { AtomicUsize::from_ptr(slot) }.store(0x3333, Ordering::Release);
+        assert!(unsafe { exchange_iat(slot, &state, false) }.is_ok());
+        assert_eq!(unsafe { slot.read() }, 0x3333);
+        assert!(!state.owned.load(Ordering::Acquire));
+        assert_eq!(state.protection.load(Ordering::Acquire), 0);
+        let mut info = std::mem::MaybeUninit::<
+            windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+        >::uninit();
+        assert_ne!(
+            unsafe { VirtualQuery(page, info.as_mut_ptr(), std::mem::size_of_val(&info)) },
+            0
+        );
+        assert_eq!(unsafe { info.assume_init() }.Protect, PAGE_READONLY);
+
+        // A different installation restores its pointer but fails to restore
+        // protection. The retry must not write that pointer for a second time.
+        let state = IatSlot::installed(0, 0x3333, 0x4444);
+        state.owned.store(false, Ordering::Release);
+        assert!(unsafe { exchange_iat(slot, &state, true) }.is_ok());
+        let mut calls = 0;
+        assert!(unsafe {
+            exchange_iat_with(slot, &state, false, |address, size, protection, old| {
+                calls += 1;
+                if calls == 2 {
+                    0
+                } else {
+                    VirtualProtect(address, size, protection, old)
+                }
+            })
+        }
+        .is_err());
+        assert_eq!(unsafe { slot.read() }, 0x3333);
+        assert!(!state.owned.load(Ordering::Acquire));
+        unsafe { AtomicUsize::from_ptr(slot) }.store(0x5555, Ordering::Release);
+        assert!(unsafe { exchange_iat(slot, &state, false) }.is_ok());
+        assert_eq!(unsafe { slot.read() }, 0x5555);
+        let conflict = IatSlot::installed(0, 0x3333, 0x6666);
+        conflict.owned.store(false, Ordering::Release);
+        assert!(matches!(
+            unsafe { exchange_iat(slot, &conflict, true) },
+            Err(EngineError::IatChanged)
+        ));
+        assert_eq!(unsafe { slot.read() }, 0x5555);
+        assert!(!conflict.owned.load(Ordering::Acquire));
+        assert_eq!(conflict.protection.load(Ordering::Acquire), 0);
+        let mut info = std::mem::MaybeUninit::<
+            windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION,
+        >::uninit();
+        assert_ne!(
+            unsafe { VirtualQuery(page, info.as_mut_ptr(), std::mem::size_of_val(&info)) },
+            0
+        );
+        assert_eq!(unsafe { info.assume_init() }.Protect, PAGE_READONLY);
+        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
