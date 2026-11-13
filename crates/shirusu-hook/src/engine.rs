@@ -215,7 +215,19 @@ pub unsafe fn install_hooks(
     // SAFETY: SizeOfImage 分がモジュールイメージ。
     let image = unsafe { std::slice::from_raw_parts(module_base, size) };
     let sites = pe::parse_imports(image);
-    let plan = build_plan(&sites);
+    let mut plan = build_plan(&sites);
+    // Inline installation later replaces the per-API original with its export
+    // trampoline. Routing a preexisting IAT wrapper through that shared slot
+    // would silently bypass the wrapper. Leave such imports untouched.
+    plan.preserve_noncanonical(|entry| {
+        let Some(export) = resolve_export(&entry.dll_name, entry.api.function) else {
+            return false;
+        };
+        // SAFETY: the import parser bounds-checks the pointer slot in this image.
+        let original =
+            unsafe { (module_base.add(entry.iat_rva as usize) as *const usize).read_unaligned() };
+        follow_import_thunks(original) == Some(export)
+    });
     if plan.entries.is_empty() {
         return Err(EngineError::NoTargets(plan));
     }

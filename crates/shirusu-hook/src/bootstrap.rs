@@ -180,6 +180,8 @@ impl AgentBootstrap {
                 1 => "installed",
                 2 => "not-imported-in-main-module",
                 3 => "not-attempted-internal-api",
+                4 => "noncanonical-import-preserved",
+                5 => "partially-installed-noncanonical-import-preserved",
                 _ => return None,
             };
             let bytes = &self.result_inline[id];
@@ -204,7 +206,9 @@ impl AgentBootstrap {
                     module: api.module.into(),
                     function: api.function.into(),
                     method: method.into(),
-                    outcome: if reason == "installed" {
+                    outcome: if reason == "partially-installed-noncanonical-import-preserved" {
+                        "partial"
+                    } else if reason == "installed" {
                         "installed"
                     } else if reason == "unknown" {
                         "unknown"
@@ -433,10 +437,27 @@ mod tests {
             .iter()
             .filter(|h| h.method == "inline")
             .all(|h| h.outcome == "installed"));
+        for (value, outcome, reason) in [
+            (4, "not-installed", "noncanonical-import-preserved"),
+            (
+                5,
+                "partial",
+                "partially-installed-noncanonical-import-preserved",
+            ),
+        ] {
+            b.result_iat[1] = value;
+            let report = b.hook_evidence().unwrap();
+            let iat = report
+                .iter()
+                .find(|h| h.api_id == 1 && h.method == "iat")
+                .unwrap();
+            assert_eq!(iat.outcome, outcome);
+            assert_eq!(iat.reason, reason);
+        }
         b.result_inline[1][0] = 0xff;
         assert!(b.hook_evidence().is_none());
         b.result_inline[1][0] = b'i';
-        b.result_iat[1] = 4;
+        b.result_iat[1] = 255;
         assert!(b.hook_evidence().is_none());
     }
 

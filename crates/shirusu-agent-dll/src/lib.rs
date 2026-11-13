@@ -374,6 +374,17 @@ mod win {
             let id = api.api_id as usize;
             b.result_iat[id] = if shirusu_hook::api::is_internal_api(api.api_id) {
                 3
+            } else if installed
+                .plan
+                .preserved
+                .iter()
+                .any(|e| e.api.api_id == api.api_id)
+            {
+                if iat_ids.contains(&api.api_id) {
+                    5
+                } else {
+                    4
+                }
             } else if iat_ids.contains(&api.api_id) {
                 1
             } else {

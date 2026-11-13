@@ -3,8 +3,8 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
-現時点で全ジョブの成功を確認済みの基準は `0a25f55` の
-[CI 43421257820](https://github.com/a-kaibu/shirusu-poc/actions/runs/43421257820)。
+現時点で全ジョブの成功を確認済みの基準は `f6c5048` の
+[CI 43424324395](https://github.com/a-kaibu/shirusu-poc/actions/runs/43424324395)。
 Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
 形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
 成功を新しいコードの合格証拠に流用しない。
@@ -537,3 +537,17 @@ Two regressions failed before the tracker fix; all Hook tests pass afterward,
 including rediscovery through each entry point and old/new identity separation.
 Windows also compiles a delayed-completion regression. This fixes tracking state;
 standard shared COM method interception remains deliberately disabled.
+
+## 既存 IAT ラッパーの保持
+
+IAT の実際の参照先が解決済みのシステム export（透明な import thunk を含む）と
+異なる場合、そのスロットを置き換えない。Inline 設置が API 共通の original を
+trampoline に更新した結果、アプリや別ツールの既存ラッパーを迂回する問題を防ぐ。
+Coverage には `noncanonical-import-preserved` を記録し、一部スロットだけを
+設置した場合も `partial` として区別する。静的 import の証拠は失わない。
+
+ネイティブ Attach fixture は事前に GetCurrentProcessId の IAT ラッパーを設置し、
+失敗時 rollback、Drop/unwind、再 Attach の後にも 100 回の呼び出しがすべて
+ラッパーを通ることと、Inline 経由の記録を確認する。今回追加した fixture の
+Windows 実行結果は次の CI で確認する。並行する第三者の IAT 書き換えとの
+競合解決はこの変更の保証に含めない。

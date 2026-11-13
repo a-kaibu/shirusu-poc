@@ -84,11 +84,11 @@ try {
     $coverage = ($coverageRaw -join [Environment]::NewLine) | ConvertFrom-Json
     $pidApi = @($coverage.apis | Where-Object { $_.api -eq "kernel32!GetCurrentProcessId" })
     if ($pidApi.Count -ne 1 -or $pidApi[0].enter -lt 100) { throw "coverage observation count missing" }
-    $iat = @($pidApi[0].hook_evidence | Where-Object { $_.method -eq "iat" -and $_.outcome -eq "installed" })
+    $iat = @($pidApi[0].hook_evidence | Where-Object { $_.method -eq "iat" -and $_.reason -eq "noncanonical-import-preserved" })
     $inline = @($pidApi[0].hook_evidence | Where-Object { $_.method -eq "inline" })
     if ($iat.Count -ne 1 -or $inline.Count -ne 1 -or -not $inline[0].reason) { throw "native per-API hook evidence missing" }
     Write-Host "API coverage ledger passed ($arch)"
-    Write-Host "Attach rollback, abandonment, unwind and reattach passed ($arch)"
+    Write-Host "Attach rollback, abandonment, unwind, IAT wrapper preservation and reattach passed ($arch)"
 } finally {
     foreach ($process in @($recorderProcess, $targetProcess)) {
         if ($null -ne $process) {

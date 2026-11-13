@@ -22,10 +22,27 @@ pub struct PatchEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookPlan {
     pub entries: Vec<PatchEntry>,
+    /// Imported slots preserved because their current target is not canonical.
+    pub preserved: Vec<PatchEntry>,
     /// このモジュールのインポートに現れず、フックできなかった API。
     /// 序数インポートは名前で照合できないため、対象関数の序数
     /// インポートもここに残る（正直な Coverage 欠落として扱う）。
     pub missing: Vec<&'static ApiDef>,
+}
+
+impl HookPlan {
+    /// Preserve wrappers belonging to the application or another instrumentation
+    /// tool. `missing` describes static imports, not installation success.
+    pub fn preserve_noncanonical(&mut self, mut canonical: impl FnMut(&PatchEntry) -> bool) {
+        let entries = std::mem::take(&mut self.entries);
+        for entry in entries {
+            if canonical(&entry) {
+                self.entries.push(entry);
+            } else {
+                self.preserved.push(entry);
+            }
+        }
+    }
 }
 
 pub fn build_plan(sites: &[ImportSite]) -> HookPlan {
@@ -58,7 +75,11 @@ pub fn build_plan(sites: &[ImportSite]) -> HookPlan {
     let missing = api_table()
         .filter(|a| !crate::api::is_internal_api(a.api_id) && !hooked.contains(&a.api_id))
         .collect();
-    HookPlan { entries, missing }
+    HookPlan {
+        entries,
+        missing,
+        preserved: Vec::new(),
+    }
 }
 
 /// 設置失敗時の巻き戻し結果（レビュー第5回 #8）。
@@ -141,6 +162,21 @@ mod tests {
             ordinal: if func.is_none() { Some(7) } else { None },
             iat_rva: iat,
         }
+    }
+
+    #[test]
+    fn preserving_a_wrapper_keeps_static_import_evidence() {
+        let mut plan = build_plan(&[
+            site("kernel32.dll", Some("ReadFile"), 0x100),
+            site("kernel32.dll", Some("ReadFile"), 0x108),
+        ]);
+        let missing = plan.missing.clone();
+        plan.preserve_noncanonical(|entry| entry.iat_rva == 0x108);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].iat_rva, 0x108);
+        assert_eq!(plan.preserved.len(), 1);
+        assert_eq!(plan.preserved[0].iat_rva, 0x100);
+        assert_eq!(plan.missing, missing);
     }
 
     #[test]
