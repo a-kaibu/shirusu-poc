@@ -321,6 +321,9 @@ mod win {
         // 成功として継続する。Factory 関数が 1 つもフックできなくても、
         // Win32 API の記録は続く（COM メソッドの記録だけが無い）。
         // SAFETY: 初期化専用スレッドからの呼び出し（L01 と同じ前提）。
+        // Cold initialization outside DllMain, before any factory can publish
+        // an adapter. Failure leaves factory observation available with skips.
+        let _ = shirusu_hook::shared_com::initialize();
         let com_factory_outcome = unsafe { engine::install_com_factory_hooks(&rt) };
         // L14: WinRT アクティベーション関数の Inline Hook を COM Factory
         // の後で設置する。COM Factory と同じく best-effort であり、
@@ -501,7 +504,8 @@ mod win {
         // SAFETY: lifecycle operations are serialized and descriptors are kept
         // only for installed hooks in their original, still-loaded modules.
         let unrestored = unsafe {
-            engine::uninstall_pending_inline_hooks(&mut state.com_factories)
+            shirusu_hook::shared_com::restore_all()
+                + engine::uninstall_pending_inline_hooks(&mut state.com_factories)
                 + engine::uninstall_pending_inline_hooks(&mut state.winrt_activations)
                 + engine::uninstall_pending_inline_hooks(&mut state.internal_hooks)
                 + engine::uninstall_pending_inline_hooks(&mut state.callbacks)

@@ -52,7 +52,8 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// SetWindowLongPtrW/A）。
 /// v10: bounded per-API IAT and Inline installation evidence.
 /// v11: freeze evidence capacity independently of API_COUNT.
-pub const BOOTSTRAP_VERSION: u32 = 11;
+/// v12: distinguish COM method return kinds from factory HRESULT payloads.
+pub const BOOTSTRAP_VERSION: u32 = 12;
 // Fixed protocol capacity: adding an API must not silently enlarge the native
 // structure while keeping the same Bootstrap version.
 pub const HOOK_EVIDENCE_COUNT: usize = 256;

@@ -170,6 +170,13 @@ mod win {
         unsafe {
             let shell = link as *const IShellLinkW;
             let vtbl = (*shell).vtbl;
+            // Balance an explicit application AddRef/Release, observable in
+            // both the hooked and baseline runs without assuming exact counts.
+            ((*vtbl).add_ref)(link);
+            ((*vtbl).release)(link);
+            if (*shell).vtbl != vtbl {
+                return Err("IUnknown interception changed object vptr".into());
+            }
             let mut persist: *mut c_void = std::ptr::null_mut();
             let hr = ((*vtbl).query_interface)(link, &IID_IPERSIST_FILE, &mut persist);
             if hr != 0 || persist.is_null() {

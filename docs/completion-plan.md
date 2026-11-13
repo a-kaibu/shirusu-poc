@@ -3,8 +3,8 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
-現時点で全ジョブの成功を確認済みの基準は `8e21c58` の
-[CI 43429384511](https://github.com/a-kaibu/shirusu-poc/actions/runs/43429384511)。
+現時点で全ジョブの成功を確認済みの基準は `7e8f22e` の
+[CI 43435482648](https://github.com/a-kaibu/shirusu-poc/actions/runs/43435482648)。
 Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
 形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
 成功を新しいコードの合格証拠に流用しない。
@@ -601,7 +601,7 @@ Runner 判定で同じ対象差分が 2 回連続して確認できたときだ�
 入力値の縮小・大域的最小性は保証しない。実際の互換実装との再現性は、
 利用者が設定する Runner と記録する実行証拠で判定する。
 
-## 共有 IUnknown の検証用 Adapter（標準モードはまだ無効）
+## 共有 IUnknown の Adapter と標準経路への接続
 
 画像に属する vtable の先頭 3 スロットだけを、正確な QueryInterface / ULONG
 ABI の Adapter にアトミックに置き換える実装を追加した。オブジェクトの vptr と
@@ -623,5 +623,13 @@ Windows の隔離子プロセステストで、共有 vtable、参照カウン�
 LastError、QI の同一性、元メソッドを実際に停止させた状態での並行解除、遅延呼出し、
 SEH の所有権回収、復元失敗、未公開失敗の反復、第三者の置換保持、実 DLL の
 アンロード通知とアドレス再利用モデルを検証する。x86/x64 Clippy と MSRV 1.87
-compile、Linux Hook テストは通過した。ネイティブ結果は次の CI で確認する。
-標準 Factory 経路への有効化は、この検証を通してから別途行う。
+compile、Linux Hook テストに加え、`7e8f22e` の CI 43435482648 で x86、x64 latest、
+Server 2022 のネイティブ検証を通過した。
+
+次の変更で標準 Factory / QI 経路へ接続し、Shutdown の復元・再試行にも組み込む。
+DLL アンロード済みの Adapter を持つ追跡記録は旧寿命として終了させ、同じアドレスの
+再発見に引き継がない。アンロードから Release=0 を推測しない。メソッド Leave は
+`return_i32_bits` と `return_kind` で HRESULT / ULONG を区別し、Factory Leave の
+3 フィールドは維持する。Bootstrap v12 で旧 Agent との混在を拒否する。
+標準経路の ShellLink E2E と新しい Trace のネイティブ検証は、この変更の CI で確認する。
+既存 Adapter 単体の成功を標準経路全体の合格とは扱わない。

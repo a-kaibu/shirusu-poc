@@ -41,7 +41,7 @@ fn trace(base: u64, width: u32, context: u32, clsid: Option<Guid>) -> shirusu_tr
         (
             2,
             COM_FACTORY_LEAVE_SCHEMA_ID,
-            encode_com_factory_leave(&com_method_leave_values(0, base + 400, 0)).unwrap(),
+            encode_com_factory_leave(&com_factory_leave_values(0, base + 400, 0)).unwrap(),
         ),
     ] {
         events.push(TraceEvent {

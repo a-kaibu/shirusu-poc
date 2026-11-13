@@ -333,13 +333,28 @@ fn pending(saved: &Slot) -> bool {
     })
 }
 
+/// Identity of a published adapter. Published slot identities are never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Installation {
+    pub newly_installed: bool,
+    pub table: usize,
+    pub slot: u32,
+}
+
+pub(crate) fn installation_retired(slot: u32) -> bool {
+    MODULE_EPOCHS.get(slot as usize).is_none_or(|epoch| {
+        let value = epoch.load(Ordering::Acquire);
+        value == 0 || value & 1 != 0
+    })
+}
+
 /// Install only the three universally typed IUnknown slots.
 ///
 /// # Safety
 /// `object` is a valid COM interface with an owned live reference throughout
 /// this call. Its first three slots obey the native IUnknown ABI. No concurrent
 /// third party may change page protections or unload its implementation module.
-pub unsafe fn install(rt: &Arc<HookRuntime>, object: usize) -> Result<bool, &'static str> {
+pub unsafe fn install(rt: &Arc<HookRuntime>, object: usize) -> Result<Installation, &'static str> {
     let _guard = crate::runtime::ReentrancyGuard::try_enter();
     if OBSERVER.load(Ordering::Acquire) == 0 {
         return Err("module-unload-observer-unavailable");
@@ -364,7 +379,11 @@ pub unsafe fn install(rt: &Arc<HookRuntime>, object: usize) -> Result<bool, &'st
                     originals[i] == wrapper(index, i)
                         && saved.protection[i].load(Ordering::Acquire) == 0
                 }) {
-                    return Ok(false);
+                    return Ok(Installation {
+                        newly_installed: false,
+                        table,
+                        slot: index as u32,
+                    });
                 }
                 return Err("iunknown-installation-incomplete");
             }
@@ -417,7 +436,11 @@ pub unsafe fn install(rt: &Arc<HookRuntime>, object: usize) -> Result<bool, &'st
         }
         return Err("iunknown-installation-incomplete");
     }
-    Ok(true)
+    Ok(Installation {
+        newly_installed: true,
+        table,
+        slot: index as u32,
+    })
 }
 
 /// Restore owned slots after the recording gate has closed. Keep failures for
@@ -485,6 +508,13 @@ pub fn restore_all() -> usize {
 
 #[cfg(test)]
 mod tests {
+    unsafe fn install(
+        rt: &std::sync::Arc<crate::runtime::HookRuntime>,
+        object: usize,
+    ) -> Result<bool, &'static str> {
+        unsafe { super::install(rt, object) }.map(|installation| installation.newly_installed)
+    }
+
     use super::*;
     use crate::com::IID_IUNKNOWN;
     use shirusu_agent::Agent;
@@ -722,7 +752,11 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        assert_eq!(unsafe { install(&rt, ptr) }, Ok(true));
+        assert_eq!(
+            unsafe { crate::engine::intercept_object(&rt, ptr, IID_IUNKNOWN) },
+            crate::engine::ComInterceptOutcome::IUnknownIntercepted
+        );
+        assert!(rt.with_com_tracker(|t| t.lookup(ptr as u64).unwrap().iunknown_intercepted));
         stop.store(true, Ordering::Release);
         reader.join().unwrap();
         assert_eq!(unsafe { install(&rt, ptr) }, Ok(false));
@@ -791,6 +825,30 @@ mod tests {
         assert_eq!(
             rt.with_com_tracker(|t| t.lookup(ptr as u64).unwrap().refcount),
             Some(0x80000001)
+        );
+        let tid = crate::thread_id::current() as u64;
+        let base =
+            unsafe { rt.agent().thread_region_base(tid) }.expect("recorded main-thread Ring");
+        let mut reader = unsafe {
+            shirusu_transport::ring::RingReader::new(base, RingConfig::new(8192, 1024 * 1024))
+        };
+        let batch = reader.drain_all();
+        let types =
+            shirusu_trace::schema::schema_types(&crate::com::com_method_leave_schema()).unwrap();
+        assert!(
+            batch
+                .events
+                .iter()
+                .filter(|e| e.descriptor.kind
+                    == shirusu_transport::descriptor::EventKind::CallLeave as u16
+                    && e.descriptor.schema_id == crate::com::COM_METHOD_LEAVE_SCHEMA_ID)
+                .any(|e| {
+                    let values = shirusu_trace::compact::decode_values(&types, &e.payload).unwrap();
+                    values[2].value == shirusu_trace::schema::TypedValue::U32(0x80000001)
+                        && values[3].value
+                            == shirusu_trace::schema::TypedValue::Str("refcount".into())
+                }),
+            "native ULONG result must carry the explicit refcount kind in the Trace"
         );
         object.refs.store(1, Ordering::SeqCst);
 

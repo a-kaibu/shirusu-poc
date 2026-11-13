@@ -1,10 +1,8 @@
 //! COM Factory observation, identity tracking, and interception metadata.
 //!
-//! Standard capture records CoCreateInstance / CoGetClassObject and the returned
-//! interface pointers. A returned pointer may refer to an existing shared
-//! object, so standard capture never replaces its vtable. The tracker retains
-//! `shared-object-safety-unproven` as the reason method capture was skipped;
-//! Host writes this limitation to Capture Coverage.
+//! Standard capture observes factories and intercepts image-backed IUnknown
+//! slots with typed adapters while preserving object vptr identity. Heap/private
+//! tables and derived methods remain unsupported; Host reports partial Coverage.
 //!
 //! The method tables and clone registry also support the experimental unsafe
 //! `engine::intercept_exclusive_object` path. Its caller must independently
@@ -18,8 +16,7 @@
 //!
 //! Direct3DCreate9 is listed as a known factory but is not intercepted in this
 //! version. COM method schemas describe raw argument slots (L1); they do not
-//! establish that typed capture or transparent shared-object interception is
-//! available.
+//! establish semantic output capture for derived methods.
 
 use shirusu_trace::compact::encode_values;
 use shirusu_trace::proto::SchemaDef;
@@ -482,42 +479,39 @@ pub fn com_method_enter_schema() -> SchemaDef {
     def
 }
 
-/// COM メソッド呼び出しの leave Schema。
-///
-/// フィールド:
-/// - `hresult` (I32): メソッドの HRESULT。AddRef / Release では
-///   返された参照カウント（ULONG）を I32 へ写したもの（この 2 メソッド
-///   では HRESULT ではない）。
-/// - `returned_object` (U64, CreatedObject): 新しく得られた
-///   インターフェイスのポインタ。Factory 呼び出しの成功時と
-///   `QueryInterface` の成功時に有効で、それ以外は 0。
-/// - `refcount` (U32): AddRef / Release が返した参照カウント。
-///   それ以外のメソッドでは 0（「対象外」を表す）。
+/// COM method result with explicit return interpretation. `return_i32_bits`
+/// preserves all 32 bits; only QueryInterface is classified as HRESULT by the
+/// method-index adapter. AddRef/Release have an unsigned `refcount` result.
+fn com_result_fields(return_name: &str) -> Vec<(String, Ty, u32)> {
+    vec![
+        (
+            return_name.into(),
+            Ty::I32,
+            ValueKind::Scalar.flags() | after(),
+        ),
+        (
+            "returned_object".into(),
+            Ty::U64,
+            ValueKind::CreatedObject.flags() | after(),
+        ),
+        (
+            "refcount".into(),
+            Ty::U32,
+            ValueKind::Scalar.flags() | after(),
+        ),
+    ]
+}
 pub fn com_method_leave_schema() -> SchemaDef {
-    let mut def = make_schema(
-        COM_METHOD_LEAVE_SCHEMA_ID,
-        "com!method/leave",
-        vec![
-            (
-                "hresult".to_string(),
-                Ty::I32,
-                ValueKind::Scalar.flags() | after(),
-            ),
-            (
-                "returned_object".to_string(),
-                Ty::U64,
-                ValueKind::CreatedObject.flags() | after(),
-            ),
-            (
-                "refcount".to_string(),
-                Ty::U32,
-                ValueKind::Scalar.flags() | after(),
-            ),
-        ],
-    );
-    def.annotation = "L1 (COM): hresult is the refcount for AddRef/Release; \
-        returned_object is set for factory calls and successful QueryInterface"
-        .to_string();
+    let mut fields = com_result_fields("return_i32_bits");
+    fields.push((
+        "return_kind".into(),
+        Ty::Str,
+        ValueKind::Scalar.flags() | after(),
+    ));
+    let mut def = make_schema(COM_METHOD_LEAVE_SCHEMA_ID, "com!method/leave", fields);
+    def.annotation = "L1 (COM): return_kind distinguishes hresult, refcount and opaque-32; \
+        return_i32_bits preserves raw 32-bit bits, refcount is ULONG for AddRef/Release"
+        .into();
     def
 }
 
@@ -569,12 +563,14 @@ pub fn com_factory_enter_schema() -> SchemaDef {
     schema
 }
 pub fn com_factory_leave_schema() -> SchemaDef {
-    let mut schema = com_method_leave_schema();
-    schema.schema_id = COM_FACTORY_LEAVE_SCHEMA_ID;
-    schema.name = "com!factory/leave".into();
-    // Schema identity includes its name and fields, not its numeric ID.
-    schema.content_hash = shirusu_trace::schema::schema_content_hash(&schema.name, &schema.fields);
-    schema
+    let mut def = make_schema(
+        COM_FACTORY_LEAVE_SCHEMA_ID,
+        "com!factory/leave",
+        com_result_fields("hresult"),
+    );
+    def.annotation =
+        "L1 (COM factory): HRESULT and returned interface; refcount is not observed".into();
+    def
 }
 pub fn com_factory_enter_values(args: &ComFactoryArgs) -> Vec<CapturedValue> {
     use shirusu_trace::schema::ValueCapture;
@@ -626,7 +622,7 @@ pub fn com_method_enter_values(
 }
 
 /// leave 値列を作る。
-pub fn com_method_leave_values(
+pub fn com_factory_leave_values(
     hresult: i32,
     returned_object: u64,
     refcount: u32,
@@ -635,6 +631,40 @@ pub fn com_method_leave_values(
         CapturedValue::captured(TypedValue::I32(hresult)),
         CapturedValue::captured(TypedValue::U64(returned_object)),
         CapturedValue::captured(TypedValue::U32(refcount)),
+    ]
+}
+/// For callers with an independently known HRESULT-returning method.
+pub fn com_method_leave_values(
+    hresult: i32,
+    returned_object: u64,
+    refcount: u32,
+) -> Vec<CapturedValue> {
+    method_result_values("hresult", hresult, returned_object, refcount)
+}
+pub fn com_method_leave_values_for(
+    method_index: u32,
+    bits: i32,
+    returned_object: u64,
+    refcount: u32,
+) -> Vec<CapturedValue> {
+    let kind = match method_index {
+        0 => "hresult",
+        1 | 2 => "refcount",
+        _ => "opaque-32",
+    };
+    method_result_values(kind, bits, returned_object, refcount)
+}
+fn method_result_values(
+    kind: &str,
+    bits: i32,
+    returned_object: u64,
+    refcount: u32,
+) -> Vec<CapturedValue> {
+    vec![
+        CapturedValue::captured(TypedValue::I32(bits)),
+        CapturedValue::captured(TypedValue::U64(returned_object)),
+        CapturedValue::captured(TypedValue::U32(refcount)),
+        CapturedValue::captured(TypedValue::Str(kind.into())),
     ]
 }
 
@@ -696,6 +726,10 @@ pub struct ComObject {
     pub discovered: ComDiscovery,
     /// vtable 複製による Detour が設置済みか。
     pub intercepted: bool,
+    /// First three image-backed slots are intercepted without replacing vptr.
+    pub iunknown_intercepted: bool,
+    /// Published adapter identity, retained on skips to detect module unload.
+    pub iunknown_slot: Option<u32>,
     /// Why standard observation did not install method interception.
     pub interception_skip_reason: Option<&'static str>,
     /// Release が 0 を返して寿命が終わったか（記録は残す）。
@@ -722,6 +756,8 @@ impl ComObject {
             refcount: None,
             discovered,
             intercepted: false,
+            iunknown_intercepted: false,
+            iunknown_slot: None,
             interception_skip_reason: None,
             destroyed: false,
             original_vtable: 0,
@@ -771,8 +807,35 @@ impl ComTracker {
     }
 
     pub fn note_interception_skipped(&mut self, ptr: u64) {
+        self.note_interception_skipped_with_reason(ptr, "shared-object-safety-unproven");
+    }
+
+    pub fn note_interception_skipped_with_reason(&mut self, ptr: u64, reason: &'static str) {
         if let Some(object) = self.objects.get_mut(&ptr) {
-            object.interception_skip_reason = Some("shared-object-safety-unproven");
+            object.interception_skip_reason = Some(reason);
+            object.iunknown_intercepted = false;
+        }
+    }
+
+    pub fn note_iunknown_intercepted(&mut self, ptr: u64, table: u64, slot: u32) {
+        if let Some(object) = self.objects.get_mut(&ptr).filter(|o| !o.destroyed) {
+            object.iunknown_intercepted = true;
+            object.iunknown_slot = Some(slot);
+            object.original_vtable = table;
+            object.interception_skip_reason = interface_by_iid(&object.iid)
+                .filter(|def| def.methods.len() > 3)
+                .map(|_| "remaining-methods-unsupported");
+        }
+    }
+
+    /// Module unload ends this implementation lifetime, without inventing a
+    /// Release return value. A later discovery must create a new instance.
+    pub fn note_implementation_unloaded(&mut self, ptr: u64) {
+        if let Some(object) = self.objects.get_mut(&ptr) {
+            object.destroyed = true;
+            object.refcount = None;
+            object.iunknown_intercepted = false;
+            object.interception_skip_reason = Some("implementation-unloaded");
         }
     }
 
@@ -1233,10 +1296,44 @@ mod tests {
         let bytes = encode_com_leave(&leave).expect("encode leave");
         let types = schema_types(&com_method_leave_schema()).unwrap();
         let back = decode_values(&types, &bytes).expect("decode leave");
-        assert_eq!(back.len(), 3);
+        assert_eq!(back.len(), 4);
+        assert_eq!(back[3].value, TypedValue::Str("hresult".into()));
         assert_eq!(back[0].value, TypedValue::I32(0));
         assert_eq!(back[1].value, TypedValue::U64(0x9999));
         assert_eq!(back[2].value, TypedValue::U32(0));
+    }
+
+    #[test]
+    fn method_return_kind_preserves_unsigned_refcounts_and_factory_hresult() {
+        let method = com_method_leave_schema();
+        assert_eq!(method.fields[0].name, "return_i32_bits");
+        assert_eq!(method.fields[3].name, "return_kind");
+        let types = schema_types(&method).unwrap();
+        for index in [1, 2] {
+            for count in [0, 1, 0x80000001, u32::MAX] {
+                let values = com_method_leave_values_for(index, count as i32, 0, count);
+                let decoded = decode_values(&types, &encode_com_leave(&values).unwrap()).unwrap();
+                assert_eq!(decoded[0].value, TypedValue::I32(count as i32));
+                assert_eq!(decoded[2].value, TypedValue::U32(count));
+                assert_eq!(decoded[3].value, TypedValue::Str("refcount".into()));
+            }
+        }
+        let query = com_method_leave_values_for(0, 0x80004002u32 as i32, 0, 0);
+        assert_eq!(query[3].value, TypedValue::Str("hresult".into()));
+        let unknown = com_method_leave_values_for(3, -1, 0, 0);
+        assert_eq!(unknown[3].value, TypedValue::Str("opaque-32".into()));
+        let factory = com_factory_leave_schema();
+        assert_eq!(factory.fields.len(), 3);
+        assert_eq!(factory.fields[0].name, "hresult");
+        let values = com_factory_leave_values(0x80004002u32 as i32, 0, 0);
+        assert_eq!(
+            decode_values(
+                &schema_types(&factory).unwrap(),
+                &encode_com_factory_leave(&values).unwrap()
+            )
+            .unwrap(),
+            values
+        );
     }
 
     #[test]
@@ -1316,6 +1413,34 @@ mod tests {
             t.note_query_interface(0x1000, 0x1000, IID_ISHELL_LINK_W, true),
             QueryInterfaceOutcome::SamePointer
         );
+    }
+
+    #[test]
+    fn unloaded_implementation_retires_identity_without_fabricating_release() {
+        let mut t = ComTracker::new();
+        t.note_factory_result(0x1000, IID_ISHELL_LINK_W, "fixture");
+        let old = t.instance_token(0x1000).unwrap();
+        t.note_add_ref(0x1000, 7);
+        t.note_iunknown_intercepted(0x1000, 0x7000, 12);
+        let object = t.lookup(0x1000).unwrap();
+        assert!(object.iunknown_intercepted);
+        assert_eq!(
+            object.interception_skip_reason,
+            Some("remaining-methods-unsupported")
+        );
+        assert_eq!(object.cloned_vtable, None);
+        t.note_interception_skipped_with_reason(0x1000, "iunknown-installation-incomplete");
+        assert_eq!(t.lookup(0x1000).unwrap().iunknown_slot, Some(12));
+        t.note_implementation_unloaded(0x1000);
+        assert!(!t.instance_matches(0x1000, &old));
+        assert_eq!(t.lookup(0x1000).unwrap().refcount, None);
+        t.note_factory_result(0x1000, IID_IUNKNOWN, "fixture");
+        assert!(!t.instance_matches(0x1000, &old));
+        let fresh = t.lookup(0x1000).unwrap();
+        assert!(!fresh.iunknown_intercepted);
+        assert_eq!(fresh.iunknown_slot, None);
+        t.note_iunknown_intercepted(0x1000, 0x7000, 13);
+        assert_eq!(t.lookup(0x1000).unwrap().interception_skip_reason, None);
     }
 
     #[test]

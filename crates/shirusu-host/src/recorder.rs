@@ -899,8 +899,8 @@ impl CaptureSession {
         if self.com_factory_count.is_some() || self.winrt_activation_count.is_some() {
             report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
             report.notes.push(
-                "COM/WinRT method interception skipped: shared-object-safety-unproven; \
-                 factory and activation results do not establish exclusive access"
+                "COM/WinRT method coverage is partial: image-backed-iunknown-only; \
+                 heap/private vtables and remaining methods are unsupported"
                     .into(),
             );
         }

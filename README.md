@@ -24,7 +24,7 @@ shirusu の Agent–Host 転送仕様 v0.4（SPSC Ring と状態遷移）の PoC
 
 > 範囲について: 最初の実装対象は `shirusu-transport` の SPSC Ring と状態遷移でした（spec.md 末尾の決定）。
 > 2026-11-09 の指示で対象はトレーサー全体へ拡大し、Phase 2（公開 Trace への変換）、Phase 3（フック＋レコーダ）、Phase 4（解析 CLI）、Phase 5（ippai 連携基盤）へ対象を拡大しました。Windows／Linux／macOS の CI でも検証していますが、全体の完成を意味しません。確認済みの基準と残件は completion-plan に記録しています。
-> COMとWinRTはFactory／Activation呼び出しと返却ポインタを記録します。通常の記録では、返されたインターフェイスが他スレッドと共有されていないことを証明できないため、vtableを書き換えず、メソッド記録の不足をCoverageに`shared-object-safety-unproven`として残します。Inline Hookの解除ではトランポリンをプロセス終了まで保持し、公開済みの保持領域と未公開の予約を合わせて4,096件に制限します。未公開の領域は見送り・失敗時に解放し、解放を確認できた予約分を上限へ戻します。Hostへの再接続と予備Queueは初版では扱いません。
+> COMとWinRTはFactory／Activation呼び出しと返却ポインタを記録します。通常の記録では、画像領域のvtableに対してIUnknownの3メソッドを型付きで記録し、オブジェクトのvptrは変更しません。ヒープ上のvtableと派生メソッドは未対応で、Coverageに`image-backed-iunknown-only`として不足を残します。Inline Hookの解除ではトランポリンをプロセス終了まで保持し、公開済みの保持領域と未公開の予約を合わせて4,096件に制限します。未公開の領域は見送り・失敗時に解放し、解放を確認できた予約分を上限へ戻します。Hostへの再接続と予備Queueは初版では扱いません。
 
 ## 当初設計との照合（2026年11月13日）
 

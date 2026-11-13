@@ -364,14 +364,14 @@ fn com_methods_missing_for_safety_degrade_coverage_with_reason() {
         .integrity
         .notes
         .iter()
-        .any(|n| n.contains("shared-object-safety-unproven")));
+        .any(|n| n.contains("image-backed-iunknown-only")));
     let trace = shirusu_trace::reader::read_trace(&std::fs::read(&path).unwrap()).unwrap();
     assert!(trace
         .finalization
         .unwrap()
         .notes
         .iter()
-        .any(|n| n.contains("shared-object-safety-unproven")));
+        .any(|n| n.contains("image-backed-iunknown-only")));
 }
 
 #[test]

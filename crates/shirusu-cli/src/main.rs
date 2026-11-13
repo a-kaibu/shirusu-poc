@@ -176,10 +176,10 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                             JsonValue::Str("CoGetClassObject".into()),
                         ]),
                     ),
-                    ("standard_method_interception", JsonValue::Bool(false)),
+                    ("standard_method_interception", JsonValue::Bool(true)),
                     (
                         "method_limit",
-                        JsonValue::Str("shared-object-safety-unproven".into()),
+                        JsonValue::Str("image-backed-iunknown-only".into()),
                     ),
                 ]),
             ),
@@ -203,7 +203,7 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                 }
             );
         }
-        println!("COM: {} known IIDs; factory observation; standard method interception unavailable (shared-object-safety-unproven)", shirusu_trace::com_catalog::COM_INTERFACES.len());
+        println!("COM: {} known IIDs; factory observation; partial method interception (image-backed-iunknown-only)", shirusu_trace::com_catalog::COM_INTERFACES.len());
     }
     Ok(())
 }

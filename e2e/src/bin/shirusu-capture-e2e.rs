@@ -752,19 +752,42 @@ mod win {
                             );
                             c.check(
                                 names.iter().all(|name| !name.contains("::")),
-                                "shared COM object methods are not patched",
+                                "COM factory names remain separate from method names",
                             );
                             c.check(
                                 com_enters.len() == com_leaves.len(),
                                 "COM factory enter/leave pairs",
+                            );
+                            let method_names: Vec<String> = events
+                                .iter()
+                                .filter(|e| {
+                                    e.schema_id == shirusu_hook::com::COM_METHOD_ENTER_SCHEMA_ID
+                                })
+                                .filter_map(|e| com_method_name(&trace, e))
+                                .collect();
+                            for method in ["QueryInterface", "AddRef", "Release"] {
+                                c.check(
+                                    method_names
+                                        .iter()
+                                        .any(|name| name.ends_with(&format!("::{method}"))),
+                                    &format!("image-backed IUnknown {method} recorded"),
+                                );
+                            }
+                            c.check(
+                                method_names.iter().all(|name| {
+                                    ["::QueryInterface", "::AddRef", "::Release"]
+                                        .iter()
+                                        .any(|suffix| name.ends_with(suffix))
+                                }),
+                                "derived COM methods are not claimed as intercepted",
                             );
                             c.check(
                                 summary
                                     .integrity
                                     .notes
                                     .iter()
-                                    .any(|n| n.contains("shared-object-safety-unproven")),
-                                "COM method Coverage explains the safety skip",
+                                    .any(|n| n.contains("image-backed-iunknown-only")),
+                                "COM method Coverage explains partial coverage",
                             );
                         }
                         // WinRT (L14): winrt アプリは RoActivateInstance、
@@ -857,16 +880,16 @@ mod win {
                                 })
                                 .collect();
                             c.check(
-                                com_enters.is_empty() && com_leaves.is_empty(),
-                                "shared WinRT interfaces are not patched",
+                                com_enters.len() == com_leaves.len(),
+                                "WinRT IUnknown method enter/leave pairs",
                             );
                             c.check(
                                 summary
                                     .integrity
                                     .notes
                                     .iter()
-                                    .any(|n| n.contains("shared-object-safety-unproven")),
-                                "WinRT method Coverage explains the safety skip",
+                                    .any(|n| n.contains("image-backed-iunknown-only")),
+                                "WinRT method Coverage explains partial coverage",
                             );
                         }
                         // コールバック (L16): gui アプリはメッセージ専用
@@ -1125,8 +1148,8 @@ mod win {
         // WinRT は L14 でアクティベーション関数（Inline Hook）と vtable メソッドを記録する。
         println!("coverage evaluation (L17):");
         println!("  recorded: file I/O (CreateFileW/WriteFile/ReadFile/CloseHandle)");
-        println!("  recorded: COM factory results; method interception skipped (shared-object-safety-unproven)");
-        println!("  recorded: WinRT activations; shared interface methods skipped (shared-object-safety-unproven)");
+        println!("  recorded: COM factory results; method interception skipped (image-backed-iunknown-only)");
+        println!("  recorded: WinRT activations; shared interface methods skipped (image-backed-iunknown-only)");
         for (group, names, note) in [
             (
                 "registry",

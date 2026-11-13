@@ -1086,6 +1086,10 @@ pub enum ComInterceptOutcome {
     UnknownInterface,
     /// Factory / QI does not prove exclusive access to the returned object.
     SharedObjectSafetyUnproven,
+    /// Installed only the three typed IUnknown methods in an image-backed table.
+    IUnknownIntercepted,
+    IUnknownAlreadyIntercepted,
+    MethodInterceptionSkipped(&'static str),
     /// オブジェクト／元の vtable の読み取りに失敗した。
     ReadFailed,
     /// 複製 vtable の確保に失敗した。
@@ -1423,15 +1427,48 @@ pub unsafe fn install_callback_hooks(rt: &HookRuntime) -> CallbackOutcome {
     outcome
 }
 
-/// Standard observation never patches an object whose exclusive ownership is
-/// unknown. COM factories, QI and WinRT activation may return shared objects.
-/// The skip reason is retained by the tracker and reported in host Coverage.
-pub fn intercept_object(rt: &HookRuntime, ptr: usize, iid: Guid) -> ComInterceptOutcome {
+fn retire_unloaded_com_address(tracker: &mut crate::com::ComTracker, ptr: u64) {
+    if tracker
+        .lookup(ptr)
+        .and_then(|o| o.iunknown_slot)
+        .is_some_and(crate::shared_com::installation_retired)
+    {
+        tracker.note_implementation_unloaded(ptr);
+    }
+}
+
+/// Install typed IUnknown adapters without replacing the object's vptr.
+///
+/// # Safety
+/// `ptr` must hold a valid owned COM reference throughout installation and
+/// obey the IUnknown ABI and module lifetime contract of `shared_com::install`.
+pub unsafe fn intercept_object(
+    rt: &Arc<HookRuntime>,
+    ptr: usize,
+    iid: Guid,
+) -> ComInterceptOutcome {
     if interface_by_iid(&iid).is_none() {
         return ComInterceptOutcome::UnknownInterface;
     }
-    rt.with_com_tracker(|t| t.note_interception_skipped(ptr as u64));
-    ComInterceptOutcome::SharedObjectSafetyUnproven
+    if rt.with_com_tracker(|t| t.lookup(ptr as u64).is_some_and(|o| o.intercepted)) {
+        return ComInterceptOutcome::AlreadyIntercepted;
+    }
+    match unsafe { crate::shared_com::install(rt, ptr) } {
+        Ok(installed) => {
+            rt.with_com_tracker(|t| {
+                t.note_iunknown_intercepted(ptr as u64, installed.table as u64, installed.slot)
+            });
+            if installed.newly_installed {
+                ComInterceptOutcome::IUnknownIntercepted
+            } else {
+                ComInterceptOutcome::IUnknownAlreadyIntercepted
+            }
+        }
+        Err(reason) => {
+            rt.with_com_tracker(|t| t.note_interception_skipped_with_reason(ptr as u64, reason));
+            ComInterceptOutcome::MethodInterceptionSkipped(reason)
+        }
+    }
 }
 
 /// 追跡対象のインターフェイスへ vtable 複製による Detour を設置する。
@@ -1452,6 +1489,9 @@ pub unsafe fn intercept_exclusive_object(
     let Some(def) = interface_by_iid(&iid) else {
         return ComInterceptOutcome::UnknownInterface;
     };
+    if rt.with_com_tracker(|t| t.lookup(ptr as u64).is_some_and(|o| o.iunknown_intercepted)) {
+        return ComInterceptOutcome::IUnknownAlreadyIntercepted;
+    }
     let already =
         rt.with_com_tracker(|t| t.lookup(ptr as u64).map(|o| o.intercepted).unwrap_or(false));
     if already {
@@ -1981,11 +2021,12 @@ type CoGetClassObjectFn = unsafe extern "system-unwind" fn(
 /// 設置の成否は呼び出しの成否に影響しない（best-effort）。
 fn on_factory_result(rt: &Arc<HookRuntime>, factory: &'static str, iid: Guid, ptr: usize) {
     rt.with_com_tracker(|t| {
+        retire_unloaded_com_address(t, ptr as u64);
         t.note_factory_result(ptr as u64, iid, factory);
     });
     if interface_by_iid(&iid).is_some() {
-        // Factory results may already be shared; record the safe skip.
-        let _ = intercept_object(rt, ptr, iid);
+        // SAFETY: successful factory returned an owned live COM reference.
+        let _ = unsafe { intercept_object(rt, ptr, iid) };
     }
 }
 
@@ -2064,7 +2105,7 @@ unsafe extern "system-unwind" fn detour_co_create_instance(
             }
         }
     }
-    let values = crate::com::com_method_leave_values(hr, returned_object, 0);
+    let values = crate::com::com_factory_leave_values(hr, returned_object, 0);
     if let Ok(bytes) = crate::com::encode_com_factory_leave(&values) {
         rt.record_com_factory_leave(tid, call_id, &bytes);
     }
@@ -2148,7 +2189,7 @@ unsafe extern "system-unwind" fn detour_co_get_class_object(
             }
         }
     }
-    let values = crate::com::com_method_leave_values(hr, returned_object, 0);
+    let values = crate::com::com_factory_leave_values(hr, returned_object, 0);
     if let Ok(bytes) = crate::com::encode_com_factory_leave(&values) {
         rt.record_com_factory_leave(tid, call_id, &bytes);
     }
@@ -2886,6 +2927,8 @@ fn com_method_post_call(
                 return (0, 0);
             }
             rt.with_com_tracker(|t| {
+                retire_unloaded_com_address(t, this as u64);
+                retire_unloaded_com_address(t, out as u64);
                 if t.instance_matches(this as u64, instance) {
                     t.note_query_interface(this as u64, out as u64, iid, true);
                 } else {
@@ -2897,7 +2940,7 @@ fn com_method_post_call(
             if interface_by_iid(&iid).is_some() {
                 // SAFETY: out は元の QI が返した有効なインターフェイス。
                 // Detour の中で、ポインタがアプリへ返される前に呼ぶ。
-                let _ = intercept_object(rt, out, iid);
+                let _ = unsafe { intercept_object(rt, out, iid) };
             }
             (out as u64, 0)
         }
@@ -2952,12 +2995,13 @@ fn com_method_post_call(
                 return (0, 0);
             };
             rt.with_com_tracker(|t| {
+                retire_unloaded_com_address(t, ptr as u64);
                 t.note_method_returned(ptr as u64, iid, this as u64, method_name);
             });
             if interface_by_iid(&iid).is_some() {
                 // SAFETY: ptr は元のメソッドが返した有効なインターフェイス。
                 // Detour の中で、ポインタがアプリへ返される前に呼ぶ。
-                let _ = intercept_object(rt, ptr, iid);
+                let _ = unsafe { intercept_object(rt, ptr, iid) };
             }
             (ptr as u64, 0)
         }
@@ -3019,6 +3063,7 @@ pub(crate) fn com_method_dispatch_with(
     // 追跡対象の確認：このセッションで追跡していないオブジェクトは
     // 元のメソッドを素通しで呼ぶ（記録しない）。
     let (iid, interface_name, method_name, instance) = match rt.with_com_tracker(|t| {
+        retire_unloaded_com_address(t, this as u64);
         let instance = t.instance_token(this as u64)?;
         t.lookup(this as u64).and_then(|o| {
             interface_by_iid(&o.iid).and_then(|d| {
@@ -3080,7 +3125,8 @@ pub(crate) fn com_method_dispatch_with(
     pop_call(call_id);
     let (returned_object, refcount) =
         com_method_post_call(&rt, this, &instance, method_index, args, ret);
-    let values = crate::com::com_method_leave_values(ret, returned_object, refcount);
+    let values =
+        crate::com::com_method_leave_values_for(method_index, ret, returned_object, refcount);
     if let Ok(bytes) = crate::com::encode_com_leave(&values) {
         rt.record_com_leave(tid, call_id, &bytes);
     }
@@ -4537,9 +4583,17 @@ mod tests {
         unsafe extern "system-unwind" fn method(_: usize) -> u32 {
             123
         }
-        let vtable = Arc::new([method as *const () as usize; 3]);
+        unsafe extern "system-unwind" fn qi(_: usize, _: *const Guid, _: *mut usize) -> i32 {
+            COM_E_FAIL
+        }
+        let vtable = Arc::new([
+            qi as *const () as usize,
+            method as *const () as usize,
+            method as *const () as usize,
+        ]);
         let object = Arc::new(vtable.as_ptr() as usize);
-        let rt = test_runtime();
+        let rt = Arc::new(test_runtime());
+        assert!(crate::shared_com::initialize());
         let ptr = Arc::as_ptr(&object) as usize;
         rt.with_com_tracker(|t| {
             t.note_factory_result(ptr as u64, IID_IUNKNOWN, "fixture");
@@ -4554,15 +4608,15 @@ mod tests {
         });
         for _ in 0..1000 {
             assert_eq!(
-                intercept_object(&rt, ptr, IID_IUNKNOWN),
-                ComInterceptOutcome::SharedObjectSafetyUnproven
+                unsafe { intercept_object(&rt, ptr, IID_IUNKNOWN) },
+                ComInterceptOutcome::MethodInterceptionSkipped("vtable-not-image-data")
             );
         }
         reader.join().unwrap();
         assert_eq!(*object, vtable.as_ptr() as usize);
         assert_eq!(
             rt.with_com_tracker(|t| t.lookup(ptr as u64).unwrap().interception_skip_reason),
-            Some("shared-object-safety-unproven")
+            Some("vtable-not-image-data")
         );
     }
 
