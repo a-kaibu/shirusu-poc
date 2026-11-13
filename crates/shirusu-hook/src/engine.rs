@@ -413,6 +413,25 @@ pub struct InlineHook {
     pub stolen_len: usize,
     /// パッチ前の先頭バイト（stolen_len 分）。
     pub original_bytes: Vec<u8>,
+    /// Only these bytes were overwritten; stolen instruction tails stay intact.
+    pub patched_len: usize,
+    /// Exact bytes published by this hook, for ownership checks on removal.
+    pub installed_bytes: Vec<u8>,
+    pub restoration: InlineRestoration,
+}
+
+#[derive(Debug, Default)]
+pub struct InlineRestoration {
+    protection: std::sync::atomic::AtomicU32,
+    code_released: std::sync::atomic::AtomicBool,
+    cache_pending: std::sync::atomic::AtomicBool,
+}
+impl InlineHook {
+    pub fn maintenance_pending(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.restoration.protection.load(Ordering::Acquire) != 0
+            || self.restoration.cache_pending.load(Ordering::Acquire)
+    }
 }
 
 /// Inline Hook の設置結果。IAT とは別経路のため、API ごとに設置／
@@ -753,32 +772,160 @@ fn alloc_near(target: usize, size: usize) -> Option<usize> {
 
 /// 対象アドレスへパッチバイト列を書き込む（保護属性を一時変更し、
 /// 命令キャッシュを捨てる）。
-fn patch_target(target: usize, patch: &[u8]) -> Result<(), ()> {
-    patch_target_with(target, patch, || {})
+fn restore_inline(hook: &InlineHook) -> Result<(), ()> {
+    restore_inline_with_ops(
+        hook,
+        |address, size, protection, old| unsafe { VirtualProtect(address, size, protection, old) },
+        |address, size| unsafe { FlushInstructionCache(GetCurrentProcess(), address, size) },
+    )
 }
 
-fn patch_target_with(target: usize, patch: &[u8], before_write: impl FnOnce()) -> Result<(), ()> {
-    let mut old: u32 = 0;
-    // SAFETY: 呼び出し側が有効な対象アドレスを渡す。
-    let ok = unsafe {
-        VirtualProtect(
-            target as *const c_void,
-            patch.len(),
-            PAGE_EXECUTE_READWRITE,
-            &mut old,
-        )
+fn restore_inline_with_ops(
+    hook: &InlineHook,
+    mut protect: impl FnMut(*const c_void, usize, u32, *mut u32) -> i32,
+    mut flush: impl FnMut(*const c_void, usize) -> i32,
+) -> Result<(), ()> {
+    use std::sync::atomic::Ordering;
+    let bytes = hook.original_bytes.get(..hook.patched_len).ok_or(())?;
+    if !hook.restoration.code_released.load(Ordering::Acquire) {
+        // Current x86/x64 jump encodings are at most 14 bytes. A fixed buffer
+        // avoids allocation while application threads are suspended.
+        let mut observed = [0u8; 32];
+        let observed = observed.get_mut(..hook.patched_len).ok_or(())?;
+        if hook.installed_bytes.len() != observed.len()
+            || !ProcessMemory.read_exact(hook.target as u64, observed)
+        {
+            return Err(());
+        }
+        if observed != hook.installed_bytes.as_slice() {
+            // A different owner replaced the patch. Retain its bytes and only
+            // finish page/cache work still owed by our earlier publication.
+            hook.restoration
+                .code_released
+                .store(true, Ordering::Release);
+            finish_inline_write(hook.target, bytes.len(), &hook.restoration, protect, flush);
+            return if hook.maintenance_pending() {
+                Err(())
+            } else {
+                Ok(())
+            };
+        }
+        patch_target_with_ops(
+            hook.target,
+            bytes,
+            &hook.restoration,
+            || {},
+            &mut protect,
+            &mut flush,
+        )?;
+        hook.restoration
+            .code_released
+            .store(true, Ordering::Release);
+    } else {
+        finish_inline_write(hook.target, bytes.len(), &hook.restoration, protect, flush);
+    }
+    if hook.maintenance_pending() {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_inline_write(
+    target: usize,
+    len: usize,
+    state: &InlineRestoration,
+    mut protect: impl FnMut(*const c_void, usize, u32, *mut u32) -> i32,
+    mut flush: impl FnMut(*const c_void, usize) -> i32,
+) {
+    use std::sync::atomic::Ordering;
+    let protection = state.protection.load(Ordering::Acquire);
+    if protection != 0 {
+        let mut ignored = 0;
+        if protect(target as *const c_void, len, protection, &mut ignored) != 0 {
+            state.protection.store(0, Ordering::Release);
+        }
+    }
+    if state.cache_pending.load(Ordering::Acquire) && flush(target as *const c_void, len) != 0 {
+        state.cache_pending.store(false, Ordering::Release);
+    }
+}
+
+/// Err means nothing was published. Post-write failures remain owned by state;
+/// callers must keep the descriptor even though the pointer is already live.
+fn patch_target_with(
+    target: usize,
+    patch: &[u8],
+    state: &InlineRestoration,
+    before_write: impl FnOnce(),
+) -> Result<(), ()> {
+    patch_target_with_ops(
+        target,
+        patch,
+        state,
+        before_write,
+        |address, size, protection, old| unsafe { VirtualProtect(address, size, protection, old) },
+        |address, size| unsafe { FlushInstructionCache(GetCurrentProcess(), address, size) },
+    )
+}
+
+fn patch_target_with_ops(
+    target: usize,
+    patch: &[u8],
+    state: &InlineRestoration,
+    before_write: impl FnOnce(),
+    mut protect: impl FnMut(*const c_void, usize, u32, *mut u32) -> i32,
+    flush: impl FnMut(*const c_void, usize) -> i32,
+) -> Result<(), ()> {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS,
     };
-    if ok == 0 {
+    let end = target.checked_add(patch.len()).ok_or(())?;
+    if patch.is_empty() {
         return Err(());
     }
+    let mut region = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+    if unsafe {
+        VirtualQuery(
+            target as *const c_void,
+            region.as_mut_ptr(),
+            std::mem::size_of_val(&region),
+        )
+    } == 0
+    {
+        return Err(());
+    }
+    let region = unsafe { region.assume_init() };
+    // VirtualProtect reports only the first page's protection. Refuse crossing
+    // regions rather than flattening different original protections on restore.
+    if region.State != MEM_COMMIT
+        || region.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+        || (region.BaseAddress as usize)
+            .checked_add(region.RegionSize)
+            .is_none_or(|limit| end > limit)
+    {
+        return Err(());
+    }
+    let mut old = 0;
+    if protect(
+        target as *const c_void,
+        patch.len(),
+        PAGE_EXECUTE_READWRITE,
+        &mut old,
+    ) == 0
+    {
+        return Err(());
+    }
+    let _ = state
+        .protection
+        .compare_exchange(0, old, Ordering::AcqRel, Ordering::Acquire);
     before_write();
-    // SAFETY: 同上。書き込み後は元の保護属性へ戻す。
     unsafe {
         std::ptr::copy_nonoverlapping(patch.as_ptr(), target as *mut u8, patch.len());
-        let mut tmp: u32 = 0;
-        VirtualProtect(target as *const c_void, patch.len(), old, &mut tmp);
-        FlushInstructionCache(GetCurrentProcess(), target as *const c_void, patch.len());
     }
+    state.cache_pending.store(true, Ordering::Release);
+    finish_inline_write(target, patch.len(), state, protect, flush);
     Ok(())
 }
 
@@ -883,11 +1030,14 @@ fn prepare_inline(
     // SAFETY: 確保したての実行可能領域へ書き込む。
     unsafe {
         std::ptr::copy_nonoverlapping(code.as_ptr(), trampoline as *mut u8, code.len());
-        FlushInstructionCache(
+        if FlushInstructionCache(
             GetCurrentProcess(),
             trampoline as *const c_void,
             TRAMPOLINE_SIZE,
-        );
+        ) == 0
+        {
+            return Err("flush-failed");
+        }
     }
     Ok((
         InlineHook {
@@ -897,6 +1047,9 @@ fn prepare_inline(
             trampoline_size: TRAMPOLINE_SIZE,
             stolen_len: p.plan.stolen_len,
             original_bytes: p.original_bytes.clone(),
+            patched_len: patch.len(),
+            installed_bytes: patch.clone(),
+            restoration: InlineRestoration::default(),
         },
         patch,
         allocation,
@@ -926,7 +1079,18 @@ fn install_planned(
                     *result = Err("thread-in-target");
                     continue;
                 }
-                if patch_target_with(p.target, patch, || {
+                let mut observed = [0u8; 64];
+                let unchanged = observed
+                    .get_mut(..p.original_bytes.len())
+                    .is_some_and(|bytes| {
+                        ProcessMemory.read_exact(p.target as u64, bytes)
+                            && bytes == p.original_bytes.as_slice()
+                    });
+                if !unchanged {
+                    *result = Err("target-changed");
+                    continue;
+                }
+                if patch_target_with(p.target, patch, &hook.restoration, || {
                     // VirtualProtect has succeeded, so the only remaining steps
                     // publish the original and copy the patch. Once visible, retain
                     // the trampoline even if a later operation cannot complete.
@@ -1067,11 +1231,11 @@ unsafe fn uninstall_inline_indices(installed: &[InlineHook]) -> Vec<usize> {
         return (0..installed.len()).collect();
     };
     for (index, h) in installed.iter().enumerate() {
-        if suspender.any_ip_in_range(h.target, h.target + h.original_bytes.len()) {
+        if suspender.any_ip_in_range(h.target, h.target + h.patched_len) {
             unrestored.push(index);
             continue;
         }
-        match patch_target(h.target, &h.original_bytes) {
+        match restore_inline(h) {
             Ok(()) => {}
             Err(()) => unrestored.push(index),
         }
@@ -4865,6 +5029,20 @@ mod tests {
                 0
             );
         }
+        // A hook installed after planning must not be overwritten or leave a
+        // stale trampoline published as this session's original.
+        unsafe {
+            (target as *mut u8).write(0xcc);
+        }
+        let rt = test_runtime();
+        let result = install_planned(&rt, &[planned], bitness).pop().unwrap();
+        assert!(matches!(result, Err("target-changed")));
+        assert_eq!(unsafe { (target as *const u8).read() }, 0xcc);
+        assert_eq!(rt.original(17), 0);
+        assert_eq!(
+            TRAMPOLINE_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         unsafe { VirtualFree(target as *mut c_void, 0, MEM_RELEASE) };
     }
 
@@ -4977,10 +5155,203 @@ mod tests {
     }
 
     #[test]
+    fn inline_post_write_failures_retain_protection_and_cache_retry_state() {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+        };
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!page.is_null());
+        unsafe {
+            std::ptr::write_bytes(page, 0x90, 4096);
+        }
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &mut old) },
+            0
+        );
+        let hook = InlineHook {
+            api_id: 17,
+            target: page as usize,
+            trampoline: 0,
+            trampoline_size: 0,
+            stolen_len: 8,
+            original_bytes: vec![0x90; 8],
+            patched_len: 5,
+            installed_bytes: vec![0xcc; 5],
+            restoration: InlineRestoration::default(),
+        };
+        let published = std::cell::Cell::new(false);
+        let mut calls = 0;
+        assert!(patch_target_with_ops(
+            hook.target,
+            &[0xcc; 5],
+            &hook.restoration,
+            || published.set(true),
+            |address, size, protection, old| {
+                calls += 1;
+                if calls == 2 {
+                    0
+                } else {
+                    unsafe { VirtualProtect(address, size, protection, old) }
+                }
+            },
+            |_, _| 0
+        )
+        .is_ok());
+        assert!(published.get());
+        assert!(hook.maintenance_pending());
+        assert_eq!(
+            hook.restoration.protection.load(Ordering::Acquire),
+            PAGE_EXECUTE_READ
+        );
+        assert!(hook.restoration.cache_pending.load(Ordering::Acquire));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(page.cast::<u8>(), 5) },
+            &[0xcc; 5]
+        );
+        // Bytes beyond the actual patch may have a different owner.
+        unsafe {
+            page.cast::<u8>().add(7).write(0x77);
+        }
+        let mut calls = 0;
+        assert!(restore_inline_with_ops(
+            &hook,
+            |address, size, protection, old| {
+                calls += 1;
+                if calls == 2 {
+                    0
+                } else {
+                    unsafe { VirtualProtect(address, size, protection, old) }
+                }
+            },
+            |_, _| 0
+        )
+        .is_err());
+        assert!(hook.restoration.code_released.load(Ordering::Acquire));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(page.cast::<u8>(), 5) },
+            &[0x90; 5]
+        );
+        assert_eq!(unsafe { page.cast::<u8>().add(7).read() }, 0x77);
+        // Retry protection/cache only; never write restored bytes again.
+        unsafe {
+            page.cast::<u8>().write(0xab);
+        }
+        assert!(restore_inline(&hook).is_ok());
+        assert!(!hook.maintenance_pending());
+        assert_eq!(unsafe { page.cast::<u8>().read() }, 0xab);
+        let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+        assert_ne!(
+            unsafe { VirtualQuery(page, info.as_mut_ptr(), std::mem::size_of_val(&info)) },
+            0
+        );
+        assert_eq!(unsafe { info.assume_init() }.Protect, PAGE_EXECUTE_READ);
+        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn inline_restore_preserves_a_foreign_patch_without_changing_protection() {
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!page.is_null());
+        unsafe {
+            std::ptr::write_bytes(page, 0xdd, 4096);
+        }
+        let hook = InlineHook {
+            api_id: 17,
+            target: page as usize,
+            trampoline: 0,
+            trampoline_size: 0,
+            stolen_len: 5,
+            original_bytes: vec![0x90; 5],
+            patched_len: 5,
+            installed_bytes: vec![0xcc; 5],
+            restoration: InlineRestoration::default(),
+        };
+        assert!(restore_inline_with_ops(
+            &hook,
+            |_, _, _, _| panic!("foreign code protection changed"),
+            |_, _| panic!("no cache update owed")
+        )
+        .is_ok());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(page.cast::<u8>(), 5) },
+            &[0xdd; 5]
+        );
+        assert!(hook
+            .restoration
+            .code_released
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn inline_patch_refuses_different_page_protections_before_publication() {
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8192,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!page.is_null());
+        unsafe {
+            std::ptr::write_bytes(page, 0x90, 8192);
+        }
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &mut old) },
+            0
+        );
+        let target = page as usize + 4094;
+        let published = std::cell::Cell::new(false);
+        let mut protect_calls = 0;
+        assert!(patch_target_with_ops(
+            target,
+            &[0xcc; 4],
+            &InlineRestoration::default(),
+            || published.set(true),
+            |_, _, _, _| {
+                protect_calls += 1;
+                0
+            },
+            |_, _| 0
+        )
+        .is_err());
+        assert!(!published.get());
+        assert_eq!(protect_calls, 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(target as *const u8, 4) },
+            &[0x90; 4]
+        );
+        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
     fn failed_page_protection_does_not_publish_a_trampoline() {
         let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
         let published = std::cell::Cell::new(false);
-        assert!(patch_target_with(0, &[0x90], || published.set(true)).is_err());
+        assert!(
+            patch_target_with(0, &[0x90], &InlineRestoration::default(), || published
+                .set(true))
+            .is_err()
+        );
         assert!(!published.get());
     }
 
@@ -5036,6 +5407,9 @@ mod tests {
                 trampoline_size: 4096,
                 stolen_len: code.len(),
                 original_bytes: code.to_vec(),
+                patched_len: code.len(),
+                installed_bytes: vec![0x90; code.len()],
+                restoration: InlineRestoration::default(),
             };
             let address = hook.trampoline;
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -5125,6 +5499,9 @@ mod tests {
             trampoline_size: 0,
             stolen_len: code.len(),
             original_bytes: vec![0x90; code.len()],
+            patched_len: code.len(),
+            installed_bytes: code.to_vec(),
+            restoration: InlineRestoration::default(),
         };
         let mut pending = vec![hook];
         let unrestored = unsafe { uninstall_pending_inline_hooks(&mut pending) };

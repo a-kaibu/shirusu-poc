@@ -421,8 +421,12 @@ mod win {
             };
             let reason = if shirusu_hook::api::is_internal_api(api.api_id) && b.detailed_mode == 0 {
                 "detailed-mode-disabled"
-            } else if outcome.installed.iter().any(|h| h.api_id == api.api_id) {
-                "installed"
+            } else if let Some(hook) = outcome.installed.iter().find(|h| h.api_id == api.api_id) {
+                if hook.maintenance_pending() {
+                    "installed-restoration-pending"
+                } else {
+                    "installed"
+                }
             } else {
                 outcome
                     .skipped

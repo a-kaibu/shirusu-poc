@@ -210,7 +210,11 @@ impl AgentBootstrap {
                     module: api.module.into(),
                     function: api.function.into(),
                     method: method.into(),
-                    outcome: if reason == "partially-installed-noncanonical-import-preserved" {
+                    outcome: if matches!(
+                        reason,
+                        "partially-installed-noncanonical-import-preserved"
+                            | "installed-restoration-pending"
+                    ) {
                         "partial"
                     } else if reason == "installed" {
                         "installed"
@@ -458,6 +462,16 @@ mod tests {
             assert_eq!(iat.outcome, outcome);
             assert_eq!(iat.reason, reason);
         }
+        let pending = b"installed-restoration-pending";
+        b.result_inline[1].fill(0);
+        b.result_inline[1][..pending.len()].copy_from_slice(pending);
+        let report = b.hook_evidence().unwrap();
+        let inline = report
+            .iter()
+            .find(|h| h.api_id == 1 && h.method == "inline")
+            .unwrap();
+        assert_eq!(inline.outcome, "partial");
+        assert_eq!(inline.reason, "installed-restoration-pending");
         b.result_inline[1][0] = 0xff;
         assert!(b.hook_evidence().is_none());
         b.result_inline[1][0] = b'i';
