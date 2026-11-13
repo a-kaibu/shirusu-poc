@@ -137,9 +137,24 @@ pub struct ReentrancyGuard {
 impl ReentrancyGuard {
     /// Detour 入口で呼ぶ。再入中なら `None` を返す。
     pub fn try_enter() -> Option<Self> {
-        Self::try_enter_with(|| {
+        let guard = Self::try_enter_with(|| {
             CALL_STACK.try_with(|_| ()).is_ok() && shirusu_agent::current_thread_capture_available()
-        })
+        })?;
+        // Initialize destructor-bearing runtime TLS only after all earlier TLS
+        // registration has returned. Nested allocator detours cannot do this:
+        // Rust rejects registering another destructor inside System allocation.
+        let ready = RUNTIME_CACHE_READY
+            .try_with(|ready| {
+                if !ready.get() {
+                    if DETOUR_RUNTIME.try_with(|_| ()).is_err() {
+                        return false;
+                    }
+                    ready.set(true);
+                }
+                true
+            })
+            .unwrap_or(false);
+        ready.then_some(guard)
     }
 
     fn try_enter_with(available: impl FnOnce() -> bool) -> Option<Self> {
@@ -481,6 +496,7 @@ impl Drop for DetourFlight {
 // Exhaustion refuses publication rather than wrapping into an old TLS identity.
 static NEXT_RUNTIME_REVISION: AtomicU64 = AtomicU64::new(1);
 thread_local! {
+    static RUNTIME_CACHE_READY: Cell<bool> = const { Cell::new(false) };
     static RUNTIME_CACHE_BUSY: Cell<bool> = const { Cell::new(false) };
     static DETOUR_RUNTIME: RefCell<(u64, Weak<HookRuntime>)> =
         const { RefCell::new((0, Weak::new())) };
@@ -573,9 +589,10 @@ impl RuntimeSlot {
         // acquires ownership before use; there are no borrowed atomic pointers.
         // An entry concurrent with replacement may still take the old runtime,
         // whose recording gate is disabled before unregister publishes retirement.
-        if let Some(_access) = ReentrancyGuard::is_active()
-            .then(RuntimeCacheAccess::enter)
-            .flatten()
+        if let Some(_access) = (ReentrancyGuard::is_active()
+            && RUNTIME_CACHE_READY.try_with(Cell::get).unwrap_or(false))
+        .then(RuntimeCacheAccess::enter)
+        .flatten()
         {
             if let Ok(Some(rt)) = DETOUR_RUNTIME.try_with(|cache| {
                 let mut cache = cache.try_borrow_mut().ok()?;
@@ -1651,6 +1668,33 @@ mod tests {
         assert!(rt.wait_in_flight_drained(Duration::from_secs(5)));
         holder.join().unwrap();
         assert_eq!(rt.in_flight(), 0);
+    }
+
+    #[test]
+    fn nested_detour_during_capture_tls_registration_cannot_initialize_cache() {
+        std::thread::spawn(|| {
+            let slot = RuntimeSlot::new();
+            let (_, rt) = runtime();
+            let rt = Arc::new(rt);
+            assert!(slot.register(rt.clone()).is_ok());
+            assert!(!RUNTIME_CACHE_READY.with(Cell::get));
+            let guard = ReentrancyGuard::try_enter_with(|| {
+                // CALL_STACK/Agent TLS destructor registration can enter here
+                // before try_enter has finished preparing capture TLS.
+                assert!(ReentrancyGuard::is_active());
+                assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &rt));
+                true
+            })
+            .unwrap();
+            assert_eq!(DETOUR_RUNTIME.with(|c| c.borrow().0), 0);
+            drop(guard);
+            let _guard = ReentrancyGuard::try_enter().unwrap();
+            assert!(RUNTIME_CACHE_READY.with(Cell::get));
+            assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &rt));
+            assert_ne!(DETOUR_RUNTIME.with(|c| c.borrow().0), 0);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
