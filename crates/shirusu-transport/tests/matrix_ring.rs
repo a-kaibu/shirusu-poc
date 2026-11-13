@@ -234,6 +234,48 @@ fn leave_of_dropped_enter_is_dropped_even_with_space() {
     );
 }
 #[test]
+fn dropped_enter_terminal_events_consume_tracking_and_account_payload() {
+    for terminal in [EventKind::CallLeave, EventKind::CallAborted] {
+        let (_rg, mut writer, mut reader, _clock) = setup(2, 256, no_wait());
+        writer.write(input(EventKind::CallEnter, 1, b"a"));
+        writer.write(input(EventKind::CallEnter, 2, b"b"));
+        assert_eq!(
+            kind_of(&writer.write(input(EventKind::CallEnter, 3, b"entry"))),
+            "dropped"
+        );
+        reader.drain_all();
+        let terminal_payload = if terminal == EventKind::CallLeave {
+            &b"leave"[..]
+        } else {
+            &[][..]
+        };
+        assert_eq!(
+            kind_of(&writer.write(input(terminal, 3, terminal_payload))),
+            "dropped"
+        );
+        let counters = reader.loss_counters();
+        assert_eq!(counters.dropped_events, 2);
+        assert_eq!(
+            counters.dropped_payload_bytes,
+            (5 + terminal_payload.len()) as u64
+        );
+        assert!(reader.drain_all().events.is_empty());
+        // Reusing the ID here verifies the terminal consumed the dropped-enter
+        // marker; a later terminal must not inherit obsolete tracking.
+        assert_eq!(
+            kind_of(&writer.write(input(EventKind::CallEnter, 3, b"new"))),
+            "published"
+        );
+        assert_eq!(
+            kind_of(&writer.write(input(EventKind::CallLeave, 3, b"done"))),
+            "published"
+        );
+        assert_eq!(reader.drain_all().events.len(), 2);
+        assert_eq!(reader.loss_counters(), counters);
+    }
+}
+
+#[test]
 fn leave_with_unrelated_call_id_unaffected() {
     let (_rg, mut w, _rd, _clk) = setup(2, 256, no_wait());
     w.write(input(EventKind::CallEnter, 1, b"a"));

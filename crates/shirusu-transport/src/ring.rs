@@ -483,9 +483,13 @@ impl RingWriter {
         let seq = self.next_sequence;
         self.next_sequence += 1; // 失敗したイベントにも Sequence を割り当てる
         let payload_len = input.payload.len() as u64;
-        // CallEnter を捨てた呼出の CallLeave も捨てる（writer 側で追跡）。
-        if input.kind == EventKind::CallLeave && self.dropped_enter_calls.remove(&input.call_id) {
+        // A dropped Enter cannot have a paired normal or exceptional terminal event.
+        // Consume tracking on either path and account for every discarded byte.
+        if matches!(input.kind, EventKind::CallLeave | EventKind::CallAborted)
+            && self.dropped_enter_calls.remove(&input.call_id)
+        {
             fetch_add(self.base, OFF_DROPPED_EVENTS, 1);
+            fetch_add(self.base, OFF_DROPPED_PAYLOAD_BYTES, payload_len);
             return WriteOutcome::Dropped {
                 sequence: seq,
                 reason: CaptureState::DroppedByBackpressure,

@@ -380,3 +380,14 @@ pointer widths. Without the required input context the raw value is Unsupported,
 not silently discarded. This is a narrow handwritten L1 semantic rule; the
 four-API declarative contract pilot remains unchanged. Native typed-Detour tests
 exercise all five dispositions and caller LastError transparency.
+
+### Terminal events after dropped entries (2026-11-13)
+
+RingWriter now consumes dropped-enter tracking on CallAborted as well as CallLeave,
+so an exceptional return cannot leave a stale marker or publish an orphan terminal
+that the normal-return policy would suppress. Forced terminal drops now count their
+payload bytes as well as their event. A regression failed against the old writer
+(dropped payload 5 instead of 10 bytes) and passes with the fix; it also covers an
+aborted call and subsequent reuse of its ID to detect stale tracking. Full transport
+and Agent tests pass. This corrects loss accounting, not the underlying throughput
+shortfall; it must not be reported as eliminating event loss.
