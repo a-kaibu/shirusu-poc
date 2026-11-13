@@ -478,7 +478,7 @@ mod imp {
     pub fn wait_process(process_handle_value: HandleValue, timeout: Duration) -> Option<u32> {
         use windows_sys::Win32::Foundation::CloseHandle as CH;
         use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-        let handle = h(process_handle_value as usize);
+        let handle = h(process_handle_value);
         let ms = super::wait_timeout_millis(timeout);
         let r = unsafe { WaitForSingleObject(handle, ms) };
         if r != 0 {
@@ -1242,9 +1242,10 @@ impl shirusu_transport::TimestampSource for QpcTimestampSource {
             let mut v: i64 = 0;
             let ok = unsafe { QueryPerformanceCounter(&mut v) };
             if ok != 0 && v > 0 {
-                return v as u64;
+                v as u64
+            } else {
+                0
             }
-            return 0;
         }
         #[cfg(not(windows))]
         {

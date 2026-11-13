@@ -284,3 +284,32 @@ observed pre-publication occupancy instead of requiring an intermediate producer
 publication below the threshold. The real Ring regression fails before the fix;
 all transport tests, Clippy and MSRV checks pass after it. No new fence or waiting
 operation was added, and the bounded polling fallback remains required.
+
+### Rejected Agent cache borrowing experiment
+
+An isolated Linux release component experiment held a checked TLS state borrow
+through publication to avoid the per-event Arc clone/drop, while retaining the
+Ring writer Mutex and falling back to owned state on cache misses. It passed the
+Agent tests, including management calls while the cache was borrowed, but
+`shirusu-phases-bench` measured roughly 81–87 ns/event instead of 65–70 ns/event.
+Explicit inlining did not improve it; restoring the original source restored
+roughly 65–70 ns/event. The experiment was discarded, not shipped as a Fast Path.
+These are isolated component observations, not Windows injected measurements.
+
+The corpus CI suite now also includes a 14-call error/sharing/disposition Probe.
+It records errors without pinning an unobserved numerical LastError value in the
+input. Expected valid handles and failed CloseHandle outcomes are checked;
+CreateFileW's raw failure and meaningful success errors remain evidence to
+compare across environments. This extends the initial happy-path sample without
+claiming complete filesystem-state or asynchronous coverage.
+
+Run `43407103711` (`4dc6364`) passed the complete CI matrix, including fuzz and
+both notification regressions on Windows. GUI remained complete at 1.524x /
+1.742x / 2.074x, while high-load remained degraded at 121.123x / 111.979x /
+100.704x (latest x64 / Server 2022 / WoW64). The next measurement adds an explicit
+release-only invocation of the real typed HeapAlloc Detour with a stub original,
+including Runtime acquisition, call-stack state, SEH cleanup boundary and two
+Ring events. Direct-stub and SEH-only timings are reported separately. It patches
+no process, allocates no real application heap block, has no competing Host or
+notification event, verifies zero losses and preserves LastError; it must not be
+read as the injected application's slowdown or additive CPU attribution.

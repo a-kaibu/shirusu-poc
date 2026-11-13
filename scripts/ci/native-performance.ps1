@@ -19,6 +19,10 @@ $phasesPath = Join-Path $work "native-performance-phases-$arch.txt"
 $phasesExit = $LASTEXITCODE
 if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR }
 if ($phasesExit -ne 0) { throw "component benchmark failed: $phasesExit" }
+& cargo test -p shirusu-hook --release --target $Target --lib engine::tests::measure_generic_detour -- --ignored --exact --nocapture | Tee-Object -FilePath $phasesPath -Append
+$detourPhasesExit = $LASTEXITCODE
+if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }
+if ($detourPhasesExit -ne 0) { throw "typed detour benchmark failed: $detourPhasesExit" }
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "MSVC compiler not found" }

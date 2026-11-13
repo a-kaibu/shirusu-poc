@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "name": "file-io-open-errors-v1",
+  "rules": [],
+  "steps": [
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "missing.bin",
+        "dwDesiredAccess": 2147483648,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 3,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "missing"
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "missing"
+        }
+      },
+      "expect": {
+        "return": "zero"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "shared.bin",
+        "dwDesiredAccess": 3221225472,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 1,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "exclusive",
+      "expect": {
+        "return": "valid-handle"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "shared.bin",
+        "dwDesiredAccess": 3221225472,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 1,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "duplicate"
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "duplicate"
+        }
+      },
+      "expect": {
+        "return": "zero"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "shared.bin",
+        "dwDesiredAccess": 2147483648,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 3,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "denied"
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "denied"
+        }
+      },
+      "expect": {
+        "return": "zero"
+      }
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "exclusive"
+        }
+      },
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "shared.bin",
+        "dwDesiredAccess": 3221225472,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 4,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "existing_always",
+      "expect": {
+        "return": "valid-handle"
+      }
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "existing_always"
+        }
+      },
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "shared.bin",
+        "dwDesiredAccess": 3221225472,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 2,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "existing_replace",
+      "expect": {
+        "return": "valid-handle"
+      }
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "existing_replace"
+        }
+      },
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "lpFileName": "new.bin",
+        "dwDesiredAccess": 3221225472,
+        "dwShareMode": 0,
+        "lpSecurityAttributes": null,
+        "dwCreationDisposition": 4,
+        "dwFlagsAndAttributes": 128,
+        "hTemplateFile": null
+      },
+      "store": "new_always",
+      "expect": {
+        "return": "valid-handle"
+      }
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "new_always"
+        }
+      },
+      "expect": {
+        "return": "nonzero"
+      }
+    }
+  ]
+}

@@ -3873,6 +3873,121 @@ mod tests {
         )
     }
 
+    /// Explicit release-only measurement; normal test runs skip it. This invokes
+    /// the actual typed Detour and SEH boundary, but patches no process and has
+    /// no concurrent Host, notification event or real heap allocation.
+    #[test]
+    #[ignore = "run explicitly in release mode for native component measurements"]
+    fn measure_generic_detour() {
+        use shirusu_transport::ring::RingReader;
+        use std::{hint::black_box, time::Instant};
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        // Compile in debug test builds too, but reject accidentally measuring
+        // an unoptimized binary when this ignored test is explicitly selected.
+        #[allow(clippy::assertions_on_constants)]
+        assert!(!cfg!(debug_assertions), "measurement requires --release");
+        #[inline(never)]
+        unsafe extern "system-unwind" fn original(
+            _: *mut c_void,
+            _: u32,
+            size: usize,
+        ) -> *mut c_void {
+            crate::last_error::set(0x1234);
+            size as *mut c_void
+        }
+        const CALLS: usize = 1024;
+        const ROUNDS: usize = 7;
+        let config = RingConfig::new(4096, 1024 * 1024);
+        let agent = Arc::new(
+            Agent::new(
+                Arc::new(SlotPool::new(2)),
+                config,
+                Arc::new(HostMonitor::always_alive()),
+            )
+            .with_timestamp_source(Arc::new(shirusu_transport_win::QpcTimestampSource::new())),
+        );
+        let rt = Arc::new(HookRuntime::new(agent.clone(), Vec::new(), None));
+        let api = crate::api::api_by_import("kernel32.dll", "HeapAlloc").unwrap();
+        rt.set_original(api.api_id, original as *const () as usize);
+        assert!(set_runtime(rt.clone()).is_ok());
+        let tid = unsafe { GetCurrentThreadId() } as u64;
+        rt.ensure_thread(tid);
+        // SAFETY: Agent owns the local Ring through all samples; this is its
+        // only producer and consumer. No hook patches are installed.
+        let base = unsafe { agent.thread_region_base(tid) }.unwrap();
+        let mut reader = unsafe { RingReader::new(base, config) };
+        let direct: unsafe extern "system-unwind" fn(*mut c_void, u32, usize) -> *mut c_void =
+            black_box(original);
+        let detour: unsafe extern "system-unwind" fn(*mut c_void, u32, usize) -> *mut c_void =
+            black_box(detour_generated_kernel32_heap_alloc);
+        for _ in 0..512 {
+            unsafe {
+                black_box(detour(std::ptr::null_mut(), 0, 64));
+            }
+        }
+        assert_eq!(reader.drain_all().events.len(), 1024);
+        let mut baseline = Vec::new();
+        let mut boundary = Vec::new();
+        let mut captured = Vec::new();
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                unsafe {
+                    black_box(direct(std::ptr::null_mut(), 0, black_box(64)));
+                }
+            }
+            baseline.push(started.elapsed().as_nanos() as f64 / CALLS as f64);
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                black_box(crate::seh::invoke(
+                    direct as *const () as usize,
+                    |address| {
+                        let call: unsafe extern "system-unwind" fn(
+                            *mut c_void,
+                            u32,
+                            usize,
+                        )
+                            -> *mut c_void = unsafe { std::mem::transmute(address) };
+                        unsafe { call(std::ptr::null_mut(), 0, 64) }
+                    },
+                    (),
+                ));
+            }
+            boundary.push(started.elapsed().as_nanos() as f64 / CALLS as f64);
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                unsafe {
+                    black_box(detour(std::ptr::null_mut(), 0, black_box(64)));
+                }
+            }
+            let last_error = crate::last_error::get();
+            captured.push(started.elapsed().as_nanos() as f64 / CALLS as f64);
+            assert_eq!(last_error, 0x1234);
+            let events = reader.drain_all().events;
+            assert_eq!(events.len(), 2 * CALLS);
+            assert!(events
+                .iter()
+                .all(|e| e.descriptor.api_id == api.api_id && !e.descriptor.payload_dropped()));
+            assert_eq!(rt.in_flight(), 0);
+        }
+        assert_eq!(reader.loss_counters(), Default::default());
+        assert!(clear_runtime(&rt));
+        println!("scope=typed-detour-with-stub-original; no patch, real heap work, Host, notification or disk; per-call includes two events; components overlap");
+        for (name, mut samples) in [
+            ("stub_original", baseline),
+            ("seh_stub_original", boundary),
+            ("typed_detour_two_events", captured),
+        ] {
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "phase={name} median_ns_per_call={:.2} min={:.2} max={:.2}",
+                samples[ROUNDS / 2],
+                samples[0],
+                samples[ROUNDS - 1]
+            );
+        }
+    }
+
     #[test]
     fn exit_thread_releases_detour_ownership_without_unwinding() {
         use windows_sys::Win32::System::Threading::{

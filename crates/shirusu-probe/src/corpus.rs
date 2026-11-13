@@ -380,6 +380,16 @@ mod tests {
         assert!(observations(&s, &bad).is_err());
     }
     #[test]
+    fn checked_in_probes_are_within_corpus_scope() {
+        for input in [
+            include_str!("../tests/fixtures/corpus-file-io.json"),
+            include_str!("../tests/fixtures/corpus-file-errors.json"),
+        ] {
+            validate(&TestSpec::parse(input).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn paths_are_local_and_not_devices() {
         for s in [
             "../a", "a/b", "C:a", "CON", "con.txt", "LPT9.bin", "a.", "..", "", "a b", "NUL",

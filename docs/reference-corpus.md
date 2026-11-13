@@ -45,7 +45,9 @@ Windows version/build and process architecture; this does not attest that the
 machine runs native Windows (a compatibility layer can report the same values).
 Labels and execution metadata provide provenance context, not attestation.
 
-Windows CI records the same six-call write/reopen/read Probe on Windows x64,
+Windows CI records the six-call write/reopen/read Probe and a separate
+14-call file-open/error Probe (missing file, exclusive sharing, duplicate create,
+CREATE_ALWAYS and OPEN_ALWAYS with existing/new files) on Windows x64,
 WoW64 x86 and Server 2022 and uploads `windows-reference-corpus-*` artifacts for
 30 days. Initial real entries for builds 26100 (x86/x64) and 20348 (x64) are also retained in
 [`corpus/`](../corpus/README.md), with CI provenance and exact raw bytes. These
