@@ -475,3 +475,13 @@ The regression fails before the fix with `notify: None` at 50% payload usage whi
 descriptor usage is below 5%, and passes afterward including partial-drain rearming.
 Transport, Agent and Host suites pass. Defaults remain unchanged and native
 performance/loss impact still requires measurement.
+
+### HeapAlloc LastError semantics (2026-11-13)
+
+The generic pointer-return default incorrectly treated HeapAlloc's residual
+LastError as meaningful on NULL failure. Microsoft explicitly states that
+[HeapAlloc does not call SetLastError on failure](https://learn.microsoft.com/windows/win32/api/heapapi/nf-heapapi-heapalloc).
+Its metadata override is now `never`: capture preserves the raw value as Stale
+on both success and failure. A regression failed on the old generated table and
+passes with NULL/non-NULL results and four residual values. Hook and generator
+suites, strict Clippy and generated-file consistency checks pass.

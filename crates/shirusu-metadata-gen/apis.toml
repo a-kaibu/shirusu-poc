@@ -301,6 +301,9 @@ function = "GetProcessHeap"
 namespace = "Windows.Win32.System.Memory"
 module = "kernel32.dll"
 function = "HeapAlloc"
+# HeapAlloc does not set LastError, even when it returns NULL.
+# https://learn.microsoft.com/windows/win32/api/heapapi/nf-heapapi-heapalloc
+last_error = "never"
 [[api]]
 namespace = "Windows.Win32.System.Memory"
 module = "kernel32.dll"

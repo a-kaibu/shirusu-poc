@@ -660,7 +660,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("hHeap", Ty::U64, ValueKind::Handle, BEFORE), ("dwFlags", Ty::U32, ValueKind::Scalar, BEFORE), ("dwBytes", Ty::U64, ValueKind::Scalar, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Pointer, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+    last_error_meaning: LastErrorMeaning::Never,
 },
 ApiDef {
     api_id: 73,

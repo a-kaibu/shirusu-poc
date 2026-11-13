@@ -784,6 +784,21 @@ mod tests {
     }
 
     #[test]
+    fn heap_alloc_does_not_claim_residual_last_error_on_failure() {
+        // HeapAlloc explicitly does not set LastError, including NULL failures.
+        let api = api_by_name("HeapAlloc").unwrap();
+        let types = schema_types(&api.leave_schema()).unwrap();
+        for returned in [0, 0x1234] {
+            for raw_error in [0, 5, 8, u32::MAX] {
+                let encoded = encode_generic_leave(api, returned, raw_error);
+                let values = decode_values(&types, encoded.as_bytes()).unwrap();
+                assert_eq!(values[1].capture, ValueCapture::Stale);
+                assert_eq!(values[1].value, TypedValue::U32(raw_error));
+            }
+        }
+    }
+
+    #[test]
     fn direct_field_encoding_matches_published_schemas_for_all_generated_apis() {
         for api in GENERATED_API_TABLE {
             for raw in [
