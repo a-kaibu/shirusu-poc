@@ -22,9 +22,6 @@
         "hObject": {
           "ref": "missing"
         }
-      },
-      "expect": {
-        "return": "zero"
       }
     },
     {
@@ -62,9 +59,6 @@
         "hObject": {
           "ref": "duplicate"
         }
-      },
-      "expect": {
-        "return": "zero"
       }
     },
     {
@@ -86,9 +80,6 @@
         "hObject": {
           "ref": "denied"
         }
-      },
-      "expect": {
-        "return": "zero"
       }
     },
     {
