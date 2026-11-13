@@ -1051,6 +1051,7 @@ fn inline_post_write_failures_retain_protection_and_cache_retry_state() {
         patched_len: 5,
         installed_bytes: vec![0xcc; 5],
         restoration: InlineRestoration::default(),
+        caller_boundary: false,
     };
     let published = std::cell::Cell::new(false);
     let mut calls = 0;
@@ -1145,6 +1146,7 @@ fn inline_restore_preserves_a_foreign_patch_without_changing_protection() {
         patched_len: 5,
         installed_bytes: vec![0xcc; 5],
         restoration: InlineRestoration::default(),
+        caller_boundary: false,
     };
     assert!(restore_inline_with_ops(
         &hook,
@@ -1274,6 +1276,7 @@ fn trampoline_survives_uninstall_for_late_passthrough() {
             patched_len: code.len(),
             installed_bytes: vec![0x90; code.len()],
             restoration: InlineRestoration::default(),
+            caller_boundary: false,
         };
         let address = hook.trampoline;
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1366,6 +1369,7 @@ fn uninstall_refuses_to_rewrite_a_stopped_instruction_pointer() {
         patched_len: code.len(),
         installed_bytes: code.to_vec(),
         restoration: InlineRestoration::default(),
+        caller_boundary: false,
     };
     let mut pending = vec![hook];
     let unrestored = unsafe { uninstall_pending_inline_hooks(&mut pending) };

@@ -21,7 +21,7 @@ Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意�
 | 要件 | 現状と残件 | 合格に必要な証拠 |
 | --- | --- | --- |
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
-| 標準の呼び出し境界 | Nt は詳細モードに分離。公開 Windows API 同士の内部呼び出しは caller address による境界判定が未実装 | Application / Runtime 起点の記録と Windows 内部起点の除外、callback 内の再開を実走で比較 |
+| 標準の呼び出し境界 | Inline Hook の入口スタブが呼び出し元の戻りアドレスを Detour へ渡し、Windows 配置のイメージから入った呼び出しを標準モードで除外。Application / Runtime / callback 内は記録、詳細モードは全記録。Windows 3 環境の `--modules` E2E で比較済み。Agent 内の Windows 判定は配置ベースで署名は未使用、`--module-class` 上書きは Agent へ未伝達 | Agent 側判定と Host の署名付き分類の一致検査、上書きの Agent への伝達 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
 | 全 Win32 の L0/L1 | 標準層197件に加え、主要23 DLL の生成可能 export 5,693 件を IAT 限定の広域層で記録（計5,890件）。広域層は動的解決・他 DLL 経由を捕捉しない。その他の DLL（約11,700件）、可変長引数、複合構造体の値渡し、13 引数以上が不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復、広域層の実機 Capture |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
@@ -845,3 +845,36 @@ API ID に対応付ける。TLS にはその frame のポインタだけを保�
 callback の実走確認が残る。土台の検証には、スレッド別・API 別の入れ子、
 入口の戻り先アドレス、LastError の往復、Rust allocator を呼ばない通常経路、
 ネイティブ例外後の外側状態の復元を使う。Windows 実行結果は CI で確認する。
+
+### 標準の呼び出し境界の接続（L23）
+
+API 表の Inline Hook は、パッチ先を Detour ではなくトランポリン領域内の
+入口スタブにした。スタブは入口時点の戻りアドレスを TEB の TLS スロットへ
+書いて Detour へ分岐する（x64 は `r11`、x86 は `eax` のみ。スタックは不変）。
+Detour は `prepare_inner` の最初でスロットを読んで 0 に戻すため、入れ子の
+呼び出しに上書きされず、別 API へ外側の呼び出し元を引き継がない。
+戻りアドレスを含むイメージを、実際の `kernel32.dll` と同じ Windows
+ディレクトリ配下の `System32` / `SysWOW64` / `WinSxS` か（デバイスパスで
+比較）で判定し、Windows なら標準モードでは記録せず素通しにする。
+実行基盤（UCRT 等）は Runtime、対象 EXE は Application、非イメージは
+Unknown として記録する。分類はイメージ範囲ごとにキャッシュし、
+`LdrRegisterDllNotification` のアンロード通知で捨てる。メインモジュールの
+IAT 経由はスタブを通らないが、呼び出し元は Application と確定している。
+スタブを置けなかった Inline Hook は `installed-without-caller-boundary`
+（partial）として Hook 証拠に残し、全呼び出しを記録する。
+
+`capture-e2e --modules` は既定・Runtime 記録・詳細モードの 3 回を比べる。
+`GetProcAddress` 経由のアプリの CreateFileW、CRT 経由、
+`EnumSystemCodePagesW` のコールバック内の CreateFileW は全モードで記録、
+`SHCreateStreamOnFileEx` 内部の CreateFileW は既定・Runtime 記録で 0 件、
+詳細モードで 1 件。ブランチの CI
+[43465004944](https://github.com/a-kaibu/shirusu-poc/actions/runs/43465004944)
+で Windows latest x64 / Server 2022 x64 / x86 WoW64 の 3 環境とも通過
+（rebase 前の `7b3727a`。macOS は待機の打ち切りで未完了）。スタブの戻りアドレスの
+受け渡しと実モジュールの分類はネイティブ単体テストでも確認する。
+
+残る制約: Agent 内の Windows 判定は配置ベースで、Host の署名付き分類と
+一致するかは検査していない。`--module-class` の上書きは Trace の分類にだけ
+効き、Agent の境界判定へは渡していない。COM メソッド・WinRT・コールバック
+検出の Hook は対象外（API 表のみ）。前節の native callsite frame は型付き
+入口向けの土台として残し、標準経路の判定は入口スタブ側で行う。

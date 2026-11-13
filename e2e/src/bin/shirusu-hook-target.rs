@@ -286,10 +286,169 @@ mod win {
             println!("TARGET_FAIL crt write n={n} closed={closed}");
             return 5;
         }
+        // L23: 標準の呼び出し境界の比較。Inline Hook の入口スタブを通る
+        // 3 経路（アプリ自身・Windows 内部・Windows からのコールバック内）で
+        // 同じ CreateFileW を使う。
+        let inline =
+            std::path::PathBuf::from(dir).join(format!("shirusu-runtime-caller-inline-{pid}.tmp"));
+        let windows =
+            std::path::PathBuf::from(dir).join(format!("shirusu-runtime-caller-windows-{pid}.tmp"));
+        let callback = std::path::PathBuf::from(dir)
+            .join(format!("shirusu-runtime-caller-callback-{pid}.tmp"));
+        if let Err(e) = boundary_calls(&inline, &windows, &callback) {
+            println!("TARGET_FAIL boundary: {e}");
+            return 6;
+        }
         println!("RUNTIME_CALLER direct {}", direct.display());
         println!("RUNTIME_CALLER crt {}", crt.display());
+        println!("RUNTIME_CALLER inline {}", inline.display());
+        println!("RUNTIME_CALLER windows {}", windows.display());
+        println!("RUNTIME_CALLER callback {}", callback.display());
         println!("RUNTIME_CALLER_DONE ok");
         0
+    }
+
+    type CreateFileWPtr = unsafe extern "system" fn(
+        *const u16,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
+    ) -> *mut c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn EnumSystemCodePagesW(callback: extern "system" fn(*const u16) -> i32, flags: u32)
+            -> i32;
+    }
+
+    static CALLBACK_TARGET: std::sync::Mutex<Option<(usize, Vec<u16>)>> =
+        std::sync::Mutex::new(None);
+    static CALLBACK_RESULT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn wide(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .collect()
+    }
+
+    /// GetProcAddress のポインタで呼ぶ（IAT を通らず Inline Hook の入口
+    /// スタブを通る）。呼び出し元はこの EXE（Application）。
+    fn create_via_pointer(create: CreateFileWPtr, path: &[u16]) -> Result<(), String> {
+        // SAFETY: path は NUL 終端。CREATE_ALWAYS で作って閉じる。
+        let h = unsafe {
+            create(
+                path.as_ptr(),
+                0x4000_0000,
+                0,
+                std::ptr::null_mut(),
+                2,
+                0x80,
+                std::ptr::null_mut(),
+            )
+        };
+        if is_invalid_handle(h) {
+            return Err(format!("create error={}", unsafe { GetLastError() }));
+        }
+        close(h);
+        Ok(())
+    }
+
+    extern "system" fn code_page_callback(_name: *const u16) -> i32 {
+        // Windows (kernelbase) calls this; the API call below comes from the app.
+        if CALLBACK_RESULT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            let ok = CALLBACK_TARGET
+                .lock()
+                .ok()
+                .and_then(|t| t.as_ref().map(|(f, p)| (*f, p.clone())))
+                .map(|(f, path)| {
+                    // SAFETY: f は GetProcAddress で得た CreateFileW。
+                    let create: CreateFileWPtr = unsafe { std::mem::transmute(f) };
+                    create_via_pointer(create, &path).is_ok()
+                })
+                .unwrap_or(false);
+            CALLBACK_RESULT.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::SeqCst);
+        }
+        0 // stop enumeration
+    }
+
+    fn boundary_calls(
+        inline: &std::path::Path,
+        windows: &std::path::Path,
+        callback: &std::path::Path,
+    ) -> Result<(), String> {
+        let kernel32 = wide(std::path::Path::new("kernel32.dll"));
+        // SAFETY: NUL 終端の名前。
+        let module = unsafe { GetModuleHandleW(kernel32.as_ptr()) };
+        // SAFETY: module はロード済み、名前は NUL 終端。
+        let f = unsafe { GetProcAddress(module, c"CreateFileW".as_ptr().cast()) };
+        if f.is_null() {
+            return Err("GetProcAddress(CreateFileW)".into());
+        }
+        // SAFETY: CreateFileW のシグネチャ。
+        let create: CreateFileWPtr = unsafe { std::mem::transmute(f) };
+        create_via_pointer(create, &wide(inline)).map_err(|e| format!("inline {e}"))?;
+
+        // Windows 内部起点: shlwapi/shcore が内部で CreateFileW を呼ぶ。
+        type ShCreateStreamFn = unsafe extern "system" fn(
+            *const u16,
+            u32,
+            u32,
+            i32,
+            *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+        let shlwapi = wide(std::path::Path::new("shlwapi.dll"));
+        // SAFETY: NUL 終端の名前。
+        let lib = unsafe { LoadLibraryW(shlwapi.as_ptr()) };
+        if lib.is_null() {
+            return Err("LoadLibraryW(shlwapi)".into());
+        }
+        // SAFETY: lib はロード済み、名前は NUL 終端。
+        let proc = unsafe { GetProcAddress(lib, c"SHCreateStreamOnFileEx".as_ptr().cast()) };
+        if proc.is_null() {
+            return Err("GetProcAddress(SHCreateStreamOnFileEx)".into());
+        }
+        // SAFETY: SHCreateStreamOnFileEx のシグネチャ。
+        let sh_create: ShCreateStreamFn = unsafe { std::mem::transmute(proc) };
+        let mut stream: *mut c_void = std::ptr::null_mut();
+        // STGM_CREATE | STGM_WRITE, FILE_ATTRIBUTE_NORMAL, fCreate = TRUE.
+        // SAFETY: path は NUL 終端、stream は書き込み可能。
+        let hr = unsafe {
+            sh_create(
+                wide(windows).as_ptr(),
+                0x1001,
+                0x80,
+                1,
+                std::ptr::null_mut(),
+                &mut stream,
+            )
+        };
+        if hr < 0 || stream.is_null() {
+            return Err(format!("SHCreateStreamOnFileEx hr={hr:#x}"));
+        }
+        // SAFETY: IUnknown::Release は vtable の 3 番目。
+        unsafe {
+            let vtbl = *(stream as *const *const usize);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*vtbl.add(2));
+            release(stream);
+        }
+
+        // Windows からアプリへのコールバック内で、アプリ自身が呼ぶ。
+        *CALLBACK_TARGET.lock().map_err(|_| "callback lock")? = Some((f as usize, wide(callback)));
+        // SAFETY: コールバックは 'static。CP_INSTALLED = 1。
+        unsafe { EnumSystemCodePagesW(code_page_callback, 1) };
+        match CALLBACK_RESULT.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => Ok(()),
+            0 => Err("code page callback was not invoked".into()),
+            _ => Err("callback CreateFileW failed".into()),
+        }
     }
 
     /// L01: `GetProcAddress` で取得した関数ポインタ経由の呼び出し。

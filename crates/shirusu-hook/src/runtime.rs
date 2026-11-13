@@ -1043,10 +1043,9 @@ pub struct HookRuntime {
     /// 有効な場合のみ、内部 API（Nt*）の呼び出しを記録する。
     /// Bootstrap v8 で Host から渡す。
     detailed_mode: bool,
-    /// 呼び出し元分類のためのモジュール一覧（L23）。Detour の入口で
-    /// 戻りアドレスから呼び出し元を引く。DLL 起動時に作り、遅れて
-    /// ロードされたモジュールには再列挙で追随する。
-    caller_modules: RwLock<crate::caller::CallerModules>,
+    /// 呼び出し元アドレスによる標準の記録境界（L23）が準備できたか。
+    /// 偽の間は呼び出し元を判定せず、全呼び出しを記録する（fail-open）。
+    caller_boundary: AtomicBool,
     /// COM 追跡対象の登録表（L02）。セッション単位。Detour は
     /// ここからインターフェイスの同一性・寿命を引く。
     com_tracker: Mutex<ComTracker>,
@@ -1094,7 +1093,7 @@ impl HookRuntime {
             pending_overlapped: OverlappedRegistry::new(),
             record_runtime_apis: false,
             detailed_mode: false,
-            caller_modules: RwLock::new(crate::caller::CallerModules::new()),
+            caller_boundary: AtomicBool::new(false),
             com_tracker: Mutex::new(ComTracker::new()),
             com_factory_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
             winrt_activation_originals: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -1229,12 +1228,29 @@ impl HookRuntime {
         !self.detailed_mode && crate::api::is_internal_api(api_id)
     }
 
-    /// 実験用の呼び出し元モジュール一覧を作り直す。標準 Detour はこの
-    /// 一覧から呼び出し元を抑制しない。列挙に失敗したら従来の一覧を残す。
-    pub fn refresh_caller_modules(&self) {
-        if let Ok(mut guard) = self.caller_modules.write() {
-            guard.refresh();
+    /// 呼び出し元アドレスによる標準の記録境界を有効にする（L23）。Windows
+    /// ディレクトリを特定できない場合は無効のまま偽を返す（全呼び出しを
+    /// 記録する）。Agent の初期化スレッドで、Hook の設置前に呼ぶ。
+    pub fn enable_caller_boundary(&self) -> bool {
+        let ready = crate::caller::prepare_boundary();
+        self.caller_boundary.store(ready, Ordering::Release);
+        ready
+    }
+
+    /// 呼び出し元アドレスによる標準の記録境界が有効か。
+    pub fn caller_boundary_enabled(&self) -> bool {
+        self.caller_boundary.load(Ordering::Acquire)
+    }
+
+    /// 入口スタブが渡した呼び出し元アドレスが Windows 内部で、標準の境界の
+    /// 外にあるか。`caller == 0`（IAT 等スタブを通らない経路）、境界が無効、
+    /// 詳細調査モード、分類不明はいずれも偽（記録する）。
+    #[inline]
+    pub fn should_suppress_caller(&self, caller: usize) -> bool {
+        if caller == 0 || self.detailed_mode || !self.caller_boundary_enabled() {
+            return false;
         }
+        crate::caller::should_suppress_caller(crate::caller::classify_caller(caller), false)
     }
 
     /// Runtime 独自の API の除外は呼び出し先で決める。
@@ -2918,9 +2934,32 @@ mod tests {
     }
 
     #[test]
-    fn refresh_caller_modules_does_not_panic() {
-        let (_agent, rt) = runtime();
-        rt.refresh_caller_modules();
+    fn caller_boundary_never_suppresses_without_a_stub_address_or_in_detailed_mode() {
+        let (agent, rt) = runtime();
+        assert!(!rt.caller_boundary_enabled());
+        assert!(!rt.should_suppress_caller(0));
+        let enabled = rt.enable_caller_boundary();
+        assert_eq!(enabled, cfg!(windows));
+        assert_eq!(rt.caller_boundary_enabled(), enabled);
+        // IAT and other stub-less paths carry no caller and stay recorded.
+        assert!(!rt.should_suppress_caller(0));
+        // This test binary is the main module: Application, never suppressed.
+        let own = caller_boundary_never_suppresses_without_a_stub_address_or_in_detailed_mode
+            as *const () as usize;
+        assert!(!rt.should_suppress_caller(own));
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+            let name: Vec<u16> = "kernelbase.dll".encode_utf16().chain([0]).collect();
+            let kernelbase = unsafe { GetModuleHandleW(name.as_ptr()) } as usize;
+            assert_ne!(kernelbase, 0);
+            assert!(rt.should_suppress_caller(kernelbase + 0x1000));
+            let detailed = HookRuntime::new(agent, Vec::new(), None).with_detailed_mode(true);
+            assert!(detailed.enable_caller_boundary());
+            assert!(!detailed.should_suppress_caller(kernelbase + 0x1000));
+        }
+        #[cfg(not(windows))]
+        drop(agent);
     }
 
     #[test]

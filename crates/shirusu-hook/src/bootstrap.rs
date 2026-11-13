@@ -142,6 +142,7 @@ pub const INLINE_REASONS: &[&str] = &[
     "thread-suspend-failed",
     "trampoline-too-large",
     "not-attempted-iat-only-scope",
+    "installed-without-caller-boundary",
 ];
 
 /// Code of an Inline reason for [`HookEvidenceRecord::inline`].
@@ -373,6 +374,7 @@ impl AgentBootstrap {
                         reason,
                         "partially-installed-noncanonical-import-preserved"
                             | "installed-restoration-pending"
+                            | "installed-without-caller-boundary"
                     ) {
                         "partial"
                     } else if reason == "installed" {
@@ -659,6 +661,16 @@ mod tests {
             .unwrap();
         assert_eq!(inline.outcome, "partial");
         assert_eq!(inline.reason, "installed-restoration-pending");
+        // L23: recorded, but without the caller boundary of the standard mode.
+        records[0].inline = inline_reason_code("installed-without-caller-boundary");
+        let report = AgentBootstrap::hook_evidence(&records).unwrap();
+        let inline = report
+            .iter()
+            .find(|h| h.api_id == 1 && h.method == "inline")
+            .unwrap();
+        assert_eq!(inline.outcome, "partial");
+        assert_eq!(inline.reason, "installed-without-caller-boundary");
+        records[0].inline = inline_reason_code("installed-restoration-pending");
         let reject = |mutate: &dyn Fn(&mut Vec<HookEvidenceRecord>)| {
             let mut bad = records.clone();
             mutate(&mut bad);

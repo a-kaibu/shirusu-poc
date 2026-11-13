@@ -1269,16 +1269,22 @@ mod win {
         let pid = std::process::id();
         let workdir = std::env::temp_dir().join(format!("shirusu-modules-{pid}"));
         let _ = std::fs::create_dir_all(&workdir);
-        for record_runtime in [false, true] {
-            let tag = if record_runtime {
-                "runtime-on"
-            } else {
-                "default"
-            };
+        // L23: 既定・Runtime 記録・詳細調査モードの 3 回で、同じ呼び出しの
+        // 記録の有無を比べる。詳細調査モードは Windows 内部起点も記録する。
+        for (tag, record_runtime, detailed) in [
+            ("default", false, false),
+            ("runtime-on", true, false),
+            ("detailed", true, true),
+        ] {
             let trace_path =
                 std::env::temp_dir().join(format!("shirusu-modules-{tag}-{pid}.trace"));
             let _ = std::fs::remove_file(&trace_path);
-            let mut launch_cfg = LaunchConfig::new(session_config(), dll.clone());
+            let session = if detailed {
+                detailed_session_config()
+            } else {
+                session_config()
+            };
+            let mut launch_cfg = LaunchConfig::new(session, dll.clone());
             launch_cfg.session.record_runtime_apis = record_runtime;
             let cmdline = format!(
                 "\"{}\" --runtime-caller \"{}\"",
@@ -1311,7 +1317,9 @@ mod win {
             match std::fs::read(&trace_path) {
                 Ok(bytes) => match shirusu_trace::read_trace(&bytes) {
                     Ok(trace) => {
-                        check_modules_trace(&mut c, &trace, tag, &summary, &workdir, target_pid);
+                        check_modules_trace(
+                            &mut c, &trace, tag, detailed, &summary, &workdir, target_pid,
+                        );
                     }
                     Err(e) => c.check(false, &format!("{tag} trace parses ({e})")),
                 },
@@ -1335,11 +1343,13 @@ mod win {
     }
 
     /// --modules シナリオの Trace 1 件分の検査。`tag` は実行区分
-    /// （"default" / "runtime-on"）。
+    /// （"default" / "runtime-on" / "detailed"）。
+    #[allow(clippy::too_many_arguments)]
     fn check_modules_trace(
         c: &mut Checker,
         trace: &shirusu_trace::reader::ReadTrace,
         tag: &str,
+        detailed: bool,
         summary: &shirusu_host::recorder::SessionSummary,
         workdir: &std::path::Path,
         pid: u32,
@@ -1416,6 +1426,15 @@ mod win {
             .join(format!("shirusu-runtime-caller-crt-{pid}.tmp"))
             .to_string_lossy()
             .to_ascii_lowercase();
+        let path_of = |kind: &str| {
+            workdir
+                .join(format!("shirusu-runtime-caller-{kind}-{pid}.tmp"))
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        };
+        let (inline, windows, callback) =
+            (path_of("inline"), path_of("windows"), path_of("callback"));
+        let (mut inline_events, mut windows_events, mut callback_events) = (0, 0, 0);
         let mut direct_events = 0;
         let mut crt_events = 0;
         for e in &events {
@@ -1434,6 +1453,12 @@ mod win {
                     direct_events += 1;
                 } else if path == crt {
                     crt_events += 1;
+                } else if path == inline {
+                    inline_events += 1;
+                } else if path == windows {
+                    windows_events += 1;
+                } else if path == callback {
+                    callback_events += 1;
                 }
             }
         }
@@ -1447,6 +1472,42 @@ mod win {
         c.check(
             crt_events >= 1,
             &format!("{tag} crt-mediated CreateFileW recorded (got {crt_events})"),
+        );
+        // L23: the standard boundary is decided by the caller address that the
+        // Inline Hook entry stub hands to the Detour.
+        c.check(
+            inline_events == 1,
+            &format!("{tag} application CreateFileW through the inline stub recorded once (got {inline_events})"),
+        );
+        c.check(
+            callback_events == 1,
+            &format!("{tag} application CreateFileW inside a Windows callback recorded once (got {callback_events})"),
+        );
+        if detailed {
+            // Proves the fixture really reaches CreateFileW from Windows code.
+            c.check(
+                windows_events >= 1,
+                &format!("{tag} Windows-internal CreateFileW recorded in detailed mode (got {windows_events})"),
+            );
+        } else {
+            c.check(
+                windows_events == 0,
+                &format!("{tag} Windows-internal CreateFileW excluded by the standard boundary (got {windows_events})"),
+            );
+        }
+        let Some(env) = trace.environment.as_ref() else {
+            return;
+        };
+        let inline_evidence = env
+            .hook_evidence
+            .iter()
+            .find(|h| h.api_id == API_CREATE_FILE_W && h.method == "inline");
+        c.check(
+            inline_evidence.is_some_and(|h| h.outcome == "installed" && h.reason == "installed"),
+            &format!(
+                "{tag} CreateFileW inline hook has the caller boundary ({:?})",
+                inline_evidence.map(|h| (&h.outcome, &h.reason))
+            ),
         );
     }
     /// L01: Inline Hook の E2E。hook-target `--getprocaddress` は

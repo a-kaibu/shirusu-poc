@@ -35,6 +35,9 @@ pub struct InlineHook {
     /// Exact bytes published by this hook, for ownership checks on removal.
     pub installed_bytes: Vec<u8>,
     pub restoration: InlineRestoration,
+    /// L23: the patch enters through a caller-capturing entry stub, so the
+    /// Detour can exclude Windows-internal callers. False records every caller.
+    pub caller_boundary: bool,
 }
 
 #[derive(Debug, Default)]
@@ -352,16 +355,32 @@ pub(super) fn is_existing_detour(target: usize, detour: usize, bitness: u32, byt
     if bytes.starts_with(&build_patch(target as u64, detour as u64, bitness)) {
         return true;
     }
-    if bitness != 64 || bytes.len() < 5 || bytes[0] != 0xe9 {
+    // A relay or caller-capturing entry stub (L23) sits between the patch and
+    // the Detour. Follow one jump and compare the bytes we would have written.
+    let Some(relay) = crate::inline::jump_destination(target as u64, bytes, bitness, |slot| {
+        let mut value = [0u8; 8];
+        let width = (bitness / 8) as usize;
+        ProcessMemory
+            .read_exact(slot, &mut value[..width])
+            .then(|| u64::from_le_bytes(value))
+    }) else {
+        return false;
+    };
+    let mut relay_bytes = [0; 32];
+    if !ProcessMemory.read_exact(relay, &mut relay_bytes) {
         return false;
     }
-    let displacement = i32::from_le_bytes(bytes[1..5].try_into().unwrap());
-    let relay = (target as u64)
-        .wrapping_add(5)
-        .wrapping_add_signed(displacement as i64);
-    let mut relay_bytes = [0; 14];
-    ProcessMemory.read_exact(relay, &mut relay_bytes)
-        && relay_bytes.starts_with(&build_patch(relay, detour as u64, bitness))
+    if relay_bytes.starts_with(&build_patch(relay, detour as u64, bitness)) {
+        return true;
+    }
+    crate::caller::entry_slot_offset().is_some_and(|slot| {
+        relay_bytes.starts_with(&crate::caller::entry_stub_bytes(
+            relay,
+            detour as u64,
+            bitness,
+            slot,
+        ))
+    })
 }
 
 /// `target` の近く（±2GB）に実行可能メモリを確保する。近くに空きが
@@ -628,8 +647,32 @@ pub(super) fn prepare_inline(
             return Err(e.reason());
         }
     };
+    // L23: API-table hooks enter through a stub that hands the caller's return
+    // address to the Detour. It lives in this allocation, so it is retained with
+    // the trampoline. Without a reachable stub, fall back to the direct patch
+    // and record every caller, as before.
+    let stub = match (&p.slot, crate::caller::entry_slot_offset()) {
+        (InlineOriginalSlot::Api(_), Some(slot)) => {
+            let stub = trampoline + RELAY_OFFSET;
+            let entry = build_patch(p.target as u64, stub as u64, bitness);
+            let stub_code =
+                crate::caller::entry_stub_bytes(stub as u64, p.detour as u64, bitness, slot);
+            (entry.len() <= p.plan.patch_len
+                && code.len() <= RELAY_OFFSET
+                && RELAY_OFFSET + stub_code.len() <= TRAMPOLINE_SIZE)
+                .then_some((stub, entry, stub_code))
+        }
+        _ => None,
+    };
+    let caller_boundary = stub.is_some();
     let direct_patch = build_patch(p.target as u64, p.detour as u64, bitness);
-    let patch = if direct_patch.len() > p.plan.patch_len {
+    let patch = if let Some((stub, entry, stub_code)) = stub {
+        // SAFETY: stub lies inside the freshly allocated executable region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(stub_code.as_ptr(), stub as *mut u8, stub_code.len());
+        }
+        entry
+    } else if direct_patch.len() > p.plan.patch_len {
         let relay = trampoline + RELAY_OFFSET;
         let entry = build_patch(p.target as u64, relay as u64, bitness);
         if bitness != 64 || entry.len() > p.plan.patch_len || code.len() > RELAY_OFFSET {
@@ -669,6 +712,7 @@ pub(super) fn prepare_inline(
             patched_len: patch.len(),
             installed_bytes: patch.clone(),
             restoration: InlineRestoration::default(),
+            caller_boundary,
         },
         patch,
         allocation,

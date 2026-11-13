@@ -368,10 +368,11 @@ mod win {
                 // v15: Capture Policy（filtered）を Agent 側で適用する。
                 .with_capture_selection(selection.as_ref()),
         );
-        // L23: 呼び出し元分類のためのモジュール一覧を初期化時に作る。
-        // 列挙に失敗しても一覧が空のままになるだけで、呼び出し元不明
-        // として記録を続ける（fail-open）。
-        rt.refresh_caller_modules();
+        // L23: 呼び出し元アドレスによる標準の記録境界を Hook の設置前に
+        // 準備する。Windows ディレクトリを特定できなければ無効のままで、
+        // 全呼び出しを記録する（fail-open）。各 Inline Hook が入口スタブを
+        // 持てたかは result_inline の理由に残す。
+        let caller_boundary = rt.enable_caller_boundary();
         if engine::set_runtime(Arc::clone(&rt)).is_err() {
             return STATUS_ALREADY_INITIALIZED;
         }
@@ -510,7 +511,7 @@ mod win {
             .iter()
             .map(|e| e.api.api_id)
             .collect();
-        let index_outcome = |outcome: &engine::InlineInstallOutcome| {
+        let index_outcome = |outcome: &engine::InlineInstallOutcome, internal: bool| {
             let mut reasons: std::collections::HashMap<u32, &'static str> =
                 std::collections::HashMap::new();
             for (api_id, reason) in outcome.skipped.iter().rev() {
@@ -521,6 +522,9 @@ mod win {
                     hook.api_id,
                     if hook.maintenance_pending() {
                         "installed-restoration-pending"
+                    } else if !internal && !(caller_boundary && hook.caller_boundary) {
+                        // Recorded, but Windows-internal callers cannot be excluded.
+                        "installed-without-caller-boundary"
                     } else {
                         "installed"
                     },
@@ -528,8 +532,8 @@ mod win {
             }
             reasons
         };
-        let inline_reasons = index_outcome(&inline_outcome);
-        let internal_reasons = index_outcome(&internal_hook_outcome);
+        let inline_reasons = index_outcome(&inline_outcome, false);
+        let internal_reasons = index_outcome(&internal_hook_outcome, true);
         use shirusu_hook::bootstrap as boot;
         let mut records = Vec::new();
         for api in api_table() {

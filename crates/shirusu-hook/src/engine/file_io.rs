@@ -95,6 +95,10 @@ pub(super) enum PrepareInner {
 
 #[inline(always)]
 pub(super) fn prepare_inner(api_id: u32) -> PrepareInner {
+    // L23: 入口スタブが TEB へ置いた呼び出し元アドレスを最初に取り出す。
+    // これより前に Hook 対象 API を呼ぶ処理はないため、入れ子の呼び出しに
+    // 上書きされない。スタブを通らない経路（メインモジュールの IAT 等）では 0。
+    let caller = crate::caller::take_entry_caller();
     // P1-5: LastError は入口 (ここ) で保存する。素通し経路は元の API
     // を呼ぶ前に保存値へ戻してから返し、記録経路はガードごと Detour
     // へ渡す (Detour が元の API の直前で復元する)。Unavailable 経路は
@@ -129,6 +133,13 @@ pub(super) fn prepare_inner(api_id: u32) -> PrepareInner {
     // The option controls Runtime's own exported APIs, not Windows API calls
     // made by Runtime. Agent-originated calls are excluded by reentrancy above.
     if rt.should_suppress_api_id(api.api_id) {
+        le.restore_before_original();
+        return PrepareInner::Passthrough { original };
+    }
+    // L23: 標準の記録境界。Windows 内部から入った呼び出しは記録しない。
+    // コールバックでアプリへ戻った後のアプリ自身の呼び出しは、呼び出し元が
+    // Application なので記録される。詳細調査モードでは抑制しない。
+    if rt.should_suppress_caller(caller) {
         le.restore_before_original();
         return PrepareInner::Passthrough { original };
     }

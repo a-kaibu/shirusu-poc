@@ -201,6 +201,39 @@ pub fn jump_bytes(from: u64, to: u64, bitness: u32) -> Vec<u8> {
     }
 }
 
+/// [`jump_bytes`] が置く分岐の行き先。`E9 rel32` は直接、`FF 25` の
+/// 絶対間接分岐はアドレススロットを `read_slot` で読む。それ以外は `None`。
+pub fn jump_destination(
+    from: u64,
+    bytes: &[u8],
+    bitness: u32,
+    read_slot: impl FnOnce(u64) -> Option<u64>,
+) -> Option<u64> {
+    match bytes {
+        [0xE9, d0, d1, d2, d3, ..] => {
+            let disp = i32::from_le_bytes([*d0, *d1, *d2, *d3]) as i64;
+            let next = from.checked_add(PATCH_LEN_REL32 as u64)?;
+            let dest = next.wrapping_add_signed(disp);
+            Some(if bitness == 32 {
+                dest & 0xFFFF_FFFF
+            } else {
+                dest
+            })
+        }
+        [0xFF, 0x25, d0, d1, d2, d3, ..] => {
+            let disp = u32::from_le_bytes([*d0, *d1, *d2, *d3]);
+            let slot = if bitness == 64 {
+                from.checked_add(6)?
+                    .checked_add_signed(disp as i32 as i64)?
+            } else {
+                disp as u64
+            };
+            read_slot(slot).filter(|dest| *dest != 0)
+        }
+        _ => None,
+    }
+}
+
 /// `target` に置くパッチのバイト列（[`jump_bytes`] と同じ）。
 pub fn build_patch(target: u64, detour: u64, bitness: u32) -> Vec<u8> {
     jump_bytes(target, detour, bitness)
@@ -548,6 +581,37 @@ mod tests {
         assert_eq!(instrs.len(), 4); // 3 命令 + 戻りジャンプ
         let last = instrs.last().unwrap();
         assert_eq!(last.near_branch_target(), target + 6);
+    }
+
+    #[test]
+    fn jump_destination_reads_back_every_jump_form() {
+        let none = |_| None;
+        for (from, to, bitness) in [
+            (0x1000u64, 0x2000u64, 64),
+            (0x7ff0_0000_0000, 0x1000, 64),
+            (0x1000, 0x7000_0000, 32),
+            (0x7000_0000, 0x1000, 32),
+        ] {
+            let bytes = jump_bytes(from, to, bitness);
+            let slot_value = |slot: u64| {
+                let offset = (slot - from) as usize;
+                let width = (bitness / 8) as usize;
+                let mut v = [0u8; 8];
+                v[..width].copy_from_slice(&bytes[offset..offset + width]);
+                Some(u64::from_le_bytes(v))
+            };
+            assert_eq!(
+                jump_destination(from, &bytes, bitness, slot_value),
+                Some(to),
+                "{from:#x} -> {to:#x} ({bitness})"
+            );
+        }
+        assert_eq!(jump_destination(0x1000, &[0x90; 8], 64, none), None);
+        assert_eq!(jump_destination(0x1000, &[0xE9, 0, 0], 64, none), None);
+        assert_eq!(
+            jump_destination(0x1000, &[0xFF, 0x25, 0, 0, 0, 0], 64, |_| Some(0)),
+            None
+        );
     }
 
     #[test]
