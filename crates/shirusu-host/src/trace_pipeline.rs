@@ -29,7 +29,36 @@ pub(crate) const QUEUE_BYTE_BUDGET: usize = if usize::BITS >= 64 {
 
 /// A Ring's validation state, shared by the collection thread (stop checks,
 /// final accounting after a barrier) and the worker (validation).
-pub(crate) type SharedDrainWorker = Arc<Mutex<DrainWorker>>;
+pub(crate) type SharedDrainWorker = Arc<RingValidation>;
+
+/// The worker validates under `worker`'s lock, which a large chunk holds for
+/// a while. The collection thread must never wait for it while the writer is
+/// producing: it polls `stopped` instead, and locks only after a barrier.
+pub(crate) struct RingValidation {
+    worker: Mutex<DrainWorker>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl RingValidation {
+    pub(crate) fn new(worker: DrainWorker) -> Arc<Self> {
+        Arc::new(Self {
+            stopped: std::sync::atomic::AtomicBool::new(worker.is_stopped()),
+            worker: Mutex::new(worker),
+        })
+    }
+    /// Whether validation stopped this Ring (no lock).
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+    /// Validation state. Call only after a pipeline barrier.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, DrainWorker> {
+        // A panic while validating leaves no half-applied state that matters
+        // here: the pipeline worker failure itself forbids Finalization.
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 enum Command {
     Events(TraceBatchContext, Vec<ReceivedEvent>),
@@ -108,10 +137,19 @@ impl WorkerState {
 fn materialize(command: Command) -> Command {
     match command {
         Command::Chunk(context, worker, chunk) => {
-            let events = match worker.lock() {
-                Ok(mut worker) => worker.ingest_chunk(&chunk).events,
+            let events = match worker.worker.lock() {
+                Ok(mut validator) => {
+                    let events = validator.ingest_chunk(&chunk).events;
+                    if validator.is_stopped() {
+                        worker.stopped.store(true, Ordering::Release);
+                    }
+                    events
+                }
                 // A poisoned validator cannot vouch for anything.
-                Err(_) => Vec::new(),
+                Err(_) => {
+                    worker.stopped.store(true, Ordering::Release);
+                    Vec::new()
+                }
             };
             Command::Events(context, events)
         }

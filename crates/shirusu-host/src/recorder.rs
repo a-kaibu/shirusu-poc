@@ -20,7 +20,7 @@
 
 use crate::trace_convert::{RecordMode, TraceBatchContext, TraceRecorder};
 pub use crate::trace_pipeline::HostPipelineStats;
-use crate::trace_pipeline::{SharedDrainWorker, TracePipeline};
+use crate::trace_pipeline::{RingValidation, SharedDrainWorker, TracePipeline};
 use crate::{CommittedRangeCollector, DrainWorker, IntegrityLevel, IntegrityReport};
 use shirusu_hook::api as hook_api;
 use shirusu_hook::callback as hook_callback;
@@ -426,11 +426,7 @@ fn retire_ring_worker(
 }
 
 fn lock_worker(worker: &SharedDrainWorker) -> std::sync::MutexGuard<'_, DrainWorker> {
-    // A panic while validating leaves no half-applied state that matters
-    // here: the pipeline worker failure itself forbids Finalization.
-    worker
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    worker.lock()
 }
 
 pub struct CaptureSession {
@@ -768,7 +764,7 @@ impl CaptureSession {
                 // opt-in diagnostic key history: it would retain one unused key
                 // per payload for the entire Ring lifetime. Event context and
                 // generation validation remain independent of that history.
-                ring.worker = Some(std::sync::Arc::new(std::sync::Mutex::new(worker)));
+                ring.worker = Some(RingValidation::new(worker));
                 // SAFETY: mapping は RingConfig 分の共有領域を指し、
                 // セッションの存続期間中有効（add_ring の契約）。新しい
                 // incarnation は読み位置 0 から始まる。
@@ -778,7 +774,7 @@ impl CaptureSession {
             }
             let shared = ring.worker.as_ref().expect("worker just ensured");
             let collector = ring.collector.as_mut().expect("collector just ensured");
-            if !collector.is_stopped() && lock_worker(shared).is_stopped() {
+            if !collector.is_stopped() && shared.is_stopped() {
                 // The validator rejected an earlier chunk: stop releasing space.
                 collector.stop();
             }
