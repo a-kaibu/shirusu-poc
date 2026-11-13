@@ -3,6 +3,18 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
+現時点で全ジョブの成功を確認済みの基準は `cde8d31` の
+[CI 43416317062](https://github.com/a-kaibu/shirusu-poc/actions/runs/43416317062)。
+Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
+形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
+成功を新しいコードの合格証拠に流用しない。
+
+性能は未完成。直前の `efb6e89` の Windows 3 環境では GUI が約 1.58〜1.65 倍で
+完全な記録を達成した一方、高負荷は約 79〜87 倍で欠落が残った。
+Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意味契約、
+2 Windows ビルドの参照コーパスは実装済みだが、下表の一般化・安全性・性能の
+残件があるため、全体の完成率を単純な実装件数から算出しない。
+
 | 要件 | 現状と残件 | 合格に必要な証拠 |
 | --- | --- | --- |
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
@@ -27,7 +39,7 @@
 
 ## Windows 実行の追跡
 
-最新の検証は `e7e2fc2` の [run `43281728421`](https://github.com/a-kaibu/shirusu-poc/actions/runs/43281728421)。
+初期の統合検証は `e7e2fc2` の [run `43281728421`](https://github.com/a-kaibu/shirusu-poc/actions/runs/43281728421)。
 Windows latest / Server 2022 の x64 で基本 Capture + Application Verifier、
 child-tree、ABI、GUI / COM / WinRT、詳細 Nt、Inline、CRT、native SEH、
 Capture → 差分 → Probe 再実行が通過した。x86 の実注入 Capture / ABI、
