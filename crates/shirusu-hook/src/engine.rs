@@ -2844,6 +2844,7 @@ unsafe fn call_com_original(original: usize, this: usize, args: &[usize]) -> i32
 fn com_method_post_call(
     rt: &Arc<HookRuntime>,
     this: usize,
+    instance: &crate::com::ComInstanceToken,
     method_index: u32,
     args: &[usize],
     ret: i32,
@@ -2865,7 +2866,13 @@ fn com_method_post_call(
                 return (0, 0);
             }
             rt.with_com_tracker(|t| {
-                t.note_query_interface(this as u64, out as u64, iid, true);
+                if t.instance_matches(this as u64, instance) {
+                    t.note_query_interface(this as u64, out as u64, iid, true);
+                } else {
+                    // A later discovery has replaced this address while the
+                    // original call was in progress. Do not merge lifetimes.
+                    t.note_discovered(out as u64, iid);
+                }
             });
             if interface_by_iid(&iid).is_some() {
                 // SAFETY: out は元の QI が返した有効なインターフェイス。
@@ -2877,13 +2884,21 @@ fn com_method_post_call(
         1 => {
             // AddRef: 戻り値が新しい参照カウント。
             let count = ret as u32;
-            rt.with_com_tracker(|t| t.note_add_ref(this as u64, count));
+            rt.with_com_tracker(|t| {
+                if t.instance_matches(this as u64, instance) {
+                    t.note_add_ref(this as u64, count);
+                }
+            });
             (0, count)
         }
         2 => {
             // Release: 戻り値が新しい参照カウント。0 なら寿命終了。
             let count = ret as u32;
-            rt.with_com_tracker(|t| t.note_release(this as u64, count));
+            rt.with_com_tracker(|t| {
+                if t.instance_matches(this as u64, instance) {
+                    t.note_release(this as u64, count);
+                }
+            });
             (0, count)
         }
         _ => {
@@ -2895,6 +2910,9 @@ fn com_method_post_call(
                 return (0, 0);
             }
             let Some((method_name, out_arg, iid)) = rt.with_com_tracker(|t| {
+                if !t.instance_matches(this as u64, instance) {
+                    return None;
+                }
                 t.lookup(this as u64).and_then(|o| {
                     interface_by_iid(&o.iid).and_then(|d| {
                         d.method(method_index).and_then(|m| {
@@ -2960,10 +2978,13 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
     let _flight = flight;
     // 追跡対象の確認：このセッションで追跡していないオブジェクトは
     // 元のメソッドを素通しで呼ぶ（記録しない）。
-    let (iid, interface_name, method_name) = match rt.with_com_tracker(|t| {
+    let (iid, interface_name, method_name, instance) = match rt.with_com_tracker(|t| {
+        let instance = t.instance_token(this as u64)?;
         t.lookup(this as u64).and_then(|o| {
-            interface_by_iid(&o.iid)
-                .and_then(|d| d.method(method_index).map(|m| (o.iid, d.name, m.name)))
+            interface_by_iid(&o.iid).and_then(|d| {
+                d.method(method_index)
+                    .map(|m| (o.iid, d.name, m.name, instance))
+            })
         })
     }) {
         Some(v) => v,
@@ -3006,17 +3027,18 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: original はこの引数個数の COM メソッド。
-    let (ret, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
+    let (ret, (mut call_guard, rt, _flight, mut guard, instance)) = crate::seh::invoke(
         original,
         |_| unsafe { call_com_original(original, this, args) },
-        (call_guard, rt, _flight, guard),
+        (call_guard, rt, _flight, guard, instance),
     );
     let last_error = le.capture_after_original();
     call_guard.complete();
     guard.resume();
     let _ = last_error; // COM は HRESULT が誤りの経路。LastError は復元だけ行う。
     pop_call(call_id);
-    let (returned_object, refcount) = com_method_post_call(&rt, this, method_index, args, ret);
+    let (returned_object, refcount) =
+        com_method_post_call(&rt, this, &instance, method_index, args, ret);
     let values = crate::com::com_method_leave_values(ret, returned_object, refcount);
     if let Ok(bytes) = crate::com::encode_com_leave(&values) {
         rt.record_com_leave(tid, call_id, &bytes);
@@ -3871,6 +3893,31 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[test]
+    fn delayed_com_completion_does_not_mutate_a_reused_pointer() {
+        let rt = Arc::new(test_runtime());
+        let instance = rt.with_com_tracker(|t| {
+            t.note_factory_result(0x1000, IID_IUNKNOWN, "CoCreateInstance");
+            let token = t.instance_token(0x1000).unwrap();
+            t.note_release(0x1000, 0);
+            t.note_factory_result(0x1000, IID_IUNKNOWN, "CoCreateInstance");
+            token
+        });
+        assert_eq!(
+            com_method_post_call(&rt, 0x1000, &instance, 1, &[], 99),
+            (0, 99)
+        );
+        assert_eq!(
+            com_method_post_call(&rt, 0x1000, &instance, 2, &[], 0),
+            (0, 0)
+        );
+        rt.with_com_tracker(|t| {
+            let current = t.lookup(0x1000).unwrap();
+            assert!(!current.destroyed);
+            assert_eq!(current.refcount, None);
+        });
     }
 
     #[test]

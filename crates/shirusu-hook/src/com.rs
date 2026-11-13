@@ -28,7 +28,7 @@ use shirusu_trace::schema::{
 };
 use shirusu_trace::CompactError;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// COM メソッド呼び出しイベントの api_id。API 表（api.rs）の ID 空間
 /// とは別の予約値（表が伸びても衝突しないよう、表の連番とは離す）。
@@ -672,6 +672,10 @@ pub enum ComDiscovery {
 /// 追跡対象の COM インターフェイス 1 件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComObject {
+    // Pointer values can be reused. These allocation identities distinguish
+    // a record's lifetime and its QI-equivalence group without wrapping counters.
+    instance: Arc<()>,
+    identity_group: Arc<()>,
     pub ptr: u64,
     pub iid: Guid,
     /// 既知インターフェイス名。未知の IID では "unknown"。
@@ -703,6 +707,33 @@ pub struct ComObject {
     /// 複製前の元のメソッドポインタ列（vtable インデックス順）。
     pub original_methods: Vec<u64>,
 }
+
+impl ComObject {
+    fn fresh(ptr: u64, iid: Guid, discovered: ComDiscovery) -> Self {
+        let instance = Arc::new(());
+        Self {
+            identity_group: Arc::clone(&instance),
+            instance,
+            ptr,
+            iid,
+            interface_name: interface_name_for_iid(&iid),
+            identity: ptr,
+            identity_confirmed: false,
+            refcount: None,
+            discovered,
+            intercepted: false,
+            interception_skip_reason: None,
+            destroyed: false,
+            original_vtable: 0,
+            cloned_vtable: None,
+            original_methods: Vec::new(),
+        }
+    }
+}
+
+/// Identifies one observed interface lifetime across a call to user code.
+#[derive(Debug, Clone)]
+pub struct ComInstanceToken(Arc<()>);
 
 /// `QueryInterface` 観測の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,6 +776,7 @@ impl ComTracker {
         }
     }
 
+    /// Number of indexed addresses, including retired records until reuse.
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
@@ -767,38 +799,42 @@ impl ComTracker {
         identity
     }
 
-    /// Factory 呼び出しが返したインターフェイスを登録する。
-    /// 既に登録済みのポインタ（再利用されたアドレス等）は、既存の
-    /// 記録を残して identity だけ返す（上書きしない）。
+    /// Register a factory result. Preserve an already-live object, but a
+    /// pointer observed after Release(0) starts a fresh lifetime and hook state.
     pub fn note_factory_result(&mut self, ptr: u64, iid: Guid, factory: &'static str) -> u64 {
-        if let Some(o) = self.objects.get(&ptr) {
+        if ptr == 0 {
+            return 0;
+        }
+        if let Some(o) = self.objects.get(&ptr).filter(|o| !o.destroyed) {
             return o.identity;
         }
-        let name = interface_name_for_iid(&iid);
-        self.insert(ComObject {
+        self.insert(ComObject::fresh(
             ptr,
             iid,
-            interface_name: name,
-            identity: ptr,
-            identity_confirmed: false,
-            refcount: None,
-            discovered: ComDiscovery::Factory { factory },
-            intercepted: false,
-            interception_skip_reason: None,
-            destroyed: false,
-            original_vtable: 0,
-            cloned_vtable: None,
-            original_methods: Vec::new(),
-        })
+            ComDiscovery::Factory { factory },
+        ))
+    }
+
+    pub fn instance_token(&self, ptr: u64) -> Option<ComInstanceToken> {
+        self.objects
+            .get(&ptr)
+            .filter(|o| !o.destroyed)
+            .map(|o| ComInstanceToken(Arc::clone(&o.instance)))
+    }
+
+    pub fn instance_matches(&self, ptr: u64, token: &ComInstanceToken) -> bool {
+        self.objects
+            .get(&ptr)
+            .is_some_and(|o| !o.destroyed && Arc::ptr_eq(&o.instance, &token.0))
     }
 
     /// アプリが実行した `QueryInterface` の結果を反映する。成功時は
     /// 返されたポインタを追跡対象に加える（同一オブジェクトの別面）。
     /// - `iid == IID_IUnknown` の成功は同一性の確定：返す IUnknown
-    ///   ポインタを正規キーにし、呼び出し元と同じ identity キーを
-    ///   持つ全ての記録（呼び出し元自身と、そこから QI で派生した
-    ///   別面）を付け替える。返すポインタが既に別キーで追跡されて
-    ///   いた場合、そのキーを持つ記録も同じ正規キーへ付け替える
+    ///   ポインタを正規キーにし、同じ寿命グループの生存中の記録
+    ///   （呼び出し元自身と、そこから QI で派生した別面）を付け替える。
+    ///   返すポインタが別の生存グループに属する場合も明示的に結合する。
+    ///   アドレスが同じでも以前の寿命のグループは結合しない
     ///   （同一オブジェクトの別面だったことの確定）。
     /// - それ以外の IID の成功は、呼び出し元の identity を引き継ぐ
     ///   （未確認のまま。COM の契約上は同一オブジェクトだが、shirusu
@@ -814,73 +850,62 @@ impl ComTracker {
         if !succeeded || out == 0 {
             return QueryInterfaceOutcome::Failed;
         }
+        let source = self.objects.get(&this).filter(|o| !o.destroyed);
+        let source_identity = source.map(|o| {
+            (
+                o.identity,
+                o.identity_confirmed,
+                Arc::clone(&o.identity_group),
+            )
+        });
         if iid == IID_IUNKNOWN {
-            // 同一性の確定：正規キーへ付け替える対象は、呼び出し元の
-            // キーと、返すポインタの従来のキー（既に追跡されていた場合）。
-            let mut keys: Vec<u64> = Vec::new();
-            if let Some(o) = self.objects.get(&this) {
-                keys.push(o.identity);
+            let existing = self.objects.get(&out).filter(|o| !o.destroyed);
+            let mut groups: Vec<Arc<()>> = source_identity
+                .as_ref()
+                .map(|(_, _, group)| vec![Arc::clone(group)])
+                .unwrap_or_default();
+            if let Some(o) = existing {
+                groups.push(Arc::clone(&o.identity_group));
             }
-            if let Some(o) = self.objects.get(&out) {
-                if !keys.contains(&o.identity) {
-                    keys.push(o.identity);
-                }
-            }
+            let canonical_group = existing
+                .map(|o| Arc::clone(&o.identity_group))
+                .or_else(|| groups.first().cloned())
+                .unwrap_or_else(|| Arc::new(()));
             for o in self.objects.values_mut() {
-                if keys.contains(&o.identity) {
+                if !o.destroyed
+                    && groups
+                        .iter()
+                        .any(|group| Arc::ptr_eq(group, &o.identity_group))
+                {
                     o.identity = out;
                     o.identity_confirmed = true;
+                    o.identity_group = Arc::clone(&canonical_group);
                 }
             }
-            if out == this {
-                return QueryInterfaceOutcome::SamePointer;
+            if !self.objects.get(&out).is_some_and(|o| !o.destroyed) {
+                let mut object =
+                    ComObject::fresh(out, iid, ComDiscovery::QueryInterface { from: this });
+                object.identity_confirmed = true;
+                object.identity_group = canonical_group;
+                self.insert(object);
             }
-            if !self.objects.contains_key(&out) {
-                self.insert(ComObject {
-                    ptr: out,
-                    iid,
-                    interface_name: "IUnknown",
-                    identity: out,
-                    identity_confirmed: true,
-                    refcount: None,
-                    discovered: ComDiscovery::QueryInterface { from: this },
-                    intercepted: false,
-                    interception_skip_reason: None,
-                    destroyed: false,
-                    original_vtable: 0,
-                    cloned_vtable: None,
-                    original_methods: Vec::new(),
-                });
+        } else if !self.objects.get(&out).is_some_and(|o| !o.destroyed) {
+            let mut object =
+                ComObject::fresh(out, iid, ComDiscovery::QueryInterface { from: this });
+            if let Some((identity, confirmed, group)) = source_identity {
+                object.identity = identity;
+                object.identity_confirmed = confirmed;
+                object.identity_group = group;
+            } else {
+                object.identity = this;
             }
-            return QueryInterfaceOutcome::NewInterface { ptr: out };
+            self.insert(object);
         }
         if out == this {
-            return QueryInterfaceOutcome::SamePointer;
+            QueryInterfaceOutcome::SamePointer
+        } else {
+            QueryInterfaceOutcome::NewInterface { ptr: out }
         }
-        let (identity, confirmed) = match self.objects.get(&this) {
-            Some(o) => (o.identity, o.identity_confirmed),
-            None => (this, false),
-        };
-        if self.objects.contains_key(&out) {
-            return QueryInterfaceOutcome::NewInterface { ptr: out };
-        }
-        let name = interface_name_for_iid(&iid);
-        self.insert(ComObject {
-            ptr: out,
-            iid,
-            interface_name: name,
-            identity,
-            identity_confirmed: confirmed,
-            refcount: None,
-            discovered: ComDiscovery::QueryInterface { from: this },
-            intercepted: false,
-            interception_skip_reason: None,
-            destroyed: false,
-            original_vtable: 0,
-            cloned_vtable: None,
-            original_methods: Vec::new(),
-        });
-        QueryInterfaceOutcome::NewInterface { ptr: out }
     }
 
     /// メソッドが返したインターフェイスを追跡対象に加える（将来の
@@ -894,58 +919,37 @@ impl ComTracker {
         from: u64,
         method: &'static str,
     ) -> Option<u64> {
-        if ptr == 0 || self.objects.contains_key(&ptr) {
-            return self.objects.get(&ptr).map(|o| o.identity);
+        if ptr == 0 {
+            return None;
         }
-        let name = interface_name_for_iid(&iid);
-        Some(self.insert(ComObject {
+        if let Some(o) = self.objects.get(&ptr).filter(|o| !o.destroyed) {
+            return Some(o.identity);
+        }
+        Some(self.insert(ComObject::fresh(
             ptr,
             iid,
-            interface_name: name,
-            identity: ptr,
-            identity_confirmed: false,
-            refcount: None,
-            discovered: ComDiscovery::MethodReturn { from, method },
-            intercepted: false,
-            interception_skip_reason: None,
-            destroyed: false,
-            original_vtable: 0,
-            cloned_vtable: None,
-            original_methods: Vec::new(),
-        }))
+            ComDiscovery::MethodReturn { from, method },
+        )))
     }
 
-    /// 来歴不明のポインタを追跡対象に加える（途中から発見した場合）。
-    /// 同一性は未確認のまま別々に保持する。
+    /// Register an otherwise discovered pointer; a retired address is a fresh
+    /// lifetime, with identity unconfirmed until a new QI observation.
     pub fn note_discovered(&mut self, ptr: u64, iid: Guid) -> u64 {
-        if let Some(o) = self.objects.get(&ptr) {
+        if ptr == 0 {
+            return 0;
+        }
+        if let Some(o) = self.objects.get(&ptr).filter(|o| !o.destroyed) {
             return o.identity;
         }
-        let name = interface_name_for_iid(&iid);
-        self.insert(ComObject {
-            ptr,
-            iid,
-            interface_name: name,
-            identity: ptr,
-            identity_confirmed: false,
-            refcount: None,
-            discovered: ComDiscovery::Discovered,
-            intercepted: false,
-            interception_skip_reason: None,
-            destroyed: false,
-            original_vtable: 0,
-            cloned_vtable: None,
-            original_methods: Vec::new(),
-        })
+        self.insert(ComObject::fresh(ptr, iid, ComDiscovery::Discovered))
     }
 
     /// 診断用オプションによる `QueryInterface(IID_IUnknown)` の結果で
     /// 同一性を確定する。`canonical` は返された IUnknown ポインタ。
     /// 対象が未登録なら何もしない。
     pub fn note_identity_confirmed(&mut self, ptr: u64, canonical: u64) {
-        if let Some(o) = self.objects.get_mut(&ptr) {
-            o.identity = canonical;
-            o.identity_confirmed = true;
+        if canonical != 0 && self.objects.get(&ptr).is_some_and(|o| !o.destroyed) {
+            self.note_query_interface(ptr, canonical, IID_IUNKNOWN, true);
         }
     }
 
@@ -1312,6 +1316,81 @@ mod tests {
             t.note_query_interface(0x1000, 0x1000, IID_ISHELL_LINK_W, true),
             QueryInterfaceOutcome::SamePointer
         );
+    }
+
+    #[test]
+    fn recycled_factory_pointer_discards_old_lifetime_and_hook_metadata() {
+        let mut t = ComTracker::new();
+        t.note_factory_result(0x1000, IID_ISHELL_LINK_W, "CoCreateInstance");
+        t.note_intercepted(0x1000, 0x7000, 0x8000, vec![1, 2, 3]);
+        t.note_release(0x1000, 0);
+        t.note_factory_result(0x1000, IID_IPERSIST_FILE, "CoCreateInstance");
+        let object = t.lookup(0x1000).unwrap();
+        assert!(!object.destroyed);
+        assert_eq!(object.iid, IID_IPERSIST_FILE);
+        assert_eq!(object.refcount, None);
+        assert!(!object.intercepted);
+        assert_eq!(object.original_vtable, 0);
+        assert_eq!(object.cloned_vtable, None);
+        assert!(object.original_methods.is_empty());
+        assert_eq!(t.live_count(), 1);
+    }
+
+    #[test]
+    fn recycled_pointer_does_not_merge_previous_lifetimes_aliases() {
+        let mut t = ComTracker::new();
+        t.note_factory_result(0x1000, IID_ISHELL_LINK_W, "CoCreateInstance");
+        t.note_query_interface(0x1000, 0x2000, IID_IPERSIST_FILE, true);
+        t.note_release(0x1000, 0);
+        t.note_factory_result(0x1000, IID_ISHELL_LINK_W, "CoCreateInstance");
+        t.note_query_interface(0x1000, 0x3000, IID_IUNKNOWN, true);
+        assert_eq!(t.lookup(0x1000).unwrap().identity, 0x3000);
+        assert_eq!(t.lookup(0x3000).unwrap().identity, 0x3000);
+        let old_alias = t.lookup(0x2000).unwrap();
+        assert_eq!(old_alias.identity, 0x1000);
+        assert!(!old_alias.identity_confirmed);
+    }
+
+    #[test]
+    fn every_discovery_path_replaces_retired_pointer_metadata() {
+        for mode in 0..4 {
+            let mut t = ComTracker::new();
+            t.note_factory_result(0x1000, IID_ISHELL_LINK_W, "CoCreateInstance");
+            let old = t.instance_token(0x1000).unwrap();
+            t.note_interception_skipped(0x1000);
+            t.note_release(0x1000, 0);
+            match mode {
+                0 => {
+                    t.note_discovered(0x1000, IID_IPERSIST_FILE);
+                }
+                1 => {
+                    t.note_method_returned(0x1000, IID_IPERSIST_FILE, 0x2000, "GetSomething");
+                }
+                2 => {
+                    t.note_query_interface(0x2000, 0x1000, IID_IPERSIST_FILE, true);
+                }
+                _ => {
+                    t.note_query_interface(0x2000, 0x1000, IID_IUNKNOWN, true);
+                }
+            }
+            let current = t.lookup(0x1000).unwrap();
+            assert!(!current.destroyed);
+            assert_eq!(current.interception_skip_reason, None);
+            assert!(!t.instance_matches(0x1000, &old));
+            assert!(t.instance_matches(0x1000, &t.instance_token(0x1000).unwrap()));
+        }
+    }
+
+    #[test]
+    fn null_discovery_is_not_an_object() {
+        let mut t = ComTracker::new();
+        t.note_factory_result(0, IID_IUNKNOWN, "CoCreateInstance");
+        t.note_discovered(0, IID_IUNKNOWN);
+        assert_eq!(
+            t.note_method_returned(0, IID_IUNKNOWN, 1, "GetSomething"),
+            None
+        );
+        assert_eq!(t.object_count(), 0);
     }
 
     #[test]

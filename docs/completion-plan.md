@@ -517,3 +517,23 @@ all five generated lpName bindings and failed against the prior generated schema
 A native CreateEventW reopen test checks the real Windows error and encoded capture
 status. Linux Hook/generator suites and x86/x64 strict Clippy pass; native execution
 of the new test is pending CI.
+
+### COM pointer reuse and delayed completion (2026-11-13)
+
+The tracker retained destroyed/IID/interception state when a factory reused an
+address after an observed Release(0). It also merged QI identity groups solely by
+raw pointer values, allowing a new lifetime to absorb an older lifetime's aliases.
+Fresh discoveries now reset retired records; opaque allocation identities separate
+interface lifetimes and QI groups without relying on address uniqueness or wrapping
+counters. Factory, QI, method-return and discovery paths share fresh-state creation.
+An already-live record remains intact; missing Release observations do not prove
+reuse. Historical trace events are unchanged; the tracker indexes the latest record
+for each address, not an unlimited history of incarnations.
+
+COM method completion checks the lifetime captured before calling the original,
+so a delayed old AddRef/Release cannot update or destroy a newly discovered object
+at the same address. That lifetime token is owned by the native SEH finally tuple.
+Two regressions failed before the tracker fix; all Hook tests pass afterward,
+including rediscovery through each entry point and old/new identity separation.
+Windows also compiles a delayed-completion regression. This fixes tracking state;
+standard shared COM method interception remains deliberately disabled.
