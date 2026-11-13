@@ -217,11 +217,25 @@ impl EventTimestamper {
 
 /// Reads the source between two counter readings and pairs it with their midpoint.
 fn paired_sample(source: &dyn TimestampSource) -> (u64, u64) {
-    let before = read_tsc();
-    let qpc = source.now_qpc();
-    let after = read_tsc();
-    (before + after.wrapping_sub(before) / 2, qpc)
+    // A preemption between the reads widens the TSC window around the source
+    // read and with it the pairing error. Keep the narrowest of a few tries
+    // (an anchor is taken about once per millisecond, so this is cheap).
+    let mut best: Option<(u64, u64, u64)> = None;
+    for _ in 0..PAIRING_ATTEMPTS {
+        let before = read_tsc();
+        let qpc = source.now_qpc();
+        let after = read_tsc();
+        let window = after.wrapping_sub(before);
+        if best.is_none_or(|(w, _, _)| window < w) {
+            best = Some((window, before + window / 2, qpc));
+        }
+    }
+    let (_, tsc, qpc) = best.expect("at least one attempt");
+    (tsc, qpc)
 }
+
+/// Paired reads per anchor; the narrowest TSC window wins.
+const PAIRING_ATTEMPTS: usize = 3;
 
 /// Builds an interpolation anchored at `(tsc, qpc)` with the scale measured
 /// over the baseline from the origin. Rejects scales whose products could
