@@ -276,3 +276,11 @@ is retained beside the other two and all three compare equal. Native performance
 in this corpus CI run was GUI 1.598x / 1.701x / 1.641x with complete event integrity,
 and high-load 115.497x / 112.969x / 102.794x with degraded integrity (latest x64 /
 Server 2022 x64 / WoW64 respectively). This precedes the degraded-event wakeup fix.
+
+The notification review also reproduced a stale threshold latch after partial
+consumer drain: with a four-descriptor Ring, publish two (50%), drain one (25%),
+then publish one (50%) failed to notify. PublishNotifyTracker now rearms from the
+observed pre-publication occupancy instead of requiring an intermediate producer
+publication below the threshold. The real Ring regression fails before the fix;
+all transport tests, Clippy and MSRV checks pass after it. No new fence or waiting
+operation was added, and the bounded polling fallback remains required.

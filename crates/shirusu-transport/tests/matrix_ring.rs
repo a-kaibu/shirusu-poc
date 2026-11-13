@@ -467,6 +467,36 @@ fn notify_threshold_25_fires_on_first_publish() {
     }
 }
 #[test]
+fn notify_threshold_rearms_after_partial_drain_without_an_intermediate_publish() {
+    let (_region, mut writer, mut reader, _clock) = setup(4, 256, no_wait());
+    writer.write(input(EventKind::CallEnter, 1, b"a"));
+    assert!(matches!(
+        writer.write(input(EventKind::CallEnter, 2, b"b")),
+        WriteOutcome::Published {
+            notify: NotifySignal::ThresholdCrossing,
+            ..
+        }
+    ));
+    assert_eq!(reader.drain(1).events.len(), 1);
+    // Occupancy moved from 50% down to 25% in the consumer. The producer
+    // did not publish an event below the threshold before this next crossing.
+    assert!(matches!(
+        writer.write(input(EventKind::CallEnter, 3, b"c")),
+        WriteOutcome::Published {
+            notify: NotifySignal::ThresholdCrossing,
+            ..
+        }
+    ));
+    assert!(matches!(
+        writer.write(input(EventKind::CallEnter, 4, b"d")),
+        WriteOutcome::Published {
+            notify: NotifySignal::None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn notify_crossing_takes_precedence_over_host_waiting() {
     let (region, mut w, _rd, _clk) = setup(4, 256, no_wait());
     store(

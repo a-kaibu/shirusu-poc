@@ -36,6 +36,10 @@ impl PublishNotifyTracker {
         let pct = |u: u64| crate::layout::usage_percent(u, capacity);
         let was_above = pct(used_before) >= threshold_percent && used_before > 0;
         let is_above = pct(used_after) >= threshold_percent;
+        // The consumer can drain below the threshold between publications.
+        // Its current read cursor (used_before) rearms the edge even when no
+        // producer event was published while occupancy was below threshold.
+        self.above_threshold &= was_above;
         let crossed = is_above && !self.above_threshold && !was_above;
         self.above_threshold = is_above;
         if crossed {
