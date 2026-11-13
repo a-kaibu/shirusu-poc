@@ -219,6 +219,8 @@ shirusu-conformance <trace> [--json]
 生成時には行わないため、`minimal` と `execution_verified` は共に false とする。
 対応範囲は、単一プロセス・単一スレッドのトップレベル呼び出しで、
 `CreateFileW`、`WriteFile`、`ReadFile`、`CloseHandle` の成功した同期操作。
+ReadFile／WriteFile／CloseHandle の BOOL 戻り値は、負数を含めて非ゼロを成功とする。
+`1` と別の非ゼロ値だけの違いは、再実行用 fingerprint の意味上の差分にしない。
 最初のオープンは `CREATE_NEW`、以後は記録内で作成した同じファイルの
 `OPEN_EXISTING` に限る。排他的共有、通常属性、GENERIC_READ/WRITE のみ扱う。
 非 NULL の `lpOverlapped` は同期ハンドルでも明示位置の指定になり得るため拒否する。

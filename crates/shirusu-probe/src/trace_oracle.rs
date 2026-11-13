@@ -130,7 +130,7 @@ fn observation(view: &TraceView, call: &NormCall) -> Result<TargetObservation, S
     ) {
         return Err("target API has no supported output fingerprint".into());
     }
-    let succeeded = number(leave, "return")? != 0;
+    let succeeded = crate::replay::bool_return(leave)?;
     let mut result = TargetObservation {
         succeeded,
         failure_error: None,

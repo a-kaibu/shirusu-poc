@@ -788,17 +788,13 @@ Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
   Trace へ残す（理由は `CLI override (module not loaded at capture start)`）。
 - Runtime 独自の API を記録するかは設定で選ぶ：
   `CaptureSessionConfig::record_runtime_apis`（既定は false＝記録しない）
-  と CLI の `--record-runtime-apis`。設定は Bootstrap v5 で Agent DLL
-  へ伝え、Detour の入口で呼び出し元の戻りアドレスからモジュールを特定
-  し、分類が Runtime で設定が無効ならその呼び出しを記録しない（元の
-  API だけ素通しで呼ぶ）。呼び出し元が特定できない場合は記録する
-  （fail-open）。戻りアドレスは `RtlCaptureStackBackTrace` で取り、
-  Agent DLL 自身のフレームを飛ばした最初の DLL 外のアドレスを使う。
-  モジュール一覧は DLL 起動時に作り、呼び出し元が一覧に無い場合にだけ
-  500ms に 1 回まで再列挙する（遅れてロードされたモジュールへの追随）。
-  DLL 側の分類は名前だけに依存する Runtime 判定が目的のため、署名検証
-  はしない（System32 のモジュールは Unknown になるが、抑制の判定は
-  Runtime かどうかだけを見るため影響しない）。
+  と CLI の `--record-runtime-apis`。Bootstrap で Agent DLL へ伝え、
+  Detour の呼び出し先 API の分類が Runtime かどうかで記録を選ぶ。
+  Runtime から Windows API へ入る呼び出し（例：fopen → CreateFileW）は記録する。
+  呼び出し元の直接の戻りアドレスに基づく Windows 内部呼び出しの除外は未実装。
+  `caller_return_address` の stack walk と再列挙 helper は実験用であり、
+  標準 Detour の抑制判定には使わない。直接の呼び出し元を保証できず、
+  DLL 側のモジュール一覧には Microsoft 署名の証拠も含まれないためである。
 - ロード済みモジュールの列挙と署名検証（L23）：capture 開始時に Host が
   対象プロセスの全モジュールを列挙する（`EnumProcessModulesEx` 等）。
   起動時は注入直後（再開前）の分と、再開後の安定化待ち（10ms 間隔・
@@ -807,7 +803,8 @@ Windows / Runtime / Application / Unknown の 4 分類で扱い、判定理由
   されたモジュールは含まれないことがある）。Trace と Ring 接続は起動対象
   の再開前に準備し、再開後の列挙・署名確認は別スレッドで行う。終了時に
   更新した Environment を追記するまでイベント回収を続ける。署名は `WinVerifyTrust`（失効確認なし）＋署名者証明書の
-  表示名が "Microsoft Corporation" であることで確認し、
+  Organization 属性（OID 2.5.4.10）が、大文字小文字を除いて
+  "Microsoft Corporation" と全体一致することで確認し、
   `ModuleEvidence.microsoft_signed` へ渡す。API Set 契約名はローダ経由
   （`GetModuleHandleW(契約名)` が apisets スキーマを参照して返す実装
   モジュール）で実装モジュールへ解決する。CLI が作った既存の

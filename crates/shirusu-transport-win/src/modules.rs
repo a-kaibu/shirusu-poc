@@ -4,7 +4,8 @@
 //!   `GetModuleFileNameExW` + `GetModuleInformation` で、対象プロセスの
 //!   全ロード済みモジュール（ベースアドレス・イメージサイズ・パス）を列挙する。
 //! - [`verify_microsoft_signature`]: `WinVerifyTrust` で署名の有効性を
-//!   確認し、署名者証明書の表示名に "Microsoft Corporation" を含むことを
+//!   確認し、署名者証明書の Organization 属性（OID 2.5.4.10）が
+//!   大文字小文字を除いて "Microsoft Corporation" と全体一致することを
 //!   確認する。失効確認は行わない（オフライン CI での遅延・失敗を避ける
 //!   ため。分類に必要なのは「Microsoft 製であること」であり、失効状態
 //!   ではない）。

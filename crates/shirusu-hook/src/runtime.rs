@@ -14,7 +14,8 @@
 //! 専用スレッド（DllMain の外）で行う。記録経路では Agent の
 //! DLL が設定する LoaderLockState::Unknown と WriterPolicy 既定
 //! （Loader Lock 保持が不明な書き込みは待機 0、A69）
-//! に従い、ここでも待機する操作は行わない（SetEvent は待たない操作）。
+//! に従う（SetEvent は待たない操作）。これは Ring 空き待ちの制約であり、
+//! 初回登録・管理用ロックやメモリ確保まで待機なしと保証するものではない。
 
 use crate::api::{ApiDef, API_COUNT};
 use crate::callback::{
@@ -835,9 +836,8 @@ impl HookRuntime {
         !self.detailed_mode && crate::api::is_internal_api(api_id)
     }
 
-    /// 呼び出し元分類のためのモジュール一覧を作り直す。DLL 初期化時と、
-    /// 一覧に無い呼び出し元が現れたときに呼ぶ。列挙に失敗したら
-    /// 従来の一覧を残す（呼び出し元不明 → 記録する fail-open）。
+    /// 実験用の呼び出し元モジュール一覧を作り直す。標準 Detour はこの
+    /// 一覧から呼び出し元を抑制しない。列挙に失敗したら従来の一覧を残す。
     pub fn refresh_caller_modules(&self) {
         if let Ok(mut guard) = self.caller_modules.write() {
             guard.refresh();

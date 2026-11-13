@@ -141,7 +141,7 @@ fn observations(spec: &TestSpec, report: &RunReportData) -> Result<J, String> {
     if env.target_os != "windows"
         || !matches!(env.pointer_width, 32 | 64)
         || env.windows_version.as_ref().is_none_or(String::is_empty)
-        || env.windows_build.is_none()
+        || env.windows_build.is_none_or(|build| build == 0)
         || env.version_source.as_deref() != Some("RtlGetVersion")
     {
         return Err("missing Windows version identity".into());
@@ -365,6 +365,9 @@ mod tests {
         let (s, r) = fixture();
         let mut bad = r.clone();
         bad.environment = None;
+        assert!(observations(&s, &bad).is_err());
+        let mut bad = r.clone();
+        bad.environment.as_mut().unwrap().windows_build = Some(0);
         assert!(observations(&s, &bad).is_err());
         let mut bad = r.clone();
         bad.steps[1].executed = false;

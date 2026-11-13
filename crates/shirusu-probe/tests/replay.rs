@@ -1016,3 +1016,73 @@ fn replay_does_not_remap_special_windows_paths_to_ordinary_files() {
         assert!(generate_replay(&with_path(path)).is_ok(), "{path:?}");
     }
 }
+
+#[test]
+fn replay_accepts_all_nonzero_win32_bool_success_values() {
+    use shirusu_trace::compact::{decode_values, encode_values};
+    let original = generate_replay(&record(1, 42))
+        .unwrap()
+        .to_json()
+        .render_pretty();
+    for result in [1, 2, i32::MAX, -1, i32::MIN, 0] {
+        let mut trace = record(1, 42);
+        for batch in &mut trace.batches {
+            for event in &mut batch.events {
+                if event.kind != 2 {
+                    continue;
+                }
+                let types = trace.registry.types(event.schema_id).unwrap();
+                let mut values = decode_values(&types, event.args.as_ref().unwrap()).unwrap();
+                if matches!(values[0].value, V::I32(_)) {
+                    values[0].value = V::I32(result);
+                    event.args = Some(encode_values(&types, &values).unwrap());
+                }
+            }
+        }
+        let replay = generate_replay(&trace);
+        if result == 0 {
+            assert!(replay.is_err());
+        } else {
+            assert_eq!(replay.unwrap().to_json().render_pretty(), original);
+        }
+    }
+}
+
+#[test]
+fn trace_fingerprint_normalizes_negative_bool_without_inventing_a_difference() {
+    use shirusu_trace::{
+        compact::{decode_values, encode_values},
+        schema::Ty,
+    };
+    for read_byte in [42, 43] {
+        let left = record(1, 42);
+        let mut right = record(1, read_byte);
+        // The fifth call in the fixture is ReadFile; retain its output bytes.
+        let leave = &mut right.batches[0].events[9];
+        let types = [Ty::I32, Ty::U32, Ty::Bytes, Ty::U32];
+        let mut values = decode_values(&types, leave.args.as_ref().unwrap()).unwrap();
+        values[0].value = V::I32(-1);
+        leave.args = Some(encode_values(&types, &values).unwrap());
+        let diff = shirusu_compare::compare_traces(&left, &right);
+        let candidate = diff
+            .candidates
+            .iter()
+            .find(|c| {
+                c.left_event
+                    .as_ref()
+                    .is_some_and(|e| e.api == "kernel32!ReadFile")
+            })
+            .unwrap();
+        let fingerprint =
+            shirusu_probe::trace_oracle::fingerprint_from_traces(&left, &right, candidate);
+        if read_byte == 42 {
+            assert!(fingerprint
+                .unwrap_err()
+                .contains("no supported semantic output difference"));
+        } else {
+            let (_, fingerprint) = fingerprint.unwrap();
+            assert!(fingerprint.candidate.succeeded);
+            assert_eq!(fingerprint.candidate.data.as_deref(), Some("2b"));
+        }
+    }
+}

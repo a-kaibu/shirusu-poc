@@ -73,9 +73,9 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
                 outputs: vec![],
             }),
         };
-        let ret = number(leave, "return")?;
         match api {
             "kernel32!CreateFileW" => {
+                let ret = number(leave, "return")?;
                 let path = match value(enter, "lpFileName")? {
                     TypedValue::Str16(v) => {
                         String::from_utf16(v).map_err(|_| "filename contains ill-formed UTF-16")?
@@ -126,7 +126,7 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
                 handles.insert(ret, (name, path, 0, access));
             }
             "kernel32!WriteFile" | "kernel32!ReadFile" => {
-                if ret != 1 {
+                if !bool_return(leave)? {
                     return Err(format!(
                         "{api}: only successful synchronous I/O is supported"
                     ));
@@ -206,7 +206,7 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
                 }
             }
             "kernel32!CloseHandle" => {
-                if ret != 1 {
+                if !bool_return(leave)? {
                     return Err("CloseHandle did not succeed".into());
                 }
                 let handle = number(enter, "hObject")?;
@@ -403,5 +403,15 @@ fn number(event: &EventView, name: &str) -> Result<u64, String> {
         TypedValue::U32(v) | TypedValue::Ptr32(v) => Ok(u64::from(*v)),
         TypedValue::I32(v) if *v >= 0 => Ok(*v as u64),
         _ => Err(format!("field {name} is not a nonnegative integer")),
+    }
+}
+
+/// Win32 BOOL is a signed 32-bit value: every nonzero value means success.
+/// Keep this separate from unsigned counts, handles and buffer lengths.
+pub(crate) fn bool_return(event: &EventView) -> Result<bool, String> {
+    match value(event, "return")? {
+        TypedValue::I32(value) => Ok(*value != 0),
+        TypedValue::U32(value) => Ok(*value != 0),
+        _ => Err("return is not a 32-bit BOOL".into()),
     }
 }
