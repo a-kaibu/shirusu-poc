@@ -188,7 +188,7 @@ mod win {
             return STATUS_BAD_BOOTSTRAP;
         }
         // SAFETY: caller supplies this version's structure until init returns.
-        let mut b = unsafe { *bootstrap };
+        let b = unsafe { *bootstrap };
         if b.version != BOOTSTRAP_VERSION {
             return STATUS_BAD_BOOTSTRAP;
         }
@@ -451,25 +451,32 @@ mod win {
         };
         let inline_reasons = index_outcome(&inline_outcome);
         let internal_reasons = index_outcome(&internal_hook_outcome);
+        use shirusu_hook::bootstrap as boot;
+        let mut records = Vec::new();
         for api in api_table() {
-            let id = api.api_id as usize;
             let internal = shirusu_hook::api::is_internal_api(api.api_id);
-            b.result_iat[id] = if internal {
-                3
+            let iat = if internal {
+                boot::IAT_INTERNAL
             } else if preserved_ids.contains(&api.api_id) {
                 if iat_ids.contains(&api.api_id) {
-                    5
+                    boot::IAT_PARTIAL_PRESERVED
                 } else {
-                    4
+                    boot::IAT_PRESERVED
                 }
             } else if iat_ids.contains(&api.api_id) {
-                1
+                boot::IAT_INSTALLED
             } else {
-                2
+                boot::IAT_NOT_IMPORTED
             };
+            let iat_only = shirusu_hook::api::is_iat_only_api(api.api_id);
+            // A broad-tier API the main module does not import has nothing to
+            // report beyond its scope; thousands of such records are omitted.
+            if iat_only && iat == boot::IAT_NOT_IMPORTED {
+                continue;
+            }
             let reason = if internal && b.detailed_mode == 0 {
                 "detailed-mode-disabled"
-            } else if shirusu_hook::api::is_iat_only_api(api.api_id) {
+            } else if iat_only {
                 "not-attempted-iat-only-scope"
             } else {
                 let reasons = if internal {
@@ -479,15 +486,18 @@ mod win {
                 };
                 reasons.get(&api.api_id).copied().unwrap_or("unknown")
             };
-            // Reasons outside the fixed code table are reported as unknown.
-            b.result_inline[id] = shirusu_hook::bootstrap::inline_reason_code(reason);
+            records.push(boot::HookEvidenceRecord {
+                api_id: api.api_id,
+                iat,
+                // Reasons outside the fixed code table are reported as unknown.
+                inline: boot::inline_reason_code(reason),
+                reserved: 0,
+            });
         }
-        // SAFETY: writable Bootstrap owned by Host until initialization returns.
-        unsafe {
-            (*bootstrap.cast_mut()).result_iat = b.result_iat;
-            (*bootstrap.cast_mut()).result_inline = b.result_inline;
-            (*bootstrap.cast_mut()).result_evidence_ready = 1;
-        }
+        // SAFETY: writable Bootstrap owned by Host until initialization
+        // returns; Host allocated `evidence_capacity` records at
+        // `evidence_address` in the same region.
+        unsafe { AgentBootstrap::write_hook_evidence(bootstrap.cast_mut(), &records) };
         // Host が読み戻せるよう、init_done を立てる前に Bootstrap へ
         // 設置/欠落件数を書き戻す。
         // SAFETY: bootstrap は Host が書き込み可能に確保した領域で、

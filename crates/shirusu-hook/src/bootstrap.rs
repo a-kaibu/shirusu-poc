@@ -55,14 +55,50 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v12: distinguish COM method return kinds from factory HRESULT payloads.
 /// v13: 8,192 evidence slots for the IAT-only broad tier (IDs up to
 /// MAX_API_ID); Inline reasons are 1-byte codes of [`INLINE_REASONS`].
-pub const BOOTSTRAP_VERSION: u32 = 13;
+/// v14: Hook evidence leaves the fixed structure. Host passes the address and
+/// capacity of a separate record area ([`HookEvidenceRecord`]); Agent writes
+/// one record per reported API and the record count. The structure size no
+/// longer depends on the number of APIs.
+pub const BOOTSTRAP_VERSION: u32 = 14;
 /// Initialization published hooks but could not complete installation. Only
 /// this failure status authorizes Host to retry this attempt's shutdown.
 pub const INIT_HOOK_FAILED: u32 = 3;
-// Fixed protocol capacity: adding an API must not silently enlarge the native
-// structure while keeping the same Bootstrap version.
-pub const HOOK_EVIDENCE_COUNT: usize = 8192;
-const _: () = assert!(crate::api::MAX_API_ID < HOOK_EVIDENCE_COUNT);
+/// `result_evidence_ready`: Agent wrote every record it had.
+pub const EVIDENCE_COMPLETE: u32 = 1;
+/// `result_evidence_ready`: the record area was too small or absent; Host must
+/// treat all installation evidence as unknown rather than a partial claim.
+pub const EVIDENCE_TRUNCATED: u32 = 2;
+
+/// IAT evidence codes of [`HookEvidenceRecord::iat`]. Code `n` names
+/// `IAT_REASONS[n]`; 0 means unknown. Append only.
+pub const IAT_REASONS: &[&str] = &[
+    "unknown",
+    "installed",
+    "not-imported-in-main-module",
+    "not-attempted-internal-api",
+    "noncanonical-import-preserved",
+    "partially-installed-noncanonical-import-preserved",
+];
+pub const IAT_INSTALLED: u8 = 1;
+pub const IAT_NOT_IMPORTED: u8 = 2;
+pub const IAT_INTERNAL: u8 = 3;
+pub const IAT_PRESERVED: u8 = 4;
+pub const IAT_PARTIAL_PRESERVED: u8 = 5;
+
+/// One API's installation result, written by Agent into the record area that
+/// Host allocated and named in [`AgentBootstrap::evidence_address`]. The
+/// record carries codes only; names, levels and reason strings come from the
+/// API table, so the format does not change when APIs are added.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HookEvidenceRecord {
+    pub api_id: u32,
+    /// Code of [`IAT_REASONS`].
+    pub iat: u8,
+    /// Code of [`INLINE_REASONS`] (1-based; 0 = not written).
+    pub inline: u8,
+    pub reserved: u16,
+}
 /// Inline evidence codes. Code `n` (1-based) names `INLINE_REASONS[n - 1]`;
 /// 0 means not written. Append only: a code keeps its meaning across builds.
 /// A reason outside this table is reported as `unknown`, never truncated
@@ -93,7 +129,7 @@ pub const INLINE_REASONS: &[&str] = &[
     "not-attempted-iat-only-scope",
 ];
 
-/// Code of an Inline reason for [`AgentBootstrap::result_inline`].
+/// Code of an Inline reason for [`HookEvidenceRecord::inline`].
 pub fn inline_reason_code(reason: &str) -> u8 {
     let index = INLINE_REASONS
         .iter()
@@ -164,9 +200,14 @@ pub struct AgentBootstrap {
     /// 初期化結果 (v9, L16): DLL が設置したコールバック検出フックの
     /// 数（0〜4）。Host は読み戻して Coverage へ写す。
     pub result_callback_hook_count: u32,
+    /// 0 = not written, [`EVIDENCE_COMPLETE`] or [`EVIDENCE_TRUNCATED`].
     pub result_evidence_ready: u32,
-    pub result_iat: [u8; HOOK_EVIDENCE_COUNT],
-    pub result_inline: [u8; HOOK_EVIDENCE_COUNT],
+    /// Target-process address of the Host-allocated record area. 0 = none.
+    pub evidence_address: u64,
+    /// Number of [`HookEvidenceRecord`] slots at `evidence_address`.
+    pub evidence_capacity: u32,
+    /// Number of records Agent wrote (at most `evidence_capacity`).
+    pub result_evidence_count: u32,
 }
 
 impl Default for AgentBootstrap {
@@ -194,8 +235,9 @@ impl Default for AgentBootstrap {
             result_internal_hook_count: 0,
             result_callback_hook_count: 0,
             result_evidence_ready: 0,
-            result_iat: [0; HOOK_EVIDENCE_COUNT],
-            result_inline: [0; HOOK_EVIDENCE_COUNT],
+            evidence_address: 0,
+            evidence_capacity: 0,
+            result_evidence_count: 0,
         }
     }
 }
@@ -210,30 +252,66 @@ pub enum BootstrapError {
 }
 
 impl AgentBootstrap {
-    /// Validate bounded native fields before producing portable Trace evidence.
-    pub fn hook_evidence(&self) -> Option<Vec<shirusu_trace::proto::HookEvidence>> {
-        if self.version != BOOTSTRAP_VERSION || self.result_evidence_ready != 1 {
-            return None;
+    /// Agent side: copy `records` into the Host-named record area and publish
+    /// the count. A missing or too small area marks the report truncated, so
+    /// Host never takes a partial list for the complete one.
+    ///
+    /// # Safety
+    /// `bootstrap` must be writable, and a nonzero `evidence_address` must
+    /// name `evidence_capacity` writable records in this process (Host's
+    /// allocation contract, valid until initialization returns).
+    pub unsafe fn write_hook_evidence(
+        bootstrap: *mut AgentBootstrap,
+        records: &[HookEvidenceRecord],
+    ) {
+        // SAFETY: caller contract.
+        unsafe {
+            let address = usize::try_from((*bootstrap).evidence_address).unwrap_or(0);
+            let capacity = (*bootstrap).evidence_capacity as usize;
+            if address == 0 || records.len() > capacity {
+                (*bootstrap).result_evidence_count = 0;
+                (*bootstrap).result_evidence_ready = EVIDENCE_TRUNCATED;
+                return;
+            }
+            std::ptr::copy_nonoverlapping(
+                records.as_ptr(),
+                address as *mut HookEvidenceRecord,
+                records.len(),
+            );
+            (*bootstrap).result_evidence_count = records.len() as u32;
+            (*bootstrap).result_evidence_ready = EVIDENCE_COMPLETE;
         }
-        let mut evidence = Vec::new();
-        for api in crate::api::api_table() {
-            let id = api.api_id as usize;
-            let iat_reason = match self.result_iat[id] {
-                0 => "unknown",
-                1 => "installed",
-                2 => "not-imported-in-main-module",
-                3 => "not-attempted-internal-api",
-                4 => "noncanonical-import-preserved",
-                5 => "partially-installed-noncanonical-import-preserved",
-                _ => return None,
-            };
+    }
+
+    /// Number of records Host should read back, validated against the
+    /// capacity Host itself allocated (`host_capacity`). None = unknown.
+    pub fn evidence_record_count(&self, host_capacity: u32) -> Option<usize> {
+        (self.version == BOOTSTRAP_VERSION
+            && self.result_evidence_ready == EVIDENCE_COMPLETE
+            && self.result_evidence_count <= host_capacity)
+            .then_some(self.result_evidence_count as usize)
+    }
+
+    /// Validate records read from the record area before producing portable
+    /// Trace evidence. Unknown API IDs, duplicate IDs and unknown codes reject
+    /// the whole report. APIs without a record have no evidence (unknown).
+    pub fn hook_evidence(
+        records: &[HookEvidenceRecord],
+    ) -> Option<Vec<shirusu_trace::proto::HookEvidence>> {
+        let mut seen = std::collections::HashSet::with_capacity(records.len());
+        let mut evidence = Vec::with_capacity(records.len() * 2);
+        for record in records {
+            let api = crate::api::api_by_id(record.api_id)?;
+            if !seen.insert(record.api_id) || record.reserved != 0 {
+                return None;
+            }
+            let iat_reason = *IAT_REASONS.get(record.iat as usize)?;
             // A broad-tier API absent from the main module's imports has no
-            // installation fact beyond its scope; omit thousands of such rows.
-            // Imported (installed or preserved) broad APIs keep full evidence.
-            if crate::api::is_iat_only_api(api.api_id) && self.result_iat[id] == 2 {
+            // installation fact beyond its scope; Agent normally omits it.
+            if crate::api::is_iat_only_api(api.api_id) && record.iat == IAT_NOT_IMPORTED {
                 continue;
             }
-            let code = self.result_inline[id] as usize;
+            let code = record.inline as usize;
             let inline_reason = *INLINE_REASONS.get(code.checked_sub(1)?)?;
             for (method, reason, scope) in [
                 ("iat", iat_reason, "main-module-at-initialization"),
@@ -467,17 +545,31 @@ mod tests {
         );
     }
 
+    fn record(api_id: u32, iat: u8, inline: &str) -> HookEvidenceRecord {
+        HookEvidenceRecord {
+            api_id,
+            iat,
+            inline: inline_reason_code(inline),
+            reserved: 0,
+        }
+    }
+
     #[test]
     fn hook_evidence_rejects_incomplete_or_malformed_reports() {
         let mut b = AgentBootstrap::default();
-        assert!(b.hook_evidence().is_none());
-        b.result_evidence_ready = 1;
-        assert!(b.hook_evidence().is_none());
-        for api in crate::api::api_table() {
-            b.result_iat[api.api_id as usize] = 2;
-            b.result_inline[api.api_id as usize] = inline_reason_code("installed");
-        }
-        let evidence = b.hook_evidence().unwrap();
+        assert!(b.evidence_record_count(16).is_none(), "not written");
+        b.result_evidence_ready = EVIDENCE_TRUNCATED;
+        assert!(b.evidence_record_count(16).is_none());
+        b.result_evidence_ready = EVIDENCE_COMPLETE;
+        b.result_evidence_count = 17;
+        assert!(b.evidence_record_count(16).is_none(), "over Host capacity");
+        b.result_evidence_count = 16;
+        assert_eq!(b.evidence_record_count(16), Some(16));
+
+        let mut records: Vec<_> = crate::api::api_table()
+            .map(|api| record(api.api_id, IAT_NOT_IMPORTED, "installed"))
+            .collect();
+        let evidence = AgentBootstrap::hook_evidence(&records).unwrap();
         // Non-imported broad-tier APIs are summarized away.
         assert_eq!(
             evidence.len(),
@@ -488,15 +580,19 @@ mod tests {
             .filter(|h| h.method == "inline")
             .all(|h| h.outcome == "installed"));
         for (value, outcome, reason) in [
-            (4, "not-installed", "noncanonical-import-preserved"),
             (
-                5,
+                IAT_PRESERVED,
+                "not-installed",
+                "noncanonical-import-preserved",
+            ),
+            (
+                IAT_PARTIAL_PRESERVED,
                 "partial",
                 "partially-installed-noncanonical-import-preserved",
             ),
         ] {
-            b.result_iat[1] = value;
-            let report = b.hook_evidence().unwrap();
+            records[0].iat = value;
+            let report = AgentBootstrap::hook_evidence(&records).unwrap();
             let iat = report
                 .iter()
                 .find(|h| h.api_id == 1 && h.method == "iat")
@@ -504,21 +600,68 @@ mod tests {
             assert_eq!(iat.outcome, outcome);
             assert_eq!(iat.reason, reason);
         }
-        b.result_inline[1] = inline_reason_code("installed-restoration-pending");
-        let report = b.hook_evidence().unwrap();
+        records[0].inline = inline_reason_code("installed-restoration-pending");
+        let report = AgentBootstrap::hook_evidence(&records).unwrap();
         let inline = report
             .iter()
             .find(|h| h.api_id == 1 && h.method == "inline")
             .unwrap();
         assert_eq!(inline.outcome, "partial");
         assert_eq!(inline.reason, "installed-restoration-pending");
-        b.result_inline[1] = 0xff;
-        assert!(b.hook_evidence().is_none());
-        b.result_inline[1] = 0;
-        assert!(b.hook_evidence().is_none());
-        b.result_inline[1] = inline_reason_code("installed");
-        b.result_iat[1] = 255;
-        assert!(b.hook_evidence().is_none());
+        let reject = |mutate: &dyn Fn(&mut Vec<HookEvidenceRecord>)| {
+            let mut bad = records.clone();
+            mutate(&mut bad);
+            AgentBootstrap::hook_evidence(&bad).is_none()
+        };
+        assert!(reject(&|r| r[0].inline = 0xff));
+        assert!(reject(&|r| r[0].inline = 0));
+        assert!(reject(&|r| r[0].iat = 255));
+        assert!(reject(&|r| r[0].reserved = 1));
+        assert!(reject(&|r| r[0].api_id = 0));
+        assert!(reject(&|r| r[0].api_id = u32::MAX));
+        assert!(reject(&|r| {
+            let first = r[0];
+            r.push(first)
+        }));
+        // A subset is valid: APIs without a record simply have no evidence.
+        let subset = AgentBootstrap::hook_evidence(&records[..1]).unwrap();
+        assert_eq!(subset.len(), 2);
+        assert!(AgentBootstrap::hook_evidence(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_hook_evidence_never_overflows_the_host_area() {
+        let records = [
+            record(1, IAT_INSTALLED, "installed"),
+            record(2, IAT_NOT_IMPORTED, "too-short"),
+        ];
+        let mut area = [HookEvidenceRecord::default(); 3];
+        let mut b = AgentBootstrap {
+            evidence_address: area.as_mut_ptr() as usize as u64,
+            evidence_capacity: 2,
+            ..AgentBootstrap::default()
+        };
+        // SAFETY: `area` holds 3 >= capacity records.
+        unsafe { AgentBootstrap::write_hook_evidence(&mut b, &records) };
+        assert_eq!(b.result_evidence_ready, EVIDENCE_COMPLETE);
+        assert_eq!(b.evidence_record_count(2), Some(2));
+        assert_eq!(&area[..2], &records);
+        assert_eq!(area[2], HookEvidenceRecord::default());
+
+        // Too many records: nothing is claimed, nothing is written past capacity.
+        let mut small = [HookEvidenceRecord::default(); 1];
+        b.evidence_address = small.as_mut_ptr() as usize as u64;
+        b.evidence_capacity = 1;
+        // SAFETY: capacity 1 matches `small`; the call must not write 2.
+        unsafe { AgentBootstrap::write_hook_evidence(&mut b, &records) };
+        assert_eq!(b.result_evidence_ready, EVIDENCE_TRUNCATED);
+        assert!(b.evidence_record_count(1).is_none());
+        assert_eq!(small[0], HookEvidenceRecord::default());
+
+        b.evidence_address = 0;
+        // SAFETY: a zero address is never dereferenced.
+        unsafe { AgentBootstrap::write_hook_evidence(&mut b, &[]) };
+        assert_eq!(b.result_evidence_ready, EVIDENCE_TRUNCATED);
     }
 
     #[test]
@@ -533,23 +676,28 @@ mod tests {
             INLINE_REASONS[inline_reason_code("future-reason") as usize - 1],
             "unknown"
         );
+        assert_eq!(IAT_REASONS[IAT_INSTALLED as usize], "installed");
+        assert_eq!(
+            IAT_REASONS[IAT_PARTIAL_PRESERVED as usize],
+            "partially-installed-noncanonical-import-preserved"
+        );
         // Every broad-tier API reports its scope instead of an Inline result.
-        let mut b = AgentBootstrap {
-            result_evidence_ready: 1,
-            ..AgentBootstrap::default()
-        };
-        for api in crate::api::api_table() {
-            b.result_iat[api.api_id as usize] = 2;
-            b.result_inline[api.api_id as usize] =
-                inline_reason_code(if crate::api::is_iat_only_api(api.api_id) {
-                    "not-attempted-iat-only-scope"
-                } else {
-                    "installed"
-                });
-        }
         let broad = crate::api::BROAD_API_TABLE[0].api_id;
-        b.result_iat[broad as usize] = 1;
-        let evidence = b.hook_evidence().unwrap();
+        let records: Vec<_> = crate::api::api_table()
+            .map(|api| {
+                if crate::api::is_iat_only_api(api.api_id) {
+                    let iat = if api.api_id == broad {
+                        IAT_INSTALLED
+                    } else {
+                        IAT_NOT_IMPORTED
+                    };
+                    record(api.api_id, iat, "not-attempted-iat-only-scope")
+                } else {
+                    record(api.api_id, IAT_NOT_IMPORTED, "installed")
+                }
+            })
+            .collect();
+        let evidence = AgentBootstrap::hook_evidence(&records).unwrap();
         assert_eq!(
             evidence
                 .iter()
@@ -572,15 +720,15 @@ mod tests {
     }
 
     #[test]
-    fn layout_is_fixed_size() {
-        assert_eq!(
-            std::mem::size_of::<AgentBootstrap>(),
-            (616 + HOOK_EVIDENCE_COUNT * 2).next_multiple_of(8)
-        );
+    fn layout_is_fixed_size_and_independent_of_api_count() {
+        assert_eq!(std::mem::size_of::<AgentBootstrap>(), 632);
         assert_eq!(
             std::mem::offset_of!(AgentBootstrap, result_evidence_ready),
             612
         );
+        assert_eq!(std::mem::offset_of!(AgentBootstrap, evidence_address), 616);
+        assert_eq!(std::mem::size_of::<HookEvidenceRecord>(), 8);
+        assert_eq!(std::mem::align_of::<HookEvidenceRecord>(), 4);
     }
 
     #[test]

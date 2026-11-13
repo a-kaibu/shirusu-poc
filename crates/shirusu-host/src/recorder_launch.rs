@@ -34,7 +34,7 @@ use crate::recorder::{
 };
 use shirusu_hook::api::API_COUNT;
 use shirusu_hook::bootstrap::{
-    AgentBootstrap, SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK,
+    AgentBootstrap, HookEvidenceRecord, SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED, SHUTDOWN_OK,
 };
 use shirusu_hook::pe;
 use shirusu_transport::EXPANDED_SLOT_GENERATION;
@@ -628,7 +628,11 @@ struct BootstrapResult {
 /// 捏造しない）。DLL は init_done を立てる前（成功時）か、失敗を
 /// 返す直前（設置失敗の詳細）に書き戻すため、リモートスレッドの
 /// 完了後には確定している。
-fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<BootstrapResult> {
+fn read_bootstrap_result(
+    process: win::HandleValue,
+    remote: usize,
+    evidence_capacity: u32,
+) -> Option<BootstrapResult> {
     let mut buf = AgentBootstrap::default();
     // SAFETY: AgentBootstrap は repr(C) の値型。バイト列として読み込む。
     let bytes = unsafe {
@@ -668,8 +672,26 @@ fn read_bootstrap_result(process: win::HandleValue, remote: usize) -> Option<Boo
     if callback_hooks as usize > shirusu_hook::callback::CALLBACK_HOOK_COUNT {
         return None;
     }
+    // Records are read from the area Host allocated, at Host's own address and
+    // capacity; the count Agent wrote is only trusted within that capacity.
+    let hook_evidence = buf
+        .evidence_record_count(evidence_capacity)
+        .and_then(|count| {
+            let mut records = vec![HookEvidenceRecord::default(); count];
+            // SAFETY: HookEvidenceRecord は repr(C) の値型。
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    records.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of_val(records.as_slice()),
+                )
+            };
+            let address = remote + std::mem::size_of::<AgentBootstrap>();
+            win::read_process_memory(process, address, bytes.as_mut_ptr(), bytes.len()).ok()?;
+            AgentBootstrap::hook_evidence(&records)
+        })
+        .unwrap_or_default();
     Some(BootstrapResult {
-        hook_evidence: buf.hook_evidence().unwrap_or_default(),
+        hook_evidence,
         hooked: hooked as usize,
         missing: missing as usize,
         unrestored: unrestored as usize,
@@ -861,7 +883,18 @@ fn inject_and_init(
         .find_map(|name| pe::find_export(&image, name))
         .map(|r| base + r as usize);
 
-    let remote = win::remote_alloc(process, std::mem::size_of::<AgentBootstrap>())?;
+    // One region: the control Bootstrap followed by the Hook evidence record
+    // area. Its capacity follows this build's API table at run time (each API
+    // reports at most once), so adding APIs never changes the Bootstrap ABI.
+    // Sharing the region keeps the existing lifetime rule: it is freed with
+    // the Bootstrap, and left alone when the remote call is still pending.
+    let evidence_capacity = u32::try_from(API_COUNT)
+        .map_err(|_| SessionError::Injection("API table exceeds evidence capacity".into()))?;
+    let region_len = std::mem::size_of::<AgentBootstrap>()
+        + API_COUNT * std::mem::size_of::<HookEvidenceRecord>();
+    let remote = win::remote_alloc(process, region_len)?;
+    bootstrap.evidence_address = (remote + std::mem::size_of::<AgentBootstrap>()) as u64;
+    bootstrap.evidence_capacity = evidence_capacity;
     let write_result = (|| -> Result<(), SessionError> {
         // SAFETY: AgentBootstrap は repr(C) の値型。バイト列として書き込む。
         let bytes = unsafe {
@@ -883,7 +916,7 @@ fn inject_and_init(
     // （復元失敗スロット数）が書き戻されている場合がある
     // （レビュー第5回 #8）。
     let outcome = if status.is_ok() {
-        read_bootstrap_result(process, remote)
+        read_bootstrap_result(process, remote, evidence_capacity)
     } else {
         None
     };

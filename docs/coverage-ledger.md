@@ -6,8 +6,15 @@ shirusu coverage capture.trace --json
 ```
 
 静的依存、Hook 設置、観測、意味情報を別々の証拠として表示する。記録する Agent と
-Host は Bootstrap v13 の同じビルドを使う。結果欄は API ID で引く固定 8,192 スロット
-（IAT 1 バイト、Inline 理由コード 1 バイト）で、API を追加しても構造体サイズを暗黙に変えない。
+Host は Bootstrap v14 の同じビルドを使う。Bootstrap は制御情報（Session、Mapping、
+イベント、設定）と結果の書き込み先だけを持つ固定 632 バイトの構造体で、Hook 設置結果は
+含まない。Host は Bootstrap の直後に、そのビルドの API 表の件数ぶんの記録領域を同じ
+リモート領域として確保し、アドレスと容量を Bootstrap に書く。Agent は API ごとに
+`{api_id u32, IAT コード u8, Inline 理由コード u8, 予約 u16}` の 8 バイト記録を書き、
+件数を返す。API の件数が増えても転送 ABI は変わらない。容量不足や書き込み先なしは
+`truncated` として全件を不明扱いにし、一部だけを完全な結果として扱わない。Host は自分が
+確保したアドレスと容量で読み戻し、未知の API ID、重複、未知のコード、予約欄の非 0 を
+含む報告を丸ごと破棄する。記録の無い API は証拠なし（不明）になる。
 Inline の理由は追記のみの固定コード表で、表に無い理由は `unknown` と報告する。新しい Agent は旧版の小さい Bootstrap を
 全体コピーする前に version を検査して拒否する。
 

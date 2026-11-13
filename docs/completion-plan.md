@@ -140,6 +140,12 @@ export 5,693 件を L1 の広域層として追加した。標準層（197 件�
   ExitThread と同じ扱いにするかを実機検証後に決める。
 - Bootstrap v13: Hook 証拠は API ID で引く固定 8,192 スロットに拡大し、Inline の
   理由は 1 バイトの固定コード表へ変更した（構造体は約 17 KiB）。
+- Bootstrap v14（アーキテクチャレビュー P0）: Hook 設置結果を Bootstrap から外し、
+  Host が確保する可変長の記録領域（API ID + IAT/Inline コードの 8 バイト記録）へ
+  移した。Bootstrap は固定 632 バイトの制御情報だけになり、API 数の上限は転送 ABI に
+  残らない（容量は実行時の API 表の件数）。Agent は main module が import しない
+  広域層 API の記録を書かないため、通常の記録数は標準層 197 件 + import された広域層の
+  件数になる。Windows 実機での読み戻しは CI の Windows ジョブで確認する。
 - 全 Schema を開始時に登録すると 1 Trace あたり約 6.2 MB 増えた（11,780 Schema、
   Linux debug 測定）。標準層は従来どおり開始時に登録し、広域層の Schema は
   イベントが初めて参照した時点で登録する（Writer は使用する Event Chunk の前に
