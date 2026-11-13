@@ -227,6 +227,9 @@ fn parse_args(args: &[String], flags: &[&str]) -> Result<Parsed, ToolError> {
             // `--key=value` 形式も受け付ける（overview の `--order=global`
             // の表記どおり打てるようにする。値は最初の `=` で区切る）。
             if let Some((name, value)) = name.split_once('=') {
+                if flags.contains(&name) {
+                    return Err(ToolError::Usage(format!("--{name} does not take a value")));
+                }
                 parsed
                     .opts
                     .push((name.to_string(), Some(value.to_string())));
@@ -239,6 +242,7 @@ fn parse_args(args: &[String], flags: &[&str]) -> Result<Parsed, ToolError> {
             } else {
                 let value = args
                     .get(i + 1)
+                    .filter(|value| !value.starts_with("--"))
                     .ok_or_else(|| ToolError::Usage(format!("--{name} needs a value")))?;
                 parsed.opts.push((name.to_string(), Some(value.clone())));
                 i += 2;
@@ -252,6 +256,14 @@ fn parse_args(args: &[String], flags: &[&str]) -> Result<Parsed, ToolError> {
 }
 
 impl Parsed {
+    fn validate_options(&self, allowed: &[&str]) -> Result<(), ToolError> {
+        for (name, _) in &self.opts {
+            if !allowed.contains(&name.as_str()) {
+                return Err(ToolError::Usage(format!("unknown option: --{name}")));
+            }
+        }
+        Ok(())
+    }
     fn opt(&self, name: &str) -> Option<&str> {
         self.opts
             .iter()
@@ -290,6 +302,7 @@ fn load_trace(parsed: &Parsed) -> Result<(String, ReadTrace), ToolError> {
 
 fn cmd_inspect(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &["json"])?;
+    parsed.validate_options(&["json"])?;
     let (path, trace) = load_trace(&parsed)?;
     let view = TraceView::build(&trace);
     if parsed.has("json") {
@@ -775,6 +788,9 @@ fn build_filter(parsed: &Parsed) -> Result<EventFilter, ToolError> {
 
 fn cmd_dump(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &["json"])?;
+    parsed.validate_options(&[
+        "json", "api", "kind", "seq", "thread", "text", "limit", "order",
+    ])?;
     let (_path, trace) = load_trace(&parsed)?;
     let view = TraceView::build(&trace);
     let filter = build_filter(&parsed)?;
@@ -827,8 +843,31 @@ fn cmd_dump(args: &[String]) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// Build output beside its destination and publish only after writing succeeds.
+/// Replacing the directory entry also avoids truncating an input hard-link alias.
+fn prepare_output(input: &str, output: &str) -> Result<tempfile::NamedTempFile, ToolError> {
+    if output == input
+        || std::fs::canonicalize(output)
+            .ok()
+            .zip(std::fs::canonicalize(input).ok())
+            .is_some_and(|(a, b)| a == b)
+    {
+        return Err(ToolError::Runtime(
+            "refusing to overwrite the input trace".into(),
+        ));
+    }
+    let parent = Path::new(output)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        ToolError::Runtime(format!("cannot create temporary output for {output}: {e}"))
+    })
+}
+
 fn cmd_export(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &[])?;
+    parsed.validate_options(&["format", "output"])?;
     let format = parsed
         .opt("format")
         .ok_or_else(|| ToolError::Usage("export needs --format".into()))?;
@@ -846,22 +885,7 @@ fn cmd_export(args: &[String]) -> Result<(), ToolError> {
     let view = TraceView::build(&trace);
     if format == "parquet" {
         let output = parsed.opt("output").expect("validated output path");
-        if std::fs::canonicalize(output)
-            .ok()
-            .zip(std::fs::canonicalize(&path).ok())
-            .is_some_and(|(a, b)| a == b)
-        {
-            return Err(ToolError::Runtime(
-                "refusing to overwrite the input trace".into(),
-            ));
-        }
-        let parent = Path::new(output)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
-            ToolError::Runtime(format!("cannot create temporary output for {output}: {e}"))
-        })?;
+        let mut file = prepare_output(&path, output)?;
         parquet_export::write(
             file.as_file_mut(),
             &view,
@@ -873,16 +897,27 @@ fn cmd_export(args: &[String]) -> Result<(), ToolError> {
         })?;
         return Ok(());
     }
-    let mut sink: Box<dyn std::io::Write> = match parsed.opt("output") {
-        Some(path) => Box::new(
-            std::fs::File::create(path)
-                .map_err(|e| ToolError::Runtime(format!("cannot create {path}: {e}")))?,
-        ),
-        None => Box::new(std::io::stdout()),
-    };
-    for ev in &view.events {
-        writeln!(sink, "{}", ev.to_json().render())
-            .map_err(|e| ToolError::Runtime(format!("write failed: {e}")))?;
+    let mut file = parsed
+        .opt("output")
+        .map(|output| prepare_output(&path, output))
+        .transpose()?;
+    {
+        let mut sink: Box<dyn std::io::Write + '_> = match file.as_mut() {
+            Some(file) => Box::new(std::io::BufWriter::new(file.as_file_mut())),
+            None => Box::new(std::io::stdout()),
+        };
+        for ev in &view.events {
+            writeln!(sink, "{}", ev.to_json().render())
+                .map_err(|e| ToolError::Runtime(format!("write failed: {e}")))?;
+        }
+        sink.flush()
+            .map_err(|e| ToolError::Runtime(format!("flush failed: {e}")))?;
+    }
+    if let Some(file) = file {
+        let output = parsed.opt("output").expect("output file was prepared");
+        file.persist(output).map_err(|e| {
+            ToolError::Runtime(format!("cannot publish JSONL output {output}: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -1237,26 +1272,18 @@ fn repair_json(report: &RepairReport) -> JsonValue {
 
 fn cmd_repair(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &["json"])?;
+    parsed.validate_options(&["json", "output"])?;
     let (input, trace) = load_trace(&parsed)?;
     let output = match parsed.opt("output") {
         Some(path) => path.to_string(),
         None => format!("{input}.repaired"),
     };
-    // 入力そのものへの上書きを拒否する（修復元を壊さない）。
-    let same = output == input
-        || std::fs::canonicalize(&output)
-            .ok()
-            .zip(std::fs::canonicalize(&input).ok())
-            .map(|(a, b)| a == b)
-            .unwrap_or(false);
-    if same {
-        return Err(ToolError::Runtime(format!(
-            "refusing to overwrite the input trace: {output} is the same file as {input}"
-        )));
-    }
+    let mut file = prepare_output(&input, &output)?;
     let (bytes, mut report) = repair_trace(&input, &trace)?;
-    std::fs::write(&output, &bytes)
+    file.write_all(&bytes)
         .map_err(|e| ToolError::Runtime(format!("cannot write {output}: {e}")))?;
+    file.persist(&output)
+        .map_err(|e| ToolError::Runtime(format!("cannot publish repaired trace {output}: {e}")))?;
     report.output = output;
     if parsed.has("json") {
         println!("{}", repair_json(&report).render_pretty());
@@ -1346,6 +1373,19 @@ struct CaptureOptions {
 
 impl CaptureOptions {
     fn parse(parsed: &Parsed) -> Result<Self, ToolError> {
+        parsed.validate_options(&[
+            "output",
+            "dll",
+            "timeout",
+            "order",
+            "module-class",
+            "record-runtime-apis",
+            "diagnostic-query-interface",
+            "mode",
+            "api",
+            "follow-children",
+            "buffer",
+        ])?;
         let ring_config = match parsed.opt("buffer") {
             None | Some("standard") => shirusu_transport::RingConfig::PRODUCTION,
             Some("burst") => shirusu_transport::RingConfig::BURST,

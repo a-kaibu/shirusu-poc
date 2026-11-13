@@ -1369,24 +1369,131 @@ fn parquet_export_empty_trace_still_has_schema_and_finalization_metadata() {
 }
 
 #[test]
-fn parquet_export_refuses_to_replace_its_input() {
+fn invalid_options_fail_before_reading_or_capturing() {
+    let dir = fresh_dir();
+    for args in [
+        vec!["capture", "--bufer=burst", "--", "not-started.exe"],
+        vec!["attach", "123", "--buffer", "--mode", "full"],
+        vec![
+            "capture",
+            "--follow-children=false",
+            "--",
+            "not-started.exe",
+        ],
+        vec!["inspect", "missing.trace", "--json=false"],
+        vec!["inspect", "missing.trace", "--unknown=value"],
+        vec!["coverage", "missing.trace", "--unknown=value"],
+        vec!["dump", "missing.trace", "--unknown=value"],
+        vec![
+            "export",
+            "missing.trace",
+            "--format",
+            "jsonl",
+            "--outpt",
+            "wrong",
+        ],
+        vec!["repair", "missing.trace", "--outpt", "wrong"],
+    ] {
+        let (_, err, code) = run_in(&dir, &args);
+        assert_eq!(code, Some(2), "{args:?}: {err}");
+        assert!(err.contains("usage error"), "{err}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn export_refuses_to_replace_its_input() {
     let dir = fresh_dir();
     let bytes = sample_trace_bytes();
     std::fs::write(dir.join("sample.trace"), &bytes).unwrap();
-    let (_, err, code) = run_in(
-        &dir,
-        &[
-            "export",
-            "sample.trace",
-            "--format",
-            "parquet",
-            "--output",
-            "./sample.trace",
-        ],
-    );
-    assert_eq!(code, Some(1));
-    assert!(err.contains("overwrite the input"), "{err}");
-    assert_eq!(std::fs::read(dir.join("sample.trace")).unwrap(), bytes);
+    for format in ["jsonl", "parquet"] {
+        let (_, err, code) = run_in(
+            &dir,
+            &[
+                "export",
+                "sample.trace",
+                "--format",
+                format,
+                "--output",
+                "./sample.trace",
+            ],
+        );
+        assert_eq!(code, Some(1));
+        assert!(err.contains("overwrite the input"), "{err}");
+        assert_eq!(std::fs::read(dir.join("sample.trace")).unwrap(), bytes);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn file_outputs_replace_hard_link_entry_without_truncating_source() {
+    let dir = fresh_dir();
+    let bytes = sample_trace_bytes();
+    let source = dir.join("sample.trace");
+    std::fs::write(&source, &bytes).unwrap();
+    for command in ["jsonl", "parquet", "repair"] {
+        let dest = dir.join("output");
+        std::fs::hard_link(&source, &dest).unwrap();
+        let args = if command == "repair" {
+            vec!["repair", "sample.trace", "--output", "output"]
+        } else {
+            vec![
+                "export",
+                "sample.trace",
+                "--format",
+                command,
+                "--output",
+                "output",
+            ]
+        };
+        let (_, err, code) = run_in(&dir, &args);
+        assert_eq!(code, Some(0), "{command}: {err}");
+        assert_eq!(std::fs::read(&source).unwrap(), bytes, "{command}");
+        let result = std::fs::read(&dest).unwrap();
+        match command {
+            "jsonl" => assert_eq!(std::str::from_utf8(&result).unwrap().lines().count(), 4),
+            "parquet" => assert_eq!(&result[..4], b"PAR1"),
+            _ => assert_eq!(
+                shirusu_trace::read_trace(&result).unwrap().total_events(),
+                4
+            ),
+        }
+        std::fs::remove_file(dest).unwrap();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn failed_output_publication_preserves_destination_and_cleans_temporary_file() {
+    let dir = fresh_dir();
+    let bytes = sample_trace_bytes();
+    std::fs::write(dir.join("sample.trace"), &bytes).unwrap();
+    std::fs::create_dir(dir.join("output")).unwrap();
+    std::fs::write(dir.join("output/keep"), b"keep").unwrap();
+    for command in ["jsonl", "parquet", "repair"] {
+        let args = if command == "repair" {
+            vec!["repair", "sample.trace", "--output", "output"]
+        } else {
+            vec![
+                "export",
+                "sample.trace",
+                "--format",
+                command,
+                "--output",
+                "output",
+            ]
+        };
+        let (_, err, code) = run_in(&dir, &args);
+        assert_eq!(code, Some(1), "{command}: {err}");
+        assert_eq!(std::fs::read(dir.join("sample.trace")).unwrap(), bytes);
+        assert_eq!(std::fs::read(dir.join("output/keep")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "temporary file leaked: {command}"
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 

@@ -105,6 +105,7 @@ fn rows(view: &TraceView<'_>) -> BTreeMap<String, Row> {
 const LIMITS: &str = "Imports cover only the captured main executable's normal import table; absence does not exclude dynamic resolution, delay imports or calls from other modules. Hook evidence describes initialization, not all later execution paths. Zero observations never prove an API was unused. Semantic levels describe recorder capability, not complete state for every call. Missing evidence in older traces remains unknown. COM/WinRT method interception is not covered by Win32 hook evidence.";
 pub(super) fn run(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &["json"])?;
+    parsed.validate_options(&["json"])?;
     let (path, trace) = load_trace(&parsed)?;
     let view = TraceView::build(&trace);
     let rows = rows(&view);
