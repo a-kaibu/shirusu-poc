@@ -15,6 +15,7 @@ use crate::clock::{system_timestamp_source, Clock, TimestampSource};
 use crate::descriptor::{flags, CaptureState, EventDescriptor, EventKind};
 use crate::layout::*;
 use crate::notify::{NotifySignal, PublishNotifyTracker};
+use crate::tsc::EventTimestamper;
 use crate::validate::{IntegrityError, MAX_DROPPED_ORIGINAL_LEN};
 
 /// 満杯ポリシーの状態。
@@ -255,7 +256,7 @@ pub struct RingWriter {
     clock: Arc<dyn Clock>,
     /// イベント時刻専用の時刻源 (レビュー第2回・項目8)。待機用 `clock`
     /// とは分離し、Clock を差し替えても刻印の原点は動かない。
-    timestamps: Arc<dyn TimestampSource>,
+    timestamps: EventTimestamper,
     next_sequence: u64,
     payload_write_position: u64,
     state: OverflowState,
@@ -301,7 +302,7 @@ impl RingWriter {
             cfg,
             policy,
             clock,
-            timestamps,
+            timestamps: EventTimestamper::new(timestamps),
             next_sequence: 1,
             payload_write_position: load(base, OFF_PAYLOAD_WRITE_POSITION, Ordering::Relaxed),
             state: OverflowState::Normal,
@@ -328,7 +329,7 @@ impl RingWriter {
     /// イベント時刻源を差し替える。待機用 Clock の差し替え (R7 の
     /// EventClock 化) とは独立で、刻印だけに効く。
     pub fn set_timestamp_source(&mut self, timestamps: Arc<dyn TimestampSource>) {
-        self.timestamps = timestamps;
+        self.timestamps = EventTimestamper::new(timestamps);
     }
     /// この書き手が刻印に使うイベント時刻源の周波数。
     pub fn timestamp_frequency(&self) -> u64 {
@@ -437,7 +438,7 @@ impl RingWriter {
     }
 
     fn make_desc(
-        &self,
+        &mut self,
         seq: u64,
         input: &EventInput,
         payload_position: u64,
@@ -446,7 +447,7 @@ impl RingWriter {
     ) -> EventDescriptor {
         let mut d = EventDescriptor::new(input.kind, seq);
         // 刻印はイベント時刻専用の源から取る (待機用 Clock ではない)。
-        d.timestamp_qpc = self.timestamps.now_qpc();
+        d.timestamp_qpc = self.timestamps.now();
         d.call_id = input.call_id;
         d.parent_call_id = input.parent_call_id;
         d.api_id = input.api_id;
@@ -515,7 +516,10 @@ impl RingWriter {
         let payload_len = input.payload.len() as u64;
         // A dropped Enter cannot have a paired normal or exceptional terminal event.
         // Consume tracking on either path and account for every discarded byte.
+        // The set is empty unless an Enter was dropped; skip hashing on the
+        // normal path (every Leave would otherwise pay a SipHash lookup).
         if matches!(input.kind, EventKind::CallLeave | EventKind::CallAborted)
+            && !self.dropped_enter_calls.is_empty()
             && self.dropped_enter_calls.remove(&input.call_id)
         {
             fetch_add(self.base, OFF_DROPPED_EVENTS, 1);

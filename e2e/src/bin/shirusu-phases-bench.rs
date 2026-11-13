@@ -18,6 +18,21 @@ use shirusu_transport::{
 use std::{hint::black_box, sync::Arc, time::Instant};
 
 const OPS: usize = 100_000;
+
+#[cfg(not(windows))]
+struct PortableInterpolated(shirusu_transport::SystemTimestampSource);
+#[cfg(not(windows))]
+impl TimestampSource for PortableInterpolated {
+    fn now_qpc(&self) -> u64 {
+        self.0.now_qpc()
+    }
+    fn frequency(&self) -> u64 {
+        self.0.frequency()
+    }
+    fn tsc_interpolation(&self) -> bool {
+        shirusu_transport::tsc::invariant_tsc_available()
+    }
+}
 const ROUNDS: usize = 5;
 
 fn measure(name: &str, mut operation: impl FnMut()) {
@@ -63,8 +78,12 @@ fn main() {
     #[cfg(windows)]
     let timestamps: Arc<dyn TimestampSource> =
         Arc::new(shirusu_transport_win::QpcTimestampSource::new());
+    // Off Windows, mirror the Windows source's choice: interpolate the portable
+    // clock with the TSC when the CPU reports an invariant TSC.
     #[cfg(not(windows))]
-    let timestamps: Arc<dyn TimestampSource> = shirusu_transport::clock::system_timestamp_source();
+    let timestamps: Arc<dyn TimestampSource> = Arc::new(PortableInterpolated(
+        shirusu_transport::SystemTimestampSource::new(),
+    ));
     let agent = Arc::new(
         Agent::new(
             Arc::new(SlotPool::new(2)),
@@ -122,6 +141,18 @@ fn main() {
     measure("timestamp", || {
         black_box(timestamps.now_qpc());
     });
+    // The Ring writer's event clock: TSC interpolation of the same source when
+    // the source enables it (Windows with an invariant TSC), else direct reads.
+    println!(
+        "event_clock tsc_interpolation={} invariant_tsc={}",
+        timestamps.tsc_interpolation(),
+        shirusu_transport::tsc::invariant_tsc_available()
+    );
+    let mut event_clock = shirusu_transport::tsc::EventTimestamper::new(timestamps.clone());
+    measure("event_timestamp", || {
+        black_box(event_clock.now());
+    });
+    println!("event_clock interpolating={}", event_clock.interpolating());
     measure("scalar_enter_encode", || {
         black_box(capture::encode_generic_enter::<3>(api, black_box(&args)));
     });

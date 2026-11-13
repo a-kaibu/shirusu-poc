@@ -1353,6 +1353,10 @@ impl shirusu_transport::Clock for EventClock {
 /// Windows 以外では transport の既定時刻源へ委譲する (API 形のスタブ)。
 pub struct QpcTimestampSource {
     frequency: u64,
+    /// Ring の書き手が TSC で補間してよいか。Windows かつ invariant TSC の
+    /// CPU だけで有効にする (値は常に QPC 単位。transport の `tsc` を参照)。
+    /// `SHIRUSU_EVENT_CLOCK=qpc` で無効化できる (比較測定・問題切り分け用)。
+    tsc_interpolation: bool,
     #[cfg(not(windows))]
     fallback: shirusu_transport::SystemTimestampSource,
 }
@@ -1360,9 +1364,16 @@ impl QpcTimestampSource {
     pub fn new() -> Self {
         Self {
             frequency: qpc_frequency(),
+            tsc_interpolation: cfg!(windows)
+                && shirusu_transport::tsc::invariant_tsc_available()
+                && std::env::var_os("SHIRUSU_EVENT_CLOCK").is_none_or(|v| v != "qpc"),
             #[cfg(not(windows))]
             fallback: shirusu_transport::SystemTimestampSource::new(),
         }
+    }
+    /// 書き手が TSC 補間を使う設定かどうか (診断・測定の記録用)。
+    pub fn uses_tsc_interpolation(&self) -> bool {
+        self.tsc_interpolation
     }
 }
 impl Default for QpcTimestampSource {
@@ -1406,6 +1417,9 @@ impl shirusu_transport::TimestampSource for QpcTimestampSource {
     }
     fn frequency(&self) -> u64 {
         self.frequency
+    }
+    fn tsc_interpolation(&self) -> bool {
+        self.tsc_interpolation
     }
 }
 

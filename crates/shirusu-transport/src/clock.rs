@@ -107,6 +107,12 @@ pub trait TimestampSource: Send + Sync {
     fn now_qpc(&self) -> u64;
     /// 1 秒あたりの tick 数 (`now_qpc` の周波数)。
     fn frequency(&self) -> u64;
+    /// Ring の書き手がこの時刻源を TSC で補間してよいか
+    /// ([`crate::tsc::EventTimestamper`])。値は常にこの時刻源の単位に保つ。
+    /// 既定は false (毎回 `now_qpc` を読む)。
+    fn tsc_interpolation(&self) -> bool {
+        false
+    }
 }
 
 /// 既定のイベント時刻源 (std のみ・ポータブル)。

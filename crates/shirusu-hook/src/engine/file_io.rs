@@ -77,7 +77,24 @@ pub(super) enum Prepare {
     Unavailable,
 }
 
-pub(super) fn prepare(api_id: u32) -> Prepare {
+/// `prepare` up to (not including) the in-flight section: shared by the
+/// hand-written detours (`prepare`) and the generated ones (`prepare_generic`).
+pub(super) enum PrepareInner {
+    Ready {
+        rt: Arc<HookRuntime>,
+        original: usize,
+        api: &'static ApiDef,
+        guard: ReentrancyGuard,
+        last_error: crate::runtime::LastErrorGuard<WinLastError>,
+    },
+    Passthrough {
+        original: usize,
+    },
+    Unavailable,
+}
+
+#[inline(always)]
+pub(super) fn prepare_inner(api_id: u32) -> PrepareInner {
     // P1-5: LastError は入口 (ここ) で保存する。素通し経路は元の API
     // を呼ぶ前に保存値へ戻してから返し、記録経路はガードごと Detour
     // へ渡す (Detour が元の API の直前で復元する)。Unavailable 経路は
@@ -90,30 +107,30 @@ pub(super) fn prepare(api_id: u32) -> Prepare {
     // 各 Detour は Prepare の結果に従うだけにする。
     let Some(guard) = ReentrancyGuard::try_enter() else {
         let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
-            return Prepare::Unavailable;
+            return PrepareInner::Unavailable;
         };
         let original = rt.original(api_id);
         if original == 0 {
-            return Prepare::Unavailable;
+            return PrepareInner::Unavailable;
         }
         le.restore_before_original();
-        return Prepare::Passthrough { original };
+        return PrepareInner::Passthrough { original };
     };
     let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
-        return Prepare::Unavailable;
+        return PrepareInner::Unavailable;
     };
     let original = rt.original(api_id);
     if original == 0 {
-        return Prepare::Unavailable;
+        return PrepareInner::Unavailable;
     }
     let Some(api) = api_by_id(api_id) else {
-        return Prepare::Unavailable;
+        return PrepareInner::Unavailable;
     };
     // The option controls Runtime's own exported APIs, not Windows API calls
     // made by Runtime. Agent-originated calls are excluded by reentrancy above.
     if rt.should_suppress_api_id(api.api_id) {
         le.restore_before_original();
-        return Prepare::Passthrough { original };
+        return PrepareInner::Passthrough { original };
     }
     // L15: 内部 API (Nt*) は詳細調査モードでのみ記録する。無効なら
     // 元の API だけ素通しで呼ぶ（Detour が設置されていても記録しない）。
@@ -121,8 +138,29 @@ pub(super) fn prepare(api_id: u32) -> Prepare {
     // 内部呼び出しも record_runtime_apis と合わせて記録される。
     if rt.should_suppress_internal(api.api_id) {
         le.restore_before_original();
-        return Prepare::Passthrough { original };
+        return PrepareInner::Passthrough { original };
     }
+    PrepareInner::Ready {
+        rt,
+        original,
+        api,
+        guard,
+        last_error: le,
+    }
+}
+
+pub(super) fn prepare(api_id: u32) -> Prepare {
+    let (rt, original, api, guard, le) = match prepare_inner(api_id) {
+        PrepareInner::Ready {
+            rt,
+            original,
+            api,
+            guard,
+            last_error,
+        } => (rt, original, api, guard, last_error),
+        PrepareInner::Passthrough { original } => return Prepare::Passthrough { original },
+        PrepareInner::Unavailable => return Prepare::Unavailable,
+    };
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
             let tid = crate::thread_id::current() as u64;
@@ -140,6 +178,55 @@ pub(super) fn prepare(api_id: u32) -> Prepare {
         None => {
             le.restore_before_original();
             Prepare::Passthrough { original }
+        }
+    }
+}
+
+/// Generated detours: the flight owns the only runtime reference.
+pub(super) enum GenericPrepare {
+    Record {
+        original: usize,
+        tid: u64,
+        api: &'static ApiDef,
+        flight: crate::runtime::DetourFlight,
+        guard: ReentrancyGuard,
+        last_error: crate::runtime::LastErrorGuard<WinLastError>,
+    },
+    Passthrough {
+        original: usize,
+    },
+    Unavailable,
+}
+
+#[inline(always)]
+pub(super) fn prepare_generic(api_id: u32) -> GenericPrepare {
+    let (rt, original, api, guard, le) = match prepare_inner(api_id) {
+        PrepareInner::Ready {
+            rt,
+            original,
+            api,
+            guard,
+            last_error,
+        } => (rt, original, api, guard, last_error),
+        PrepareInner::Passthrough { original } => return GenericPrepare::Passthrough { original },
+        PrepareInner::Unavailable => return GenericPrepare::Unavailable,
+    };
+    match crate::runtime::DetourFlight::begin_owned(rt) {
+        Some(flight) => {
+            let tid = crate::thread_id::current() as u64;
+            flight.runtime().ensure_thread(tid);
+            GenericPrepare::Record {
+                original,
+                tid,
+                api,
+                flight,
+                guard,
+                last_error: le,
+            }
+        }
+        None => {
+            le.restore_before_original();
+            GenericPrepare::Passthrough { original }
         }
     }
 }

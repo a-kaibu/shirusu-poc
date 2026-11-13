@@ -282,6 +282,54 @@ impl Drop for CallGuard {
     }
 }
 
+/// [`CallGuard`] that owns the call's [`DetourFlight`] (and through it the only
+/// runtime reference). Dropping it first records `CallAborted` if still armed,
+/// then leaves the in-flight section, preserving the order of the separate guards.
+pub struct FlightCallGuard {
+    flight: DetourFlight,
+    thread_id: u64,
+    api: &'static ApiDef,
+    call_id: u64,
+    armed: bool,
+}
+
+impl FlightCallGuard {
+    pub fn new(flight: DetourFlight, thread_id: u64, api: &'static ApiDef, call_id: u64) -> Self {
+        Self {
+            flight,
+            thread_id,
+            api,
+            call_id,
+            armed: true,
+        }
+    }
+
+    pub fn runtime(&self) -> &Arc<HookRuntime> {
+        self.flight.runtime()
+    }
+
+    /// 元の呼び出しが正常に戻った: 武装解除する。
+    pub fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FlightCallGuard {
+    fn drop(&mut self) {
+        if !self.armed || !native_tls_available() {
+            return;
+        }
+        self.armed = false;
+        let _guard = ReentrancyGuard::try_enter();
+        pop_call(self.call_id);
+        let rt = self.flight.runtime();
+        let (thread_id, api, call_id) = (self.thread_id, self.api, self.call_id);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.record_aborted(thread_id, api, call_id);
+        }));
+    }
+}
+
 /// Detour の LastError 保持プロトコル (レビュー #6 P1-5)。
 ///
 /// 呼び出し側から見た LastError は「Detour が無い場合の元の API の
@@ -465,6 +513,24 @@ impl DetourFlight {
             return None;
         }
         Some(Self { rt: Arc::clone(rt) })
+    }
+
+    /// [`DetourFlight::begin`] that takes over the caller's reference instead
+    /// of cloning it (one fewer shared reference-count update per call).
+    pub fn begin_owned(rt: Arc<HookRuntime>) -> Option<Self> {
+        if !rt.recording_enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        rt.in_flight.fetch_add(1, Ordering::SeqCst);
+        if !rt.recording_enabled.load(Ordering::SeqCst) {
+            rt.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self { rt })
+    }
+
+    pub fn runtime(&self) -> &Arc<HookRuntime> {
+        &self.rt
     }
 }
 

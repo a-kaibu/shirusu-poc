@@ -21,6 +21,7 @@ pub mod notify;
 pub mod ring;
 pub mod slot;
 pub mod snapshot;
+pub mod tsc;
 pub mod validate;
 
 pub use clock::{

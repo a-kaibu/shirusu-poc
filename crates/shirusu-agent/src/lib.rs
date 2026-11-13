@@ -468,9 +468,36 @@ impl Agent {
         if !self.host_monitor.recording_enabled() {
             return RecordResult::PassthroughHostStopped;
         }
+        // Fast path: write through the TLS-cached state without cloning its
+        // Arc (no shared reference-count traffic per event). Only nested
+        // records could reach TLS_STATE meanwhile, and PublishGuard rejects
+        // those before they touch the cache.
+        let cached = TLS_STATE
+            .try_with(|c| {
+                let c = c.try_borrow().ok()?;
+                match &*c {
+                    Some((agent, tid, state))
+                        if *agent == self.id
+                            && *tid == thread_id
+                            && !state.retired.load(Ordering::Acquire) =>
+                    {
+                        Some(self.write_to(state, input.clone()))
+                    }
+                    _ => None,
+                }
+            })
+            .ok()
+            .flatten();
+        if let Some(result) = cached {
+            return result;
+        }
         let Some(state) = self.state_for(thread_id) else {
             return RecordResult::NoSlot;
         };
+        self.write_to(&state, input)
+    }
+
+    fn write_to(&self, state: &ThreadSlotState, input: EventInput) -> RecordResult {
         let outcome = {
             let mut writer = state.writer.lock().unwrap();
             if writer.is_detached() {

@@ -644,6 +644,42 @@ impl<const FIELDS: usize> GenericPayload<FIELDS> {
         }
     }
 
+    /// Encode a raw generated-table scalar exactly as `scalar(raw_to_value(..))`
+    /// would, without building the intermediate `CapturedValue`.
+    #[inline(always)]
+    fn raw_scalar(&mut self, capture: ValueCapture, function: &str, name: &str, ty: Ty, raw: u64) {
+        self.byte(capture.code());
+        match ty {
+            Ty::U32 => self.uleb(raw as u32 as u64),
+            Ty::U64 => self.uleb(raw),
+            Ty::I32 => {
+                let v = raw as i32 as i64;
+                self.uleb(((v << 1) ^ (v >> 63)) as u64);
+            }
+            Ty::I64 => {
+                let v = raw as i64;
+                self.uleb(((v << 1) ^ (v >> 63)) as u64);
+            }
+            Ty::Bool => self.byte((raw != 0) as u8),
+            Ty::F32 => {
+                for byte in (raw as u32).to_le_bytes() {
+                    self.byte(byte);
+                }
+            }
+            Ty::F64 => {
+                for byte in raw.to_le_bytes() {
+                    self.byte(byte);
+                }
+            }
+            other => {
+                panic!(
+                    "{function}: field {name} uses unsupported Ty {other:?} for generic L1 capture"
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn scalar(&mut self, value: CapturedValue) {
         self.byte(value.capture.code());
         match value.value {
@@ -684,7 +720,7 @@ pub fn encode_generic_enter<const FIELDS: usize>(
     assert!(args.len() <= FIELDS, "generated payload capacity exceeded");
     let mut payload = GenericPayload::new();
     for ((name, ty, _, _), raw) in api.enter_fields.iter().zip(args) {
-        payload.scalar(raw_to_value(api.function, name, *ty, *raw));
+        payload.raw_scalar(ValueCapture::Captured, api.function, name, *ty, *raw);
     }
     payload
 }
@@ -709,11 +745,27 @@ pub fn encode_generic_leave_with_inputs(
     );
     let mut payload = GenericPayload::new();
     for (name, ty, _, _) in api.leave_fields {
-        payload.scalar(match *name {
-            "return" => raw_to_value(api.function, name, *ty, return_value),
-            "last_error" => last_error_value(meaning, return_value, last_error),
+        match *name {
+            "return" => payload.raw_scalar(
+                ValueCapture::Captured,
+                api.function,
+                name,
+                *ty,
+                return_value,
+            ),
+            // Same capture state as `last_error_value`, always a U32 value.
+            "last_error" => {
+                let capture = if meaning == LastErrorMeaning::DependsOnInputs {
+                    ValueCapture::Unsupported
+                } else if meaning.is_meaningful(return_value) {
+                    ValueCapture::Captured
+                } else {
+                    ValueCapture::Stale
+                };
+                payload.raw_scalar(capture, api.function, name, Ty::U32, last_error as u64)
+            }
             other => panic!("{}: unexpected leave field {other}", api.function),
-        });
+        }
     }
     payload
 }

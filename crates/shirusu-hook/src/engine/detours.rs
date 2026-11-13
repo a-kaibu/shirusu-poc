@@ -256,54 +256,55 @@ pub(super) fn generic_detour_with<const N: usize>(
     args: &[u64; N],
     invoke: impl FnOnce(usize) -> u64 + Copy,
 ) -> u64 {
-    let (rt, original, tid, api, _flight, mut guard, mut le) = match prepare(api_id) {
-        Prepare::Record {
-            rt,
+    let (original, tid, api, flight, mut guard, mut le) = match prepare_generic(api_id) {
+        GenericPrepare::Record {
             original,
             tid,
             api,
             flight,
             guard,
             last_error,
-        } => (rt, original, tid, api, flight, guard, last_error),
-        Prepare::Passthrough { original } => {
+        } => (original, tid, api, flight, guard, last_error),
+        GenericPrepare::Passthrough { original } => {
             // SAFETY: 終了手順の進行中は記録せず本物を素通しで呼ぶ。
             return invoke(original);
         }
-        Prepare::Unavailable => return 0,
+        GenericPrepare::Unavailable => return 0,
     };
-    let call_id = rt.alloc_call_id();
+    let call_id = flight.runtime().alloc_call_id();
     {
         let bytes = capture::encode_generic_enter::<N>(api, args);
-        rt.record_enter(tid, api, call_id, bytes.as_bytes());
+        flight
+            .runtime()
+            .record_enter(tid, api, call_id, bytes.as_bytes());
     }
-    if api.module.eq_ignore_ascii_case("kernel32.dll") && api.function == "ExitThread" {
+    if api.api_id == crate::api::EXIT_THREAD_API_ID {
         // ExitThread does not unwind Rust frames. Release recorder ownership
         // before entering the OS; otherwise DetourFlight and Arc references
         // survive forever and shutdown cannot drain. There is no normal Leave.
         // Stop capture before TLS/DllMain teardown starts, not only when this
         // DLL's native thread-detach callback is eventually reached.
         ReentrancyGuard::mark_thread_exiting();
-        drop(_flight);
-        drop(rt);
+        drop(flight);
         drop(guard);
         le.restore_before_original();
         return invoke(original);
     }
     push_call(call_id);
-    // L08: 元の呼び出しが例外で中断したら、巻き戻しで CallGuard が
-    // CallAborted を記録する（例外は捕捉しない）。
-    let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
+    // L08: 元の呼び出しが例外で中断したら、巻き戻しで呼び出しガードが
+    // CallAborted を記録してから進行中区間を抜ける（例外は捕捉しない）。
+    let call_guard = crate::runtime::FlightCallGuard::new(flight, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す。元の呼び出しの中で
     // アプリ由来の入れ子呼び出しが起きた場合は記録される (A43)。
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: 元の呼び出しは引数をそのまま渡す。
-    // Tuple field order drops CallGuard before the reentrancy/flight guards.
-    // Option::take in the native finally prevents a second cleanup if Rust
-    // also runs destructors (for example, a Rust panic through C-unwind).
-    let (ret, (mut call_guard, rt, _flight, mut guard)) =
-        crate::seh::invoke(original, invoke, (call_guard, rt, _flight, guard));
+    // Tuple field order drops the call guard (abort record, then flight)
+    // before the reentrancy guard. Option::take in the native finally prevents
+    // a second cleanup if Rust also runs destructors (for example, a Rust
+    // panic through C-unwind).
+    let (ret, (mut call_guard, mut guard)) =
+        crate::seh::invoke(original, invoke, (call_guard, guard));
     let last_error = le.capture_after_original();
     call_guard.complete();
     // Loader heap operations may have destroyed the TLS vector in the original
@@ -316,7 +317,11 @@ pub(super) fn generic_detour_with<const N: usize>(
     guard.resume();
     pop_call(call_id);
     let bytes = capture::encode_generic_leave_with_inputs(api, ret, last_error, args);
-    rt.record_leave(tid, api, call_id, bytes.as_bytes());
+    call_guard
+        .runtime()
+        .record_leave(tid, api, call_id, bytes.as_bytes());
+    drop(call_guard);
+    drop(guard);
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();
     ret

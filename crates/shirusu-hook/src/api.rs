@@ -405,6 +405,37 @@ static API_BY_ID: [Option<&ApiDef>; API_COUNT + 1] = {
     indexed
 };
 
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `kernel32.dll!ExitThread` の API ID。Detour の通常経路が毎回文字列を
+/// 比較しないよう、コンパイル時に表から求める（無ければビルドを拒否）。
+pub const EXIT_THREAD_API_ID: u32 = {
+    let mut i = 0;
+    let mut found = 0;
+    while i < GENERATED_API_TABLE.len() {
+        let api = &GENERATED_API_TABLE[i];
+        if const_str_eq(api.module, "kernel32.dll") && const_str_eq(api.function, "ExitThread") {
+            found = api.api_id;
+        }
+        i += 1;
+    }
+    assert!(found != 0);
+    found
+};
+
 pub fn api_by_id(api_id: u32) -> Option<&'static ApiDef> {
     API_BY_ID.get(api_id as usize).copied().flatten()
 }
@@ -479,6 +510,17 @@ pub fn is_hook_schema(schema_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exit_thread_id_constant_matches_table_lookup() {
+        let api = super::api_by_import("kernel32.dll", "ExitThread").unwrap();
+        assert_eq!(api.api_id, super::EXIT_THREAD_API_ID);
+        // Only this entry may take the ExitThread ownership-release path.
+        let matches = super::api_table()
+            .filter(|a| a.api_id == super::EXIT_THREAD_API_ID)
+            .count();
+        assert_eq!(matches, 1);
+    }
+
     #[test]
     fn indexed_api_lookup_matches_all_tables_and_rejects_unknown_ids() {
         for expected in super::api_table() {
