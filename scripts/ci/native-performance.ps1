@@ -23,6 +23,10 @@ if ($phasesExit -ne 0) { throw "component benchmark failed: $phasesExit" }
 $detourPhasesExit = $LASTEXITCODE
 if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }
 if ($detourPhasesExit -ne 0) { throw "typed detour benchmark failed: $detourPhasesExit" }
+& cargo test -p shirusu-host --release --target $Target --lib trace_pipeline::tests::measure_queued_conversion -- --ignored --exact --nocapture | Tee-Object -FilePath $phasesPath -Append
+$hostPhasesExit = $LASTEXITCODE
+if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }
+if ($hostPhasesExit -ne 0) { throw "host conversion benchmark failed: $hostPhasesExit" }
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw "MSVC compiler not found" }

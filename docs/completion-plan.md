@@ -356,3 +356,15 @@ and FS:0x24 on x86/WoW64, with API fallback on other architectures. Native tests
 compare with Windows on eight simultaneously live threads and check LastError
 preservation. The component bench measures unhooked API and TEB reads separately;
 any injected performance effect must be established by the next native run.
+
+### Host queued batch coalescing (2026-11-13)
+
+Adjacent, already-queued Events with identical context now share conversion and
+compression, bounded by five commands, 4096 events and 1 MiB of payload. Context,
+environment and loss boundaries retain FIFO order, and no fill delay is added.
+Standalone oversized batches retain their existing acceptance behavior. Queue
+and lookahead memory ownership is documented. A new counter records merged
+commands without changing original command/event totals. Linux release component
+measurement: 256,000 events, five rounds, 102–121 ms without coalescing versus
+68–74 ms with coalescing; a second enabled run measured 71–91 ms. Native
+application impact still requires CI measurement.

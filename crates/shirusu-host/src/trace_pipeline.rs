@@ -10,7 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 // A producer holds at most one drained batch while waiting; the worker owns
-// one more. Each event batch is bounded by its Ring's descriptor/payload limits.
+// a bounded group and at most one lookahead command. Individual batches retain
+// their Ring descriptor/payload bounds; coalescing never waits for more input.
 pub(crate) const QUEUED_BATCHES: usize = 4;
 
 enum Command {
@@ -23,6 +24,7 @@ enum Command {
 pub struct HostPipelineStats {
     pub commands_processed: u64,
     pub events_received: u64,
+    pub merged_event_commands: u64,
     pub conversion_wall_ns: u64,
     pub queue_full_count: u64,
     pub drain_wait_ns: u64,
@@ -49,10 +51,45 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             .name("shirusu-trace-writer".into())
             .spawn(move || {
                 let mut totals = PipelineReport::default();
-                for command in receiver {
+                let mut pending = None;
+                while let Some(command) = pending.take().or_else(|| receiver.recv().ok()) {
                     let started = Instant::now();
                     match command {
-                        Command::Events(context, events) => {
+                        Command::Events(context, mut events) => {
+                            let mut payload_bytes = events
+                                .iter()
+                                .fold(0usize, |n, e| n.saturating_add(e.payload.len()));
+                            for _ in 0..QUEUED_BATCHES {
+                                // Preserve context, loss and environment boundaries. Do not
+                                // delay a sparse stream to fill a larger output chunk.
+                                let Ok(next) = receiver.try_recv() else { break };
+                                match next {
+                                    Command::Events(next_context, next_events)
+                                        if next_context == context
+                                            && events.len().saturating_add(next_events.len())
+                                                <= 4096
+                                            && payload_bytes.saturating_add(
+                                                next_events.iter().fold(0usize, |n, e| {
+                                                    n.saturating_add(e.payload.len())
+                                                }),
+                                            ) <= 1024 * 1024 =>
+                                    {
+                                        payload_bytes += next_events
+                                            .iter()
+                                            .map(|e| e.payload.len())
+                                            .sum::<usize>();
+                                        events.extend(next_events);
+                                        totals.metrics.commands_processed =
+                                            totals.metrics.commands_processed.saturating_add(1);
+                                        totals.metrics.merged_event_commands =
+                                            totals.metrics.merged_event_commands.saturating_add(1);
+                                    }
+                                    other => {
+                                        pending = Some(other);
+                                        break;
+                                    }
+                                }
+                            }
                             totals.metrics.events_received = totals
                                 .metrics
                                 .events_received
@@ -428,6 +465,10 @@ mod tests {
         ));
         resume.send(()).unwrap();
         let (recorder, stats) = pipeline.finish().unwrap();
+        assert_eq!(
+            stats.metrics.merged_event_commands,
+            (QUEUED_BATCHES - 1) as u64
+        );
         assert_eq!(stats.args.args_attached, QUEUED_BATCHES * 2);
         assert_eq!(stats.metrics.events_received, (QUEUED_BATCHES * 2) as u64);
         assert_eq!(
@@ -436,10 +477,136 @@ mod tests {
         );
         let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
         let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(trace.batches.len(), 1);
         assert_eq!(
             trace.finalization.unwrap().total_events,
             (QUEUED_BATCHES * 2) as u64
         );
+    }
+
+    #[test]
+    fn coalescing_preserves_context_boundaries_and_event_order() {
+        let (writer, blocked, resume) = controlled();
+        let flag = writer.mode.clone();
+        let mut pipeline = TracePipeline::new(recorder(writer, RecordMode::Full)).unwrap();
+        flag.store(3, Ordering::SeqCst);
+        pipeline.update_environment(&environment()).unwrap();
+        blocked
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        for (call, thread_id) in [(1, 1), (2, 1), (3, 2), (4, 1)] {
+            let mut ctx = context();
+            ctx.thread_id = thread_id;
+            pipeline
+                .record_owned_batch_with_args(&ctx, events(call))
+                .unwrap();
+        }
+        resume.send(()).unwrap();
+        let (recorder, stats) = pipeline.finish().unwrap();
+        assert_eq!(stats.metrics.merged_event_commands, 1);
+        assert_eq!(stats.metrics.commands_processed, 5);
+        let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
+        let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(
+            trace
+                .batches
+                .iter()
+                .map(|b| b.events.len())
+                .collect::<Vec<_>>(),
+            [4, 2, 2]
+        );
+        assert_eq!(
+            trace
+                .batches
+                .iter()
+                .map(|b| b.thread_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 1]
+        );
+        assert_eq!(
+            trace
+                .batches
+                .iter()
+                .flat_map(|b| b.events.iter().map(|e| e.call_id))
+                .collect::<Vec<_>>(),
+            [1, 1, 2, 2, 3, 3, 4, 4]
+        );
+    }
+
+    #[test]
+    fn coalescing_respects_event_and_payload_limits() {
+        for oversized_payload in [false, true] {
+            let (writer, blocked, resume) = controlled();
+            let flag = writer.mode.clone();
+            let mut pipeline = TracePipeline::new(recorder(writer, RecordMode::Full)).unwrap();
+            flag.store(3, Ordering::SeqCst);
+            pipeline.update_environment(&environment()).unwrap();
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let mut first = if oversized_payload {
+                events(1)
+            } else {
+                (1..=2048).flat_map(events).collect::<Vec<_>>()
+            };
+            if oversized_payload {
+                // Valid transport payload may be opaque to the schema converter.
+                first[0].payload = vec![0; 1024 * 1024];
+                first[0].descriptor.payload_len = first[0].payload.len() as u32;
+            }
+            let first_len = first.len();
+            pipeline
+                .record_owned_batch_with_args(&context(), first)
+                .unwrap();
+            for call in 2049..=2051 {
+                pipeline
+                    .record_owned_batch_with_args(&context(), events(call))
+                    .unwrap();
+            }
+            resume.send(()).unwrap();
+            let (recorder, stats) = pipeline.finish().unwrap();
+            assert_eq!(stats.metrics.merged_event_commands, 2);
+            assert_eq!(stats.metrics.events_received, (first_len + 6) as u64);
+            let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
+            let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
+            assert_eq!(
+                trace
+                    .batches
+                    .iter()
+                    .map(|b| b.events.len())
+                    .collect::<Vec<_>>(),
+                [first_len, 6]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release measurement, not a timing assertion"]
+    fn measure_queued_conversion() {
+        for round in 0..5 {
+            let mut pipeline = TracePipeline::new(recorder(Vec::new(), RecordMode::Full)).unwrap();
+            let batches: Vec<_> = (0..2000)
+                .map(|batch| {
+                    (1..=64)
+                        .flat_map(|i| events(batch * 64 + i))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let start = Instant::now();
+            for batch in batches {
+                pipeline
+                    .record_owned_batch_with_args(&context(), batch)
+                    .unwrap();
+            }
+            let (recorder, stats) = pipeline.finish().unwrap();
+            let bytes = recorder.finish(&IntegrityReport::default()).unwrap();
+            println!(
+                "queued_conversion round={round} elapsed_ms={} bytes={} merged={}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                bytes.len(),
+                stats.metrics.merged_event_commands
+            );
+        }
     }
 
     #[test]
