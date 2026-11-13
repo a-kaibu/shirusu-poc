@@ -120,93 +120,15 @@ const BOOL: Ty = Ty::I32; // Win32 BOOL は int
 const BEFORE: CaptureTiming = CaptureTiming::Before;
 const AFTER: CaptureTiming = CaptureTiming::After;
 
+include!("api_file_io_generated.inc");
+
 /// 手書き API の定義表（api_id 1〜6）。ファイル I/O の 4 API と非同期
 /// 完了観測の 2 API。専用の Detour と専用の取得を持つ。
 pub const HANDWRITTEN_API_TABLE: &[ApiDef] = &[
-    ApiDef {
-        api_id: API_CREATE_FILE_W,
-        module: "kernel32.dll",
-        function: "CreateFileW",
-        level: 2,
-        level_note: "パス文字列 (Str16) を復元する。lpSecurityAttributes と \
-                     hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で \
-                     後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)",
-        enter_fields: &[
-            ("lpFileName", Ty::Str16, ValueKind::Scalar, BEFORE),
-            ("dwDesiredAccess", DWORD, ValueKind::Scalar, BEFORE),
-            ("dwShareMode", DWORD, ValueKind::Scalar, BEFORE),
-            ("lpSecurityAttributes", HANDLE, ValueKind::Pointer, BEFORE),
-            ("dwCreationDisposition", DWORD, ValueKind::Scalar, BEFORE),
-            ("dwFlagsAndAttributes", DWORD, ValueKind::Scalar, BEFORE),
-            ("hTemplateFile", HANDLE, ValueKind::Handle, BEFORE),
-        ],
-        leave_fields: &[
-            ("return", HANDLE, ValueKind::CreatedObject, AFTER),
-            ("last_error", DWORD, ValueKind::Scalar, AFTER),
-        ],
-        // F20: CreateFileW は失敗時に INVALID_HANDLE_VALUE を返す場合に
-        // だけ LastError が意味を持つ。
-        last_error_meaning: LastErrorMeaning::WhenReturnIsInvalidHandle,
-    },
-    ApiDef {
-        api_id: API_READ_FILE,
-        module: "kernel32.dll",
-        function: "ReadFile",
-        level: 2,
-        level_note: "同期完了時の出力バッファ内容を上限付きで復元する \
-                     (上限超過は Truncated)。OVERLAPPED 指定時は完了が非同期の \
-                     ためバッファ内容と読取バイト数は Unsupported として記録する",
-        enter_fields: &[
-            ("hFile", HANDLE, ValueKind::Handle, BEFORE),
-            ("lpBuffer", HANDLE, ValueKind::Pointer, BEFORE),
-            ("nNumberOfBytesToRead", DWORD, ValueKind::Scalar, BEFORE),
-            ("lpOverlapped", HANDLE, ValueKind::Pointer, BEFORE),
-        ],
-        leave_fields: &[
-            ("return", BOOL, ValueKind::Scalar, AFTER),
-            ("lpNumberOfBytesRead", DWORD, ValueKind::Scalar, AFTER),
-            ("data", Ty::Bytes, ValueKind::Scalar, AFTER),
-            ("last_error", DWORD, ValueKind::Scalar, AFTER),
-        ],
-        // F20: ReadFile は FALSE を返す場合にだけ LastError が意味を持つ。
-        last_error_meaning: LastErrorMeaning::WhenReturnIsFalse,
-    },
-    ApiDef {
-        api_id: API_WRITE_FILE,
-        module: "kernel32.dll",
-        function: "WriteFile",
-        level: 2,
-        level_note: "入力バッファ内容を呼び出し前に上限付きで復元する \
-                     (上限超過は Truncated)",
-        enter_fields: &[
-            ("hFile", HANDLE, ValueKind::Handle, BEFORE),
-            ("data", Ty::Bytes, ValueKind::Scalar, BEFORE),
-            ("nNumberOfBytesToWrite", DWORD, ValueKind::Scalar, BEFORE),
-            ("lpOverlapped", HANDLE, ValueKind::Pointer, BEFORE),
-        ],
-        leave_fields: &[
-            ("return", BOOL, ValueKind::Scalar, AFTER),
-            ("lpNumberOfBytesWritten", DWORD, ValueKind::Scalar, AFTER),
-            ("last_error", DWORD, ValueKind::Scalar, AFTER),
-        ],
-        // F20: WriteFile は FALSE を返す場合にだけ LastError が意味を持つ。
-        last_error_meaning: LastErrorMeaning::WhenReturnIsFalse,
-    },
-    ApiDef {
-        api_id: API_CLOSE_HANDLE,
-        module: "kernel32.dll",
-        function: "CloseHandle",
-        level: 1,
-        level_note: "型付き引数・戻り値のみ。対象 HANDLE の生値で生成側 \
-                     イベントと相関可能 (Object ID は未割当)",
-        enter_fields: &[("hObject", HANDLE, ValueKind::Handle, BEFORE)],
-        leave_fields: &[
-            ("return", BOOL, ValueKind::Scalar, AFTER),
-            ("last_error", DWORD, ValueKind::Scalar, AFTER),
-        ],
-        // F20: CloseHandle は FALSE を返す場合にだけ LastError が意味を持つ。
-        last_error_meaning: LastErrorMeaning::WhenReturnIsFalse,
-    },
+    FILE_IO_API_TABLE[0],
+    FILE_IO_API_TABLE[1],
+    FILE_IO_API_TABLE[2],
+    FILE_IO_API_TABLE[3],
     ApiDef {
         api_id: API_GET_OVERLAPPED_RESULT,
         module: "kernel32.dll",

@@ -26,6 +26,8 @@
 //! - COM インターフェイス型はネイティブのポインタとして記録する。
 //!   これは COM メソッドの設置や参照先の取得を意味しない。
 
+pub mod contracts;
+
 use serde::Deserialize;
 use shirusu_trace::schema::{LastErrorMeaning, Ty, ValueKind};
 use windows_metadata::reader::{HasAttributes, TypeCategory, TypeIndex};

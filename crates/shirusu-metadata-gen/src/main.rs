@@ -24,12 +24,19 @@ const ENGINE_INC: &str = "engine_generated.inc";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--check]"
+        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--check]\n       win32-metadata-gen --file-io-contracts [--check]"
     );
     std::process::exit(2);
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--file-io-contracts") {
+        if let Err(e) = file_io_contracts_run() {
+            eprintln!("win32-metadata-gen: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let mut winmd: Option<String> = None;
     let mut config_path = "crates/shirusu-metadata-gen/apis.toml".to_string();
     let mut out_dir = "crates/shirusu-hook/src".to_string();
@@ -150,4 +157,22 @@ fn run(
         );
     }
     Ok(())
+}
+
+fn file_io_contracts_run() -> Result<(), String> {
+    let args: Vec<_> = std::env::args().skip(2).collect();
+    if !(args.is_empty() || args == ["--check"]) {
+        return Err("usage: win32-metadata-gen --file-io-contracts [--check]".into());
+    }
+    let source = std::fs::read_to_string("crates/shirusu-metadata-gen/file-io-contracts.toml")
+        .map_err(|e| e.to_string())?;
+    let generated = shirusu_metadata_gen::contracts::emit_file_io_contracts(&source)?;
+    let path = "crates/shirusu-hook/src/api_file_io_generated.inc";
+    if args.is_empty() {
+        std::fs::write(path, generated).map_err(|e| e.to_string())
+    } else if std::fs::read_to_string(path).ok().as_deref() == Some(&generated) {
+        Ok(())
+    } else {
+        Err(format!("{path} is stale"))
+    }
 }

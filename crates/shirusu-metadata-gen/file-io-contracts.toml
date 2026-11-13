@@ -1,0 +1,169 @@
+# File I/O semantic contracts v1. Field order and annotations are wire compatibility.
+version = 1
+
+[[api]]
+id = 1
+module = "kernel32.dll"
+function = "CreateFileW"
+level = 2
+note = "パス文字列 (Str16) を復元する。lpSecurityAttributes と hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で 後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)"
+last_error = "WhenReturnIsInvalidHandle"
+
+[[api.enter]]
+name = "lpFileName"
+ty = "Str16"
+kind = "Scalar"
+
+[[api.enter]]
+name = "dwDesiredAccess"
+ty = "U32"
+kind = "Scalar"
+
+[[api.enter]]
+name = "dwShareMode"
+ty = "U32"
+kind = "Scalar"
+
+[[api.enter]]
+name = "lpSecurityAttributes"
+ty = "U64"
+kind = "Pointer"
+
+[[api.enter]]
+name = "dwCreationDisposition"
+ty = "U32"
+kind = "Scalar"
+
+[[api.enter]]
+name = "dwFlagsAndAttributes"
+ty = "U32"
+kind = "Scalar"
+
+[[api.enter]]
+name = "hTemplateFile"
+ty = "U64"
+kind = "Handle"
+
+[[api.leave]]
+name = "return"
+ty = "U64"
+kind = "CreatedObject"
+
+[[api.leave]]
+name = "last_error"
+ty = "U32"
+kind = "Scalar"
+
+[[api]]
+id = 2
+module = "kernel32.dll"
+function = "ReadFile"
+level = 2
+note = "同期完了時の出力バッファ内容を上限付きで復元する (上限超過は Truncated)。OVERLAPPED 指定時は完了が非同期の ためバッファ内容と読取バイト数は Unsupported として記録する"
+last_error = "WhenReturnIsFalse"
+
+[[api.enter]]
+name = "hFile"
+ty = "U64"
+kind = "Handle"
+
+[[api.enter]]
+name = "lpBuffer"
+ty = "U64"
+kind = "Pointer"
+
+[[api.enter]]
+name = "nNumberOfBytesToRead"
+ty = "U32"
+kind = "Scalar"
+
+[[api.enter]]
+name = "lpOverlapped"
+ty = "U64"
+kind = "Pointer"
+
+[[api.leave]]
+name = "return"
+ty = "I32"
+kind = "Scalar"
+
+[[api.leave]]
+name = "lpNumberOfBytesRead"
+ty = "U32"
+kind = "Scalar"
+
+[[api.leave]]
+name = "data"
+ty = "Bytes"
+kind = "Scalar"
+
+[[api.leave]]
+name = "last_error"
+ty = "U32"
+kind = "Scalar"
+
+[[api]]
+id = 3
+module = "kernel32.dll"
+function = "WriteFile"
+level = 2
+note = "入力バッファ内容を呼び出し前に上限付きで復元する (上限超過は Truncated)"
+last_error = "WhenReturnIsFalse"
+
+[[api.enter]]
+name = "hFile"
+ty = "U64"
+kind = "Handle"
+
+[[api.enter]]
+name = "data"
+ty = "Bytes"
+kind = "Scalar"
+
+[[api.enter]]
+name = "nNumberOfBytesToWrite"
+ty = "U32"
+kind = "Scalar"
+
+[[api.enter]]
+name = "lpOverlapped"
+ty = "U64"
+kind = "Pointer"
+
+[[api.leave]]
+name = "return"
+ty = "I32"
+kind = "Scalar"
+
+[[api.leave]]
+name = "lpNumberOfBytesWritten"
+ty = "U32"
+kind = "Scalar"
+
+[[api.leave]]
+name = "last_error"
+ty = "U32"
+kind = "Scalar"
+
+[[api]]
+id = 4
+module = "kernel32.dll"
+function = "CloseHandle"
+level = 1
+note = "型付き引数・戻り値のみ。対象 HANDLE の生値で生成側 イベントと相関可能 (Object ID は未割当)"
+last_error = "WhenReturnIsFalse"
+
+[[api.enter]]
+name = "hObject"
+ty = "U64"
+kind = "Handle"
+
+[[api.leave]]
+name = "return"
+ty = "I32"
+kind = "Scalar"
+
+[[api.leave]]
+name = "last_error"
+ty = "U32"
+kind = "Scalar"

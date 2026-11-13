@@ -1,0 +1,199 @@
+SchemaDef {
+    schema_id: 1,
+    name: "kernel32!CreateFileW/enter",
+    content_hash: 9748394438019569237,
+    fields: [
+        FieldDef {
+            name: "lpFileName",
+            ty: 9,
+            flags: 36,
+        },
+        FieldDef {
+            name: "dwDesiredAccess",
+            ty: 3,
+            flags: 36,
+        },
+        FieldDef {
+            name: "dwShareMode",
+            ty: 3,
+            flags: 36,
+        },
+        FieldDef {
+            name: "lpSecurityAttributes",
+            ty: 4,
+            flags: 40,
+        },
+        FieldDef {
+            name: "dwCreationDisposition",
+            ty: 3,
+            flags: 36,
+        },
+        FieldDef {
+            name: "dwFlagsAndAttributes",
+            ty: 3,
+            flags: 36,
+        },
+        FieldDef {
+            name: "hTemplateFile",
+            ty: 4,
+            flags: 44,
+        },
+    ],
+    annotation: "L2 (enter): パス文字列 (Str16) を復元する。lpSecurityAttributes と hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で 後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)",
+}
+SchemaDef {
+    schema_id: 2,
+    name: "kernel32!CreateFileW/leave",
+    content_hash: 10371726516279120553,
+    fields: [
+        FieldDef {
+            name: "return",
+            ty: 4,
+            flags: 80,
+        },
+        FieldDef {
+            name: "last_error",
+            ty: 3,
+            flags: 836,
+        },
+    ],
+    annotation: "L2 (leave): パス文字列 (Str16) を復元する。lpSecurityAttributes と hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で 後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)",
+}
+SchemaDef {
+    schema_id: 3,
+    name: "kernel32!ReadFile/enter",
+    content_hash: 17534590658914530398,
+    fields: [
+        FieldDef {
+            name: "hFile",
+            ty: 4,
+            flags: 44,
+        },
+        FieldDef {
+            name: "lpBuffer",
+            ty: 4,
+            flags: 40,
+        },
+        FieldDef {
+            name: "nNumberOfBytesToRead",
+            ty: 3,
+            flags: 36,
+        },
+        FieldDef {
+            name: "lpOverlapped",
+            ty: 4,
+            flags: 40,
+        },
+    ],
+    annotation: "L2 (enter): 同期完了時の出力バッファ内容を上限付きで復元する (上限超過は Truncated)。OVERLAPPED 指定時は完了が非同期の ためバッファ内容と読取バイト数は Unsupported として記録する",
+}
+SchemaDef {
+    schema_id: 4,
+    name: "kernel32!ReadFile/leave",
+    content_hash: 2813619993672481861,
+    fields: [
+        FieldDef {
+            name: "return",
+            ty: 1,
+            flags: 68,
+        },
+        FieldDef {
+            name: "lpNumberOfBytesRead",
+            ty: 3,
+            flags: 68,
+        },
+        FieldDef {
+            name: "data",
+            ty: 10,
+            flags: 68,
+        },
+        FieldDef {
+            name: "last_error",
+            ty: 3,
+            flags: 580,
+        },
+    ],
+    annotation: "L2 (leave): 同期完了時の出力バッファ内容を上限付きで復元する (上限超過は Truncated)。OVERLAPPED 指定時は完了が非同期の ためバッファ内容と読取バイト数は Unsupported として記録する",
+}
+SchemaDef {
+    schema_id: 5,
+    name: "kernel32!WriteFile/enter",
+    content_hash: 10341864104380307771,
+    fields: [
+        FieldDef {
+            name: "hFile",
+            ty: 4,
+            flags: 44,
+        },
+        FieldDef {
+            name: "data",
+            ty: 10,
+            flags: 36,
+        },
+        FieldDef {
+            name: "nNumberOfBytesToWrite",
+            ty: 3,
+            flags: 36,
+        },
+        FieldDef {
+            name: "lpOverlapped",
+            ty: 4,
+            flags: 40,
+        },
+    ],
+    annotation: "L2 (enter): 入力バッファ内容を呼び出し前に上限付きで復元する (上限超過は Truncated)",
+}
+SchemaDef {
+    schema_id: 6,
+    name: "kernel32!WriteFile/leave",
+    content_hash: 11966167465441560632,
+    fields: [
+        FieldDef {
+            name: "return",
+            ty: 1,
+            flags: 68,
+        },
+        FieldDef {
+            name: "lpNumberOfBytesWritten",
+            ty: 3,
+            flags: 68,
+        },
+        FieldDef {
+            name: "last_error",
+            ty: 3,
+            flags: 580,
+        },
+    ],
+    annotation: "L2 (leave): 入力バッファ内容を呼び出し前に上限付きで復元する (上限超過は Truncated)",
+}
+SchemaDef {
+    schema_id: 7,
+    name: "kernel32!CloseHandle/enter",
+    content_hash: 3722817731428470913,
+    fields: [
+        FieldDef {
+            name: "hObject",
+            ty: 4,
+            flags: 44,
+        },
+    ],
+    annotation: "L1 (enter): 型付き引数・戻り値のみ。対象 HANDLE の生値で生成側 イベントと相関可能 (Object ID は未割当)",
+}
+SchemaDef {
+    schema_id: 8,
+    name: "kernel32!CloseHandle/leave",
+    content_hash: 12858316894026062010,
+    fields: [
+        FieldDef {
+            name: "return",
+            ty: 1,
+            flags: 68,
+        },
+        FieldDef {
+            name: "last_error",
+            ty: 3,
+            flags: 580,
+        },
+    ],
+    annotation: "L1 (leave): 型付き引数・戻り値のみ。対象 HANDLE の生値で生成側 イベントと相関可能 (Object ID は未割当)",
+}

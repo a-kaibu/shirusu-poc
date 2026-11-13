@@ -234,7 +234,8 @@ pub fn create_file_w_leave(return_handle: u64, last_error: u32) -> Vec<CapturedV
     vec![
         u64v(return_handle),
         last_error_value(
-            LastErrorMeaning::WhenReturnIsInvalidHandle,
+            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_CREATE_FILE_W - 1) as usize]
+                .last_error_meaning,
             return_handle,
             last_error,
         ),
@@ -275,7 +276,8 @@ pub fn read_file_leave(
             unsupported_u32(),
             unsupported_bytes(),
             last_error_value(
-                LastErrorMeaning::WhenReturnIsFalse,
+                crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_READ_FILE - 1) as usize]
+                    .last_error_meaning,
                 success as u64,
                 last_error,
             ),
@@ -303,7 +305,8 @@ pub fn read_file_leave(
         count_value,
         data,
         last_error_value(
-            LastErrorMeaning::WhenReturnIsFalse,
+            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_READ_FILE - 1) as usize]
+                .last_error_meaning,
             success as u64,
             last_error,
         ),
@@ -345,7 +348,8 @@ pub fn write_file_leave(
         i32v(success),
         count,
         last_error_value(
-            LastErrorMeaning::WhenReturnIsFalse,
+            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_WRITE_FILE - 1) as usize]
+                .last_error_meaning,
             success as u64,
             last_error,
         ),
@@ -452,7 +456,8 @@ pub fn close_handle_leave(success: i32, last_error: u32) -> Vec<CapturedValue> {
     vec![
         i32v(success),
         last_error_value(
-            LastErrorMeaning::WhenReturnIsFalse,
+            crate::api::HANDWRITTEN_API_TABLE[(crate::api::API_CLOSE_HANDLE - 1) as usize]
+                .last_error_meaning,
             success as u64,
             last_error,
         ),
