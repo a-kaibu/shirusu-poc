@@ -3878,13 +3878,13 @@ mod tests {
     /// no concurrent Host, notification event or real heap allocation.
     #[test]
     #[ignore = "run explicitly in release mode for native component measurements"]
+    #[allow(clippy::assertions_on_constants)] // Runtime refusal, not a compile-time assertion.
     fn measure_generic_detour() {
         use shirusu_transport::ring::RingReader;
         use std::{hint::black_box, time::Instant};
         let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
         // Compile in debug test builds too, but reject accidentally measuring
         // an unoptimized binary when this ignored test is explicitly selected.
-        #[allow(clippy::assertions_on_constants)]
         assert!(!cfg!(debug_assertions), "measurement requires --release");
         #[inline(never)]
         unsafe extern "system-unwind" fn original(
