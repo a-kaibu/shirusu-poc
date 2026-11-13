@@ -146,3 +146,4 @@ Write-Host "Native performance report: $reportPath"
 # Targets are development evaluation criteria, not correctness gates. Timing
 # misses and real loss remain visible in the report; failures to run/observe
 # the workload are fatal. The model benchmark measures buffer occupancy apart.
+& (Join-Path $PSScriptRoot "buffer-capacity.ps1") -Target $Target -Fixture $exe -Dll $dll -Cli $cli -Work $work -Rounds $Rounds

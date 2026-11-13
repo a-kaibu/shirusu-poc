@@ -426,3 +426,15 @@ run/finish errors retain both the original error and cleanup outcome; a bare
 Drop reports unconfirmed cleanup to stderr. Native attach regression now includes
 successful attach followed by plain drop and caught unwinding, then checks target
 survival, restored entry bytes, absent Finalization and successful reattach.
+
+### Native Ring-capacity experiment (2026-11-13)
+
+The default native acceptance benchmark remains unchanged. A separate report now
+runs the same high-load fixture with 4096, 16384 and 65536 descriptors per Ring,
+keeping payload capacity at 1 MiB, eight initial Rings and the 2 ms polling policy.
+Each capacity runs three times in alternating order. The report retains application
+QPC timings, workload checksums, trace bytes, full integrity and capture metadata;
+missing observations or changed workload results fail the experiment. Timing or
+loss differences are evidence for tuning, not proof of the 5x target. Capture
+metadata now records actual descriptor and payload capacities. Defaults have not
+been enlarged; native results are required before selecting a new configuration.

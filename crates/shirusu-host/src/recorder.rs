@@ -473,8 +473,10 @@ impl CaptureSession {
             )));
         }
         config.environment.capture_config.push_str(&format!(
-            "; host_pipeline=async-fifo; host_queue_commands={}; host_event_compression=backlog-adaptive",
+            "; host_pipeline=async-fifo; host_queue_commands={}; host_event_compression=backlog-adaptive; ring_descriptors={}; ring_payload_bytes={}",
             crate::trace_pipeline::QUEUED_BATCHES,
+            config.ring_config.descriptor_capacity,
+            config.ring_config.payload_capacity,
         ));
         let file = File::create(path.as_ref())?;
         let mut recorder = TraceRecorder::from_environment_with_options(
