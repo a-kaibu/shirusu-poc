@@ -646,3 +646,81 @@ mod integer_bounds_tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use crate::proto::{ProtoReader, ProtoWriter};
+
+    /// ULEB128 は任意の u64 で往復し、符号化長ちょうどを消費する。
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn uleb_roundtrip_consumes_exact_length() {
+        let v: u64 = kani::any();
+        let mut out = Vec::new();
+        write_uleb(&mut out, v);
+        assert!(!out.is_empty() && out.len() <= 10);
+        // 最終バイト以外は継続ビットが立ち、最終バイトは立たない (正規形)。
+        assert!(out[out.len() - 1] & 0x80 == 0);
+        let mut cur = Cursor::new(&out);
+        assert!(cur.read_uleb() == Ok(v));
+        assert!(cur.is_done());
+    }
+
+    /// zigzag 付き SLEB128 は任意の i64 で往復する (i64::MIN / MAX を含む)。
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn sleb_roundtrip() {
+        let v: i64 = kani::any();
+        let mut out = Vec::new();
+        write_sleb(&mut out, v);
+        let mut cur = Cursor::new(&out);
+        assert!(cur.read_sleb() == Ok(v));
+        assert!(cur.is_done());
+    }
+
+    /// Compact Binary の ULEB と Protobuf の varint は同じ符号であり、
+    /// 任意の 11 バイト以下の入力で、受理の可否・値・消費長が一致する
+    /// (二つの手書き実装の差分検査)。上位ビットを捨てて受理する入力はない。
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn uleb_and_proto_varint_agree_on_arbitrary_bytes() {
+        let raw: [u8; 11] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= raw.len());
+        let bytes = &raw[..len];
+        let mut a = Cursor::new(bytes);
+        let mut b = ProtoReader::new(bytes);
+        let ra = a.read_uleb();
+        let rb = b.read_varint();
+        assert!(ra.is_ok() == rb.is_ok());
+        if let (Ok(x), Ok(y)) = (ra, rb) {
+            assert!(x == y);
+            assert!(a.pos == b.position());
+            // 受理した値を再符号化すると、消費したバイト列以下の長さになる
+            // (非正規の冗長な 0 継続だけが長さの差になる)。
+            let mut w = ProtoWriter::new();
+            w.write_varint(x);
+            assert!(w.as_slice().len() <= a.pos);
+        }
+    }
+
+    /// 長さ付きバイト列は、宣言長が残りを超えると拒否し、受理時は範囲内を返す。
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn len_bytes_stays_in_bounds() {
+        let raw: [u8; 8] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= raw.len());
+        let mut cur = Cursor::new(&raw[..len]);
+        if let Ok(s) = cur.read_len_bytes() {
+            assert!(cur.pos <= len);
+            assert!(s.len() <= len);
+        }
+        let mut reader = ProtoReader::new(&raw[..len]);
+        if let Ok(s) = reader.read_len_bytes() {
+            assert!(reader.position() <= len);
+            assert!(s.len() + 1 <= len);
+        }
+    }
+}

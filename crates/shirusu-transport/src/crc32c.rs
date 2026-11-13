@@ -162,3 +162,51 @@ mod tests {
         assert_eq!(crc32c(&pattern[..100]), whole);
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// 1 バイト分の反転 CRC をビットごとに計算する定義 (表を使わない)。
+    fn bitwise_byte(mut crc: u32, byte: u8) -> u32 {
+        crc ^= byte as u32;
+        let mut k = 0;
+        while k < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            k += 1;
+        }
+        crc
+    }
+
+    /// コンパイル時に生成した表は、全 256 エントリでビット単位の定義と一致する。
+    #[kani::proof]
+    fn table_matches_bitwise_definition() {
+        let i: u8 = kani::any();
+        assert!(TABLE[i as usize] == bitwise_byte(0, i));
+    }
+
+    /// 表駆動の 1 バイト更新は、任意の途中状態でビット単位の定義と一致する。
+    #[kani::proof]
+    fn software_update_matches_bitwise_for_one_byte() {
+        let seed: u32 = kani::any();
+        let b: u8 = kani::any();
+        assert!(software_update(seed, &[b]) == !bitwise_byte(!seed, b));
+    }
+
+    /// 分割して更新しても一括と同じ値になる (Fragment ごとの連結計算の前提)。
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn software_update_is_streaming() {
+        let seed: u32 = kani::any();
+        let data: [u8; 2] = kani::any();
+        let split: usize = kani::any();
+        kani::assume(split <= data.len());
+        let whole = software_update(seed, &data);
+        let parts = software_update(software_update(seed, &data[..split]), &data[split..]);
+        assert!(whole == parts);
+    }
+}

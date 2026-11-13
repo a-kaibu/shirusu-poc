@@ -10,4 +10,9 @@ if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
   cargo install kani-verifier --version "$KANI_VERSION" --locked || { echo "KANI_UNAVAILABLE: cargo-kani を導入できませんでした" >&2; exit 1; }
   cargo kani setup || { echo "KANI_SETUP_FAILED" >&2; exit 1; }
 fi
-cargo kani -p shirusu-transport
+# set -e を使わないため、各クレートの結果を集めて最後に終了コードへ反映する。
+status=0
+for crate in shirusu-transport shirusu-trace shirusu-hook; do
+  cargo kani -p "$crate" || status=1
+done
+exit "$status"

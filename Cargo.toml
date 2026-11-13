@@ -34,5 +34,9 @@ license = "MIT"
 # rust-version.workspace = true で継承する。
 rust-version = "1.87"
 
+[workspace.lints.rust]
+# Kani の証明ハーネスは #[cfg(kani)] に置く (cargo kani だけが有効にする)。
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [workspace.lints.clippy]
 all = "warn"

@@ -375,3 +375,37 @@ fn environment_hook_evidence_roundtrips_and_is_optional() {
     current.hook_evidence.clear();
     assert_eq!(current.encode(), old.encode());
 }
+
+/// fuzz (proto_messages) で見つかった回帰: 存在に意味がある Option の
+/// 空文字列・0 が、proto3 の既定値省略で None に化けていた。
+#[test]
+fn present_empty_optionals_survive_roundtrip() {
+    use shirusu_trace::module::ModuleClassification;
+    use shirusu_trace::static_dep::StaticImport;
+    let m = ModuleClassification {
+        implementation_module: Some(String::new()),
+        ..Default::default()
+    };
+    assert_eq!(ModuleClassification::decode(&m.encode()).unwrap(), m);
+    for import in [
+        StaticImport {
+            name: Some(String::new()),
+            ordinal: None,
+        },
+        StaticImport {
+            name: None,
+            ordinal: Some(0),
+        },
+        StaticImport {
+            name: Some(String::new()),
+            ordinal: Some(0),
+        },
+        StaticImport::named("CreateFileW"),
+        StaticImport::by_ordinal(7),
+    ] {
+        assert_eq!(StaticImport::decode(&import.encode()).unwrap(), import);
+    }
+    // 非空の値の符号化は従来と同じバイト列 (既存 Trace との互換)。
+    assert_eq!(StaticImport::named("A").encode(), vec![0x0A, 0x01, b'A']);
+    assert_eq!(StaticImport::by_ordinal(7).encode(), vec![0x10, 0x07]);
+}

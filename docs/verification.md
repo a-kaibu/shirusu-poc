@@ -13,8 +13,8 @@ shirusuは、同じ不変条件を性質の異なる複数の方法で確かめ�
 | Unit | 個別の関数と状態遷移 | Cursor計算、容量判定、Descriptor、CRC32C |
 | PBT（proptest） | 操作列の組み合わせ | Ring操作、Fragment、Overflow、Slotの再利用。`VecDeque`の参照モデルと比較し、失敗した操作列を縮小する |
 | loom | スレッド間の実行順序 | Release/Acquireによる公開と回収。通常のメモリも`loom::cell::UnsafeCell`で追跡する |
-| Kani | 任意入力に対する逐次コードの性質 | Cursor演算、Hostの範囲検証。並行性は対象外 |
-| Fuzz（cargo-fuzz） | 壊れた入力 | Hostの共有メモリ解析、Trace Reader、Compact Binary、復旧 |
+| Kani | 任意入力に対する逐次コードの性質 | Cursor演算、Hostの範囲検証、通知判定、CRC32C、LEB128/varint、Blob部分更新、Inlineパッチのジャンプ符号化、PEヘッダーの境界検査。並行性は対象外 |
+| Fuzz（cargo-fuzz） | 壊れた入力 | Hostの共有メモリ解析、Trace Reader、Compact Binary、復旧、Traceメタデータ、PEイメージ解析、Inline Hookの命令再配置 |
 | TLA+（PlusCal、TLC） | アルゴリズムの安全性と進行性 | 公開・回収・再利用の状態遷移 |
 | DST | 故障と時間経過の組み合わせ | Host停止、通知の欠落、遅延、容量不足、スレッド終了 |
 | Windows E2E | 実際のOSとプロセス間の動作 | x86 Agentとx64 Host、File Mapping、通知、強制終了。Application Verifierも併用する |
@@ -26,13 +26,13 @@ Miriは`unsafe`コードの未定義動作の検出に使うが、Windows FFIや
 当初の「ShuttleとVerusは、対象が複雑になった段階で追加する」に対する評価。対象は当初の想定を超えて複雑化した（ワークスペース 16 メンバー・15 クレート、Phase 1〜4 実装済み）が、**両方とも当面は追加しない**と判断した。
 
 **Shuttle（並行性の乱択スケジューリング検査、現行 0.9.10）— 不採用（当面）**
-- Shuttle は loom に着想を得た乱択検査で、loom の網羅検査より大きなケースに届く代わりに sound ではない（通っても正しさを証明しない）。shirusu の並行性の核（Ring の公開・回収・再利用）は loom 18 シナリオ（転写モデル含む）＋ TLA+ 7 不変条件 ＋ PBT 参照モデル ＋ 実プロセス間ストレス（D51・A77）で多層化済みで、Shuttle は同じく「モデル」であるため、本節の「役割分担の限定」で自認するギャップ（TLA+ はメモリ順序を検査しない、loom モデルは実装そのものではない）を埋めない。そのギャップは実ストレスと Windows E2E が担っている。
+- Shuttle は loom に着想を得た乱択検査で、loom の網羅検査より大きなケースに届く代わりに sound ではない（通っても正しさを証明しない）。shirusu の並行性の核（Ring の公開・回収・再利用）は loom 18 シナリオ（転写モデル含む。2026-11-13 に 20）＋ TLA+ 7 不変条件 ＋ PBT 参照モデル ＋ 実プロセス間ストレス（D51・A77）で多層化済みで、Shuttle は同じく「モデル」であるため、本節の「役割分担の限定」で自認するギャップ（TLA+ はメモリ順序を検査しない、loom モデルは実装そのものではない）を埋めない。そのギャップは実ストレスと Windows E2E が担っている。
 - Shuttle が loom より強いのは std スレッドの高位協調（Mutex/Condvar/チャネル、async）の決定性探索だが、shirusu のスレッド協調は OS 境界に接している（DrainWorker は共有メモリ・ファイル I/O・Windows イベントと直結、hook runtime は FFI/TLS）。Shuttle は OS 呼び出し・FFI・プロセス間共有メモリを仮想化できず、適用には境界のスタブ化が要り、モデル忠実度は loom の MiniRing と同じ限界に直面する。
 - 導入にはテストコードを `shuttle::thread` / `shuttle::sync` 向けに書き換える必要があり、loom モデルと重複する第二のモデルを維持することになる。特別なツールチェーンは要らない点は有利だが、上記の理由で利得が無い。
 
 **Verus（SMT による Rust プログラム検証）— 不採用（当面）**
 - Verus は仕様・証明を Rust ソース内に書く SMT ベースの検証器で、ghost permission により unsafe コードの推論も可能だが、shirusu の検証したい核（共有メモリ・FFI・プロセス間）に Windows の意味論が絡む部分は Verus の対象外で、Rust コード側の性質だけが対象になる。
-- その Rust コード側の性質は既に Kani（unsafe を含む逐次コードの有界検証・14 ハーネス）＋ TLA+（プロトコル不変条件）＋ PBT/fuzz が担っている。Verus の無界の証明が Kani の有界性を上回るのは、ループ不変条件など無界の性質が求められる場合に限られるが、現行コードでその要求は具体化していない。
+- その Rust コード側の性質は既に Kani（unsafe を含む逐次コードの有界検証・14 ハーネス。2026-11-13 に 3 クレート 33 本）＋ TLA+（プロトコル不変条件）＋ PBT/fuzz が担っている。Verus の無界の証明が Kani の有界性を上回るのは、ループ不変条件など無界の性質が求められる場合に限られるが、現行コードでその要求は具体化していない。
 - 導入コストは 16 クレート全体への仕様注釈と独自ツールチェーン（verus＋Z3）の CI 導入で、MSRV 1.87・安定ツールチェーン方針とも噛み合わない。Microsoft の Brotli での実践が示す「選んだ不変条件だけを証明し、fuzz とテストを併用する」漸進形が正しい形であり、現時点では選ぶべき対象が無い。
 
 **再検討の条件**
@@ -120,6 +120,9 @@ Slot の再利用は、実装の原子操作列に合わせて段階に分けて
 | `decode_payload` | DescriptorとPayload | 参照範囲と折り返しを正しく検証する |
 | `decode_compact` | Schemaと引数のバイト列 | 不正な型定義やバイト列でReaderが崩れない |
 | `recover_trace` | 途中で切れたBlock列 | 回収できないデータを捏造しない |
+| `proto_messages` | 任意のバイト列 | Traceメタデータ全16型が panic せず、受理した値は再符号化→再復号で同じ値に戻る |
+| `pe_image` | ファイル配置／メモリ配置のPE | panic せず、IATスロットとエクスポートRVAがイメージ内に収まる |
+| `inline_plan` | 関数先頭のバイト列と配置先 | 盗む命令が命令境界で隙間なく並び、パッチが独立デコーダで見てDetourへ届く |
 
 クラッシュしないことに加え、受理したデータが公開Traceの不変条件を満たすかも確かめる。検証ロジックは純粋関数に分け、LinuxやmacOSでも実行する。
 
@@ -253,3 +256,35 @@ IID カタログは Win32 Metadata 71.0.45-preview の全インターフェイ�
 `com_factory`統合テストは実際のCapture SchemaからTraceを直列化し、32/64bitとアドレス配置を変えた同一操作が一致することを確かめる。CLSID・実行コンテキストの変化は差分になり、その差分から生成したルールが元のTraceで成功し変更後に失敗する。読めないGUIDは空の識別子として扱わない。ポインタをScalarに戻すmutationでアドレス差の回帰検出力を確認する。
 
 新しいFactory SchemaはCoCreateInstanceとCoGetClassObjectで使用する。旧Schemaの生バイト列は復元できる型情報が不足するため、自動変換しない。COSERVERINFOの参照先は未展開であり、リモート認証設定の同一性までは比較できない。
+
+## 2026-11-13 検証範囲の拡大
+
+既存の基盤（Kani は transport のみ 14 本、loom 18 シナリオ、fuzz 8 本、TLA+ 2 モデル）を、
+これまで形式検証が届いていなかった Hook の PE 解析・Inline 命令再配置、通知ロジック、
+Trace のワイヤ形式、共有 COM の Module Epoch 手順へ広げた。
+
+| 手法 | 追加したもの | 性質 |
+| --- | --- | --- |
+| Kani（transport） | `notify::proofs` 4 本、`crc32c::proofs` 3 本 | 除算なしの閾値判定が 128bit の定義式と全域で一致／閾値通知は上向きの縁でだけ出て、回収なしに二度出ない／Host 待機中は必ず通知／再確認の待ち時間は interval 以下。CRC 表が 256 エントリ全部でビット定義と一致、分割更新が一括と一致 |
+| Kani（trace） | `compact::proofs` 4 本、`blob::proofs` 1 本 | ULEB/SLEB が任意の u64/i64 で往復し正規形で終わる／Compact の ULEB と Protobuf の varint が任意の 11 バイト以下で受理・値・消費長まで一致（二つの手書き実装の差分検査）／長さ付きバイト列の範囲／Blob 部分更新は長さを保ち範囲外を変えない |
+| Kani（hook） | `inline::proofs` 5 本、`pe::proofs` 2 本 | パッチ長と実際のジャンプのバイト数が常に一致／rel32・x64 絶対・x86 絶対の各形が行き先にちょうど着く／境界検査付き読み取りはあふれ位置でも panic しない／NT ヘッダーを受理したらシグネチャとデータディレクトリがバッファ内 |
+| fuzz | `proto_messages` `pe_image` `inline_plan`（短時間・長時間の両スクリプトに追加、種は `fuzz/seeds/`） | 上表 |
+| PBT | `shirusu-hook/tests/pe_model.rs`（4 性質）、`inline_semantics.rs`（2 性質） | PE 仕様から書き起こした合成器で作ったインポート表・エクスポート表・セクション写像が解析結果と完全一致（PE32/PE32+、ILT 有無、名前と序数の混在、切り詰め）。任意のプロローグ命令列を任意の配置先へ再配置しても、独立デコーダで見て RIP 相対の実効アドレス・範囲外への分岐先・続きへの戻りが保たれ、±1GiB 内の配置では拒否しない |
+| loom | `loom_global_order_*` 2 シナリオ | L11 の全体順序採番（Relaxed の fetch_add）が一意・密で、他スレッドの公開を観測してからの採番は必ず大きい |
+| TLA+ | `NotifyLiveness.tla`、`SharedComEpoch.tla` | 下記 |
+
+TLA+ の追加モデル（どちらも `scripts/ci/tla.sh` が主モデルの成立と、変種での反例検出の両方を必須にする）:
+
+- `NotifyLiveness`：data_ready の進行性。閾値未満で通知の出ない公開や、Host の「空を確認 → 待機」の間に割り込んだ公開があっても、書き手が止まった後に全イベントが回収される（`Drained`、弱公平性は Host 側だけ）。期限なし待機の変種（`NotifyLivenessNoTimeout.cfg`）では反例が出る。期限付き待機（ReCheckPolicy）が進行性の唯一の担い手であることの証跡。
+- `SharedComEpoch`：共有 vtable フックの Module Epoch。index の回収・再利用と、任意に遅れたアンロード通知を原子操作の単位で交互実行し、遅れた通知が新しい予約を退役させない（`NoStaleRetire`）、公開後の自モジュールの通知は失われない（`UnloadObserved`）、epoch は単調で新しい予約は常に新しい偶数（`FreshEpoch`・`EpochMonotone`）ことを検査する。CAS を通常 store に変えた変種（`SharedComEpochBlindStore.cfg`）では反例が出る。
+
+この拡大で見つけて直した不具合（いずれも回帰テストを追加済み）:
+
+1. **Inline パッチの変位計算のオーバーフロー（Kani）**。`jump_bytes` の rel32 変位を i64 の減算で求めていたため、二つのアドレスが 2^63 をまたぐと、変位自体は i32 に収まるのに減算があふれて debug ビルドで panic した。ユーザーモードの正規アドレスでは到達しないが、2 の補数の折り返し減算に直した。
+2. **存在に意味がある Option の往復（fuzz `proto_messages`）**。`ModuleClassification.implementation_module = Some("")`、`StaticImport.name = Some("")`、`StaticImport.ordinal = Some(0)` が、proto3 の既定値省略で書き出されず、読み戻すと `None` に化けていた。存在するフィールドは常に書き出すようにした。空でない値の符号化は従来と同じバイト列のため、既存 Trace との互換は保たれる（`present_empty_optionals_survive_roundtrip`）。
+
+分かった限界（正直な範囲）:
+
+- loom 0.7 は変更順序を部分順序で持つため、「CAS と別スレッドの通常 store」が競合する手順で、C11 では起こり得ない結果（CAS が既に上書きされた値を読んで成功し、最終値が CAS の書いた値になる）を生成する。2 スレッドの最小リトマス（初期値 2、片方が `store(4)`、もう片方が `compare_exchange(2, 3)`、join 後の読み出しが 3）で、SeqCst を含むどの順序指定でも再現した。偽陽性の方向（実際には起きない失敗を報告する）なので既存の loom テストの合格は損なわないが、Module Epoch 手順は loom で検査できないため TLA+ で検査した。TLA+ は逐次一貫の交互実行であり、メモリ順序は検査しない。
+- 2026-11-13 時点で Host は `OFF_HOST_WAITING` を立てていない（書き込み箇所はテストだけ）。そのため `NotifySignal::HostWaiting` の経路は本番では働かず、閾値未満の公開の回収は 2ms の期限付き再確認だけが担っている。`NotifyLiveness` は実装どおり `HostSetsWaiting = FALSE` でモデル化した。仕様の「Host が待機フラグを立てる」設計とずれているため、意図的かどうかの確認が要る。
+- Kani の PE 証明は NT ヘッダーとデータディレクトリまでで、インポート／エクスポート表の走査（上限 4096×16384 反復のループと文字列化）は有界検証に向かないため、fuzz とモデルベース PBT が担う。CRC32C の SSE4.2 命令経路は Kani が扱えないため、ソフトウェア実装だけを証明し、両経路の一致は既存の単体テストが担う。

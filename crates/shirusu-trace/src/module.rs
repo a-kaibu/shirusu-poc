@@ -153,7 +153,10 @@ impl ModuleClassification {
         w.string_field(3, &self.reason);
         w.bool_field(4, self.uncertain);
         if let Some(m) = &self.implementation_module {
-            w.string_field(5, m);
+            // Presence carries meaning: Some("") must not decode as None.
+            // string_field omits empty values, so emit the field explicitly
+            // (found by the proto_messages fuzz target).
+            w.bytes_field(5, m.as_bytes());
         }
         w.bool_field(6, self.overridden);
         w.into_bytes()

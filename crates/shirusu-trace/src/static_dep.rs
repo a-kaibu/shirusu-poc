@@ -66,11 +66,14 @@ impl StaticImport {
     /// field 1: name, 2: ordinal（ある方だけ書く）。
     pub fn encode(&self) -> Vec<u8> {
         let mut w = ProtoWriter::new();
+        // Some("") / Some(0) are distinct from None, so present fields are
+        // always emitted (proto3 default omission would drop them; found by
+        // the proto_messages fuzz target).
         if let Some(n) = &self.name {
-            w.string_field(1, n);
+            w.bytes_field(1, n.as_bytes());
         }
         if let Some(o) = self.ordinal {
-            w.u32_field(2, o as u32);
+            w.u64_field_present(2, o as u64);
         }
         w.into_bytes()
     }

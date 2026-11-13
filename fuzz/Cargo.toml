@@ -11,6 +11,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 shirusu-trace = { path = "../crates/shirusu-trace" }
 shirusu-transport = { path = "../crates/shirusu-transport" }
+shirusu-hook = { path = "../crates/shirusu-hook" }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 
 [workspace]
 
@@ -66,6 +68,27 @@ bench = false
 [[bin]]
 name = "trace_budgets"
 path = "fuzz_targets/trace_budgets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_messages"
+path = "fuzz_targets/proto_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe_image"
+path = "fuzz_targets/pe_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inline_plan"
+path = "fuzz_targets/inline_plan.rs"
 test = false
 doc = false
 bench = false

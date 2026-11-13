@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 521bf7c1eb8611a71f3393da4bd06c0ab62169bc9d0866379e9c9c5503845652 # shrinks to ops = [PushRbp], target = 268435456, tramp_delta = 0, far_tramp = false, far_detour = false

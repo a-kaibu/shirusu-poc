@@ -55,6 +55,11 @@ impl ProtoWriter {
         self.key(field, WIRE_VARINT);
         self.write_varint(v);
     }
+    /// Optional scalar whose presence is meaningful: emitted even when zero.
+    pub fn u64_field_present(&mut self, field: u32, v: u64) {
+        self.key(field, WIRE_VARINT);
+        self.write_varint(v);
+    }
     pub fn u32_field(&mut self, field: u32, v: u32) {
         self.u64_field(field, v as u64);
     }

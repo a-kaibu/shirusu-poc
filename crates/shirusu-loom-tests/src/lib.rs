@@ -768,4 +768,65 @@ mod tests {
             }
         });
     }
+
+    /// L11 `--order=global` の採番 (shirusu-agent::Agent::record) の転写モデル。
+    /// 実装は書き込み確定の直前に `next_global_order.fetch_add(1, Relaxed)` で
+    /// 採番し、そのスレッドの Ring へ Release で公開する。Relaxed でも、
+    /// 同一原子への RMW は変更順序で全順序になり、happens-before と整合する。
+    /// ここでは「因果的に後の観測は大きい番号を持つ」ことを、Host を経由した
+    /// 観測 (別スレッドの Ring の公開を Acquire で見てから採番) で確かめる。
+    #[test]
+    fn loom_global_order_respects_causality_across_rings() {
+        loom::model(|| {
+            let counter = Arc::new(AtomicU64::new(1));
+            let ring_x = Arc::new(MiniRing::new());
+            let (c2, rx2) = (counter.clone(), ring_x.clone());
+            let producer = loom::thread::spawn(move || {
+                let order = c2.fetch_add(1, Ordering::Relaxed);
+                rx2.publish(order);
+                order
+            });
+            // 別スレッド: X の公開を観測したら、自分の採番はそれより後でなければならない。
+            let seen = ring_x.drain();
+            let mine = counter.fetch_add(1, Ordering::Relaxed);
+            let theirs = producer.join().unwrap();
+            assert_ne!(mine, theirs, "global order numbers must be unique");
+            if let Some(&observed) = seen.first() {
+                assert_eq!(observed, theirs);
+                assert!(
+                    mine > observed,
+                    "an observation causally after another must get a larger global order"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn loom_global_order_is_unique_and_per_thread_increasing() {
+        loom::model(|| {
+            let counter = Arc::new(AtomicU64::new(1));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let c = counter.clone();
+                    loom::thread::spawn(move || {
+                        let a = c.fetch_add(1, Ordering::Relaxed);
+                        let b = c.fetch_add(1, Ordering::Relaxed);
+                        assert!(b > a, "numbers within one thread must increase");
+                        [a, b]
+                    })
+                })
+                .collect();
+            let own = counter.fetch_add(1, Ordering::Relaxed);
+            let mut all = vec![own];
+            for h in handles {
+                all.extend(h.join().unwrap());
+            }
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                vec![1, 2, 3, 4, 5],
+                "numbering is dense and starts at 1"
+            );
+        });
+    }
 }

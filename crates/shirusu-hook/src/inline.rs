@@ -181,7 +181,10 @@ pub fn plan_with_near_relay(
 /// disp32 はアドレススロット自身（`from + 6`）を指す）。
 pub fn jump_bytes(from: u64, to: u64, bitness: u32) -> Vec<u8> {
     if rel32_fits(from + PATCH_LEN_REL32 as u64, to) {
-        let disp = (to as i64 - (from + PATCH_LEN_REL32 as u64) as i64) as i32;
+        // Two's-complement wrapping keeps the low 32 bits exact even when the
+        // two addresses straddle 2^63, where an i64 subtraction overflows
+        // although the real displacement fits (found by Kani).
+        let disp = to.wrapping_sub(from + PATCH_LEN_REL32 as u64) as u32 as i32;
         let mut v = vec![0xE9];
         v.extend_from_slice(&disp.to_le_bytes());
         v
@@ -591,5 +594,85 @@ mod tests {
             InlineRefusal::InvalidBitness(16).reason(),
             "invalid-bitness"
         );
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// 相対 32bit の判定は、変位が i32 に収まることそのもの。
+    #[kani::proof]
+    fn rel32_fits_is_i32_displacement() {
+        let from: u64 = kani::any();
+        let to: u64 = kani::any();
+        let disp = to as i128 - from as i128;
+        assert!(rel32_fits(from, to) == (i32::try_from(disp).is_ok()));
+    }
+
+    /// パッチ長は 3 種類のどれかで、実際に置くジャンプのバイト数と常に一致する
+    /// (盗む命令の範囲と書き換える範囲が食い違わない)。
+    #[kani::proof]
+    fn patch_len_matches_jump_bytes() {
+        let target: u64 = kani::any();
+        let detour: u64 = kani::any();
+        let bitness: u32 = if kani::any() { 64 } else { 32 };
+        kani::assume(target <= u64::MAX - PATCH_LEN_ABS64 as u64);
+        let len = patch_len_for(target, detour, bitness);
+        assert!(len == PATCH_LEN_REL32 || len == PATCH_LEN_ABS64 || len == PATCH_LEN_ABS32);
+        assert!(build_patch(target, detour, bitness).len() == len);
+        if bitness == 32 {
+            assert!(len != PATCH_LEN_ABS64);
+        } else {
+            assert!(len != PATCH_LEN_ABS32);
+        }
+    }
+
+    /// `E9 rel32` は次命令位置 + 変位でちょうど行き先に着く。
+    #[kani::proof]
+    fn rel32_jump_lands_on_destination() {
+        let from: u64 = kani::any();
+        let to: u64 = kani::any();
+        kani::assume(from <= u64::MAX - PATCH_LEN_ABS64 as u64);
+        let bitness: u32 = if kani::any() { 64 } else { 32 };
+        kani::assume(rel32_fits(from + PATCH_LEN_REL32 as u64, to));
+        let bytes = jump_bytes(from, to, bitness);
+        assert!(bytes.len() == 5 && bytes[0] == 0xE9);
+        let disp = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        assert!((from + 5) as i128 + disp as i128 == to as i128);
+    }
+
+    /// x64 の絶対間接ジャンプは `jmp [rip+0]` の直後に行き先の 8 バイトを置く。
+    #[kani::proof]
+    fn abs64_jump_reads_destination_from_next_qword() {
+        let from: u64 = kani::any();
+        let to: u64 = kani::any();
+        kani::assume(from <= u64::MAX - PATCH_LEN_ABS64 as u64);
+        kani::assume(!rel32_fits(from + PATCH_LEN_REL32 as u64, to));
+        let bytes = jump_bytes(from, to, 64);
+        assert!(bytes.len() == PATCH_LEN_ABS64);
+        assert!(bytes[0] == 0xFF && bytes[1] == 0x25);
+        // RIP 相対の変位 0 = 命令直後 (from + 6) のアドレススロット。
+        assert!(bytes[2] == 0 && bytes[3] == 0 && bytes[4] == 0 && bytes[5] == 0);
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&bytes[6..14]);
+        assert!(u64::from_le_bytes(slot) == to);
+    }
+
+    /// x86 の絶対間接ジャンプは `jmp [disp32]` がアドレススロット自身
+    /// (from + 6) を指し、そこに行き先が入る (32bit アドレス空間内)。
+    #[kani::proof]
+    fn abs32_jump_slot_points_to_itself() {
+        let from: u64 = kani::any::<u32>() as u64;
+        let to: u64 = kani::any::<u32>() as u64;
+        kani::assume(from <= u32::MAX as u64 - PATCH_LEN_ABS32 as u64);
+        kani::assume(!rel32_fits(from + PATCH_LEN_REL32 as u64, to));
+        let bytes = jump_bytes(from, to, 32);
+        assert!(bytes.len() == PATCH_LEN_ABS32);
+        assert!(bytes[0] == 0xFF && bytes[1] == 0x25);
+        let slot = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        assert!(slot as u64 == from + 6);
+        let dest = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+        assert!(dest as u64 == to);
     }
 }

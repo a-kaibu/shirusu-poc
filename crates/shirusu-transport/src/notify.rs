@@ -160,3 +160,95 @@ mod tests {
         assert_eq!(p.wait_timeout(Duration::from_millis(5)), Duration::ZERO);
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// 除算を使わない閾値判定は、128bit の乗算で書いた定義式と全域で一致する。
+    /// 定義式: floor(min(used*100, u64::MAX) / capacity) >= threshold
+    ///   ⇔ min(used*100, u64::MAX) >= threshold*capacity (capacity > 0)。
+    /// 容量 0 は usage_percent の「100% に潰す」意味と一致する。
+    /// (usage_percent との直接比較は記号除算になり CBMC で解けないため、
+    /// 除算の等価性は PBT と境界行列が担い、ここでは乗算側を全域で証明する)
+    #[kani::proof]
+    fn usage_at_least_matches_wide_multiplication() {
+        let used: u64 = kani::any();
+        let capacity: u64 = kani::any();
+        let threshold: u64 = kani::any();
+        let expected = if capacity == 0 {
+            threshold <= 100
+        } else {
+            let numerator = (used as u128 * 100).min(u64::MAX as u128);
+            numerator >= threshold as u128 * capacity as u128
+        };
+        assert!(usage_at_least(used, capacity, threshold) == expected);
+    }
+
+    /// ThresholdCrossing は「公開後に閾値以上」かつ「公開前は閾値未満 (または空)」
+    /// のときだけ返る。任意の内部状態から 1 回の公開について成り立つ。
+    #[kani::proof]
+    fn threshold_crossing_requires_upward_edge() {
+        let mut t = PublishNotifyTracker {
+            above_threshold: kani::any(),
+        };
+        let before: u64 = kani::any();
+        let after: u64 = kani::any();
+        let cap: u64 = kani::any();
+        let th: u64 = kani::any();
+        kani::assume(cap <= 1 << 20 && th <= 200);
+        let waiting: bool = kani::any();
+        let signal = t.after_publish(before, after, cap, th, waiting);
+        if signal == NotifySignal::ThresholdCrossing {
+            assert!(usage_at_least(after, cap, th));
+            assert!(before == 0 || !usage_at_least(before, cap, th));
+        }
+        // Host が待機中なら、必ず何らかの通知が出る (取りこぼしの元にならない)。
+        if waiting {
+            assert!(signal != NotifySignal::None);
+        }
+        // 追跡状態は直近の公開後の判定そのもの。
+        assert!(t.above_threshold == usage_at_least(after, cap, th));
+    }
+
+    /// 回収を挟まずに閾値以上のまま公開が続く間、ThresholdCrossing は二度出ない。
+    #[kani::proof]
+    fn threshold_crossing_does_not_repeat_without_drain() {
+        let mut t = PublishNotifyTracker::new();
+        let u0: u64 = kani::any();
+        let u1: u64 = kani::any();
+        let u2: u64 = kani::any();
+        let cap: u64 = kani::any();
+        let th: u64 = kani::any();
+        kani::assume(cap >= 1 && cap <= 1 << 16 && th >= 1 && th <= 100);
+        kani::assume(u0 <= u1 && u1 <= u2 && u2 <= cap);
+        let first = t.after_publish(u0, u1, cap, th, false);
+        let second = t.after_publish(u1, u2, cap, th, false);
+        assert!(
+            !(first == NotifySignal::ThresholdCrossing
+                && second == NotifySignal::ThresholdCrossing)
+        );
+        // 単調に増える列では、閾値を越えた公開でちょうど一度だけ通知する。
+        // (閾値 >= 1 かつ容量 >= 1 なので、空の Ring は閾値未満)
+        if usage_at_least(u2, cap, th) && !usage_at_least(u0, cap, th) {
+            assert!(
+                first == NotifySignal::ThresholdCrossing
+                    || second == NotifySignal::ThresholdCrossing
+            );
+        }
+    }
+
+    /// 再確認の待機時間は interval を超えず、経過が interval 以上なら 0 (再確認する)。
+    #[kani::proof]
+    fn recheck_timeout_is_bounded_by_interval() {
+        let interval = Duration::from_nanos(kani::any::<u32>() as u64);
+        let waited = Duration::from_nanos(kani::any::<u32>() as u64);
+        let p = ReCheckPolicy { interval };
+        let timeout = p.wait_timeout(waited);
+        assert!(timeout <= interval);
+        assert!(p.should_recheck(waited) == (timeout == Duration::ZERO && waited >= interval));
+        if !p.should_recheck(waited) {
+            assert!(waited + timeout == interval);
+        }
+    }
+}

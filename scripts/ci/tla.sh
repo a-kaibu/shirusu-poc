@@ -45,3 +45,29 @@ if ! grep -Eq 'Invariant (NoLostCompletion|NoEraseReusedOperation) is violated' 
   cat "$buggy_log" >&2
   exit 1
 fi
+
+# data_ready の進行性: 期限付き待機があれば、閾値未満の公開や空確認と待機の
+# すれ違いがあっても全イベントが回収される。期限を外した変種では反例が必須。
+java -cp tla2tools.jar tlc2.TLC -config NotifyLiveness.cfg NotifyLiveness
+if java -cp tla2tools.jar tlc2.TLC -config NotifyLivenessNoTimeout.cfg NotifyLiveness >"$buggy_log" 2>&1; then
+  echo "ERROR: 期限なし待機の変種で進行性の違反が検出されなかった" >&2
+  exit 1
+fi
+if ! grep -q "Temporal property Drained was violated" "$buggy_log"; then
+  cat "$buggy_log" >&2
+  exit 1
+fi
+echo "OK: 期限なし待機の変種で Drained の違反を検出した"
+
+# 共有 vtable フックの Module Epoch: 遅れたアンロード通知が再利用後の予約を
+# 退役させない。CAS を通常 store に変えた変種では反例が必須。
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config SharedComEpoch.cfg SharedComEpoch
+if java -cp tla2tools.jar tlc2.TLC -config SharedComEpochBlindStore.cfg SharedComEpoch >"$buggy_log" 2>&1; then
+  echo "ERROR: CAS を外した変種で違反が検出されなかった" >&2
+  exit 1
+fi
+if ! grep -q "Invariant NoStaleRetire is violated" "$buggy_log"; then
+  cat "$buggy_log" >&2
+  exit 1
+fi
+echo "OK: CAS を外した変種で NoStaleRetire の違反を検出した"

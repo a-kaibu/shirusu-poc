@@ -435,3 +435,59 @@ mod tests {
         assert_eq!(is_pe64(&image), Some(true));
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    const LEN: usize = 160;
+
+    /// 境界検査付きの読み取りは、範囲内なら LE 値そのもの、範囲外なら None。
+    /// オフセットの加算あふれ (usize::MAX 付近) でも panic しない。
+    #[kani::proof]
+    fn bounded_reads_are_exact_or_none() {
+        let b: [u8; 16] = kani::any();
+        let off: usize = kani::any();
+        match rd_u32(&b, off) {
+            Some(v) => {
+                assert!(off <= b.len() - 4);
+                assert!(v == u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]));
+            }
+            None => assert!(off > b.len() - 4),
+        }
+        match rd_u16(&b, off) {
+            Some(v) => assert!(off <= b.len() - 2 && v == u16::from_le_bytes([b[off], b[off + 1]])),
+            None => assert!(off > b.len() - 2),
+        }
+        assert!(rd_u64(&b, off).is_some() == (off <= b.len() - 8));
+    }
+
+    /// 任意のヘッダー領域について、NT ヘッダー解析は panic せず、受理した場合は
+    /// MZ / PE シグネチャと Optional Header が実際にバッファ内にある。
+    /// データディレクトリの位置もセクション表より前に収まる。
+    #[kani::proof]
+    fn nt_headers_accepts_only_in_bounds_headers() {
+        let mut b: [u8; LEN] = kani::any();
+        // 探索を有意な形に寄せる: 先頭は MZ、e_lfanew は記号的な小さい値。
+        b[0] = b'M';
+        b[1] = b'Z';
+        if let Some(h) = nt_headers(&b) {
+            let nt = rd_u32(&b, 0x3C).unwrap() as usize;
+            assert!(nt + 4 <= LEN);
+            assert!(b[nt] == b'P' && b[nt + 1] == b'E' && b[nt + 2] == 0 && b[nt + 3] == 0);
+            assert!(h.optional_off == nt + 24);
+            assert!(h.section_off <= LEN);
+            assert!(h.optional_off <= h.section_off);
+            let index: usize = kani::any();
+            if let Some(_) = data_directory(&b, &h, index) {
+                let base = h.optional_off + if h.is64 { 112 } else { 96 };
+                assert!(base + index * 8 + 8 <= h.section_off);
+            }
+            assert!(is_pe64(&b) == Some(h.is64));
+            assert!(machine(&b) == Some(h.machine));
+        } else {
+            assert!(is_pe64(&b).is_none() && machine(&b).is_none());
+        }
+        let _ = size_of_image(&b);
+    }
+}

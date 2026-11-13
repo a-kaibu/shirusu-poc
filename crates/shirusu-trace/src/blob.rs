@@ -230,3 +230,35 @@ impl BlobStore {
         Ok(Some(self.put(&folded)?))
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// 部分更新は長さを変えず、範囲内だけを置き換える。範囲外・あふれは拒否する。
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn apply_update_preserves_length_and_outside_bytes() {
+        let base: [u8; 4] = kani::any();
+        let data: [u8; 2] = kani::any();
+        let data_len: usize = kani::any();
+        kani::assume(data_len <= data.len());
+        let offset: u64 = kani::any();
+        let data = &data[..data_len];
+        match apply_update_to(&base, offset, data) {
+            Some(out) => {
+                assert!(out.len() == base.len());
+                let o = offset as usize;
+                assert!(o + data_len <= base.len());
+                let i: usize = kani::any();
+                kani::assume(i < base.len());
+                if i >= o && i < o + data_len {
+                    assert!(out[i] == data[i - o]);
+                } else {
+                    assert!(out[i] == base[i]);
+                }
+            }
+            None => assert!(offset.saturating_add(data_len as u64) > base.len() as u64),
+        }
+    }
+}
