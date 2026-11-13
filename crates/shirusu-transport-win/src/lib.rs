@@ -1381,6 +1381,39 @@ impl Default for QpcTimestampSource {
         Self::new()
     }
 }
+/// Scheduling priority hint for Host threads (no-op off Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadPriority {
+    /// Short, latency-critical work that mostly sleeps (Ring collection).
+    Highest,
+    /// Throughput work that must not compete with the target or collection.
+    BelowNormal,
+}
+
+/// Set the calling thread's priority. Returns whether it was applied.
+/// With fewer cores than busy threads, Ring collection must preempt Trace
+/// conversion promptly; otherwise the writer overflows while it waits.
+pub fn set_current_thread_priority(priority: ThreadPriority) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            THREAD_PRIORITY_HIGHEST,
+        };
+        let value = match priority {
+            ThreadPriority::Highest => THREAD_PRIORITY_HIGHEST,
+            ThreadPriority::BelowNormal => THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: the pseudo handle names the calling thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), value) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = priority;
+        false
+    }
+}
+
 #[cfg(windows)]
 fn qpc_frequency() -> u64 {
     use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;

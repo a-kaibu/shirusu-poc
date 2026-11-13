@@ -50,22 +50,9 @@ pub struct LaunchConfig {
     pub ring_count: usize,
     pub init_timeout: Duration,
 }
-/// Pause after a small collection. At the high-load rate (tens of ns per
-/// event) this lets at most a few thousand descriptors accumulate, well under
-/// the production Ring (4096 descriptors, 1 MiB payload).
-const COLLECTION_PACE: Duration = Duration::from_micros(20);
-
-/// Collections smaller than this are followed by [`COLLECTION_PACE`].
+/// Collections smaller than this wait for the writer's notification.
 fn collection_low_water(cfg: shirusu_transport::RingConfig) -> usize {
     (cfg.descriptor_capacity / 8).max(1)
-}
-
-fn pace(duration: Duration) {
-    // Sleep granularity on Windows is about a millisecond: spin instead.
-    let start = std::time::Instant::now();
-    while start.elapsed() < duration {
-        std::hint::spin_loop();
-    }
 }
 
 impl LaunchConfig {
@@ -217,6 +204,9 @@ impl LaunchedCapture {
     }
 
     fn drain_until_exit(&mut self, poll_interval: Duration) -> Result<(), SessionError> {
+        // Collection mostly sleeps; when the writer signals, it must run
+        // before conversion so the Ring does not overflow.
+        win::set_current_thread_priority(win::ThreadPriority::Highest);
         loop {
             if self.target_exited()? {
                 break;
@@ -227,10 +217,12 @@ impl LaunchedCapture {
             // tight loop of tiny collections bounces the Ring control lines
             // between the writer's core and this one on nearly every event;
             // after a small collection, pace briefly without touching the Ring.
-            if stats.events == 0 {
+            // A small collection means the writer is not ahead: sleep until
+            // its threshold notification (or the poll interval) instead of
+            // spinning, which on a small machine takes CPU from the target
+            // and from conversion.
+            if stats.events < collection_low_water(self.session().ring_config()) {
                 self.data_ready.data_ready.wait_timeout(poll_interval);
-            } else if stats.events < collection_low_water(self.session().ring_config()) {
-                pace(COLLECTION_PACE);
             }
         }
         // 終了直前に書かれた分を拾い切る

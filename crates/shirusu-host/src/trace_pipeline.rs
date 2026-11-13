@@ -177,6 +177,10 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
         let worker = std::thread::Builder::new()
             .name("shirusu-trace-writer".into())
             .spawn(move || {
+                // Conversion uses spare CPU; Ring collection and the target come first.
+                shirusu_transport_win::set_current_thread_priority(
+                    shirusu_transport_win::ThreadPriority::BelowNormal,
+                );
                 let mut totals = PipelineReport::default();
                 let mut pending: Option<(Command, usize)> = None;
                 while let Some((command, bytes)) = pending.take().or_else(|| {

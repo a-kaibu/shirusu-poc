@@ -230,6 +230,13 @@ mod win {
                 // outside Loader Lock does not prove later callers are outside.
                 .with_loader_lock_state(shirusu_transport::LoaderLockState::Unknown)
                 .with_timestamp_source(Arc::new(QpcTimestampSource::new()))
+                // Wake the Host at a quarter full: the writer cannot wait
+                // (Loader Lock state unknown), so the remaining three quarters
+                // are all the margin collection has.
+                .with_policy(shirusu_transport::ring::WriterPolicy {
+                    notify_threshold_percent: 25,
+                    ..Default::default()
+                })
                 // L11: Host が Bootstrap v4 で指定した --order=global を Agent へ渡す。
                 .with_order_global(b.order_global != 0),
         );
