@@ -12,7 +12,11 @@ use std::time::Instant;
 // A producer holds at most one drained batch while waiting; the worker owns
 // a bounded group and at most one lookahead command. Individual batches retain
 // their Ring descriptor/payload bounds; coalescing never waits for more input.
-pub(crate) const QUEUED_BATCHES: usize = 4;
+// Native high-load runs exhausted four entries 45-49 times per capture. Keep
+// more bounded burst slack without waiting inside an application's Loader Lock.
+// With production x64 Rings the queued event storage is about 21.5 MiB at most
+// (excluding allocator overhead and the separate producer/worker buffers).
+pub(crate) const QUEUED_BATCHES: usize = 16;
 
 enum Command {
     Events(TraceBatchContext, Vec<ReceivedEvent>),
@@ -473,11 +477,10 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            pipeline
-                .sender
-                .as_ref()
-                .unwrap()
-                .try_send(Command::Events(context(), events(5))),
+            pipeline.sender.as_ref().unwrap().try_send(Command::Events(
+                context(),
+                events(QUEUED_BATCHES as u64 + 1)
+            )),
             Err(mpsc::TrySendError::Full(_))
         ));
         resume.send(()).unwrap();
