@@ -19,7 +19,7 @@ const FILE_IO_API_TABLE: &[ApiDef] = &[
             ("return", Ty::U64, ValueKind::CreatedObject, CaptureTiming::After),
             ("last_error", Ty::U32, ValueKind::Scalar, CaptureTiming::After),
         ],
-        last_error_meaning: LastErrorMeaning::WhenReturnIsInvalidHandle,
+        last_error_meaning: LastErrorMeaning::DependsOnInputs,
     },
     ApiDef {
         api_id: 2,

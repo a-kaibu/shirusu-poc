@@ -3386,7 +3386,7 @@ unsafe extern "system-unwind" fn detour_create_file_w(
     call_guard.complete();
     guard.resume();
     pop_call(call_id);
-    let values = capture::create_file_w_leave(ret as u64, last_error);
+    let values = capture::create_file_w_leave(ret as u64, last_error, creation_disposition);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.record_leave(tid, api, call_id, &bytes);
     }
@@ -3871,6 +3871,68 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[test]
+    fn create_file_success_error_follows_creation_disposition() {
+        let _lock = TEST_RUNTIME_LOCK.lock().unwrap();
+        unsafe extern "system-unwind" fn original(
+            _: *const u16,
+            _: u32,
+            _: u32,
+            _: *mut c_void,
+            _: u32,
+            _: u32,
+            _: Handle,
+        ) -> Handle {
+            crate::last_error::set(183);
+            0x1234usize as Handle
+        }
+        let rt = Arc::new(test_runtime());
+        rt.set_original(API_CREATE_FILE_W, original as *const () as usize);
+        assert!(set_runtime(rt.clone()).is_ok());
+        let tid = unsafe { GetCurrentThreadId() } as u64;
+        rt.ensure_thread(tid);
+        let path = [b'x' as u16, 0];
+        for disposition in 1..=5 {
+            assert_eq!(
+                unsafe {
+                    detour_create_file_w(
+                        path.as_ptr(),
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        disposition,
+                        128,
+                        std::ptr::null_mut(),
+                    )
+                } as usize,
+                0x1234
+            );
+            assert_eq!(crate::last_error::get(), 183);
+        }
+        // SAFETY: this test owns the Agent and exclusively uses the local Ring.
+        let base = unsafe { rt.agent().thread_region_base(tid) }.unwrap();
+        let mut reader =
+            unsafe { shirusu_transport::ring::RingReader::new(base, rt.agent().thread_config()) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 10);
+        let api = api_by_id(API_CREATE_FILE_W).unwrap();
+        let types: Vec<_> = api.leave_fields.iter().map(|f| f.1).collect();
+        for (i, event) in batch.events.iter().skip(1).step_by(2).enumerate() {
+            let values = shirusu_trace::compact::decode_values(&types, &event.payload).unwrap();
+            assert_eq!(values[1].value, shirusu_trace::schema::TypedValue::U32(183));
+            assert_eq!(
+                values[1].capture,
+                if matches!(i + 1, 2 | 4) {
+                    shirusu_trace::schema::ValueCapture::Captured
+                } else {
+                    shirusu_trace::schema::ValueCapture::Stale
+                }
+            );
+        }
+        assert_eq!(reader.loss_counters(), Default::default());
+        assert!(clear_runtime(&rt));
     }
 
     /// Explicit release-only measurement; normal test runs skip it. This invokes

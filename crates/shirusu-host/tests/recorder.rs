@@ -95,7 +95,7 @@ fn record_file_io(agent: &Agent, tid: u64) {
         agent.record_enter(tid, cf.api_id, cf.enter_schema_id(), 1, 0, &payload),
         RecordResult::Written(_)
     ));
-    let leave = capture::create_file_w_leave(0x2A4, 0);
+    let leave = capture::create_file_w_leave(0x2A4, 0, 3);
     let payload = capture::encode_leave(cf, &leave).unwrap();
     agent.record_leave(tid, cf.api_id, cf.leave_schema_id(), 1, 0, &payload);
     let enter = capture::write_file_enter(&mem, 0x2A4, 0x2000, 10, 0);

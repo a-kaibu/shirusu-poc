@@ -248,7 +248,7 @@ pub fn file_io_api_set() -> ApiSet {
             ],
         )
         .with_annotation("L2 (file_io_api_set: shirusu-hook HANDWRITTEN_API_TABLE と同一定義)")
-        .with_last_error_meaning(LastErrorMeaning::WhenReturnIsInvalidHandle),
+        .with_last_error_meaning(LastErrorMeaning::DependsOnInputs),
         ApiSpec::new(
             "kernel32!ReadFile",
             &[
@@ -483,7 +483,7 @@ mod tests {
         }
         assert_eq!(
             set.spec(1).unwrap().last_error_meaning,
-            LastErrorMeaning::WhenReturnIsInvalidHandle,
+            LastErrorMeaning::DependsOnInputs,
             "CreateFileW"
         );
         assert_eq!(

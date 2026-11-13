@@ -49,7 +49,7 @@ pub const API_GET_QUEUED_COMPLETION_STATUS: u32 = 6;
 /// F19: 入力は呼び出し前、出力は呼び出し後に取る）。
 /// `last_error_meaning` は leave の `last_error` フィールドが「API 仕様上
 /// 意味のあるエラー値」である条件（F20。戻り値が失敗を示す場合等）。
-/// leave Schema の `last_error` フィールドの flags (bit8..=10) へ格納
+/// leave Schema の `last_error` フィールドの flags (bit8..=11) へ格納
 /// され、content_hash の入力になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiDef {
@@ -704,10 +704,7 @@ mod tests {
         // F20: 全 API の leave Schema の last_error フィールドに、その
         // API の意味条件が宣言される。条件は content_hash の入力。
         let cases = [
-            (
-                API_CREATE_FILE_W,
-                LastErrorMeaning::WhenReturnIsInvalidHandle,
-            ),
+            (API_CREATE_FILE_W, LastErrorMeaning::DependsOnInputs),
             (API_READ_FILE, LastErrorMeaning::WhenReturnIsFalse),
             (API_WRITE_FILE, LastErrorMeaning::WhenReturnIsFalse),
             (API_CLOSE_HANDLE, LastErrorMeaning::WhenReturnIsFalse),

@@ -44,7 +44,7 @@ SchemaDef {
 SchemaDef {
     schema_id: 2,
     name: "kernel32!CreateFileW/leave",
-    content_hash: 10371726516279120553,
+    content_hash: 8802171279390570402,
     fields: [
         FieldDef {
             name: "return",
@@ -54,7 +54,7 @@ SchemaDef {
         FieldDef {
             name: "last_error",
             ty: 3,
-            flags: 836,
+            flags: 2116,
         },
     ],
     annotation: "L2 (leave): パス文字列 (Str16) を復元する。lpSecurityAttributes と hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で 後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)",

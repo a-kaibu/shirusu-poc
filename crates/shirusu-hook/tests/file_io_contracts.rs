@@ -59,7 +59,7 @@ fn captures() -> String {
             &format!("create-leave-{handle}"),
             1,
             true,
-            create_file_w_leave(handle, 5),
+            create_file_w_leave(handle, 5, 3),
         );
     }
     add("read-enter", 2, false, read_file_enter(42, 0x2000, 3, 0));

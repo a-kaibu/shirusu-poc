@@ -13,9 +13,9 @@ pub fn create_file_w_enter(mem: &dyn MemoryReader, a0: u64, a1: u32, a2: u32, a3
     vec![v0, v1, v2, v3, v4, v5, v6]
 }
 #[allow(clippy::too_many_arguments)]
-pub fn create_file_w_leave(a0: u64, a1: u32) -> Vec<CapturedValue> {
+pub fn create_file_w_leave(a0: u64, a1: u32, a2: u32) -> Vec<CapturedValue> {
     let v0 = u64v(a0);
-    let v1 = last_error_value(crate::api::HANDWRITTEN_API_TABLE[0].last_error_meaning, a0, a1);
+    let v1 = last_error_value(if [2u32, 4u32].contains(&a2) { LastErrorMeaning::Always } else { LastErrorMeaning::WhenReturnIsInvalidHandle }, a0, a1);
     vec![v0, v1]
 }
 #[allow(clippy::too_many_arguments)]

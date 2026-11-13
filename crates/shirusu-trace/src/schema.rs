@@ -177,7 +177,7 @@ impl CaptureTiming {
 }
 
 /// GetLastError の生値が「API 仕様上意味のあるエラー値」である条件
-/// （FieldDef.flags の bit8..=10 に格納する）。
+/// （FieldDef.flags の bit8..=11 に格納する）。
 ///
 /// overview「型付きの値」節の決定: `GetLastError` は生の値と、API 仕様上
 /// 意味のあるエラー値を区別する。Windows の規約では、多くの API は
@@ -201,7 +201,7 @@ pub enum LastErrorMeaning {
     /// ReadFile / WriteFile / CloseHandle）。
     WhenReturnIsFalse,
     /// 戻り値が INVALID_HANDLE_VALUE の場合にだけ意味を持つ
-    /// （HANDLE 戻り値の API。CreateFileW）。
+    /// （HANDLE 戻り値の API。旧 CreateFileW 宣言など）。
     WhenReturnIsInvalidHandle,
     /// 戻り値が NULL (0) の場合にだけ意味を持つ（HANDLE / ポインタ
     /// 戻り値の API。L03 の生成 API 用。CreateMutexW / VirtualAlloc 等）。
@@ -217,11 +217,15 @@ pub enum LastErrorMeaning {
     WhenReturnIsMinusOne,
     /// Non-NULL is failure (GlobalFree / LocalFree return NULL on success).
     WhenReturnIsNotNull,
+    /// Meaning also depends on input arguments. Capture must evaluate the
+    /// contract and mark inapplicable values Stale; a return-only query cannot
+    /// prove staleness and conservatively preserves the value.
+    DependsOnInputs,
 }
 
-/// LastErrorMeaning を格納するフラグビット範囲 (bit8..=10)。
+/// LastErrorMeaning を格納するフラグビット範囲 (bit8..=11)。
 pub const LAST_ERROR_MEANING_SHIFT: u32 = 8;
-pub const LAST_ERROR_MEANING_MASK: u32 = 0b111 << LAST_ERROR_MEANING_SHIFT;
+pub const LAST_ERROR_MEANING_MASK: u32 = 0b1111 << LAST_ERROR_MEANING_SHIFT;
 
 impl LastErrorMeaning {
     pub fn from_flags(flags: u32) -> Self {
@@ -233,6 +237,7 @@ impl LastErrorMeaning {
             5 => Self::Never,
             6 => Self::WhenReturnIsMinusOne,
             7 => Self::WhenReturnIsNotNull,
+            8 => Self::DependsOnInputs,
             _ => Self::Unspecified,
         }
     }
@@ -247,6 +252,7 @@ impl LastErrorMeaning {
             Self::Never => 5,
             Self::WhenReturnIsMinusOne => 6,
             Self::WhenReturnIsNotNull => 7,
+            Self::DependsOnInputs => 8,
         };
         v << LAST_ERROR_MEANING_SHIFT
     }
@@ -254,9 +260,11 @@ impl LastErrorMeaning {
     /// 戻り値の生値に対して、この API の LastError 生値が意味を持つか。
     /// `return_value` は leave Schema の `return` フィールドの生値
     /// （HANDLE は U64、BOOL は I32 の生値として u64 へ写したもの）。
+    /// DependsOnInputs cannot be decided here and returns true conservatively;
+    /// its capture contract must evaluate inputs and set Captured/Stale.
     pub fn is_meaningful(self, return_value: u64) -> bool {
         match self {
-            Self::Unspecified | Self::Always => true,
+            Self::Unspecified | Self::Always | Self::DependsOnInputs => true,
             Self::WhenReturnIsFalse => return_value == 0,
             Self::WhenReturnIsInvalidHandle => {
                 // INVALID_HANDLE_VALUE はポインタ幅依存（64bit: 全ビット 1、
@@ -623,6 +631,7 @@ mod tests {
             LastErrorMeaning::Never,
             LastErrorMeaning::WhenReturnIsMinusOne,
             LastErrorMeaning::WhenReturnIsNotNull,
+            LastErrorMeaning::DependsOnInputs,
         ] {
             assert_eq!(LastErrorMeaning::from_flags(meaning.flags()), meaning);
             // 意味条件は bit0..=7 (inout/省略可能・ValueKind・
@@ -683,6 +692,11 @@ mod tests {
         assert!(Unspecified.is_meaningful(1));
         assert!(Always.is_meaningful(0));
         assert!(Always.is_meaningful(1));
+        assert!(
+            DependsOnInputs.is_meaningful(1),
+            "return-only checks must not discard input-dependent evidence"
+        );
+        assert!(DependsOnInputs.is_meaningful(u64::MAX));
         assert!(WhenReturnIsFalse.is_meaningful(0));
         assert!(!WhenReturnIsFalse.is_meaningful(1));
         assert!(WhenReturnIsInvalidHandle.is_meaningful(u64::MAX));

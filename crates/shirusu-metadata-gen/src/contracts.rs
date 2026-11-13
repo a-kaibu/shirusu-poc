@@ -63,14 +63,20 @@ enum CaptureOp {
         arg: usize,
         returns: usize,
     },
+    LastErrorWithInput {
+        arg: usize,
+        returns: usize,
+        input: usize,
+        meaningful_values: Vec<u32>,
+    },
 }
 
 /// Emit the first four stable ApiDefs. Reject unknown vocabulary instead of
 /// interpolating untrusted expressions into generated Rust source.
 pub fn emit_file_io_contracts(source: &str) -> Result<String, String> {
     let contracts: Contracts = toml::from_str(source).map_err(|e| e.to_string())?;
-    if contracts.version != 2 || contracts.api.len() != 4 {
-        return Err("expected version 2 and exactly four file I/O contracts".into());
+    if contracts.version != 3 || contracts.api.len() != 4 {
+        return Err("expected version 3 and exactly four file I/O contracts".into());
     }
     if !(1..=1_048_576).contains(&contracts.max_buffer_bytes)
         || !(1..=1_048_576).contains(&contracts.max_string_units)
@@ -88,7 +94,7 @@ pub fn emit_file_io_contracts(source: &str) -> Result<String, String> {
         }
         if !matches!(
             api.last_error.as_str(),
-            "WhenReturnIsInvalidHandle" | "WhenReturnIsFalse"
+            "DependsOnInputs" | "WhenReturnIsFalse"
         ) {
             return Err(format!("{}: unsupported LastError rule", api.function));
         }
@@ -137,7 +143,7 @@ pub fn emit_file_io_contracts(source: &str) -> Result<String, String> {
             || error.kind != "Scalar"
             || api.last_error
                 != if i == 0 {
-                    "WhenReturnIsInvalidHandle"
+                    "DependsOnInputs"
                 } else {
                     "WhenReturnIsFalse"
                 }
@@ -178,7 +184,7 @@ fn capture_function(api: &Api, leave: bool) -> Result<String, String> {
         1 => (
             "create_file_w",
             &["u64", "u32", "u32", "u64", "u32", "u32", "u64"],
-            &["u64", "u32"],
+            &["u64", "u32", "u32"],
         ),
         2 => (
             "read_file",
@@ -299,8 +305,43 @@ fn capture_function(api: &Api, leave: bool) -> Result<String, String> {
                 }
                 format!("read_io_output(mem, a{success}, a{address}, a{capacity}, &v{count_field}, a{asynchronous})")
             }
+            CaptureOp::LastErrorWithInput {
+                arg,
+                returns,
+                input,
+                ref meaningful_values,
+            } => {
+                if api.id != 1
+                    || !leave
+                    || api.last_error != "DependsOnInputs"
+                    || field.name != "last_error"
+                    || field.ty != "U32"
+                    || !arg_is(arg, "u32")
+                    || !arg_is(returns, "u64")
+                    || !return_is(returns)
+                    || input != 2
+                    || !arg_is(input, "u32")
+                    || meaningful_values.is_empty()
+                    || meaningful_values.len() > 5
+                    || meaningful_values.iter().any(|n| !(1..=5).contains(n))
+                    || meaningful_values
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != meaningful_values.len()
+                {
+                    return Err(bad());
+                }
+                let values = meaningful_values
+                    .iter()
+                    .map(|v| format!("{v}u32"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("last_error_value(if [{values}].contains(&a{input}) {{ LastErrorMeaning::Always }} else {{ LastErrorMeaning::WhenReturnIsInvalidHandle }}, a{returns}, a{arg})")
+            }
             CaptureOp::LastError { arg, returns } => {
                 if !leave
+                    || api.last_error == "DependsOnInputs"
                     || field.name != "last_error"
                     || field.ty != "U32"
                     || !arg_is(arg, "u32")
@@ -318,7 +359,10 @@ fn capture_function(api: &Api, leave: bool) -> Result<String, String> {
         };
         if leave
             && field.name == "last_error"
-            && !matches!(field.capture, CaptureOp::LastError { .. })
+            && !matches!(
+                field.capture,
+                CaptureOp::LastError { .. } | CaptureOp::LastErrorWithInput { .. }
+            )
         {
             return Err(bad());
         }
@@ -369,13 +413,21 @@ mod tests {
     #[test]
     fn reject_ambiguous_or_incompatible_contracts() {
         for bad in [
-            SOURCE.replacen("version = 2", "version = 3", 1),
+            SOURCE.replacen("version = 3", "version = 2", 1),
             SOURCE.replacen("id = 1", "id = 2", 1),
             SOURCE.replacen("max_buffer_bytes = 4096", "max_buffer_bytes = 0", 1),
             SOURCE.replacen("max_string_units = 1024", "max_string_units = 1048577", 1),
             SOURCE.replacen("ty = \"U64\"", "ty = \"Usize\"", 1),
             SOURCE.replacen("kind = \"Pointer\"", "kind = \"Unknown\"", 1),
-            SOURCE.replacen("WhenReturnIsInvalidHandle", "WhenReturnIsFalse", 1),
+            SOURCE.replacen("DependsOnInputs", "WhenReturnIsFalse", 1),
+            SOURCE.replacen("input = 2", "input = 1", 1),
+            SOURCE.replacen(
+                "meaningful_values = [2, 4]",
+                "meaningful_values = [2, 2]",
+                1,
+            ),
+            SOURCE.replacen("meaningful_values = [2, 4]", "meaningful_values = []", 1),
+            SOURCE.replacen("meaningful_values = [2, 4]", "meaningful_values = [6]", 1),
             SOURCE.replacen("name = \"dwShareMode\"", "name = \"dwDesiredAccess\"", 1),
             SOURCE.replacen("op = \"utf16\", arg = 0", "op = \"utf16\", arg = 999", 1),
             SOURCE.replacen("capacity = 2", "capacity = 1", 1),

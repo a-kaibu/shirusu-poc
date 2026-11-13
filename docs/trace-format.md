@@ -226,7 +226,7 @@ message FieldDef {
                                     // bit5..=7: メモリの取得タイミング CaptureTiming
                                     // (0=未指定 1=Before 2=After 3=Completion 4=Both)。
                                     // タイミングも content_hash の入力に含まれる
-                                    // bit8..=10: GetLastError の意味条件 LastErrorMeaning
+                                    // bit8..=11: GetLastError の意味条件 LastErrorMeaning
                                     // (0=未指定 1=常に意味あり 2=戻り値 FALSE 時のみ
                                     // 3=戻り値 INVALID_HANDLE_VALUE 時のみ
                                     // 4=戻り値 NULL 時のみ 5=意味なし 6=戻り値 -1 時のみ)。
@@ -326,7 +326,7 @@ flags の u32 LE）」とする（曖昧さのない連結のため区切りを�
 ### GetLastError の区別（LastErrorMeaning）
 
 GetLastError の生値と、API 仕様上意味のあるエラー値を区別する（overview
-「型付きの値」節の決定。F20）。FieldDef.flags の bit8..=10 に格納する。
+「型付きの値」節の決定。F20）。FieldDef.flags の bit8..=11 に格納する。
 
 - `Unspecified`（0）: 条件を宣言しない旧来の Schema 用。利用側は生値を
   そのまま意味のある値として扱う（フォールバック）。
@@ -335,7 +335,7 @@ GetLastError の生値と、API 仕様上意味のあるエラー値を区別す
 - `WhenReturnIsFalse`（2）: 戻り値が FALSE / 0 の場合にだけ意味を持つ
   （BOOL 戻り値の API。現行の ReadFile / WriteFile / CloseHandle）。
 - `WhenReturnIsInvalidHandle`（3）: 戻り値が INVALID_HANDLE_VALUE の
-  場合にだけ意味を持つ（HANDLE 戻り値の API。現行の CreateFileW）。
+  場合にだけ意味を持つ（HANDLE 戻り値の API。旧来の CreateFileW 宣言など）。
   INVALID_HANDLE_VALUE はポインタ幅依存（64bit: 全ビット 1、32bit:
   下位 32 ビットのみ 1。レビュー第5回 #5）。
 - `WhenReturnIsNull`（4）: 戻り値が NULL (0) の場合にだけ意味を持つ
@@ -350,10 +350,16 @@ GetLastError の生値と、API 仕様上意味のあるエラー値を区別す
 
 - `WhenReturnIsNotNull`（7）: 戻り値が非 NULL の場合だけ意味を持つ。
   GlobalFree / LocalFree は NULL が成功、ハンドルの返却が失敗を表す。
+- `DependsOnInputs`（8）: 戻り値だけでは決まらず入力条件も必要。
+  CreateFileW は失敗時、または CREATE_ALWAYS / OPEN_ALWAYS の指定時に意味を持つ。
+  Capture が契約を評価して Captured / Stale を保存する。戻り値だけを受け取る
+  `is_meaningful` はこの条件では保守的に true を返し、値を捨てない。
+  bit11 を追加使用するが既存の条件値 0〜7 と他の意味ビットは変更しない。
 
 互換性：未知の条件値は `Unspecified` として読む
-（前方互換）。値 4〜7 を知らない旧来の Reader は `Unspecified`
-として読むため、生値を意味のある値として扱う（緩い読み）。
+（前方互換）。値 4〜8 を知らない旧来の Reader は `Unspecified`
+として読むため、生値を意味のある値として扱う（緩い読み）。値 8 は旧3ビット
+mask でも 0（Unspecified）となり、値ごとの Captured / Stale は引き続き読める。
 
 取得側は、条件を満たさない生値を `ValueCapture::Stale`（符号化 5）と
 して記録する。Stale の値本体は読み取った生値を保持する（再検証のため）

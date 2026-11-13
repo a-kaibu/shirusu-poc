@@ -298,7 +298,7 @@ These are isolated component observations, not Windows injected measurements.
 
 The corpus CI suite now also includes a 14-call error/sharing/disposition Probe.
 It records errors without pinning an unobserved numerical LastError value in the
-input. Expected valid handles and failed CloseHandle outcomes are checked;
+input. Expected valid handles and successful closes of those handles are checked;
 CreateFileW's raw failure and meaningful success errors remain evidence to
 compare across environments. This extends the initial happy-path sample without
 claiming complete filesystem-state or asynchronous coverage.
@@ -313,3 +313,33 @@ Ring events. Direct-stub and SEH-only timings are reported separately. It patche
 no process, allocates no real application heap block, has no competing Host or
 notification event, verifies zero losses and preserves LastError; it must not be
 read as the injected application's slowdown or additive CPU attribution.
+
+
+The first error Probe run (`43408912881`, `cbf4eb2`) exposed an incorrect fixture
+expectation: CloseHandle of the `-1` returned by failed CreateFileW returned TRUE
+on all three native environments. `-1` is also a pseudo-handle value. The Probe
+now observes these closes without asserting that they must fail; raw returns and
+errors remain preserved. The entry validator correctly refused the aborted
+sequence, so no complete reference entry was emitted for the failed attempt.
+The new typed-Detour measurement itself passed: 253.32 / 217.87 / 369.34 ns/call
+(latest x64 / Server 2022 / WoW64), including two Ring events. SEH-with-stub was
+4.98 / 2.83 / 7.13 ns/call. These isolated measurements do not include a competing
+Host or actual heap allocation and must not be added to injected timings.
+
+### Input-dependent CreateFileW LastError contract
+
+File-I/O contract v3 declares the original creation disposition as a leave capture
+input and the success-meaningful modes `[2, 4]` (CREATE_ALWAYS / OPEN_ALWAYS).
+Failures keep their meaningful error; other successful dispositions remain Stale.
+Schema condition 8 (`DependsOnInputs`, bit11 newly used) makes this explicit;
+existing condition values 0–7 and field layouts are unchanged. Older three-bit
+readers see condition 8 as Unspecified and can still decode Captured/Stale values.
+A return-only capture helper preserves input-dependent raw errors as Unsupported
+rather than claiming the missing input condition was evaluated.
+
+The CreateFileW leave Schema flags/hash Golden changes intentionally; the prior
+23 capture-byte Goldens remain unchanged for their existing inputs. Added tests
+exercise all five dispositions, generated Capture → emitter → compare behavior,
+contract binding rejection and the actual Windows Detour passing the original
+input. Old Trace Stale decisions are not retroactively rewritten, and CreateFileA
+and other APIs outside these four contracts still need input-dependent coverage.

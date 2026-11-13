@@ -351,3 +351,54 @@ fn payload_only_difference_is_brief_only_honestly() {
     // トリムは Payload の差分も保持する（Blob を一緒に切り詰める）。
     assert_eq!(bundle.trim_reproduced, Some(true));
 }
+
+#[test]
+fn generated_create_file_contract_preserves_only_meaningful_success_errors() {
+    fn trace(disposition: u32, error: u32) -> ReadTrace {
+        use shirusu_hook::capture::{create_file_w_enter, create_file_w_leave, MapMemory};
+        let mut memory = MapMemory::new();
+        memory.write_u16s(0x1000, &[b'x' as u16, 0]);
+        let mut emitter = Emitter::new(
+            Vec::new(),
+            file_io_api_set(),
+            SessionConfig::new(1, "contract-test"),
+        )
+        .unwrap();
+        let call = emitter
+            .begin_call(
+                1,
+                "kernel32!CreateFileW",
+                &create_file_w_enter(&memory, 0x1000, 0xc0000000, 0, 0, disposition, 128, 0),
+                1,
+                EventMeta::default(),
+            )
+            .unwrap();
+        emitter
+            .end_call(
+                call,
+                &create_file_w_leave(42, error, disposition),
+                2,
+                EventMeta::default(),
+            )
+            .unwrap();
+        read(&emitter.finish(FinalizationInfo::default()).unwrap())
+    }
+    for disposition in 1..=5 {
+        let report = compare_traces(&trace(disposition, 0), &trace(disposition, 183));
+        if matches!(disposition, 2 | 4) {
+            assert_eq!(
+                report.candidates.len(),
+                1,
+                "{disposition}: {:?}",
+                report.candidates
+            );
+            assert_eq!(report.candidates[0].kind, CandidateKind::ReturnDifference);
+        } else {
+            assert!(
+                report.is_identical(),
+                "{disposition}: {:?}",
+                report.candidates
+            );
+        }
+    }
+}

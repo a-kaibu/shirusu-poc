@@ -194,6 +194,11 @@ fn unsupported_u32() -> CapturedValue {
 /// leave Schema の `return` フィールドの生値（HANDLE は U64、BOOL は
 /// I32 の生値を u64 へ写したもの）。
 pub fn last_error_value(meaning: LastErrorMeaning, return_value: u64, raw: u32) -> CapturedValue {
+    if meaning == LastErrorMeaning::DependsOnInputs {
+        // This return-only helper cannot evaluate an input-dependent contract.
+        // Preserve the raw value without claiming its meaning was captured.
+        return cap(TypedValue::U32(raw), ValueCapture::Unsupported);
+    }
     if meaning.is_meaningful(return_value) {
         u32v(raw)
     } else {
@@ -1230,12 +1235,33 @@ mod tests {
                 LastErrorMeaning::from_flags(api.leave_schema().fields.last().unwrap().flags);
             assert_eq!(declared, api.last_error_meaning, "{}", api.function);
         }
-        // CreateFileW: INVALID_HANDLE_VALUE なら意味あり、有効ハンドルなら Stale
-        let failed = create_file_w_leave(u64::MAX, 2);
+        assert_eq!(
+            last_error_value(LastErrorMeaning::DependsOnInputs, 42, 183),
+            CapturedValue {
+                value: TypedValue::U32(183),
+                capture: ValueCapture::Unsupported
+            }
+        );
+        // CreateFileW: failures always matter; CREATE_ALWAYS / OPEN_ALWAYS also
+        // define LastError on success. Other successful dispositions are stale.
+        let failed = create_file_w_leave(u64::MAX, 2, 3);
         assert_eq!(failed[1], u32v(2));
-        let failed32 = create_file_w_leave(0x0000_0000_ffff_ffff, 2);
+        let failed32 = create_file_w_leave(0x0000_0000_ffff_ffff, 2, 3);
         assert_eq!(failed32[1], u32v(2), "32bit INVALID_HANDLE_VALUE");
-        let create_ok = create_file_w_leave(0x1234, 5);
+        for disposition in 1..=5 {
+            let values = create_file_w_leave(0x1234, 183, disposition);
+            assert_eq!(
+                values[1].capture,
+                if matches!(disposition, 2 | 4) {
+                    ValueCapture::Captured
+                } else {
+                    ValueCapture::Stale
+                }
+            );
+            assert_eq!(values[1].value, TypedValue::U32(183));
+            assert_eq!(create_file_w_leave(u64::MAX, 80, disposition)[1], u32v(80));
+        }
+        let create_ok = create_file_w_leave(0x1234, 5, 3);
         assert_eq!(create_ok[1].capture, ValueCapture::Stale);
         assert_eq!(
             create_ok[1].value,

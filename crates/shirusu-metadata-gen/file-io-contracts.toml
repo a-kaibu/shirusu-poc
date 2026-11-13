@@ -1,5 +1,6 @@
-# File I/O semantic contracts v2. Field order and annotations are wire compatibility.
-version = 2
+# File I/O semantic contracts v3. Field order/types remain wire-compatible.
+# CreateFileW input-dependent LastError changes its leave Schema flags/hash.
+version = 3
 max_buffer_bytes = 4096
 max_string_units = 1024
 
@@ -9,10 +10,10 @@ module = "kernel32.dll"
 function = "CreateFileW"
 level = 2
 note = "パス文字列 (Str16) を復元する。lpSecurityAttributes と hTemplateFile は生ポインタ値のみ。返した HANDLE は生値で 後続イベントと相関可能だが Object ID は未割当 (L3 部分達成)"
-last_error = "WhenReturnIsInvalidHandle"
+last_error = "DependsOnInputs"
 
 enter_arguments = ["u64", "u32", "u32", "u64", "u32", "u32", "u64"]
-leave_arguments = ["u64", "u32"]
+leave_arguments = ["u64", "u32", "u32"]
 
 [[api.enter]]
 name = "lpFileName"
@@ -66,7 +67,7 @@ capture = { op = "scalar", arg = 0 }
 name = "last_error"
 ty = "U32"
 kind = "Scalar"
-capture = { op = "last_error", arg = 1, returns = 0 }
+capture = { op = "last_error_with_input", arg = 1, returns = 0, input = 2, meaningful_values = [2, 4] }
 
 [[api]]
 id = 2
