@@ -153,6 +153,30 @@ fn main() {
         black_box(event_clock.now());
     });
     println!("event_clock interpolating={}", event_clock.interpolating());
+    // Hardware floor references (not production code): one raw TSC read, and
+    // the least a recorded call can cost with two precise timestamps: two TSC
+    // reads and two 32-byte records stored into a private buffer.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::_rdtsc;
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::_rdtsc;
+        measure("floor_raw_tsc", || {
+            black_box(unsafe { _rdtsc() });
+        });
+        let mut buffer = vec![[0u64; 4]; 1 << 16];
+        let mut at = 0usize;
+        measure("floor_call_two_tsc_two_records", || {
+            let enter = unsafe { _rdtsc() };
+            buffer[at] = [1, black_box(0x1234), black_box(64), enter];
+            at = (at + 1) & 0xffff;
+            let leave = unsafe { _rdtsc() };
+            buffer[at] = [2, black_box(0x5678), 0, leave];
+            at = (at + 1) & 0xffff;
+        });
+        black_box(&buffer);
+    }
     measure("scalar_enter_encode", || {
         black_box(capture::encode_generic_enter::<3>(api, black_box(&args)));
     });
