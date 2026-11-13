@@ -10,7 +10,7 @@ description = "shirusu 解析・記録 CLI: inspect（メタデータ・完全�
 tempfile = "3"
 # Apache-2.0; 59.x supports our Rust 1.87 MSRV (60.x requires 1.88).
 parquet = { version = "59", default-features = false, features = ["snap"] }
-shirusu-hook = { path = "../shirusu-hook" }
+shirusu-api-catalog = { path = "../shirusu-api-catalog" }
 shirusu-analysis = { path = "../shirusu-analysis" }
 shirusu-host = { path = "../shirusu-host" }
 shirusu-trace = { path = "../shirusu-trace" }

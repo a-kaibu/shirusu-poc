@@ -22,10 +22,6 @@ use crate::trace_convert::{RecordMode, TraceBatchContext, TraceRecorder};
 pub use crate::trace_pipeline::HostPipelineStats;
 use crate::trace_pipeline::{RingValidation, SharedDrainWorker, TracePipeline};
 use crate::{CommittedRangeCollector, DrainWorker, IntegrityLevel, IntegrityReport};
-use shirusu_hook::api as hook_api;
-use shirusu_hook::callback as hook_callback;
-use shirusu_hook::com as hook_com;
-use shirusu_hook::winrt as hook_winrt;
 use shirusu_trace::proto::{CaptureEnvironment, ProfileSummary};
 use shirusu_trace::writer::{Durability, WriterOptions};
 use shirusu_transport::layout;
@@ -502,25 +498,15 @@ impl CaptureSession {
         )?;
         // L09: 記録モードを TraceRecorder へ渡す。
         recorder.set_record_mode(config.record_mode.clone());
-        for def in hook_api::eager_schemas() {
+        // API 表（broad 以外）・COM・WinRT・コールバックの Schema を API Catalog
+        // から登録する（未登録だと Payload が Blob へ逃げ、args として読めない）。
+        // Agent が同じ Catalog で符号化していることは初期化時の
+        // Fingerprint 照合で確認する。
+        for def in shirusu_api_catalog::eager_trace_schemas() {
             recorder.register_schema(def)?;
         }
         // The IAT-only broad tier is registered when an event first uses it.
-        recorder.set_lazy_schemas(hook_api::broad_schema);
-        // L02: COM メソッドイベントの Schema も登録する（未登録だと
-        // Payload が Blob へ逃げ、args として読めなくなる）。
-        for def in hook_com::com_schemas() {
-            recorder.register_schema(def)?;
-        }
-        // L14: WinRT アクティベーションイベントの Schema も登録する
-        // （COM と同じ理由）。
-        for def in hook_winrt::winrt_schemas() {
-            recorder.register_schema(def)?;
-        }
-        // L16: コールバックイベントの Schema も登録する（COM と同じ理由）。
-        for def in hook_callback::callback_schemas() {
-            recorder.register_schema(def)?;
-        }
+        recorder.set_lazy_schemas(shirusu_api_catalog::api::broad_schema);
         Ok(Self {
             config,
             recorder: TracePipeline::new(recorder)?,

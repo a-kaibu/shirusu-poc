@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/shirusu-crc32c",
+    "crates/shirusu-api-catalog",
     "crates/shirusu-transport",
     "crates/shirusu-transport-win",
     "crates/shirusu-agent",

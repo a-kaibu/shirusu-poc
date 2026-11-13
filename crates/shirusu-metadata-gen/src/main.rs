@@ -1,4 +1,4 @@
-//! `win32-metadata-gen`: Win32 Metadata から shirusu-hook の L1 生成表
+//! `win32-metadata-gen`: Win32 Metadata から shirusu-api-catalog の L1 生成表
 //! （`api_generated.inc`）と汎用 Detour（`engine_generated.inc`）を出す
 //! 開発時ツール（L03）。
 //!
@@ -10,7 +10,10 @@
 //! winmd が無い場合は `bash scripts/ci/fetch-winmd.sh` で取得する
 //! （`Microsoft.Windows.SDK.Win32Metadata` の NuGet 版を固定）。
 //! 既定値: `--config crates/shirusu-metadata-gen/apis.toml`、
-//! `--out-dir crates/shirusu-hook/src`、
+//! `--out-dir crates/shirusu-hook/src`（`engine_generated.inc`）、
+//! `--api-out-dir crates/shirusu-api-catalog/src`（`api_generated.inc`・
+//! `api_broad_generated.inc`・`api_traits_generated.inc`。省略時に
+//! `--out-dir` を指定していればその値）、
 //! `--winmd` は環境変数 `SHIRUSU_WINMD` か
 //! `target/winmd/Windows.Win32.winmd`。
 
@@ -27,7 +30,7 @@ const TRAITS_INC: &str = "api_traits_generated.inc";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--refresh-broad] [--check]\n       win32-metadata-gen --file-io-contracts [--check]"
+        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--api-out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--refresh-broad] [--check]\n       win32-metadata-gen --file-io-contracts [--check]"
     );
     std::process::exit(2);
 }
@@ -42,7 +45,8 @@ fn main() {
     }
     let mut winmd: Option<String> = None;
     let mut config_path = "crates/shirusu-metadata-gen/apis.toml".to_string();
-    let mut out_dir = "crates/shirusu-hook/src".to_string();
+    let mut out_dir: Option<String> = None;
+    let mut api_out_dir: Option<String> = None;
     let mut check = false;
     let mut catalog: Option<String> = None;
     let mut inventory: Option<String> = None;
@@ -52,7 +56,8 @@ fn main() {
         match arg.as_str() {
             "--winmd" => winmd = Some(args.next().unwrap_or_else(|| usage())),
             "--config" => config_path = args.next().unwrap_or_else(|| usage()),
-            "--out-dir" => out_dir = args.next().unwrap_or_else(|| usage()),
+            "--out-dir" => out_dir = Some(args.next().unwrap_or_else(|| usage())),
+            "--api-out-dir" => api_out_dir = Some(args.next().unwrap_or_else(|| usage())),
             "--check" => check = true,
             "--com-catalog" => catalog = Some(args.next().unwrap_or_else(|| usage())),
             "--inventory" => inventory = Some(args.next().unwrap_or_else(|| usage())),
@@ -74,7 +79,20 @@ fn main() {
     } else if let Some(path) = inventory {
         inventory_run(&winmd, &config_path, &path, check)
     } else {
-        run(&winmd, &config_path, &out_dir, check, catalog.as_deref())
+        // API 表は API Catalog、Detour は Hook に置く。--out-dir だけを
+        // 指定した場合は両方をその場所に出す（一時ディレクトリでの検査用）。
+        let api_out_dir = api_out_dir
+            .or_else(|| out_dir.clone())
+            .unwrap_or_else(|| "crates/shirusu-api-catalog/src".to_string());
+        let out_dir = out_dir.unwrap_or_else(|| "crates/shirusu-hook/src".to_string());
+        run(
+            &winmd,
+            &config_path,
+            &out_dir,
+            &api_out_dir,
+            check,
+            catalog.as_deref(),
+        )
     };
     if let Err(e) = result {
         eprintln!("win32-metadata-gen: {e}");
@@ -121,6 +139,7 @@ fn run(
     winmd: &str,
     config_path: &str,
     out_dir: &str,
+    api_out_dir: &str,
     check: bool,
     catalog: Option<&str>,
 ) -> Result<(), String> {
@@ -140,11 +159,11 @@ fn run(
     let generated = generate(&index, &config)?;
     let outputs = [
         (
-            format!("{out_dir}/{API_INC}"),
+            format!("{api_out_dir}/{API_INC}"),
             emit_api_inc(&generated, &config.winmd_version),
         ),
         (
-            format!("{out_dir}/{BROAD_INC}"),
+            format!("{api_out_dir}/{BROAD_INC}"),
             emit_broad_api_inc(&generated, &config.winmd_version),
         ),
         (
@@ -152,7 +171,7 @@ fn run(
             emit_engine_inc(&generated, &config.winmd_version),
         ),
         (
-            format!("{out_dir}/{TRAITS_INC}"),
+            format!("{api_out_dir}/{TRAITS_INC}"),
             emit_traits_inc(&generated, &config.winmd_version),
         ),
     ];
@@ -219,7 +238,7 @@ fn file_io_contracts_run() -> Result<(), String> {
             boundaries,
         ),
         (
-            "crates/shirusu-hook/src/api_file_io_generated.inc",
+            "crates/shirusu-api-catalog/src/api_file_io_generated.inc",
             generated,
         ),
         (

@@ -3,7 +3,7 @@
 //! 経路で組み立てることで、符号化側と復号側が同じ誤りを共有して
 //! 「往復は通るが形式が違う」事態を防ぐ。
 //!
-//! CRC32C だけは転送側と共用する検証済み実装（shirusu-transport）を
+//! CRC32C だけは転送側と共用する検証済み実装（shirusu-crc32c）を
 //! 使う。形式仕様上の正は docs/trace-format.md と本ベクターである。
 
 use shirusu_trace::model::PayloadRef;
@@ -32,8 +32,7 @@ fn block(sequence: u64, block_type: u8, payload: &[u8]) -> Vec<u8> {
     h[8..16].copy_from_slice(&sequence.to_le_bytes());
     h[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     h[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    let crc =
-        shirusu_transport::crc32c::crc32c_update(shirusu_transport::crc32c::crc32c(&h), payload);
+    let crc = shirusu_crc32c::crc32c_update(shirusu_crc32c::crc32c(&h), payload);
     h[24..28].copy_from_slice(&crc.to_le_bytes());
     let mut out = h.to_vec();
     out.extend_from_slice(payload);

@@ -1,0 +1,15 @@
+[package]
+name = "shirusu-api-catalog"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "shirusu API Catalog: API ID・Schema・取得契約の共有定義（Capture と Host が同じ表を使う）"
+
+[dependencies]
+shirusu-trace = { path = "../shirusu-trace" }
+# Fingerprint の計算。shirusu-trace と同じく純 Rust 実装に固定する。
+blake3 = { version = "1", features = ["pure"] }
+
+[lints]
+workspace = true

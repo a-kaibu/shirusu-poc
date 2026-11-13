@@ -148,7 +148,7 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
         [flag] if flag == "--json" => true,
         _ => return Err(ToolError::Usage("capabilities accepts only --json".into())),
     };
-    let mut apis: Vec<_> = shirusu_hook::api::api_table().collect();
+    let mut apis: Vec<_> = shirusu_api_catalog::api::api_table().collect();
     apis.sort_by_key(|a| a.api_id);
     if json {
         let report = JsonValue::obj(vec![
@@ -165,7 +165,7 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                                 ("detail", JsonValue::Str(a.level_note.into())),
                                 (
                                     "detailed_mode_only",
-                                    JsonValue::Bool(shirusu_hook::api::is_internal_api(a.api_id)),
+                                    JsonValue::Bool(shirusu_api_catalog::api::is_internal_api(a.api_id)),
                                 ),
                                 (
                                     "iat_only",
@@ -210,7 +210,7 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                 api.level,
                 api.module,
                 api.function,
-                if shirusu_hook::api::is_internal_api(api.api_id) {
+                if shirusu_api_catalog::api::is_internal_api(api.api_id) {
                     " [detailed mode]"
                 } else if shirusu_hook::api::is_iat_only_api(api.api_id) {
                     " [main-module IAT only]"

@@ -150,7 +150,7 @@ overview 初期マイルストーン節の「まず自作の小さなプログ�
 overview 初期マイルストーンの段階 4。Win32 Metadata から幅広い API の L1 定義表と汎用 Detour を生成し、対象 API を増やせるようにする。
 
 - 入力：`Microsoft.Windows.SDK.Win32Metadata` の NuGet 固定版（`71.0.45-preview`）の `Windows.Win32.winmd`。取得は `scripts/ci/fetch-winmd.sh`（nupkg と winmd の sha256 を固定）。版は `crates/shirusu-metadata-gen/apis.toml` の `winmd_version` と同じにすること。
-- 生成器：`crates/shirusu-metadata-gen`（バイナリ `win32-metadata-gen`）。設定は `apis.toml`（対象 API と `last_error` の上書き、意図的な除外）。生成物は `crates/shirusu-hook/src/api_generated.inc`（`ApiDef` の `&[...]` 式）と `engine_generated.inc`（生成 Detour と `detour_for_generated`）で、チェックインする。最新性は `scripts/ci/linux.sh` が `--check` で検査する。
+- 生成器：`crates/shirusu-metadata-gen`（バイナリ `win32-metadata-gen`）。設定は `apis.toml`（対象 API と `last_error` の上書き、意図的な除外）。生成物は `crates/shirusu-api-catalog/src/api_generated.inc`（`ApiDef` の `&[...]` 式）と `crates/shirusu-hook/src/engine_generated.inc`（生成 Detour と `detour_for_generated`）で、チェックインする。最新性は `scripts/ci/linux.sh` が `--check` で検査する。
 - 生成範囲：L1（型付き引数・戻り値・GetLastError）のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）。L2 以上は手書きの記録仕様で API ごとに拡張する。
 - 型対応：プリミティブは `Ty` へ写し（8/16bit 整数は 32bit へ拡大）、enum は基底整数型、デリゲートはポインタ値、単一フィールド構造体はそのフィールドの型（`HANDLE` 等の `*mut c_void` 1 個はハンドル、`PWSTR` はポインタ、`BOOL` は I32）。複数フィールドの値渡し構造体・COM 型・浮動小数点・可変長引数は対象外としてスキップ理由とともに報告する。
 - 1 スロット制約：汎用 Detour は引数 1 個を usize 1 個で中継するため、x86 で 2 スロットを占める固定 64bit 型（I64/U64）は生成対象外（例：`SetFilePointerEx` の `LARGE_INTEGER`（I64 化）、`GetTickCount64` の U64 戻り）。ポインタ幅の型（ISize/USize/ポインタ/ハンドル）は両ターゲットで 1 スロットのため対象内。

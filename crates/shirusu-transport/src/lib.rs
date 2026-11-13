@@ -13,7 +13,9 @@
 
 pub mod clock;
 pub mod context;
-pub mod crc32c;
+/// CRC32C は公開 Trace 形式と共有する基礎処理として `shirusu-crc32c` に置く。
+/// 既存の `shirusu_transport::crc32c` の経路は互換のために残す。
+pub use shirusu_crc32c as crc32c;
 pub mod descriptor;
 pub mod expansion;
 pub mod layout;

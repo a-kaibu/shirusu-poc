@@ -451,7 +451,7 @@ mod tests {
     fn file_io_schemas_match_hook_table_hashes() {
         let mine = file_io_api_set().schemas();
         // file_io セットは手書きの 6 API に対応する（生成 API は別物）。
-        let hook = shirusu_hook::api::handwritten_schemas();
+        let hook = shirusu_api_catalog::api::handwritten_schemas();
         assert_eq!(mine.len(), hook.len());
         for (a, b) in mine.iter().zip(hook.iter()) {
             assert_eq!(a.schema_id, b.schema_id);
@@ -472,7 +472,7 @@ mod tests {
         use shirusu_trace::schema::LastErrorMeaning;
         let set = file_io_api_set();
         // file_io セットは手書きの 6 API に対応する（生成 API は別物）。
-        let hook = shirusu_hook::api::HANDWRITTEN_API_TABLE;
+        let hook = shirusu_api_catalog::api::HANDWRITTEN_API_TABLE;
         assert_eq!(set.len(), hook.len());
         for (spec, def) in set.specs.iter().zip(hook.iter()) {
             assert_eq!(

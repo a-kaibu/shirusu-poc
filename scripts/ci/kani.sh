@@ -12,7 +12,7 @@ if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
 fi
 # set -e を使わないため、各クレートの結果を集めて最後に終了コードへ反映する。
 status=0
-for crate in shirusu-transport shirusu-trace shirusu-hook; do
+for crate in shirusu-crc32c shirusu-transport shirusu-trace shirusu-hook; do
   cargo kani -p "$crate" || status=1
 done
 exit "$status"

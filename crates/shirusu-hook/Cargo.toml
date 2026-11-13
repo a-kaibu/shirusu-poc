@@ -11,6 +11,7 @@ shirusu-transport = { path = "../shirusu-transport" }
 shirusu-transport-win = { path = "../shirusu-transport-win" }
 shirusu-agent = { path = "../shirusu-agent" }
 shirusu-trace = { path = "../shirusu-trace" }
+shirusu-api-catalog = { path = "../shirusu-api-catalog" }
 # L01: Inline Hook の命令再配置に使う。デコーダ＋BlockEncoder
 # （トランポリンへの再配置・分岐の拡大・RIP 相対の修正）のみで、
 # フォーマッタ等は不要。プラットフォーム非依存のコアは Linux でも

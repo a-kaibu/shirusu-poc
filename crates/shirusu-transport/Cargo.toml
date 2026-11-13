@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "shirusu Agent-Host transport: SPSC ring, descriptor/control layout, overflow, slots, host-side validation (OS-independent)"
 
+[dependencies]
+shirusu-crc32c = { path = "../shirusu-crc32c" }
+
 [dev-dependencies]
 proptest = "1"
 

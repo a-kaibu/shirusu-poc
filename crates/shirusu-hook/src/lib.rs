@@ -21,7 +21,9 @@
 //! フック方式は IAT フック（overview の実装順序 1）と Inline Hook
 //! （同 2）の併用。判断理由と限界は docs/traceability.md の G/L 節に記録する。
 
-pub mod api;
+/// API 定義表は `shirusu-api-catalog` に置く（Host と共有する契約）。
+/// 既存の `shirusu_hook::api` の経路は互換のために残す。
+pub use shirusu_api_catalog::api;
 pub mod bootstrap;
 pub mod callback;
 pub mod caller;

@@ -2,7 +2,7 @@
 //! `docs/trace-format.md` の「Block Container」節。
 //!
 //! ヘッダーは 32 バイト固定。CRC32C は「crc 欄を 0 にしたヘッダー＋
-//! payload」を対象とする。計算には shirusu-transport の検証済み
+//! payload」を対象とする。計算には shirusu-crc32c の検証済み
 //! CRC32C 実装を再利用する（二重実装を避ける判断。trace-format.md 参照）。
 
 use crate::error::{Result, TraceError};
@@ -120,8 +120,8 @@ pub struct BlockHeader {
 }
 
 fn header_crc(header_bytes_with_zero_crc: &[u8], payload: &[u8]) -> u32 {
-    let c = shirusu_transport::crc32c::crc32c(header_bytes_with_zero_crc);
-    shirusu_transport::crc32c::crc32c_update(c, payload)
+    let c = shirusu_crc32c::crc32c(header_bytes_with_zero_crc);
+    shirusu_crc32c::crc32c_update(c, payload)
 }
 
 /// ヘッダーを書き出す（CRC を計算して埋める）。

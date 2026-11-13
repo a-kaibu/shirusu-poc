@@ -18,7 +18,7 @@
 //! TraceEvent.args へ写す。
 
 use crate::{IntegrityLevel, IntegrityReport, LossEvent};
-use shirusu_hook::api as hook_api;
+use shirusu_api_catalog::api as hook_api;
 use shirusu_trace::compact::validate_values_completeness;
 use shirusu_trace::error::Result as TraceResult;
 use shirusu_trace::model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};

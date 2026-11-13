@@ -718,12 +718,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "shirusu-api-catalog"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "shirusu-trace",
+]
+
+[[package]]
 name = "shirusu-cli"
 version = "0.1.0"
 dependencies = [
  "parquet",
  "shirusu-analysis",
- "shirusu-hook",
+ "shirusu-api-catalog",
  "shirusu-host",
  "shirusu-trace",
  "shirusu-transport",
@@ -748,6 +756,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "shirusu-crc32c"
+version = "0.1.0"
+
+[[package]]
 name = "shirusu-e2e"
 version = "0.1.0"
 dependencies = [
@@ -764,7 +776,7 @@ name = "shirusu-emit"
 version = "0.1.0"
 dependencies = [
  "shirusu-analysis",
- "shirusu-hook",
+ "shirusu-api-catalog",
  "shirusu-trace",
 ]
 
@@ -776,6 +788,7 @@ dependencies = [
  "iced-x86",
  "proptest",
  "shirusu-agent",
+ "shirusu-api-catalog",
  "shirusu-trace",
  "shirusu-transport",
  "shirusu-transport-win",
@@ -788,6 +801,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "shirusu-agent",
+ "shirusu-api-catalog",
  "shirusu-hook",
  "shirusu-trace",
  "shirusu-transport",
@@ -840,7 +854,7 @@ dependencies = [
  "blake3",
  "proptest",
  "ruzstd",
- "shirusu-transport",
+ "shirusu-crc32c",
 ]
 
 [[package]]
@@ -848,6 +862,7 @@ name = "shirusu-transport"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "shirusu-crc32c",
 ]
 
 [[package]]

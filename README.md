@@ -43,11 +43,13 @@ Runtime 自身のエクスポートを追加する設定で、CRT 経由の Wind
 
 | クレート | 内容 | Windows 依存 |
 |---|---|---|
-| `crates/shirusu-transport` | 共有メモリレイアウト、SPSC Ring、Payload、Overflow 状態機械、Slot、通知ロジック、Host 検証、CRC32C | なし |
+| `crates/shirusu-crc32c` | CRC32C。公開 Trace 形式と共有メモリ転送が共用する基礎処理 | なし |
+| `crates/shirusu-api-catalog` | API Catalog。API ID・Schema ID・フィールドの型と意味・取得契約の共有定義と、Agent/Host 照合用の Fingerprint。Hook は Capture に、Host は Schema 登録に同じ表を使う | なし |
+| `crates/shirusu-transport` | 共有メモリレイアウト、SPSC Ring、Payload、Overflow 状態機械、Slot、通知ロジック、Host 検証 | なし |
 | `crates/shirusu-transport-win` | File Mapping（名前なし）、DuplicateHandle、Event Object（data_ready: プロセス単位 auto-reset / space_available: Ring 単位）、2ms 再確認付き待機、継承ハンドル付き子プロセス起動 | あり（他 OS はスタブ） |
 | `crates/shirusu-agent` | 書き手側。スレッド毎 Ring 取得・書込、再入ガード、Host 生存確認、DETACH 通知 | transport-win 経由 |
 | `crates/shirusu-host` | 読み手側。Drain Worker、検証付き読み、Loss Event 生成、Enter/Leave 対応付け、終了不明判定、完全性報告、公開 Trace 変換（A72） | transport-win 経由 |
-| `crates/shirusu-hook` | フックエンジン。API 定義表・型付き引数取得・IAT フック計画・Inline Hook と Windows 実装（Phase 3） | あり（計画・スキーマ・Inline コアは非依存） |
+| `crates/shirusu-hook` | フックエンジン。API Catalog による型付き引数取得・IAT フック計画・Inline Hook と Windows 実装（Phase 3） | あり（計画・スキーマ・Inline コアは非依存） |
 | `crates/shirusu-agent-dll` | Agent DLL。対象プロセスへ注入され、Bootstrap 初期化でフックを設置する cdylib（Phase 3） | あり |
 | `crates/shirusu-trace` | 公開 Trace 形式 v1（`docs/trace-format.md`）。Block Container + Protobuf メタデータ（手書きワイヤ形式）+ Compact Binary + BLAKE3 Blob + Zstd チャンク、Trace Writer / Reader（回復意味論） | なし |
 | `crates/shirusu-analysis` | 公開 Trace の解析ビュー（共有基盤）。イベント復号・表示・完全性サマリ・JSON 出力（Phase 4） | なし |

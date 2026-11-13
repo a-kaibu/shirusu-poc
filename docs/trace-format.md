@@ -1085,7 +1085,7 @@ overview「完全性と復旧」節の「Host や OS がクラッシュしたら
 | Zstd（`zstd` / `zstd-sys`） | 不採用（現時点） | Linux host ではビルドできるが、Windows ターゲット向けの `cargo check` で cc-rs が `lib.exe`（MSVC ライブラリアン）を要求し、この VM からも CI の ubuntu ジョブ（windows-check-targets）からも失敗する。最終ゲートを壊すため不採用。Windows ネイティブのビルド環境では動く見込みであり、将来 `zstd-sys` への差し替え自体は形式に影響しない（フレーム形式は標準） |
 | ruzstd の符号化レベル | `Fastest` / `Uncompressed` のみ | `Default` 以下の指定は現行版で `unimplemented!()` になることを実測。`Fastest` は実 LZ 圧縮として動作（反復 100KiB → 14 バイトで往復確認）。復号は標準フレーム全般を受ける |
 | Protobuf | 手書きワイヤ形式 | prost は protoc の事前導入（prost-build）か、protoc バイナリ同梱クレートへの依存が要り、CI の全ジョブ（特に ubuntu 上の Windows ターゲット check）で確実に通すには部品が多い。メタデータは本プロジェクトが所有する小さいスキーマであり、ワイヤ形式自体は標準なので、手書きでも他言語の Protobuf 実装から読める。生成コードとの相互運用が必要になったら .proto を正として再生成する |
-| CRC32C | `shirusu-transport` の既存実装を再利用 | 転送側で検証済みの実装があり、二重実装を避ける。Trace 形式の正は本書とテストベクターであり、実装の置き場所は問わない |
+| CRC32C | `shirusu-crc32c` を転送側と共用 | 公開形式が Capture 内部の転送実装へ依存しないよう、検証済みの実装を独立した基礎クレートへ移した（2026-11-13）。Trace 形式の正は本書とテストベクターであり、実装の置き場所は問わない |
 
 ## ABI 適合性テスト（L06）
 

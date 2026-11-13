@@ -12,7 +12,7 @@ description = "shirusu 公開 Trace 形式 v1: Block Container + Protobuf メタ
 # 純 Rust 実装に固定する（ハッシュ値の仕様は同一）。
 blake3 = { version = "1", features = ["pure"] }
 ruzstd = "0.8"
-shirusu-transport = { path = "../shirusu-transport" }
+shirusu-crc32c = { path = "../shirusu-crc32c" }
 
 [dev-dependencies]
 proptest = "1"

@@ -40,6 +40,10 @@ fn hook_src_dir() -> PathBuf {
     repo_root().join("crates/shirusu-hook/src")
 }
 
+fn catalog_src_dir() -> PathBuf {
+    repo_root().join("crates/shirusu-api-catalog/src")
+}
+
 /// 取得済みの winmd が無ければテストを飛ばす。winmd が要る
 /// テストの先頭で呼ぶ。
 macro_rules! require_winmd {
@@ -114,6 +118,8 @@ fn check_passes_when_generated_files_are_current() {
         config_path().to_str().unwrap(),
         "--out-dir",
         hook_src_dir().to_str().unwrap(),
+        "--api-out-dir",
+        catalog_src_dir().to_str().unwrap(),
         "--check",
     ]);
     assert!(
@@ -188,7 +194,12 @@ fn generate_writes_files_identical_to_checked_in() {
         "api_traits_generated.inc",
     ] {
         let generated = std::fs::read_to_string(dir.path().join(name)).expect("生成物を読む");
-        let checked_in = std::fs::read_to_string(hook_src_dir().join(name)).expect("既存物を読む");
+        let src = if name == "engine_generated.inc" {
+            hook_src_dir()
+        } else {
+            catalog_src_dir()
+        };
+        let checked_in = std::fs::read_to_string(src.join(name)).expect("既存物を読む");
         assert_eq!(
             generated, checked_in,
             "{name} がチェックイン済みの内容と違う"
@@ -274,6 +285,8 @@ fn winmd_env_var_is_used_when_flag_absent() {
             config_path().to_str().unwrap(),
             "--out-dir",
             hook_src_dir().to_str().unwrap(),
+            "--api-out-dir",
+            catalog_src_dir().to_str().unwrap(),
             "--check",
         ],
         &[("SHIRUSU_WINMD", winmd_path().to_str().unwrap())],
