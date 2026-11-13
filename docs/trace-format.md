@@ -125,6 +125,13 @@ Feature Flags は Environment / Finalization 側の Protobuf に持たせる
 
 ## 圧縮（Zstd）
 
+Live Host は待機中の Events がある場合、CPU 負荷を減らすため Event Chunk を
+無圧縮で保存できる。これは既存の compression=0 を使い、同一 Trace 内で Zstd
+Chunk と混在してよい。イベント内容や完全性を省略する機能ではない。
+`capture_config` の `host_event_compression=backlog-adaptive` と
+`host_compression_bypass_requests` に方針と要求回数を残す。
+
+
 - 圧縮単位は Block（= チャンク）ごと。Event Chunk / Blob Chunk に適用し、
   メタデータ系 Block（Header/Environment/Schema/Index/Finalization/Loss）
   は無圧縮で置く（決定：小さいことと、形式検査のしやすさを優先する。

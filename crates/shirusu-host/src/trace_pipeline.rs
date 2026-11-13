@@ -25,6 +25,9 @@ pub struct HostPipelineStats {
     pub commands_processed: u64,
     pub events_received: u64,
     pub merged_event_commands: u64,
+    /// Processing groups requesting raw Event Chunks; Profile/Filtered groups
+    /// can produce no Event Chunk, so this is not a physical chunk count.
+    pub compression_bypass_requests: u64,
     pub conversion_wall_ns: u64,
     pub queue_full_count: u64,
     pub drain_wait_ns: u64,
@@ -56,6 +59,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     let started = Instant::now();
                     match command {
                         Command::Events(context, mut events) => {
+                            let mut coalesced = false;
                             let mut payload_bytes = events
                                 .iter()
                                 .fold(0usize, |n, e| n.saturating_add(e.payload.len()));
@@ -79,6 +83,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                                             .map(|e| e.payload.len())
                                             .sum::<usize>();
                                         events.extend(next_events);
+                                        coalesced = true;
                                         totals.metrics.commands_processed =
                                             totals.metrics.commands_processed.saturating_add(1);
                                         totals.metrics.merged_event_commands =
@@ -94,7 +99,19 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                                 .metrics
                                 .events_received
                                 .saturating_add(events.len() as u64);
-                            let stats = recorder.record_owned_batch_with_args(&context, events)?;
+                            // Ready Events are evidence of backlog, not a reason to wait.
+                            // Keep every field but spend less CPU on compression until
+                            // this writer catches up. Loss/environment commands remain
+                            // ordering barriers and do not by themselves select raw output.
+                            let backlogged =
+                                coalesced || matches!(&pending, Some(Command::Events(..)));
+                            let stats = if backlogged {
+                                totals.metrics.compression_bypass_requests =
+                                    totals.metrics.compression_bypass_requests.saturating_add(1);
+                                recorder.record_owned_batch_uncompressed(&context, events)?
+                            } else {
+                                recorder.record_owned_batch_with_args(&context, events)?
+                            };
                             totals.args.args_attached += stats.args_attached;
                             totals.args.args_incomplete += stats.args_incomplete;
                             totals.args.args_fallback_blob += stats.args_fallback_blob;
@@ -469,6 +486,7 @@ mod tests {
             stats.metrics.merged_event_commands,
             (QUEUED_BATCHES - 1) as u64
         );
+        assert_eq!(stats.metrics.compression_bypass_requests, 1);
         assert_eq!(stats.args.args_attached, QUEUED_BATCHES * 2);
         assert_eq!(stats.metrics.events_received, (QUEUED_BATCHES * 2) as u64);
         assert_eq!(
@@ -504,6 +522,8 @@ mod tests {
         resume.send(()).unwrap();
         let (recorder, stats) = pipeline.finish().unwrap();
         assert_eq!(stats.metrics.merged_event_commands, 1);
+        // The final isolated group resumes normal compression.
+        assert_eq!(stats.metrics.compression_bypass_requests, 2);
         assert_eq!(stats.metrics.commands_processed, 5);
         let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
         let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
@@ -601,10 +621,11 @@ mod tests {
             let (recorder, stats) = pipeline.finish().unwrap();
             let bytes = recorder.finish(&IntegrityReport::default()).unwrap();
             println!(
-                "queued_conversion round={round} elapsed_ms={} bytes={} merged={}",
+                "queued_conversion round={round} elapsed_ms={} bytes={} merged={} compression_bypasses={}",
                 start.elapsed().as_secs_f64() * 1000.0,
                 bytes.len(),
-                stats.metrics.merged_event_commands
+                stats.metrics.merged_event_commands,
+                stats.metrics.compression_bypass_requests
             );
         }
     }

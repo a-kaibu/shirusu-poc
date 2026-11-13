@@ -391,3 +391,15 @@ payload bytes as well as their event. A regression failed against the old writer
 aborted call and subsequent reuse of its ID to detect stale tracking. Full transport
 and Agent tests pass. This corrects loss accounting, not the underlying throughput
 shortfall; it must not be reported as eliminating event loss.
+
+### Backlog-aware Event Chunk compression (2026-11-13)
+
+A compression-disabled experiment measured 45–59 ms for the same 256,000-event
+Host component workload, versus 68–91 ms with compression, at a file-size cost of
+about 0.86 MB → 4.09 MB. The live pipeline now requests raw Event Chunks only when
+already-ready Events establish backlog, and resumes normal compression when caught
+up. The implemented policy measured 46–59 ms locally. It retains all values and
+uses the existing mixed-codec container; validation, CRC, index and durability
+remain shared with the normal Writer path. Tests cover mixed-codec exact event
+roundtrips, rejected invalid batches and resuming normal policy. Native workload
+validation is still required; slower storage can change the performance tradeoff.

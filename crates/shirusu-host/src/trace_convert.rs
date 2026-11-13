@@ -9,8 +9,8 @@
 //! - Loss 情報は Loss Block の LossRecord へ、IntegrityReport の
 //!   3 指標は Finalization へ写す。
 //!
-//! 引数値列（args）は現段階の転送に存在しないため変換では常に None
-//! とする。Schema 駆動の引数取得はフック層（Phase 3）が担う。
+//! `record_batch` は Payload を Blob として保持し、args は付与しない。
+//! Schema 駆動の引数取得はフック層が担い、以下の args 対応経路で検証する。
 //!
 //! Phase 3 のフック由来イベントについては
 //! [`TraceRecorder::record_batch_with_args`] を使う： Payload が
@@ -341,7 +341,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
         ctx: &TraceBatchContext,
         events: &[ReceivedEvent],
     ) -> TraceResult<()> {
-        self.record_batch_inner(ctx, events.iter().map(Cow::Borrowed), false)
+        self.record_batch_inner(ctx, events.iter().map(Cow::Borrowed), false, true)
             .map(|_| ())
     }
 
@@ -356,7 +356,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
         ctx: &TraceBatchContext,
         events: &[ReceivedEvent],
     ) -> TraceResult<ArgsConversionStats> {
-        self.record_batch_inner(ctx, events.iter().map(Cow::Borrowed), true)
+        self.record_batch_inner(ctx, events.iter().map(Cow::Borrowed), true, true)
     }
 
     /// Consume a drained batch, transferring validated argument buffers into
@@ -366,7 +366,15 @@ impl<W: DurableWrite> TraceRecorder<W> {
         ctx: &TraceBatchContext,
         events: Vec<ReceivedEvent>,
     ) -> TraceResult<ArgsConversionStats> {
-        self.record_batch_inner(ctx, events.into_iter().map(Cow::Owned), true)
+        self.record_batch_inner(ctx, events.into_iter().map(Cow::Owned), true, true)
+    }
+
+    pub(crate) fn record_owned_batch_uncompressed(
+        &mut self,
+        ctx: &TraceBatchContext,
+        events: Vec<ReceivedEvent>,
+    ) -> TraceResult<ArgsConversionStats> {
+        self.record_batch_inner(ctx, events.into_iter().map(Cow::Owned), true, false)
     }
 
     fn record_batch_inner<'a>(
@@ -374,6 +382,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
         ctx: &TraceBatchContext,
         events: impl ExactSizeIterator<Item = Cow<'a, ReceivedEvent>>,
         args_mode: bool,
+        compress_events: bool,
     ) -> TraceResult<ArgsConversionStats> {
         let mut stats = ArgsConversionStats::default();
         if events.len() == 0 {
@@ -459,7 +468,11 @@ impl<W: DurableWrite> TraceRecorder<W> {
             qpc_frequency: ctx.qpc_frequency,
             events: converted,
         };
-        self.writer.write_batch(&batch)?;
+        if compress_events {
+            self.writer.write_batch(&batch)?;
+        } else {
+            self.writer.write_batch_uncompressed(&batch)?;
+        }
         Ok(stats)
     }
 

@@ -12,7 +12,8 @@
 //!   型付き解釈ができる）。
 //! - Event Chunk / Blob Chunk は非圧縮サイズが
 //!   `WriterOptions::chunk_raw_target`（既定 512 KiB）を目安に分割し、チャンク単位で
-//!   Zstd 圧縮する（圧縮で膨らむ場合は無圧縮で格納する）。
+//!   Zstd 圧縮を試みる（圧縮で膨らむ場合、または write_batch_uncompressed
+//!   で要求された Event Chunk は無圧縮で格納する）。
 //! - メタデータ系 Block は無圧縮。
 //! - Blob の部分的な更新は BlobUpdate Block として書く（F18）。
 //!   基底の Blob Chunk が先に書かれるよう、更新の書出し前に
@@ -43,6 +44,7 @@ use crate::proto::{
     SchemaDef, SchemaSet,
 };
 use crate::schema::SchemaRegistry;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
@@ -374,6 +376,17 @@ impl<W: DurableWrite> TraceWriter<W> {
     /// 前方参照が起きない順序を保証する。大きな Batch は目安サイズで
     /// 複数の Event Chunk に分割する（各 Chunk が Batch 文脈を持つ）。
     pub fn write_batch(&mut self, batch: &EventBatch) -> Result<()> {
+        self.write_batch_inner(batch, true)
+    }
+
+    /// Preserve the complete batch using raw Event Chunks. This avoids compression
+    /// CPU work when a live recorder is behind; schema, blob and validation rules
+    /// are unchanged. The existing container format permits mixed chunk codecs.
+    pub fn write_batch_uncompressed(&mut self, batch: &EventBatch) -> Result<()> {
+        self.write_batch_inner(batch, false)
+    }
+
+    fn write_batch_inner(&mut self, batch: &EventBatch, compress_events: bool) -> Result<()> {
         self.validate_batch(batch)?;
         self.flush_schemas()?;
         self.flush_blobs()?;
@@ -381,7 +394,7 @@ impl<W: DurableWrite> TraceWriter<W> {
         while start < batch.events.len() {
             let end = self.chunk_end(batch, start);
             let payload = compact::encode_event_chunk_slice(batch, &batch.events[start..end]);
-            self.write_block(BlockType::EventChunk, &payload, true)?;
+            self.write_block(BlockType::EventChunk, &payload, compress_events)?;
             start = end;
         }
         if let Some(last) = batch.events.last() {
@@ -612,12 +625,12 @@ impl<W: DurableWrite> TraceWriter<W> {
         let (compression, stored) = if compressible && !payload.is_empty() {
             let compressed = crate::container::compress_chunk(payload);
             if compressed.len() < payload.len() {
-                (Compression::Zstd, compressed)
+                (Compression::Zstd, Cow::Owned(compressed))
             } else {
-                (Compression::None, payload.to_vec())
+                (Compression::None, Cow::Borrowed(payload))
             }
         } else {
-            (Compression::None, payload.to_vec())
+            (Compression::None, Cow::Borrowed(payload))
         };
         let header = BlockHeader {
             block_type,

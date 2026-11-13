@@ -391,6 +391,48 @@ fn repetitive_chunk_is_stored_compressed() {
     assert_eq!(trace.total_events(), 500);
 }
 
+#[test]
+fn mixed_raw_and_compressed_batches_preserve_events_and_validation() {
+    let first = batch(
+        3,
+        (1..=500)
+            .map(|i| event(i, PayloadRef::Inline(vec![0xee; 512])))
+            .collect(),
+    );
+    let second = batch(
+        3,
+        (501..=1000)
+            .map(|i| event(i, PayloadRef::Inline(vec![0xee; 512])))
+            .collect(),
+    );
+    let mut writer = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    let mut invalid = first.clone();
+    invalid.session_id = 99;
+    assert!(writer.write_batch_uncompressed(&invalid).is_err());
+    writer.write_batch_uncompressed(&first).unwrap();
+    writer.write_batch(&second).unwrap();
+    assert!(
+        writer.write_batch_uncompressed(&first).is_err(),
+        "raw path must reject sequence regression"
+    );
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let mut codecs = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let header = parse_raw_header(&bytes[offset..]).unwrap();
+        if header.block_type_code == BlockType::EventChunk.code() {
+            codecs.push(header.compression_code);
+        }
+        offset += 32 + header.stored_len as usize;
+    }
+    assert_eq!(codecs, [0, 1]);
+    let trace = read_trace_via(&bytes).unwrap();
+    assert!(trace.issues.is_empty());
+    assert_eq!(trace.batches, [first, second]);
+    assert!(trace.index_matches_scan);
+    assert_eq!(trace.finalization.unwrap().total_events, 1000);
+}
+
 /// F22 用の最小 Trace: Schema 1 件（kernel32!CreateFileW）と
 /// その Schema を使う args 付きイベント 1 件。戻り値は
 /// (Trace バイト列, イベントの args バイト列)。

@@ -54,3 +54,24 @@ trace_pipeline::tests::measure_queued_conversion -- --ignored --nocapture`。
 Finalization まで測ると、結合なし102–121ms、結合あり68–74ms（各5回）。
 結合を再度有効化した別の5回では71–91msだった。
 同じ試作コードの結合回数だけをゼロにした比較で、Windows アプリ全体の倍率ではない。
+
+## 待機中のイベントがある場合の圧縮
+
+`host_event_compression=backlog-adaptive` を capture_config に記録する。
+worker がすでに届いている Events を結合した、または次の Events を先読みした場合、
+今回のグループの Event Chunk は無圧縮で保存する。次のグループで待機 Events が
+見つからなければ通常の Zstd 圧縮へ戻る。時間を待って判定する方式ではない。
+Loss・環境更新だけが待機している場合は、それを理由に圧縮を省かない。
+
+データの選別やサンプリングは行わず、同じイベント・引数・完全性情報を保存する。
+Blob の圧縮、検証、CRC、Index、永続化規則は変えない。既存形式の無圧縮 Chunk
+を使うため、Zstd と混在した Trace は既存 Reader で読める。直接使う TraceWriter
+の write_batch は従来どおり圧縮を試みる。
+
+`host_compression_bypass_requests` は無圧縮を要求した処理グループ数。
+Profile / Filtered ではそのグループが Event Chunk を生成しない場合があるため、
+ファイル内の無圧縮 Chunk 数ではない。CLI と性能 artifact にもこの値を残す。
+
+Linux の同じ25.6万イベントの部品測定では46–59msとなった一方、ファイルは
+約0.86MBから約4.09MBへ増加した。I/O が遅い保存先では逆効果もあり得るため、
+Windows の実アプリ測定と損失数を別途確認する。倍率目標達成の証拠ではない。
