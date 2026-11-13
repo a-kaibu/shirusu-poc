@@ -1370,7 +1370,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("lpFileName", Ty::U64, ValueKind::Pointer, BEFORE), ("dwDesiredAccess", Ty::U32, ValueKind::Scalar, BEFORE), ("dwShareMode", Ty::U32, ValueKind::Scalar, BEFORE), ("lpSecurityAttributes", Ty::U64, ValueKind::Pointer, BEFORE), ("dwCreationDisposition", Ty::U32, ValueKind::Scalar, BEFORE), ("dwFlagsAndAttributes", Ty::U32, ValueKind::Scalar, BEFORE), ("hTemplateFile", Ty::U64, ValueKind::Handle, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Handle, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsInvalidHandle,
+    last_error_meaning: LastErrorMeaning::DependsOnInputs,
 },
 ApiDef {
     api_id: 151,

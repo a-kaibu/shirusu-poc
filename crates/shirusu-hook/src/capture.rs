@@ -690,6 +690,29 @@ pub fn encode_generic_enter<const FIELDS: usize>(
 
 /// Encode the optional return value and LastError without heap allocation.
 pub fn encode_generic_leave(api: &ApiDef, return_value: u64, last_error: u32) -> GenericPayload<2> {
+    encode_generic_leave_with_inputs(api, return_value, last_error, &[])
+}
+
+/// Resolve supported input-dependent error semantics from the original scalar
+/// arguments. Missing context stays Unsupported, retaining the raw error value.
+pub fn encode_generic_leave_with_inputs(
+    api: &ApiDef,
+    return_value: u64,
+    last_error: u32,
+    args: &[u64],
+) -> GenericPayload<2> {
+    let meaning = if api.last_error_meaning == LastErrorMeaning::DependsOnInputs
+        && api.module.eq_ignore_ascii_case("kernel32.dll")
+        && api.function == "CreateFileA"
+    {
+        match args.get(4).copied().and_then(|v| u32::try_from(v).ok()) {
+            Some(2 | 4) => LastErrorMeaning::Always,
+            Some(_) => LastErrorMeaning::WhenReturnIsInvalidHandle,
+            None => LastErrorMeaning::DependsOnInputs,
+        }
+    } else {
+        api.last_error_meaning
+    };
     assert!(
         api.leave_fields.len() <= 2,
         "generated leave capacity exceeded"
@@ -698,7 +721,7 @@ pub fn encode_generic_leave(api: &ApiDef, return_value: u64, last_error: u32) ->
     for (name, ty, _, _) in api.leave_fields {
         payload.scalar(match *name {
             "return" => raw_to_value(api.function, name, *ty, return_value),
-            "last_error" => last_error_value(api.last_error_meaning, return_value, last_error),
+            "last_error" => last_error_value(meaning, return_value, last_error),
             other => panic!("{}: unexpected leave field {other}", api.function),
         });
     }
@@ -730,6 +753,35 @@ mod tests {
     use shirusu_trace::compact::{decode_values, encode_values};
     use shirusu_trace::schema::schema_types;
     use shirusu_trace::schema::Ty;
+
+    #[test]
+    fn ansi_create_file_error_uses_original_disposition_or_stays_unsupported() {
+        let api = api_by_import("kernel32.dll", "CreateFileA").unwrap();
+        let types = schema_types(&api.leave_schema()).unwrap();
+        assert_eq!(api.last_error_meaning, LastErrorMeaning::DependsOnInputs);
+        for disposition in 1..=5 {
+            let args = [0, 0, 0, 0, disposition, 128, 0];
+            for returned in [0x1234, u32::MAX as u64, u64::MAX] {
+                let encoded = encode_generic_leave_with_inputs(api, returned, 183, &args);
+                let values = decode_values(&types, encoded.as_bytes()).unwrap();
+                assert_eq!(values[1].value, TypedValue::U32(183));
+                assert_eq!(
+                    values[1].capture,
+                    if returned == 0x1234 && !matches!(disposition, 2 | 4) {
+                        ValueCapture::Stale
+                    } else {
+                        ValueCapture::Captured
+                    }
+                );
+            }
+        }
+        for args in [&[][..], &[0, 0, 0, 0, u64::MAX][..]] {
+            let encoded = encode_generic_leave_with_inputs(api, 0x1234, 183, args);
+            let values = decode_values(&types, encoded.as_bytes()).unwrap();
+            assert_eq!(values[1].capture, ValueCapture::Unsupported);
+            assert_eq!(values[1].value, TypedValue::U32(183));
+        }
+    }
 
     #[test]
     fn direct_field_encoding_matches_published_schemas_for_all_generated_apis() {

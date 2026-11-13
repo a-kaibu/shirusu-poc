@@ -656,7 +656,7 @@ last_error = "not-null"
 namespace = "Windows.Win32.Storage.FileSystem"
 module = "kernel32.dll"
 function = "CreateFileA"
-last_error = "invalid-handle"
+last_error = "depends-on-inputs"
 [[api]]
 namespace = "Windows.Win32.Storage.FileSystem"
 module = "kernel32.dll"

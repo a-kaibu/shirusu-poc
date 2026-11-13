@@ -341,8 +341,9 @@ The CreateFileW leave Schema flags/hash Golden changes intentionally; the prior
 23 capture-byte Goldens remain unchanged for their existing inputs. Added tests
 exercise all five dispositions, generated Capture → emitter → compare behavior,
 contract binding rejection and the actual Windows Detour passing the original
-input. Old Trace Stale decisions are not retroactively rewritten, and CreateFileA
-and other APIs outside these four contracts still need input-dependent coverage.
+input. Old Trace Stale decisions are not retroactively rewritten. CreateFileA
+was still pending at this checkpoint; its subsequent correction is recorded below.
+Other APIs outside these four contracts still need input-dependent coverage.
 
 The corrected error/sharing Probe and CreateFileW input-dependent Capture tests
 passed on Windows latest x64, WoW64 x86 and Server 2022 in run `43410242785`
@@ -368,3 +369,14 @@ commands without changing original command/event totals. Linux release component
 measurement: 256,000 events, five rounds, 102–121 ms without coalescing versus
 68–74 ms with coalescing; a second enabled run measured 71–91 ms. Native
 application impact still requires CI measurement.
+
+### ANSI file creation error semantics (2026-11-13)
+
+The generated CreateFileA L1 schema also marks LastError as DependsOnInputs.
+Its stack encoder receives the original scalar arguments: successful
+OPEN_ALWAYS/CREATE_ALWAYS retain meaningful LastError, while other successful
+creation modes retain it as Stale. Failure sentinels remain meaningful on both
+pointer widths. Without the required input context the raw value is Unsupported,
+not silently discarded. This is a narrow handwritten L1 semantic rule; the
+four-API declarative contract pilot remains unchanged. Native typed-Detour tests
+exercise all five dispositions and caller LastError transparency.

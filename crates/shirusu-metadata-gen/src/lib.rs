@@ -588,6 +588,7 @@ pub fn parse_last_error(s: &str) -> Result<LastErrorMeaning, String> {
         "null" => LastErrorMeaning::WhenReturnIsNull,
         "not-null" => LastErrorMeaning::WhenReturnIsNotNull,
         "invalid-handle" => LastErrorMeaning::WhenReturnIsInvalidHandle,
+        "depends-on-inputs" => LastErrorMeaning::DependsOnInputs,
         "minus-one" => LastErrorMeaning::WhenReturnIsMinusOne,
         "never" => LastErrorMeaning::Never,
         "always" => LastErrorMeaning::Always,

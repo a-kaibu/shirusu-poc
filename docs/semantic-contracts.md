@@ -49,5 +49,6 @@ LastError を Captured として保存する。条件となる作成モード `[
 宣言し、Detour が入口の dwCreationDisposition を leave 取得へ渡す。
 その他の成功モードでは従来どおり Stale。入力を受け取れない汎用の取得関数を
 DependsOnInputs に使った場合は、生値を Unsupported として残し、意味まで取得できたとは扱わない。古い Trace の Stale 判定を自動で
-書き換える機能ではなく、新しい Capture で反映される。CreateFileA など
-この4 API以外の入力依存条件はまだ一般化していない。
+書き換える機能ではなく、新しい Capture で反映される。CreateFileA の L1 Wrapper
+にも同じ条件を判定する手書きルールを適用する。それ以外の入力依存条件は
+まだ一般化していない。
