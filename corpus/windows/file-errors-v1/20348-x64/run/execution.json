@@ -1,0 +1,18 @@
+{
+  "program": "\\\\?\\D:\\a\\shirusu-poc\\shirusu-poc\\target\\x86_64-pc-windows-msvc\\debug\\shirusu-test.exe",
+  "elapsed_ms": 11,
+  "timeout_ms": 30000,
+  "process_id": 2544,
+  "exit_status": "exit code: 0",
+  "report_accepted": true,
+  "runner_environment": {
+    "target_os": "windows",
+    "process_arch": "x86_64",
+    "pointer_width": 64,
+    "windows_version": "10.0.20348",
+    "windows_build": 20348,
+    "version_source": "RtlGetVersion"
+  },
+  "error": null,
+  "environment_provenance": "runner-reported API identity when present; not OS attestation"
+}

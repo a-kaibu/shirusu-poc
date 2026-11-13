@@ -28,3 +28,23 @@ All three entries have identical normalized observations. The loader verifies co
 hashes and recomputes observations before comparing. Preserve raw bytes: newline
 conversion changes the report digest. New runs belong in new directories; do not
 replace existing evidence. See [the format and scope](../docs/reference-corpus.md).
+
+## File creation and error observations
+
+`windows/file-errors-v1` preserves the fourteen-call error/disposition Probe from
+[CI run 43410242785](https://github.com/a-kaibu/shirusu-poc/actions/runs/43410242785),
+commit `cc86db26b220946391a58102b89d6733b374ebab`, 2026-11-13 UTC.
+
+| Entry | Process | CI artifact |
+| --- | --- | --- |
+| `windows/file-errors-v1/26100-x86` | x86 under WoW64 | 14029686535 |
+| `windows/file-errors-v1/26100-x64` | x64 | 14028289685 |
+| `windows/file-errors-v1/20348-x64` | x64 | 14028918089 |
+
+All three normalized sequences agree: missing files report error 2, duplicate
+CREATE_NEW reports 80, exclusive sharing conflicts report 32, and successful
+OPEN_ALWAYS / CREATE_ALWAYS on the existing file report 183. OPEN_ALWAYS on a
+new file reports 0. These are observations for this exact Probe and environment.
+The failed-open value is also the current-process pseudo-handle; closing it
+returned success in these runs. The Probe records that result without assuming
+that every INVALID_HANDLE_VALUE passed to CloseHandle must fail.

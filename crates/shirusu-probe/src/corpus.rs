@@ -461,11 +461,15 @@ mod tests {
     }
     #[test]
     fn published_native_entries_remain_content_bound_and_comparable() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/windows/file-io-v1");
-        let result = compare(&root.join("26100-x86"), &root.join("20348-x64")).unwrap();
-        assert_eq!(get(&result, "differences"), Some(&J::Array(Vec::new())));
-        let result = compare(&root.join("26100-x64"), &root.join("20348-x64")).unwrap();
-        assert_eq!(get(&result, "differences"), Some(&J::Array(Vec::new())));
+        for suite in ["file-io-v1", "file-errors-v1"] {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../corpus/windows")
+                .join(suite);
+            for sample in ["26100-x86", "26100-x64"] {
+                let result = compare(&root.join(sample), &root.join("20348-x64")).unwrap();
+                assert_eq!(get(&result, "differences"), Some(&J::Array(Vec::new())));
+            }
+        }
     }
 
     #[test]

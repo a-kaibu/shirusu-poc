@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "label": "GitHub Actions 43410242785 cc86db26b220946391a58102b89d6733b374ebab x86_64-pc-windows-msvc",
+  "probe_digest": "0db5263ca7f62afde4d7e5977ed91296f04ae7a4ee3d5ac67496ad31850e6dc2",
+  "report_digest": "c3527494a88a8d046b3b1630223c166ec5b68eb36aee3c85f87ed0c90ebe7f93",
+  "environment": {
+    "target_os": "windows",
+    "process_arch": "x86_64",
+    "pointer_width": 64,
+    "windows_version": "10.0.26100",
+    "windows_build": 26100,
+    "version_source": "RtlGetVersion"
+  },
+  "all_expectations_met": true,
+  "observations": [
+    {
+      "handle": "invalid",
+      "last_error": 2
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "handle": "valid",
+      "last_error": null
+    },
+    {
+      "handle": "invalid",
+      "last_error": 80
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "handle": "invalid",
+      "last_error": 32
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "handle": "valid",
+      "last_error": 183
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "handle": "valid",
+      "last_error": 183
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "handle": "valid",
+      "last_error": 0
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    }
+  ]
+}
