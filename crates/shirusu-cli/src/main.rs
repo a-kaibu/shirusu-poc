@@ -1817,6 +1817,14 @@ fn print_summary(trace: &Path, summary: &shirusu_host::recorder::SessionSummary)
         "args: {} attached, {} fallback to blob",
         summary.args_attached, summary.args_fallback_blob
     );
+    let pipeline = &summary.host_pipeline;
+    println!(
+        "host pipeline: {} commands, queue full {}, drain wait {:.3}ms, conversion wall {:.3}ms",
+        pipeline.commands_processed,
+        pipeline.queue_full_count,
+        pipeline.drain_wait_ns as f64 / 1_000_000.0,
+        pipeline.conversion_wall_ns as f64 / 1_000_000.0,
+    );
     if let Some((hooked, missing)) = summary.hook_coverage {
         println!("hook coverage: {hooked} hooked, {missing} missing");
     }

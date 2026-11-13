@@ -5,8 +5,9 @@ use crate::trace_convert::{ArgsConversionStats, TraceBatchContext, TraceRecorder
 use crate::LossEvent;
 use shirusu_trace::{proto::CaptureEnvironment, DurableWrite, TraceError};
 use shirusu_transport::ring::ReceivedEvent;
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 // A producer holds at most one drained batch while waiting; the worker owns
 // one more. Each event batch is bounded by its Ring's descriptor/payload limits.
@@ -17,11 +18,28 @@ enum Command {
     Losses(Vec<LossEvent>, u64, u64),
     Environment(CaptureEnvironment),
 }
-type Finished<W> = Result<(TraceRecorder<W>, ArgsConversionStats), TraceError>;
+/// Wall-clock diagnostics, not additive CPU attribution or completeness proof.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HostPipelineStats {
+    pub commands_processed: u64,
+    pub events_received: u64,
+    pub conversion_wall_ns: u64,
+    pub queue_full_count: u64,
+    pub drain_wait_ns: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct PipelineReport {
+    pub args: ArgsConversionStats,
+    pub metrics: HostPipelineStats,
+}
+type Finished<W> = Result<(TraceRecorder<W>, PipelineReport), TraceError>;
 
 pub(crate) struct TracePipeline<W: DurableWrite + Send + 'static> {
     sender: Option<SyncSender<Command>>,
     worker: Option<JoinHandle<Finished<W>>>,
+    queue_full_count: u64,
+    drain_wait_ns: u64,
 }
 
 impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
@@ -30,14 +48,19 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
         let worker = std::thread::Builder::new()
             .name("shirusu-trace-writer".into())
             .spawn(move || {
-                let mut totals = ArgsConversionStats::default();
+                let mut totals = PipelineReport::default();
                 for command in receiver {
+                    let started = Instant::now();
                     match command {
                         Command::Events(context, events) => {
+                            totals.metrics.events_received = totals
+                                .metrics
+                                .events_received
+                                .saturating_add(events.len() as u64);
                             let stats = recorder.record_owned_batch_with_args(&context, events)?;
-                            totals.args_attached += stats.args_attached;
-                            totals.args_incomplete += stats.args_incomplete;
-                            totals.args_fallback_blob += stats.args_fallback_blob;
+                            totals.args.args_attached += stats.args_attached;
+                            totals.args.args_incomplete += stats.args_incomplete;
+                            totals.args.args_fallback_blob += stats.args_fallback_blob;
                         }
                         Command::Losses(losses, process, thread) => {
                             recorder.record_losses(&losses, process, thread)?;
@@ -46,22 +69,34 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                             recorder.update_environment(&environment)?;
                         }
                     }
+                    totals.metrics.commands_processed =
+                        totals.metrics.commands_processed.saturating_add(1);
+                    totals.metrics.conversion_wall_ns = totals
+                        .metrics
+                        .conversion_wall_ns
+                        .saturating_add(elapsed_ns(started));
                 }
                 Ok((recorder, totals))
             })?;
         Ok(Self {
             sender: Some(sender),
             worker: Some(worker),
+            queue_full_count: 0,
+            drain_wait_ns: 0,
         })
     }
 
     fn join(&mut self) -> Finished<W> {
         drop(self.sender.take());
-        self.worker
+        let (recorder, mut report) = self
+            .worker
             .take()
             .ok_or_else(|| failure("trace worker already joined"))?
             .join()
-            .map_err(|_| failure("trace worker panicked"))?
+            .map_err(|_| failure("trace worker panicked"))??;
+        report.metrics.queue_full_count = self.queue_full_count;
+        report.metrics.drain_wait_ns = self.drain_wait_ns;
+        Ok((recorder, report))
     }
 
     fn failed_worker(&mut self) -> TraceError {
@@ -80,13 +115,20 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
 
     fn send(&mut self, command: Command) -> Result<(), TraceError> {
         self.check_health()?;
-        if self
+        let sender = self
             .sender
             .as_ref()
-            .ok_or_else(|| failure("trace worker closed"))?
-            .send(command)
-            .is_err()
-        {
+            .ok_or_else(|| failure("trace worker closed"))?;
+        let command = match sender.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(command)) => command,
+            Err(TrySendError::Disconnected(_)) => return Err(self.failed_worker()),
+        };
+        self.queue_full_count = self.queue_full_count.saturating_add(1);
+        let started = Instant::now();
+        let result = sender.send(command);
+        self.drain_wait_ns = self.drain_wait_ns.saturating_add(elapsed_ns(started));
+        if result.is_err() {
             return Err(self.failed_worker());
         }
         Ok(())
@@ -132,6 +174,10 @@ impl<W: DurableWrite + Send + 'static> Drop for TracePipeline<W> {
             let _ = worker.join();
         }
     }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn failure(message: &str) -> TraceError {
@@ -259,7 +305,9 @@ mod tests {
                 pipeline.record_losses(losses, 1, 1).unwrap();
             }
             let (queued, actual) = pipeline.finish().unwrap();
-            assert_eq!(expected, actual);
+            assert_eq!(expected, actual.args);
+            assert_eq!(actual.metrics.events_received, 4);
+            assert_eq!(actual.metrics.commands_processed, 6);
             assert_eq!(direct.profile_summary(), queued.profile_summary());
             assert_eq!(
                 direct.finish(&IntegrityReport::default()).unwrap(),
@@ -380,7 +428,12 @@ mod tests {
         ));
         resume.send(()).unwrap();
         let (recorder, stats) = pipeline.finish().unwrap();
-        assert_eq!(stats.args_attached, QUEUED_BATCHES * 2);
+        assert_eq!(stats.args.args_attached, QUEUED_BATCHES * 2);
+        assert_eq!(stats.metrics.events_received, (QUEUED_BATCHES * 2) as u64);
+        assert_eq!(
+            stats.metrics.commands_processed,
+            (QUEUED_BATCHES + 1) as u64
+        );
         let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
         let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
         assert_eq!(

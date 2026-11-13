@@ -19,6 +19,7 @@
 //! 「Mapping が用意された後」の回収と Trace 化に集中する。
 
 use crate::trace_convert::{RecordMode, TraceBatchContext, TraceRecorder};
+pub use crate::trace_pipeline::HostPipelineStats;
 use crate::trace_pipeline::TracePipeline;
 use crate::{DrainWorker, IntegrityLevel, IntegrityReport, RingIdentity};
 use shirusu_hook::api as hook_api;
@@ -246,6 +247,7 @@ pub struct SessionSummary {
     pub rings_stopped: usize,
     pub args_attached: usize,
     pub args_fallback_blob: usize,
+    pub host_pipeline: HostPipelineStats,
     /// Agent DLL が報告したフック設置結果 (設置数, 欠落数)。
     /// プロセス間記録で DLL から読み戻せた場合のみ Some
     /// (レビュー #4 の #8)。
@@ -835,7 +837,15 @@ impl CaptureSession {
                     .record_losses(losses, ring.spec.process_id, ring.trace_thread_id)?;
             }
         }
-        let (recorder, args_stats) = self.recorder.finish()?;
+        let (mut recorder, pipeline_report) = self.recorder.finish()?;
+        let args_stats = pipeline_report.args;
+        let host_pipeline = pipeline_report.metrics;
+        self.config.environment.capture_config.push_str(&format!(
+            "; host_commands={}; host_events_received={}; host_conversion_wall_ns={}; host_queue_full={}; host_drain_wait_ns={}",
+            host_pipeline.commands_processed, host_pipeline.events_received,
+            host_pipeline.conversion_wall_ns, host_pipeline.queue_full_count, host_pipeline.drain_wait_ns,
+        ));
+        recorder.update_environment(&self.config.environment)?;
         reports.append(&mut self.retired_reports);
         let mut report = combine_reports(&reports);
         if args_stats.args_incomplete > 0 {
@@ -922,6 +932,7 @@ impl CaptureSession {
             rings_stopped,
             args_attached: args_stats.args_attached,
             args_fallback_blob: args_stats.args_fallback_blob,
+            host_pipeline,
             hook_coverage: self.hook_coverage,
             com_factory_count: self.com_factory_count,
             winrt_activation_count: self.winrt_activation_count,

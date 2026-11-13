@@ -136,11 +136,19 @@ fn full_capture_in_process_produces_decodable_trace() {
     assert_eq!(summary.rings_active, 1);
     assert_eq!(summary.rings_stopped, 0);
     assert_eq!(summary.args_attached, 6);
+    assert_eq!(summary.host_pipeline.events_received, summary.total_events);
+    assert_eq!(summary.host_pipeline.commands_processed, 1);
     assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
 
     let bytes = std::fs::read(&path).unwrap();
     let trace = shirusu_trace::read_trace(&bytes).unwrap();
     assert!(trace.finalization.is_some());
+    let capture_config = &trace.environment.as_ref().unwrap().capture_config;
+    assert!(capture_config.contains("host_events_received=6"));
+    assert!(capture_config.contains(&format!(
+        "host_conversion_wall_ns={}",
+        summary.host_pipeline.conversion_wall_ns
+    )));
     let events: Vec<_> = trace.batches.iter().flat_map(|b| &b.events).collect();
     assert_eq!(events.len(), 6);
     // CreateFileW のパスが L2 で復元できる
