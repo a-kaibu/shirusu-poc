@@ -150,10 +150,12 @@ fn global_order_disabled_session_rejects_stamped_descriptors() {
     }
     session.start().unwrap();
     record(&agent, 11, 1);
-    let stats = session.poll_once().unwrap();
-    // 採番済み像を無効なセッションで読むと検証で Ring が止まり、回収 0 件。
-    assert_eq!(stats.events, 0);
-    assert_eq!(stats.stopped_rings, 1);
+    // Collection only copies; validation on the Trace worker rejects the
+    // stamped descriptors, stops the Ring and accepts no event.
+    let _ = session.poll_once().unwrap();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.total_events, 0);
+    assert_eq!(summary.rings_stopped, 1);
     let _ = std::fs::remove_file(&path);
 }
 

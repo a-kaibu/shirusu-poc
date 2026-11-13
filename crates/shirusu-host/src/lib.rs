@@ -15,7 +15,7 @@ use shirusu_transport::descriptor::EventKind;
 use shirusu_transport::layout::{self, LossCounters};
 use shirusu_transport::ring::{DrainBatch, ReceivedEvent, SharedRegion};
 use shirusu_transport::slot::{SlotHandle, SlotPool};
-use shirusu_transport::validate::{IntegrityError, KnownConfig, ValidatingReader};
+use shirusu_transport::validate::{CommittedChunk, IntegrityError, KnownConfig, ValidatingReader};
 use shirusu_transport::RingConfig;
 use shirusu_transport_win::{notify_space_if_writer_waiting, RingNotify};
 use std::cell::Cell;
@@ -345,6 +345,178 @@ unsafe fn copy_logical_range(
     span as u64
 }
 
+/// Copy-only collection of committed Ring contents (the Host's fast path).
+///
+/// The collection thread copies the committed descriptors and the payload
+/// bytes they reference, then releases that space to the writer. Validation
+/// happens afterwards on the Trace worker ([`DrainWorker::ingest_chunk`]), so a
+/// producer is limited by memory bandwidth rather than by per-event checks
+/// and conversion. Nothing copied is trusted: untrusted cursors only bound the
+/// copy (never beyond the Host-known capacity), and any contradiction is
+/// reported by the validator, which then stops the Ring.
+///
+/// Compared with [`DrainWorker::drain_all`], the shared read position advances
+/// before validation. Released space only ever held bytes the Host already
+/// owns; an integrity failure still marks the Ring lost and stops it.
+pub struct CommittedRangeCollector {
+    base: *mut u8,
+    cfg: RingConfig,
+    read_cursor: u64,
+    payload_read_position: u64,
+    stopped: bool,
+}
+// SAFETY: same contract as DrainWorker (single reader per Ring, base valid).
+unsafe impl Send for CommittedRangeCollector {}
+
+impl CommittedRangeCollector {
+    /// # Safety
+    /// `base` は `cfg` 分の共有領域を指し、この値が破棄されるまで有効であること。
+    /// The Ring must start from read position 0 (a fresh incarnation).
+    pub unsafe fn new(base: *mut u8, cfg: RingConfig) -> Self {
+        Self {
+            base,
+            cfg,
+            read_cursor: 0,
+            payload_read_position: 0,
+            stopped: false,
+        }
+    }
+
+    /// Whether a structural contradiction stopped collection.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Stop collecting (for example after the validator stopped the Ring).
+    pub fn stop(&mut self) {
+        self.stopped = true;
+    }
+
+    /// Copy everything committed since the previous call and release it to
+    /// the writer. Returns None when nothing new was committed. Calls
+    /// `notify_space` when space was released and the writer is waiting.
+    pub fn collect(&mut self, notify_space: impl Fn()) -> Option<CommittedChunk> {
+        if self.stopped {
+            return None;
+        }
+        // 1. Commit boundary (pairs with the writer's publication order).
+        let write_cursor = layout::load(self.base, layout::OFF_WRITE_CURSOR, Ordering::Acquire);
+        if write_cursor == self.read_cursor {
+            return None;
+        }
+        let payload_write = layout::load(
+            self.base,
+            layout::OFF_PAYLOAD_WRITE_POSITION,
+            Ordering::Acquire,
+        );
+        let mut control = vec![0u8; layout::CONTROL_SIZE];
+        for off in (0..layout::CONTROL_SIZE).step_by(8) {
+            let v = layout::load(self.base, off, Ordering::Acquire);
+            control[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        control[layout::OFF_WRITE_CURSOR..layout::OFF_WRITE_CURSOR + 8]
+            .copy_from_slice(&write_cursor.to_le_bytes());
+        control[layout::OFF_PAYLOAD_WRITE_POSITION..layout::OFF_PAYLOAD_WRITE_POSITION + 8]
+            .copy_from_slice(&payload_write.to_le_bytes());
+        let mut chunk = CommittedChunk {
+            control,
+            first_cursor: self.read_cursor,
+            descriptors: Vec::new(),
+            payload_position: self.payload_read_position,
+            payload: Vec::new(),
+        };
+        let capacity = self.cfg.descriptor_capacity as u64;
+        let count = match write_cursor.checked_sub(self.read_cursor) {
+            Some(count) if count <= capacity => count,
+            // Contradictory cursors: hand the evidence to the validator.
+            _ => {
+                self.stopped = true;
+                return Some(chunk);
+            }
+        };
+        // 2. Descriptors [read_cursor, write_cursor) in logical order.
+        let bytes = count as usize * 64;
+        chunk.descriptors.reserve_exact(bytes);
+        let start = ((self.read_cursor % capacity) * 64) as usize;
+        let region = capacity as usize * 64;
+        let first = (region - start).min(bytes);
+        // SAFETY: base covers cfg (constructor contract); both pieces lie in
+        // the descriptor region, whose length is the Host-known capacity.
+        unsafe {
+            let src = self.base.add(self.cfg.descriptors_offset());
+            chunk
+                .descriptors
+                .extend_from_slice(std::slice::from_raw_parts(src.add(start), first));
+            chunk
+                .descriptors
+                .extend_from_slice(std::slice::from_raw_parts(src, bytes - first));
+        }
+        // 3. Payload referenced by the copied descriptors: up to the stored
+        // end of the last one. Later payload bytes may belong to a descriptor
+        // that is not committed yet and must not be released.
+        let last = shirusu_transport::EventDescriptor::from_bytes(&chunk.descriptors[bytes - 64..]);
+        let end = last.map(|d| {
+            d.payload_position.saturating_add(if d.payload_dropped() {
+                0
+            } else {
+                d.payload_len as u64
+            })
+        });
+        let payload_capacity = self.cfg.payload_capacity as u64;
+        let payload_end = match end {
+            Some(end)
+                if end >= self.payload_read_position
+                    && end <= payload_write
+                    && end - self.payload_read_position <= payload_capacity =>
+            {
+                end
+            }
+            _ => {
+                // The validator reports the inconsistent descriptor.
+                self.stopped = true;
+                return Some(chunk);
+            }
+        };
+        let span = (payload_end - self.payload_read_position) as usize;
+        if span > 0 {
+            chunk.payload.reserve_exact(span);
+            let region = self.cfg.payload_capacity;
+            let start = (self.payload_read_position % payload_capacity) as usize;
+            let first = (region - start).min(span);
+            // SAFETY: as above, within the payload region of Host-known size.
+            unsafe {
+                let src = self.base.add(self.cfg.payload_offset());
+                chunk
+                    .payload
+                    .extend_from_slice(std::slice::from_raw_parts(src.add(start), first));
+                chunk
+                    .payload
+                    .extend_from_slice(std::slice::from_raw_parts(src, span - first));
+            }
+        }
+        // 4. Release the copied range to the writer.
+        self.read_cursor = write_cursor;
+        self.payload_read_position = payload_end;
+        layout::store(
+            self.base,
+            layout::OFF_PAYLOAD_READ_POSITION,
+            payload_end,
+            Ordering::Release,
+        );
+        layout::store(
+            self.base,
+            layout::OFF_READ_CURSOR,
+            write_cursor,
+            Ordering::Release,
+        );
+        layout::fetch_add(self.base, layout::OFF_HOST_DRAIN_COUNT, 1);
+        if layout::writer_waiting(self.base) {
+            notify_space();
+        }
+        Some(chunk)
+    }
+}
+
 /// Ring 1 本分の Drain Worker。単一読み手を前提とし、複数 Worker で同じ Ring を扱わない。
 ///
 /// 回収は必ず検証付き経路を通る (R2): 共有領域を Host 側バッファへコピーし
@@ -414,6 +586,40 @@ impl DrainWorker {
             integrity_lost: false,
             degraded_seen: 0,
         }
+    }
+    /// Validation-only worker for [`CommittedRangeCollector`] chunks. It never
+    /// touches shared memory: only [`DrainWorker::ingest_chunk`], the
+    /// accounting/finalization methods and `is_stopped` may be used on it.
+    pub fn for_chunks(cfg: RingConfig, expected_generation: u64) -> Self {
+        // SAFETY: a null base is never dereferenced; the shared-memory
+        // methods are not used in chunk mode (see the doc comment).
+        unsafe { Self::new(std::ptr::null_mut(), cfg, expected_generation) }
+    }
+    /// Validate a collected chunk and account for its events exactly like
+    /// `drain_once` does for a validated image (losses, sequence gaps, open
+    /// calls). An integrity failure stops the Ring and returns no events.
+    pub fn ingest_chunk(&mut self, chunk: &CommittedChunk) -> DrainBatch {
+        if self.reader.is_stopped() {
+            return DrainBatch::default();
+        }
+        self.total_bytes_copied += chunk.owned_bytes() as u64;
+        let events = match self.reader.drain_chunk(chunk) {
+            Ok(events) => events,
+            Err(e) => {
+                self.integrity_lost = true;
+                self.loss_events.push(LossEvent::IntegrityLost {
+                    reason: format!("{e:?}"),
+                });
+                return DrainBatch::default();
+            }
+        };
+        let batch = DrainBatch {
+            events,
+            sequence_gaps: self.reader.take_sequence_gaps(),
+            integrity_error: None,
+        };
+        self.process_batch(&batch);
+        batch
     }
     /// CaptureSession writes completion events directly and never consumes the
     /// diagnostic correlated-completion counter. Avoid retaining all closed IDs
@@ -1021,6 +1227,140 @@ mod tests {
             global_order: 0,
         }
     }
+    fn chunk_setup(
+        cfg: RingConfig,
+    ) -> (
+        SharedRegion,
+        shirusu_transport::RingWriter,
+        CommittedRangeCollector,
+        DrainWorker,
+    ) {
+        let region = SharedRegion::new(cfg, 1, 1);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let w = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: std::time::Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        let collector = unsafe { CommittedRangeCollector::new(region.base(), cfg) };
+        (region, w, collector, DrainWorker::for_chunks(cfg, 1))
+    }
+
+    #[test]
+    fn collected_chunks_match_validated_drain_across_wraps() {
+        let cfg = RingConfig::new(16, 512);
+        let (_a, mut wa, mut collector, mut chunked) = chunk_setup(cfg);
+        let (_b, mut wb, mut direct) = setup();
+        let mut via_chunks = Vec::new();
+        let mut via_drain = Vec::new();
+        let mut call = 0u64;
+        for round in 0..40usize {
+            // Varying sizes wrap both regions many times; size 0 has no payload.
+            for i in 0..(round % 7 + 1) {
+                call += 1;
+                let body = vec![(call & 0xff) as u8; (round * 13 + i * 5) % 61];
+                for (w, kind) in [
+                    (&mut wa, EventKind::CallEnter),
+                    (&mut wb, EventKind::CallEnter),
+                ] {
+                    w.write(ev(kind, call, &body));
+                }
+                for w in [&mut wa, &mut wb] {
+                    w.write(ev(EventKind::CallLeave, call, b"r"));
+                }
+            }
+            if let Some(chunk) = collector.collect(|| {}) {
+                via_chunks.extend(chunked.ingest_chunk(&chunk).events);
+            }
+            via_drain.extend(direct.drain_all().events);
+        }
+        assert!(!chunked.is_stopped() && !collector.is_stopped());
+        assert!(
+            via_chunks.len() > 2 * 16 * 4,
+            "must wrap the descriptor region"
+        );
+        // Timestamps come from each writer's own clock read; all else matches.
+        let strip = |events: Vec<ReceivedEvent>| {
+            events
+                .into_iter()
+                .map(|mut e| {
+                    e.descriptor.timestamp_qpc = 0;
+                    e
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(via_chunks), strip(via_drain));
+        assert_eq!(chunked.total_events, direct.total_events);
+        assert_eq!(chunked.open_call_count(), 0);
+        assert_eq!(chunked.loss_events, direct.loss_events);
+        assert!(collector.collect(|| {}).is_none());
+    }
+
+    #[test]
+    fn collector_releases_space_and_dropped_payloads_stay_accounted() {
+        let cfg = RingConfig::new(8, 64);
+        let (region, mut w, mut collector, mut chunked) = chunk_setup(cfg);
+        let (mut written, mut degraded) = (0, 0);
+        for call in 1..=200u64 {
+            // Larger than the payload region: descriptor kept, payload dropped.
+            let body = vec![7u8; if call % 5 == 0 { 100 } else { 20 }];
+            match w.write(ev(EventKind::CallEnter, call, &body)) {
+                shirusu_transport::ring::WriteOutcome::Published { .. } => written += 1,
+                shirusu_transport::ring::WriteOutcome::PublishedDegraded { .. } => {
+                    written += 1;
+                    degraded += 1;
+                }
+                _ => {}
+            }
+            if let Some(chunk) = collector.collect(|| {}) {
+                chunked.ingest_chunk(&chunk);
+            }
+        }
+        assert!(!chunked.is_stopped());
+        assert_eq!(chunked.total_events, written);
+        assert_eq!(written, 200, "collection must keep releasing space");
+        assert_eq!(degraded, 40);
+        assert_eq!(chunked.degraded_seen, 40);
+        assert_eq!(
+            layout::load(region.base(), layout::OFF_READ_CURSOR, Ordering::Acquire),
+            layout::load(region.base(), layout::OFF_WRITE_CURSOR, Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn corrupted_chunk_stops_validation_without_events() {
+        let cfg = RingConfig::new(16, 512);
+        let (_r, mut w, mut collector, mut chunked) = chunk_setup(cfg);
+        w.write(ev(EventKind::CallEnter, 1, b"abc"));
+        let good = collector.collect(|| {}).unwrap();
+        // Each kind of tampering is rejected on its own.
+        let mut wrong_len = good.clone();
+        wrong_len.payload.pop();
+        let mut wrong_start = good.clone();
+        wrong_start.first_cursor = 1;
+        let mut bad_desc = good.clone();
+        bad_desc.descriptors[4] ^= 0xff; // payload_len
+        let mut extra = good.clone();
+        extra.payload.extend_from_slice(b"zz");
+        for bad in [wrong_len, wrong_start, bad_desc, extra] {
+            let mut v = DrainWorker::for_chunks(cfg, 1);
+            assert!(v.ingest_chunk(&bad).events.is_empty());
+            assert!(v.is_stopped() && v.integrity_lost);
+            assert!(
+                v.ingest_chunk(&good).events.is_empty(),
+                "stopped stays stopped"
+            );
+        }
+        assert_eq!(chunked.ingest_chunk(&good).events.len(), 1);
+        // Replaying an old chunk breaks continuity.
+        assert!(chunked.ingest_chunk(&good).events.is_empty());
+        assert!(chunked.is_stopped());
+    }
+
     #[test]
     fn enter_leave_pairing_and_unknown_termination() {
         let (_rg, mut w, mut host) = setup();

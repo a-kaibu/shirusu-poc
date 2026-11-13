@@ -117,7 +117,8 @@ foreach ($workload in @("gui", "high-load")) {
     $baselineNs = Median @($baseline | ForEach-Object { $_.elapsed_ns })
     $captureNs = Median @($captured | ForEach-Object { $_.elapsed_ns })
     $ratio = $captureNs / $baselineNs
-    $limit = if ($workload -eq "gui") { 3.0 } else { 5.0 }
+    # Both workloads target 3x (high-load raised from 5x on 2026-11-13).
+    $limit = 3.0
     $complete = @($captured | Where-Object { $_.integrity.status -ne "complete" -or -not $_.integrity.finalized_cleanly }).Count -eq 0
     $results += [ordered]@{
         workload = $workload; baseline_median_ns = $baselineNs; captured_median_ns = $captureNs

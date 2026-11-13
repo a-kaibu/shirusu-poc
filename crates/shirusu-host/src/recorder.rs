@@ -20,8 +20,8 @@
 
 use crate::trace_convert::{RecordMode, TraceBatchContext, TraceRecorder};
 pub use crate::trace_pipeline::HostPipelineStats;
-use crate::trace_pipeline::TracePipeline;
-use crate::{DrainWorker, IntegrityLevel, IntegrityReport};
+use crate::trace_pipeline::{SharedDrainWorker, TracePipeline};
+use crate::{CommittedRangeCollector, DrainWorker, IntegrityLevel, IntegrityReport};
 use shirusu_hook::api as hook_api;
 use shirusu_hook::callback as hook_callback;
 use shirusu_hook::com as hook_com;
@@ -208,7 +208,11 @@ struct RingEndpoint {
     mapping: RingMapping,
     /// space_available 通知（Host → Agent）。回収で空きができたら鳴らす。
     space_notify: Option<std::sync::Arc<shirusu_transport_win::RingNotify>>,
-    worker: Option<DrainWorker>,
+    /// Validation state of the current incarnation. The Trace worker validates
+    /// collected chunks with it; read it here only after a pipeline barrier.
+    worker: Option<SharedDrainWorker>,
+    /// Copy-and-release collection of the current incarnation.
+    collector: Option<CommittedRangeCollector>,
     /// 現在の Worker が対象としている Slot 世代 (レビュー #6 P1-4)。
     /// 初めは `spec.expected_generation`。Agent が Slot を回収して
     /// 別のスレッドが同じ Mapping を再初期化すると Control の世代が
@@ -396,9 +400,14 @@ fn retire_ring_worker(
     coverage_missing_calls: u64,
     ring: &mut RingEndpoint,
 ) -> Result<(), SessionError> {
-    let Some(mut worker) = ring.worker.take() else {
+    let Some(shared) = ring.worker.take() else {
         return Ok(());
     };
+    ring.collector = None;
+    // Every chunk collected from this incarnation must be validated first.
+    recorder.barrier()?;
+    let mut worker = lock_worker(&shared);
+    ring.events += worker.total_events;
     let _ = worker.finalize_thread();
     retired_reports
         .push(worker.integrity_report(coverage_missing_calls, ring.stopped || worker.is_stopped()));
@@ -414,6 +423,14 @@ fn retire_ring_worker(
         Ordering::Acquire,
     );
     Ok(())
+}
+
+fn lock_worker(worker: &SharedDrainWorker) -> std::sync::MutexGuard<'_, DrainWorker> {
+    // A panic while validating leaves no half-applied state that matters
+    // here: the pipeline worker failure itself forbids Finalization.
+    worker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub struct CaptureSession {
@@ -473,8 +490,8 @@ impl CaptureSession {
             )));
         }
         config.environment.capture_config.push_str(&format!(
-            "; host_pipeline=async-fifo; host_queue_commands={}; host_event_compression=backlog-adaptive; ring_descriptors={}; ring_payload_bytes={}",
-            crate::trace_pipeline::QUEUED_BATCHES,
+            "; host_pipeline=copy-release-then-validate; host_queue_bytes={}; host_event_compression=backlog-adaptive; ring_descriptors={}; ring_payload_bytes={}",
+            crate::trace_pipeline::QUEUE_BYTE_BUDGET,
             config.ring_config.descriptor_capacity,
             config.ring_config.payload_capacity,
         ));
@@ -682,6 +699,7 @@ impl CaptureSession {
             mapping,
             space_notify,
             worker: None,
+            collector: None,
             stopped: false,
             events: 0,
         });
@@ -736,16 +754,10 @@ impl CaptureSession {
                     stats.pending_rings += 1;
                     continue;
                 }
-                // SAFETY: mapping は RingConfig 分の共有領域を指し、
-                // セッションの存続期間中有効（add_ring の契約）。
-                let mut worker = unsafe {
-                    DrainWorker::new(
-                        ring.mapping.base(),
-                        self.config.ring_config,
-                        ring.generation,
-                    )
-                }
-                .without_completion_history();
+                // Validation runs on the Trace worker from copied chunks; it
+                // never reads the shared mapping.
+                let mut worker = DrainWorker::for_chunks(self.config.ring_config, ring.generation)
+                    .without_completion_history();
                 // L11: セッション設定で Descriptor の global_order 検証を決める。
                 worker.set_global_order(self.config.order_global);
                 // This pipeline transfers each validated payload with its event;
@@ -753,28 +765,32 @@ impl CaptureSession {
                 // opt-in diagnostic key history: it would retain one unused key
                 // per payload for the entire Ring lifetime. Event context and
                 // generation validation remain independent of that history.
-                ring.worker = Some(worker);
+                ring.worker = Some(std::sync::Arc::new(std::sync::Mutex::new(worker)));
+                // SAFETY: mapping は RingConfig 分の共有領域を指し、
+                // セッションの存続期間中有効（add_ring の契約）。新しい
+                // incarnation は読み位置 0 から始まる。
+                ring.collector = Some(unsafe {
+                    CommittedRangeCollector::new(ring.mapping.base(), self.config.ring_config)
+                });
             }
-            let worker = ring.worker.as_mut().expect("worker just ensured");
-            if worker.is_stopped() {
+            let shared = ring.worker.as_ref().expect("worker just ensured");
+            let collector = ring.collector.as_mut().expect("collector just ensured");
+            if !collector.is_stopped() && lock_worker(shared).is_stopped() {
+                // The validator rejected an earlier chunk: stop releasing space.
+                collector.stop();
+            }
+            if collector.is_stopped() {
                 ring.stopped = true;
                 stats.stopped_rings += 1;
                 continue;
             }
-            let batch = match &ring.space_notify {
-                Some(notify) => {
-                    let notify = std::sync::Arc::clone(notify);
-                    worker.drain_all_with_space_notify(move || {
-                        let _ = notify.notify_space();
-                    })
-                }
-                None => worker.drain_all(),
+            let chunk = match &ring.space_notify {
+                Some(notify) => collector.collect(|| {
+                    let _ = notify.notify_space();
+                }),
+                None => collector.collect(|| {}),
             };
-            if worker.is_stopped() {
-                ring.stopped = true;
-                stats.stopped_rings += 1;
-            }
-            if !batch.events.is_empty() {
+            if let Some(chunk) = chunk {
                 let ctx = TraceBatchContext {
                     session_id: self.config.session_id,
                     process_id: ring.spec.process_id,
@@ -782,13 +798,13 @@ impl CaptureSession {
                     thread_id: ring.trace_thread_id,
                     qpc_frequency: self.config.qpc_frequency,
                 };
-                let event_count = batch.events.len();
-                self.recorder
-                    .record_owned_batch_with_args(&ctx, batch.events)?;
-                ring.events += event_count as u64;
-                stats.events += event_count;
+                stats.events += chunk.descriptor_count();
+                self.recorder.record_chunk(&ctx, shared, chunk)?;
             }
-            if ring.worker.as_ref().is_some_and(|w| !w.is_stopped()) {
+            if collector.is_stopped() {
+                ring.stopped = true;
+                stats.stopped_rings += 1;
+            } else {
                 stats.active_rings += 1;
             }
         }
@@ -811,6 +827,8 @@ impl CaptureSession {
                 op: "stop",
             });
         }
+        // Every collected chunk must be validated before reading the workers.
+        self.recorder.barrier()?;
         let mut reports = Vec::new();
         // 世代交代で確定済みの旧 Worker 分も集計へ含める (P1-4)。
         let mut total_loss_records = self.retired_loss_records;
@@ -818,10 +836,13 @@ impl CaptureSession {
         let mut rings_never = 0usize;
         let mut rings_stopped = 0usize;
         for ring in &mut self.rings {
-            let Some(worker) = ring.worker.as_mut() else {
+            let Some(shared) = ring.worker.as_ref() else {
                 rings_never += 1;
                 continue;
             };
+            let mut worker = lock_worker(shared);
+            ring.events += worker.total_events;
+            ring.stopped |= ring.collector.as_ref().is_some_and(|c| c.is_stopped());
             rings_active += 1;
             if ring.stopped || worker.is_stopped() {
                 rings_stopped += 1;

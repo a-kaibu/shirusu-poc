@@ -310,6 +310,33 @@ pub fn decode_payload(
     Ok(out)
 }
 
+/// Committed Ring contents copied by the Host's collection thread, validated
+/// later by [`ValidatingReader::drain_chunk`]. Nothing here is trusted yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommittedChunk {
+    /// Control area words read after the write cursor, with the write cursor
+    /// and payload write position fixed to the values the copy used.
+    pub control: Vec<u8>,
+    /// Cursor of the first copied descriptor.
+    pub first_cursor: u64,
+    /// Descriptors `[first_cursor, first_cursor + n)` in logical order (64 B each).
+    pub descriptors: Vec<u8>,
+    /// Logical payload position of `payload[0]`.
+    pub payload_position: u64,
+    /// Payload bytes referenced by the copied descriptors, in logical order.
+    pub payload: Vec<u8>,
+}
+
+impl CommittedChunk {
+    pub fn descriptor_count(&self) -> usize {
+        self.descriptors.len() / 64
+    }
+    /// Approximate owned bytes (for queue budgets).
+    pub fn owned_bytes(&self) -> usize {
+        self.control.len() + self.descriptors.len() + self.payload.len()
+    }
+}
+
 /// 共有メモリ像（バイト列）を読む検証付きリーダー。
 /// 一度検証した値はコピーだけを使い、像を読み直さない。
 pub struct ValidatingReader {
@@ -398,6 +425,133 @@ impl ValidatingReader {
             self.stopped = true; // 矛盾を見つけたらその Ring を止める
         }
         result
+    }
+    /// Validate a [`CommittedChunk`] copied by the Host's collection thread.
+    ///
+    /// The chunk holds the committed descriptors from this reader's cursor in
+    /// logical order and the payload bytes they reference, starting at this
+    /// reader's payload position. The checks are those of `drain_image`:
+    /// control snapshot (magic, cursor pairs, monotonic positions and loss
+    /// counters, generation), descriptor kind/length/sequence/contiguity, and
+    /// payload bounds. Payload ranges must lie inside the copied bytes, which
+    /// is stricter than the shared write position. A contradiction stops the
+    /// Ring as `drain_image` does.
+    pub fn drain_chunk(
+        &mut self,
+        chunk: &CommittedChunk,
+    ) -> Result<Vec<crate::ring::ReceivedEvent>, IntegrityError> {
+        if self.stopped {
+            return Err(IntegrityError::RingStopped);
+        }
+        let result = self.drain_chunk_inner(chunk);
+        if result.is_err() {
+            self.stopped = true;
+        }
+        result
+    }
+    fn drain_chunk_inner(
+        &mut self,
+        chunk: &CommittedChunk,
+    ) -> Result<Vec<crate::ring::ReceivedEvent>, IntegrityError> {
+        if self.known.mapping_len < self.known.ring_cfg().required_len() {
+            return Err(IntegrityError::ImageTooSmall);
+        }
+        let snap = validate_control(&chunk.control, &self.known, self.prev.as_ref())?;
+        if snap.generation != self.expected_generation {
+            return Err(IntegrityError::GenerationMismatch {
+                expected: self.expected_generation,
+                found: snap.generation,
+            });
+        }
+        self.prev = Some(snap);
+        if chunk.first_cursor != self.read_cursor
+            || chunk.payload_position != self.payload_read_position
+        {
+            return Err(IntegrityError::CursorRegressed {
+                which: "chunk does not continue the host read position",
+            });
+        }
+        if !chunk.descriptors.len().is_multiple_of(64) {
+            return Err(IntegrityError::ImageTooSmall);
+        }
+        let count = (chunk.descriptors.len() / 64) as u64;
+        let end_cursor = self
+            .read_cursor
+            .checked_add(count)
+            .ok_or(IntegrityError::PayloadRangeInvalid)?;
+        if count > self.known.descriptor_capacity || end_cursor > snap.write_cursor {
+            return Err(IntegrityError::CursorRegressed {
+                which: "chunk beyond committed descriptors",
+            });
+        }
+        if chunk.payload.len() as u64 > self.known.payload_capacity {
+            return Err(IntegrityError::PayloadRangeInvalid);
+        }
+        let payload_end = chunk
+            .payload_position
+            .checked_add(chunk.payload.len() as u64)
+            .ok_or(IntegrityError::PayloadRangeInvalid)?;
+        if payload_end > snap.payload_write_position {
+            return Err(IntegrityError::PayloadPositionOutOfRange {
+                position: chunk.payload_position,
+                end: payload_end,
+                write_position: snap.payload_write_position,
+            });
+        }
+        if count == 0 && !chunk.payload.is_empty() {
+            return Err(IntegrityError::PayloadRangeInvalid);
+        }
+        let mut events = Vec::with_capacity(count as usize);
+        for bytes in chunk.descriptors.chunks_exact(64) {
+            let expectation = DescriptorExpectation {
+                sequence_at_least: self.expected_sequence,
+                payload_position: self.expected_payload_position,
+                // Only bytes copied into this chunk may be referenced.
+                payload_write_position: payload_end,
+            };
+            let desc = decode_descriptor_checked(
+                bytes,
+                &self.known,
+                &expectation,
+                self.allow_global_order,
+            )?;
+            if desc.sequence > self.expected_sequence {
+                self.sequence_gaps += desc.sequence - self.expected_sequence;
+            }
+            if desc.sequence >= self.expected_sequence {
+                self.expected_sequence = desc.sequence + 1;
+            }
+            let stored = stored_payload_len(&desc);
+            if desc.payload_position < chunk.payload_position {
+                return Err(IntegrityError::PayloadPositionNotContiguous {
+                    expected: chunk.payload_position,
+                    found: desc.payload_position,
+                });
+            }
+            let stored_end = desc.payload_position + stored;
+            let payload = if stored == 0 {
+                Vec::new()
+            } else {
+                let start = (desc.payload_position - chunk.payload_position) as usize;
+                chunk.payload[start..start + stored as usize].to_vec()
+            };
+            self.expected_payload_position = Some(stored_end);
+            self.payload_read_position = stored_end;
+            events.push(crate::ring::ReceivedEvent {
+                descriptor: desc,
+                payload,
+            });
+        }
+        self.read_cursor = end_cursor;
+        // Any copied payload beyond the last descriptor belongs to a descriptor
+        // that was not yet committed; the collector must not have released it.
+        if self.payload_read_position != payload_end && count > 0 {
+            return Err(IntegrityError::PayloadPositionNotContiguous {
+                expected: payload_end,
+                found: self.payload_read_position,
+            });
+        }
+        Ok(events)
     }
     /// Host 再起動時の引き継ぎ: 共有側の read_cursor / payload_read_position
     /// を正として、検証状態 (Cursor・Sequence・Payload 位置の期待値) を同期

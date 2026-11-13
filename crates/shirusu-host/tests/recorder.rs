@@ -137,7 +137,8 @@ fn full_capture_in_process_produces_decodable_trace() {
     assert_eq!(summary.rings_stopped, 0);
     assert_eq!(summary.args_attached, 6);
     assert_eq!(summary.host_pipeline.events_received, summary.total_events);
-    assert_eq!(summary.host_pipeline.commands_processed, 1);
+    // One Events command plus the final validation barrier.
+    assert_eq!(summary.host_pipeline.commands_processed, 2);
     assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
 
     let bytes = std::fs::read(&path).unwrap();

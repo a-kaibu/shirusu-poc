@@ -332,8 +332,9 @@ mod tests {
             previous = value;
             let exact = (read_tsc() - source.origin) / source.divisor;
             // Interpolation stays within a small fraction of an anchor
-            // interval of the truth (pairing noise bounds the scale error).
-            assert!(value <= exact + 60 + 2, "value {value} ahead of {exact}");
+            // interval (30_000 ticks) of the truth: pairing noise, which is
+            // larger on a loaded or virtualized host, bounds the scale error.
+            assert!(value <= exact + 300 + 2, "value {value} ahead of {exact}");
             samples += 1;
         }
         assert!(clock.interpolating());

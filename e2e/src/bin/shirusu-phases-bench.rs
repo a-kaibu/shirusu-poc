@@ -8,7 +8,7 @@ use shirusu_hook::{
 };
 use shirusu_host::{
     trace_convert::{TraceBatchContext, TraceRecorder},
-    DrainWorker,
+    CommittedRangeCollector, DrainWorker,
 };
 use shirusu_trace::proto::{CaptureEnvironment, SessionMetadata};
 use shirusu_transport::{
@@ -212,7 +212,10 @@ fn main() {
     // SAFETY: Agent owns this registered ring until after worker is dropped;
     // only this thread produces and this worker consumes it.
     let base = unsafe { agent.thread_region_base(1) }.unwrap();
-    let mut worker = unsafe { DrainWorker::new(base, cfg, 1) };
+    // Production path: the collection thread copies and releases committed
+    // contents; the Trace worker validates them before conversion.
+    let mut collector = unsafe { CommittedRangeCollector::new(base, cfg) };
+    let mut worker = DrainWorker::for_chunks(cfg, 1);
     for (owned, calls) in [false, true]
         .into_iter()
         .flat_map(|owned| [64usize, 512, 1536].map(|calls| (owned, calls)))
@@ -223,6 +226,7 @@ fn main() {
             2 * calls
         );
         let mut produce = Vec::new();
+        let mut collect = Vec::new();
         let mut drain = Vec::new();
         let mut convert = Vec::new();
         let mut release = Vec::new();
@@ -258,7 +262,11 @@ fn main() {
             }
             produce.push(start.elapsed().as_nanos() as f64 / (2 * calls) as f64);
             let start = Instant::now();
-            let mut batch = worker.drain_all();
+            let chunk = collector.collect(|| {}).expect("committed events");
+            collect.push(start.elapsed().as_nanos() as f64 / (2 * calls) as f64);
+            let start = Instant::now();
+            let mut batch = worker.ingest_chunk(&chunk);
+            drop(chunk);
             drain.push(start.elapsed().as_nanos() as f64 / (2 * calls) as f64);
             assert_eq!(batch.events.len(), 2 * calls);
             assert!(!worker.integrity_lost);
@@ -283,7 +291,12 @@ fn main() {
             "event",
         );
         report(
-            &format!("host_drain_batch_{}", 2 * calls),
+            &format!("host_collect_release_batch_{}", 2 * calls),
+            &mut collect,
+            "event",
+        );
+        report(
+            &format!("host_validate_batch_{}", 2 * calls),
             &mut drain,
             "event",
         );
