@@ -83,6 +83,7 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
                     TypedValue::Str(v) => v.clone(),
                     _ => return Err("filename is not text".into()),
                 };
+                validate_regular_file_path(&path)?;
                 let disposition = number(enter, "dwCreationDisposition")?;
                 let access = number(enter, "dwDesiredAccess")?;
                 let flags = number(enter, "dwFlagsAndAttributes")?;
@@ -227,6 +228,67 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
         steps,
         rules: vec![],
     })
+}
+
+/// Path remapping only models ordinary file bytes. Device/stream/network
+/// namespaces and Win32 normalization are not reproduced by a fresh local file.
+/// This rejects known incompatible spellings, not an attestation about reparse
+/// points or filesystem state that was never captured.
+fn validate_regular_file_path(path: &str) -> Result<(), String> {
+    let unsupported = || {
+        "replay requires an ordinary file path; device, network, stream and normalized-name semantics are unsupported".to_string()
+    };
+    let normalized = path.replace('/', "\\");
+    if normalized.is_empty()
+        || normalized.starts_with("\\\\")
+        || normalized
+            .chars()
+            .any(|c| c <= '\u{1f}' || "<>\"|?*".contains(c))
+    {
+        return Err(unsupported());
+    }
+    let rest = if normalized.as_bytes().get(1) == Some(&b':') {
+        if !normalized.as_bytes()[0].is_ascii_alphabetic()
+            || normalized.as_bytes().get(2) != Some(&b'\\')
+        {
+            return Err(unsupported());
+        }
+        &normalized[3..]
+    } else {
+        normalized.as_str()
+    };
+    if rest.is_empty() || rest.contains(':') || rest.ends_with('\\') {
+        return Err(unsupported());
+    }
+    for component in rest.split('\\').filter(|s| !s.is_empty()) {
+        if component.ends_with(['.', ' ']) {
+            return Err(unsupported());
+        }
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ');
+        let upper = stem.to_ascii_uppercase();
+        let numbered_device = upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            });
+        if numbered_device
+            || matches!(
+                upper.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+            )
+        {
+            return Err(unsupported());
+        }
+    }
+    Ok(())
 }
 
 /// A conservative file dependency slice, not an execution-verified minimum.

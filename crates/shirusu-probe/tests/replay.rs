@@ -950,3 +950,69 @@ fn grouped_reduction_checks_overlapping_windows_without_removing_prerequisites()
     assert_eq!(result.replay.target_replay_step, 4);
     assert!(result.single_deletion_fixed_point);
 }
+
+#[test]
+fn replay_does_not_remap_special_windows_paths_to_ordinary_files() {
+    use shirusu_trace::{
+        compact::{decode_values, encode_values},
+        schema::Ty,
+    };
+    let with_path = |path: &str| {
+        let mut trace = record(1, 42);
+        let types = [
+            Ty::Str16,
+            Ty::U32,
+            Ty::U32,
+            Ty::U64,
+            Ty::U32,
+            Ty::U32,
+            Ty::U64,
+        ];
+        for batch in &mut trace.batches {
+            for event in &mut batch.events {
+                // The fixture's first and fourth calls open the same file.
+                if event.kind == 1 && (event.sequence == 1 || event.sequence == 7) {
+                    let mut values = decode_values(&types, event.args.as_ref().unwrap()).unwrap();
+                    values[0].value = V::Str16(path.encode_utf16().collect());
+                    event.args = Some(encode_values(&types, &values).unwrap());
+                }
+            }
+        }
+        trace
+    };
+    for path in [
+        "NUL",
+        "nul.txt",
+        r"C:\private\CON .txt",
+        "COM1",
+        "lpt9.log",
+        "COM¹",
+        "CONIN$",
+        r"\\.\pipe\example",
+        r"\\?\C:\original.bin",
+        r"\\server\share\original.bin",
+        r"C:\original.bin:stream",
+        "file::$DATA",
+        "original.bin.",
+        "original.bin ",
+        "C:original.bin",
+        "file\0suffix",
+        "",
+        "../original.bin",
+        "C:/private/NUL",
+        r"C:\private\AUX\original.bin",
+    ] {
+        let error = generate_replay(&with_path(path)).unwrap_err();
+        assert!(error.contains("ordinary file path"), "{path:?}: {error}");
+    }
+    for path in [
+        r"C:\private\original.bin",
+        "original.bin",
+        "C:/private/original.bin",
+        "nulled.bin",
+        "com10.bin",
+        "日本語.bin",
+    ] {
+        assert!(generate_replay(&with_path(path)).is_ok(), "{path:?}");
+    }
+}

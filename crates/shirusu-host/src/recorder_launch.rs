@@ -40,7 +40,7 @@ use shirusu_hook::pe;
 use shirusu_transport::EXPANDED_SLOT_GENERATION;
 use shirusu_transport_win as win;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
@@ -518,6 +518,7 @@ impl TreeCapture {
         mut self,
         poll_interval: Duration,
     ) -> Result<TreeSummary, SessionError> {
+        let mut last_scan: Option<Instant> = None;
         loop {
             // 終了した子を回収して Trace を閉じる
             let mut i = 0;
@@ -532,23 +533,37 @@ impl TreeCapture {
                 }
             }
             let root_exited = self.root.target_exited()?;
-            match self.scan_once() {
-                Ok(()) => self.scan_failures = 0,
-                Err(e) => {
-                    self.scan_failures += 1;
-                    if self.scan_failures >= MAX_CONSECUTIVE_SCAN_FAILURES {
-                        return Err(e);
+            // An active Ring should not force a process-wide discovery scan
+            // on every drain. Keep discovery at its existing polling cadence,
+            // but always perform the final sweep before declaring completion.
+            if last_scan.is_none_or(|scan| scan.elapsed() >= poll_interval)
+                || (root_exited && self.children.is_empty())
+            {
+                match self.scan_once() {
+                    Ok(()) => self.scan_failures = 0,
+                    Err(e) => {
+                        self.scan_failures += 1;
+                        if self.scan_failures >= MAX_CONSECUTIVE_SCAN_FAILURES {
+                            return Err(e);
+                        }
                     }
                 }
+                last_scan = Some(Instant::now());
             }
-            self.root.session().poll_once()?;
+            let mut active = self.root.session().poll_once()?.events != 0;
             for child in &mut self.children {
-                child.session().poll_once()?;
+                active |= child.session().poll_once()?.events != 0;
             }
-            if root_exited && self.children.is_empty() {
+            // A failed final discovery sweep is not evidence that no live
+            // descendants remain. Retry under the existing bounded failure policy.
+            if root_exited && self.children.is_empty() && self.scan_failures == 0 {
                 break;
             }
-            std::thread::sleep(poll_interval);
+            // Visit every captured process once before the next sweep. As in
+            // single-process capture, only idle sweeps need the polling delay.
+            if !active {
+                std::thread::sleep(poll_interval);
+            }
         }
         self.finish()
     }
