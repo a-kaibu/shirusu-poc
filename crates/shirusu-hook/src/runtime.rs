@@ -481,8 +481,27 @@ impl Drop for DetourFlight {
 // Exhaustion refuses publication rather than wrapping into an old TLS identity.
 static NEXT_RUNTIME_REVISION: AtomicU64 = AtomicU64::new(1);
 thread_local! {
+    static RUNTIME_CACHE_BUSY: Cell<bool> = const { Cell::new(false) };
     static DETOUR_RUNTIME: RefCell<(u64, Weak<HookRuntime>)> =
         const { RefCell::new((0, Weak::new())) };
+}
+
+// Rust registers a destructor on first access to the Weak-bearing TLS key.
+// That registration can allocate and enter HeapAlloc's detour before the
+// RefCell borrow exists. Guard the *TLS access*, not just its contents.
+struct RuntimeCacheAccess;
+impl RuntimeCacheAccess {
+    fn enter() -> Option<Self> {
+        RUNTIME_CACHE_BUSY
+            .try_with(|busy| if busy.replace(true) { None } else { Some(Self) })
+            .ok()
+            .flatten()
+    }
+}
+impl Drop for RuntimeCacheAccess {
+    fn drop(&mut self) {
+        let _ = RUNTIME_CACHE_BUSY.try_with(|busy| busy.set(false));
+    }
 }
 
 pub struct RuntimeSlot {
@@ -554,7 +573,10 @@ impl RuntimeSlot {
         // acquires ownership before use; there are no borrowed atomic pointers.
         // An entry concurrent with replacement may still take the old runtime,
         // whose recording gate is disabled before unregister publishes retirement.
-        if ReentrancyGuard::is_active() {
+        if let Some(_access) = ReentrancyGuard::is_active()
+            .then(RuntimeCacheAccess::enter)
+            .flatten()
+        {
             if let Ok(Some(rt)) = DETOUR_RUNTIME.try_with(|cache| {
                 let mut cache = cache.try_borrow_mut().ok()?;
                 let revision = self.revision.load(Ordering::Acquire);
@@ -1629,6 +1651,21 @@ mod tests {
         assert!(rt.wait_in_flight_drained(Duration::from_secs(5)));
         holder.join().unwrap();
         assert_eq!(rt.in_flight(), 0);
+    }
+
+    #[test]
+    fn runtime_tls_registration_reentry_uses_passthrough_snapshot() {
+        let _guard = ReentrancyGuard::try_enter().unwrap();
+        let slot = RuntimeSlot::new();
+        let (_, rt) = runtime();
+        let rt = Arc::new(rt);
+        assert!(slot.register(rt.clone()).is_ok());
+        let access = RuntimeCacheAccess::enter().unwrap();
+        assert!(RuntimeCacheAccess::enter().is_none());
+        // Models a detoured allocation while the TLS destructor is registered.
+        assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &rt));
+        drop(access);
+        assert!(RuntimeCacheAccess::enter().is_some());
     }
 
     #[test]
