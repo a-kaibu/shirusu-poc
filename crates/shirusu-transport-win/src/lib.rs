@@ -687,6 +687,15 @@ mod imp {
     /// 対象プロセスで `start(param)` をリモートスレッドで実行し、戻り値
     /// （スレッド終了コード）を返す。30 秒で打ち切る。
     pub fn remote_call(process: HandleValue, start: usize, param: usize) -> Result<u32> {
+        remote_call_with_timeout(process, start, param, Duration::from_secs(30))
+    }
+
+    fn remote_call_with_timeout(
+        process: HandleValue,
+        start: usize,
+        param: usize,
+        timeout: Duration,
+    ) -> Result<u32> {
         use windows_sys::Win32::System::Threading::{
             CreateRemoteThread, GetExitCodeThread, LPTHREAD_START_ROUTINE,
         };
@@ -708,7 +717,7 @@ mod imp {
         if thread.is_null() {
             return Err(last_err("CreateRemoteThread"));
         }
-        let waited = unsafe { WaitForSingleObject(thread, 30_000) };
+        let waited = unsafe { WaitForSingleObject(thread, super::wait_timeout_millis(timeout)) };
         if waited != 0 {
             unsafe { CloseHandle(thread) };
             return Err(WinError::RemoteCallPending {
@@ -729,6 +738,14 @@ mod imp {
     /// LoadLibraryW アドレスが対象でも有効。同一ブート・同一
     /// ビットネスの system DLL はプロセス間で同じベースを持つ）。
     pub fn remote_load_library(process: HandleValue, dll_path: &str) -> Result<()> {
+        remote_load_library_with_call(process, dll_path, remote_call)
+    }
+
+    fn remote_load_library_with_call(
+        process: HandleValue,
+        dll_path: &str,
+        call: impl FnOnce(HandleValue, usize, usize) -> Result<u32>,
+    ) -> Result<()> {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
         use windows_sys::Win32::System::Memory::{
             VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -762,7 +779,7 @@ mod imp {
                     code: 0,
                 });
             };
-            let code = remote_call(process, load as usize, remote as usize)?;
+            let code = call(process, load as usize, remote as usize)?;
             if code == 0 {
                 return Err(WinError::OsError {
                     api: "LoadLibraryW(remote) returned NULL",
@@ -881,6 +898,79 @@ mod imp {
             return Err(last_err("TerminateProcess"));
         }
         Ok(())
+    }
+    #[cfg(test)]
+    mod remote_parameter_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        #[test]
+        fn timed_out_load_keeps_parameter_for_delayed_native_reader() {
+            static GATE: AtomicUsize = AtomicUsize::new(0);
+            static DONE: AtomicUsize = AtomicUsize::new(0);
+            static OBSERVED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+            unsafe extern "system" fn delayed_read(parameter: *mut c_void) -> u32 {
+                let waited = unsafe { WaitForSingleObject(h(GATE.load(Ordering::SeqCst)), 5_000) };
+                if waited == 0 {
+                    let mut first = [0u8; 2];
+                    // ReadProcessMemory reports a freed allocation without
+                    // deliberately crashing the test process on an invalid read.
+                    if read_process_memory(
+                        unsafe { hv(GetCurrentProcess()) },
+                        parameter as usize,
+                        first.as_mut_ptr(),
+                        first.len(),
+                    )
+                    .is_ok()
+                    {
+                        OBSERVED.store(u16::from_le_bytes(first) as u32, Ordering::SeqCst);
+                    }
+                }
+                unsafe { SetEvent(h(DONE.load(Ordering::SeqCst))) };
+                1
+            }
+
+            let process = unsafe { hv(GetCurrentProcess()) };
+            let gate = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            let done = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            assert!(!gate.is_null() && !done.is_null());
+            GATE.store(hv(gate), Ordering::SeqCst);
+            DONE.store(hv(done), Ordering::SeqCst);
+            let mut parameter = 0;
+            let result = remote_load_library_with_call(process, "Q-test.dll", |process, _, ptr| {
+                parameter = ptr;
+                remote_call_with_timeout(
+                    process,
+                    delayed_read as *const () as usize,
+                    ptr,
+                    Duration::ZERO,
+                )
+            });
+            // The thread cannot complete before this signal, irrespective of
+            // scheduler speed. Its delayed read happens after the timeout path.
+            unsafe { SetEvent(gate) };
+            let finished = unsafe { WaitForSingleObject(done, 5_000) } == 0;
+            let observed = OBSERVED.load(Ordering::SeqCst);
+            if finished {
+                // The callback has finished using parameter before signaling.
+                remote_free(process, parameter);
+                unsafe {
+                    CloseHandle(gate);
+                    CloseHandle(done);
+                }
+            } // On failure retain resources rather than close a live wait.
+            assert!(matches!(
+                result,
+                Err(WinError::RemoteCallPending { wait_status: 0x102 })
+            ));
+            assert!(finished, "native reader did not finish");
+            assert_eq!(
+                observed,
+                u32::from(b'Q'),
+                "parameter was freed before the late read"
+            );
+        }
     }
 }
 
