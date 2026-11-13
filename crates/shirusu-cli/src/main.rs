@@ -1663,9 +1663,8 @@ fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
         durability: Durability::Buffered,
         order_global: req.order_global,
         // L07: Runtime 独自の API を記録するか（既定は記録しない）。
-        // L23: フック時の呼び出し元分類による強制を実装済み
-        // （Bootstrap v5 で Agent DLL へ伝え、Detour の入口で Runtime
-        // からの呼び出しを記録しない。呼び出し元不明時は記録する）。
+        // Bootstrap v5 で Agent DLL へ伝え、Runtime 自身の API を
+        // 呼び出し先で判定する。Runtime から Windows API への呼び出しは記録する。
         record_runtime_apis: req.record_runtime_apis,
         // L02: 診断用の追加 QueryInterface を有効にするか
         // （既定は無効。Bootstrap v6 で Agent DLL へ伝える）。

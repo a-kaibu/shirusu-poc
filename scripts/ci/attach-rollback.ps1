@@ -2,10 +2,13 @@ param([ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")][string]$Ta
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "native-step.ps1")
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+Set-Location $repo
 $arch = if ($Target -eq "i686-pc-windows-msvc") { "x86" } else { "x64" }
 $bin = Join-Path $repo "target\$Target\debug"
 $cli = Join-Path $bin "shirusu.exe"
 $dll = Join-Path $bin "shirusu_agent_dll.dll"
+Invoke-Native { cargo build -p shirusu-e2e --target $Target --bin shirusu-capture-drop-e2e } "capture abandonment helper ($arch)"
+$dropHelper = Join-Path $bin "shirusu-capture-drop-e2e.exe"
 $work = Join-Path $repo ("target\attach-rollback-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory $work | Out-Null
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -41,6 +44,11 @@ try {
             throw "attach failure did not confirm rollback: $failure"
         }
         if ($targetProcess.HasExited) { throw "failed attach terminated the application" }
+    }
+    foreach ($mode in @("drop", "unwind")) {
+        $discarded = Join-Path $work "abandoned-$mode.trace"
+        Invoke-NativeWithTimeout -FilePath $dropHelper -ArgumentList @($dll, "$($targetProcess.Id)", $discarded, $mode)
+        if ($targetProcess.HasExited) { throw "abandoned attach terminated the application" }
     }
     New-Item -ItemType File (Join-Path $work "check-rollback") | Out-Null
     Wait-Marker "rollback-checked"
@@ -80,7 +88,7 @@ try {
     $inline = @($pidApi[0].hook_evidence | Where-Object { $_.method -eq "inline" })
     if ($iat.Count -ne 1 -or $inline.Count -ne 1 -or -not $inline[0].reason) { throw "native per-API hook evidence missing" }
     Write-Host "API coverage ledger passed ($arch)"
-    Write-Host "Attach rollback and reattach passed ($arch)"
+    Write-Host "Attach rollback, abandonment, unwind and reattach passed ($arch)"
 } finally {
     foreach ($process in @($recorderProcess, $targetProcess)) {
         if ($null -ne $process) {

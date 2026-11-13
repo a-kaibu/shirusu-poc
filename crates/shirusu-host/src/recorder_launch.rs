@@ -78,6 +78,7 @@ pub struct LaunchedCapture {
     /// 解決できなかった（旧 DLL 等）場合は None で、finish は
     /// Agent 側の終了手順を呼ばずに従来どおり閉じる。
     shutdown_addr: Option<usize>,
+    shutdown_outcome: Option<ShutdownOutcome>,
     module_scan: Option<std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>>,
     data_ready: win::ProcessNotify,
 }
@@ -129,6 +130,7 @@ impl LaunchedCapture {
             process: spawned.process,
             pid: spawned.pid,
             shutdown_addr,
+            shutdown_outcome: None,
             module_scan,
             data_ready,
         })
@@ -152,6 +154,7 @@ impl LaunchedCapture {
                         process,
                         pid,
                         shutdown_addr,
+                        shutdown_outcome: None,
                         module_scan: start_module_scan(pid, Vec::new()),
                         data_ready,
                     }),
@@ -189,6 +192,13 @@ impl LaunchedCapture {
         mut self,
         poll_interval: Duration,
     ) -> Result<SessionSummary, SessionError> {
+        if let Err(source) = self.drain_until_exit(poll_interval) {
+            return Err(self.cleanup_error(source));
+        }
+        self.finish()
+    }
+
+    fn drain_until_exit(&mut self, poll_interval: Duration) -> Result<(), SessionError> {
         loop {
             if self.target_exited()? {
                 break;
@@ -207,11 +217,36 @@ impl LaunchedCapture {
                 break;
             }
         }
-        self.finish()
+        Ok(())
+    }
+
+    // Cache every outcome, including failure: a timed-out remote worker must
+    // not be launched again by Drop. The bounded incomplete retry is internal.
+    fn shutdown_once(&mut self) -> ShutdownOutcome {
+        if let Some(outcome) = &self.shutdown_outcome {
+            return outcome.clone();
+        }
+        let outcome = rollback_initialized_agent(self.process, self.shutdown_addr);
+        self.shutdown_outcome = Some(outcome.clone());
+        outcome
+    }
+
+    fn cleanup_error(&mut self, source: SessionError) -> SessionError {
+        SessionError::PostInitialization {
+            source: Box::new(source),
+            rollback: self.shutdown_once(),
+        }
     }
 
     /// 対象を生かしたままセッションだけを閉じる。
     pub fn finish(mut self) -> Result<SessionSummary, SessionError> {
+        match self.finish_inner() {
+            Ok(summary) => Ok(summary),
+            Err(source) => Err(self.cleanup_error(source)),
+        }
+    }
+
+    fn finish_inner(&mut self) -> Result<SessionSummary, SessionError> {
         // 対象が生きているなら、先に Agent 側の終了手順（記録無効化
         // → 進行中 Detour の完了待ち → IAT 復元）を呼んでから最終
         // 回収・確定を行う（レビュー #4 の #9）。これをしないと、
@@ -224,13 +259,7 @@ impl LaunchedCapture {
         // Event Integrity が劣化する。呼び出しに失敗しても確定自体は
         // 続ける（対象が終了処理中などで応答しない場合がある）が、
         // 「正常終了として確定」はしない。
-        let outcome = if self.target_exited()? {
-            ShutdownOutcome::NotRequired
-        } else if let Some(addr) = self.shutdown_addr {
-            shutdown_with_retry(|| win::remote_call(self.process, addr, 0))
-        } else {
-            ShutdownOutcome::ExportUnavailable
-        };
+        let outcome = self.shutdown_once();
         // Keep draining even if signature verification outlives a short target.
         while self
             .module_scan
@@ -278,6 +307,23 @@ fn rollback_initialized_agent(
 
 impl Drop for LaunchedCapture {
     fn drop(&mut self) {
+        // Error propagation, unwinding and explicit abandonment all retain
+        // ownership until shutdown has been attempted. Never terminate the app
+        // or invent Finalization for a discarded capture.
+        if self.process != 0 && self.shutdown_outcome.is_none() {
+            let outcome = self.shutdown_once();
+            if !matches!(
+                outcome,
+                ShutdownOutcome::Confirmed | ShutdownOutcome::NotRequired
+            ) {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "capture cleanup for PID {} could not confirm hook removal: {outcome:?}",
+                    self.pid
+                );
+            }
+        }
         // On an early error, retain the process handle until the PID-based scan
         // ends as well. Otherwise a reused PID could classify another process.
         if let Some(scan) = self.module_scan.take() {
@@ -918,6 +964,36 @@ mod tests {
         assert!(!notification.data_ready.wait_timeout(Duration::ZERO));
         session.stop().unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cleanup_error_preserves_source_and_never_retries_a_cached_outcome() {
+        for outcome in [
+            ShutdownOutcome::Confirmed,
+            ShutdownOutcome::AgentIncomplete,
+            ShutdownOutcome::CallFailed("remote worker timed out".into()),
+            ShutdownOutcome::ExportUnavailable,
+        ] {
+            let mut capture = LaunchedCapture {
+                session: None,
+                process: 0,
+                pid: 123,
+                shutdown_addr: Some(usize::MAX),
+                shutdown_outcome: Some(outcome.clone()),
+                module_scan: None,
+                data_ready: win::ProcessNotify::new().unwrap(),
+            };
+            assert_eq!(capture.shutdown_once(), outcome);
+            let error =
+                capture.cleanup_error(SessionError::Io(std::io::Error::other("disk failure")));
+            match error {
+                SessionError::PostInitialization { source, rollback } => {
+                    assert!(source.to_string().contains("disk failure"));
+                    assert_eq!(rollback, outcome);
+                }
+                _ => panic!("cleanup context was lost"),
+            }
+        }
     }
 
     /// 最小の PE ヘッダー (nt_headers が読める形) を合成する。

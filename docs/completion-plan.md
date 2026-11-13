@@ -413,3 +413,16 @@ fail-open. The policy still concerns target APIs, not their callers. A parity te
 covers every API under both policy settings. Linux release component measurement
 for kernel32: name lookup 8.14 ns versus ID lookup 0.83 ns. This is a small isolated
 improvement, not a measured application-level speedup or source-boundary filter.
+
+### Cleanup after an initialized capture is abandoned (2026-11-13)
+
+Review found a lifecycle gap beyond the previously fixed attach-preparation error:
+LaunchedCapture's Drop only closed its process handle. A poll error, unwind or
+explicit drop could leave installed hooks in a still-running application. Drop
+now attempts shutdown before releasing its process/mapping ownership, without
+terminating the application or fabricating Finalization. Every shutdown outcome
+is cached so a timed-out remote worker is never duplicated by Drop. Explicit
+run/finish errors retain both the original error and cleanup outcome; a bare
+Drop reports unconfirmed cleanup to stderr. Native attach regression now includes
+successful attach followed by plain drop and caught unwinding, then checks target
+survival, restored entry bytes, absent Finalization and successful reattach.
