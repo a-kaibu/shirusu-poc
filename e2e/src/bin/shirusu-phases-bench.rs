@@ -132,6 +132,30 @@ fn main() {
             black_box(0),
         ));
     });
+    let enter_schema = api.enter_schema();
+    let leave_schema = api.leave_schema();
+    let enter_types = shirusu_trace::schema::schema_types(&enter_schema).unwrap();
+    let leave_types = shirusu_trace::schema::schema_types(&leave_schema).unwrap();
+    let enter_payload = capture::encode_generic_enter::<3>(api, &args);
+    let leave_payload = capture::encode_generic_leave(api, 0x5678, 0);
+    measure("scalar_enter_validate", || {
+        assert!(
+            black_box(shirusu_trace::compact::validate_values_completeness(
+                black_box(&enter_types),
+                black_box(enter_payload.as_bytes())
+            ))
+            .unwrap()
+        );
+    });
+    measure("scalar_leave_validate", || {
+        assert!(
+            black_box(shirusu_trace::compact::validate_values_completeness(
+                black_box(&leave_types),
+                black_box(leave_payload.as_bytes())
+            ))
+            .unwrap()
+        );
+    });
     #[cfg(windows)]
     measure("last_error_read_restore", || {
         let value = shirusu_hook::last_error::get();

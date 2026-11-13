@@ -188,3 +188,19 @@ Agent DLL が Writer に LoaderLockState::Unknown を渡す修正を追加する
 初期化が DllMain 外でも、後の Hook 呼び出しが Loader Lock 外だとは証明できないためである。
 従来は既定の NotHeld が残り、Unknown 時 0ms というポリシーが実記録に反映されていなかった。
 この修正による倍率低下は、欠落なしの同条件測定を伴わない限り性能改善と扱わない。
+
+
+### 値列検証の scalar fast path
+
+`validate_values_completeness` は文字列等を確保しない検証器だが、scalar でも
+大きな TypedValue enum を一度構築していた。scalar では必要な読み取りと範囲検査
+だけを行う変更を比較した。I32/U32 の範囲、Bool、固定長、LEB128、取得状態の
+検査は維持し、既存 decoder との PBT／fuzz 比較と明示的な異常値テストを用いる。
+
+Linux x64 / Rust 1.100 release、変更前後を交互に 10 組実行し、各実行内 5 回の
+中央値を集計した。両方に同じ scalar 検証の測定項目を追加し、基準実装は `1898616`。
+HeapAlloc 引数検証は中央値 23.30→13.32ns、戻り値検証は 17.19→9.60ns。
+Host の所有権移転経路は 1024 件バッチで 284.84→273.96ns/event、3072 件で
+327.49→267.28ns/event。一方 128 件では 447.43→449.08ns/event と改善しない。
+3072 件の組ごとの比率は 0.69〜1.08 と変動するため、部品の変化をアプリ全体の
+改善率とは扱わない。Windows の同一 fixture と完全性は次の CI で確認する。

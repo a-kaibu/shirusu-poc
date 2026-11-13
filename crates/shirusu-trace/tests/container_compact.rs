@@ -512,3 +512,40 @@ fn event_chunk_corruption_cases() {
     b[n - 1] = 7;
     assert!(decode_event_chunk(&b).is_err());
 }
+
+#[test]
+fn scalar_validation_preserves_decoder_errors_for_every_capture_state() {
+    let mut too_large_unsigned = Vec::new();
+    write_uleb(&mut too_large_unsigned, u32::MAX as u64 + 1);
+    let mut too_large_signed = Vec::new();
+    write_sleb(&mut too_large_signed, i32::MAX as i64 + 1);
+    let mut too_small_signed = Vec::new();
+    write_sleb(&mut too_small_signed, i32::MIN as i64 - 1);
+    let cases = [
+        (Ty::U32, too_large_unsigned, CompactError::IntegerOutOfRange),
+        (Ty::I32, too_large_signed, CompactError::IntegerOutOfRange),
+        (Ty::I32, too_small_signed, CompactError::IntegerOutOfRange),
+        (Ty::U64, vec![0xff; 10], CompactError::Leb128TooLong),
+        (Ty::I64, vec![0xff; 10], CompactError::Leb128TooLong),
+        (Ty::Bool, vec![2], CompactError::InvalidBool(2)),
+        (Ty::F32, vec![0; 3], CompactError::Truncated),
+        (Ty::F64, vec![0; 7], CompactError::Truncated),
+        (Ty::Ptr32, vec![0; 3], CompactError::Truncated),
+        (Ty::Ptr64, vec![0; 7], CompactError::Truncated),
+        (Ty::BlobRef, vec![0; 31], CompactError::Truncated),
+    ];
+    for code in 0..=u8::MAX {
+        if ValueCapture::from_code(code).is_none() {
+            continue;
+        }
+        for (ty, value, expected) in &cases {
+            let mut bytes = vec![code];
+            bytes.extend(value);
+            assert_eq!(decode_values(&[*ty], &bytes), Err(expected.clone()));
+            assert_eq!(
+                validate_values_completeness(&[*ty], &bytes),
+                Err(expected.clone())
+            );
+        }
+    }
+}

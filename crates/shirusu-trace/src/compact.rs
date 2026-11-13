@@ -250,9 +250,32 @@ pub fn validate_values_completeness(types: &[Ty], data: &[u8]) -> Result<bool, C
             Ty::Bytes => {
                 cur.read_len_bytes()?;
             }
-            // Scalar decoding does not allocate and shares range/bool checks.
-            _ => {
-                read_value(&mut cur, *ty)?;
+            // Validation does not need to materialize a TypedValue (whose
+            // string/byte variants make the enum substantially larger than a
+            // scalar). Preserve the decoder's range and representation checks.
+            Ty::I32 => {
+                i32::try_from(cur.read_sleb()?).map_err(|_| CompactError::IntegerOutOfRange)?;
+            }
+            Ty::U32 => {
+                u32::try_from(cur.read_uleb()?).map_err(|_| CompactError::IntegerOutOfRange)?;
+            }
+            Ty::I64 | Ty::U64 => {
+                cur.read_uleb()?;
+            }
+            Ty::F32 | Ty::Ptr32 => {
+                cur.read_exact(4)?;
+            }
+            Ty::F64 | Ty::Ptr64 => {
+                cur.read_exact(8)?;
+            }
+            Ty::BlobRef => {
+                cur.read_exact(32)?;
+            }
+            Ty::Bool => {
+                let value = cur.read_u8()?;
+                if value > 1 {
+                    return Err(CompactError::InvalidBool(value));
+                }
             }
         }
     }
