@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/seh.c");
+    println!("cargo:rerun-if-changed=src/callsite.h");
     let target = std::env::var("TARGET").unwrap();
     let host = std::env::var("HOST").unwrap();
     if target.ends_with("windows-msvc") && host.ends_with("windows-msvc") {

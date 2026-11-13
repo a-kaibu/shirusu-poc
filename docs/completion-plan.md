@@ -779,3 +779,17 @@ capture / attach / inspect / coverage / dump / export / repair は未知の
 burst 容量比較は各3回とも Event Integrity Complete・損失0・必要 API 観測あり。
 JSONL / repair のハードリンク入力保護・公開失敗時の保持・不正オプション拒否も
 x64 2環境の実テストで成功。macOS 等を含む全ジョブ完了とは別に記録する。
+
+### 直接の呼び出し元を取得する native entry の土台
+
+ネイティブ入口の `_ReturnAddress` を、その入口のスタック上の frame と
+API ID に対応付ける。TLS にはその frame のポインタだけを保持し、別 API の
+内側へ誤って外側の呼び出し元を引き継がない。native TLS が利用不能なら
+不明として扱う。frame の寿命は C の `__finally` で管理し、Windows SEH でも
+外側の frame へ戻す。Rust Drop だけに例外時の復元を依存させない。
+
+この段階では標準 Detour の記録抑制には接続していない。生成された型付き入口と
+署名の証拠を持つモジュール分類への接続、および Application / Runtime / Windows /
+callback の実走確認が残る。土台の検証には、スレッド別・API 別の入れ子、
+入口の戻り先アドレス、LastError の往復、Rust allocator を呼ばない通常経路、
+ネイティブ例外後の外側状態の復元を使う。Windows 実行結果は CI で確認する。
