@@ -9,6 +9,7 @@ pub mod recorder;
 pub mod recorder_launch;
 pub mod static_dep;
 pub mod trace_convert;
+mod trace_pipeline;
 
 use shirusu_transport::descriptor::EventKind;
 use shirusu_transport::layout::{self, LossCounters};

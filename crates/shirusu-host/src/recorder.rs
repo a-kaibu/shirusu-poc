@@ -18,7 +18,8 @@
 //! `recorder_launch`（cfg(windows)）が担い、本モジュールは
 //! 「Mapping が用意された後」の回収と Trace 化に集中する。
 
-use crate::trace_convert::{ArgsConversionStats, RecordMode, TraceBatchContext, TraceRecorder};
+use crate::trace_convert::{RecordMode, TraceBatchContext, TraceRecorder};
+use crate::trace_pipeline::TracePipeline;
 use crate::{DrainWorker, IntegrityLevel, IntegrityReport, RingIdentity};
 use shirusu_hook::api as hook_api;
 use shirusu_hook::callback as hook_callback;
@@ -387,7 +388,7 @@ fn combine_reports(reports: &[IntegrityReport]) -> IntegrityReport {
 /// 報告を保持し、Loss を記録する。`ring.generation` は共有
 /// Control の現在値へ進める。
 fn retire_ring_worker(
-    recorder: &mut TraceRecorder<File>,
+    recorder: &mut TracePipeline<File>,
     retired_reports: &mut Vec<IntegrityReport>,
     retired_loss_records: &mut u64,
     coverage_missing_calls: u64,
@@ -402,7 +403,7 @@ fn retire_ring_worker(
     let losses = std::mem::take(&mut worker.loss_events);
     if !losses.is_empty() {
         *retired_loss_records += losses.len() as u64;
-        recorder.record_losses(&losses, ring.spec.process_id, ring.trace_thread_id)?;
+        recorder.record_losses(losses, ring.spec.process_id, ring.trace_thread_id)?;
     }
     ring.stopped = false;
     ring.generation = layout::load(
@@ -415,11 +416,10 @@ fn retire_ring_worker(
 
 pub struct CaptureSession {
     config: CaptureSessionConfig,
-    recorder: TraceRecorder<File>,
+    recorder: TracePipeline<File>,
     rings: Vec<RingEndpoint>,
     state: SessionState,
     trace_path: PathBuf,
-    args_stats: ArgsConversionStats,
     /// 同一プロセス記録の場合に呼び出し側が知らせる Slot 不足数。
     /// プロセス間では Agent 内カウンタに留まり Host からは見えない
     /// （Phase 3 の制約として summary の注記にも残す）。
@@ -462,7 +462,7 @@ impl CaptureSession {
     /// Trace ファイルを作り、フック Schema を登録してセッションを用意する。
     pub fn create_file(
         path: impl AsRef<Path>,
-        config: CaptureSessionConfig,
+        mut config: CaptureSessionConfig,
     ) -> Result<Self, SessionError> {
         if config.environment.session.session_id != config.session_id {
             return Err(SessionError::Config(format!(
@@ -470,6 +470,10 @@ impl CaptureSession {
                 config.environment.session.session_id, config.session_id
             )));
         }
+        config.environment.capture_config.push_str(&format!(
+            "; host_pipeline=async-fifo; host_queue_commands={}",
+            crate::trace_pipeline::QUEUED_BATCHES,
+        ));
         let file = File::create(path.as_ref())?;
         let mut recorder = TraceRecorder::from_environment_with_options(
             file,
@@ -500,11 +504,10 @@ impl CaptureSession {
         }
         Ok(Self {
             config,
-            recorder,
+            recorder: TracePipeline::new(recorder)?,
             rings: Vec::new(),
             state: SessionState::Created,
             trace_path: path.as_ref().to_path_buf(),
-            args_stats: ArgsConversionStats::default(),
             coverage_missing_calls: 0,
             hook_coverage: None,
             com_factory_count: None,
@@ -688,9 +691,12 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// 全 Ring を 1 回ずつ回収し、Trace へ変換して書く。
+    /// 全 Ring を 1 回ずつ回収し、検証済みの所有バッチを変換 worker へ渡す。
+    /// 戻り値は受理件数であり、ファイルへの書き込み完了ではない。
+    /// キュー満杯時は回収側が待機する。stop が全件の書き込みと確定を待つ。
     pub fn poll_once(&mut self) -> Result<PollStats, SessionError> {
         self.ensure_state(SessionState::Recording, "poll_once")?;
+        self.recorder.check_health()?;
         let mut stats = PollStats::default();
         for ring in &mut self.rings {
             // 世代交代の検出 (レビュー #6 P1-4): Agent が Slot を
@@ -772,12 +778,8 @@ impl CaptureSession {
                     qpc_frequency: self.config.qpc_frequency,
                 };
                 let event_count = batch.events.len();
-                let s = self
-                    .recorder
+                self.recorder
                     .record_owned_batch_with_args(&ctx, batch.events)?;
-                self.args_stats.args_attached += s.args_attached;
-                self.args_stats.args_incomplete += s.args_incomplete;
-                self.args_stats.args_fallback_blob += s.args_fallback_blob;
                 ring.events += event_count as u64;
                 stats.events += event_count;
             }
@@ -830,25 +832,26 @@ impl CaptureSession {
             total_loss_records += losses.len() as u64;
             if !losses.is_empty() {
                 self.recorder
-                    .record_losses(&losses, ring.spec.process_id, ring.trace_thread_id)?;
+                    .record_losses(losses, ring.spec.process_id, ring.trace_thread_id)?;
             }
         }
+        let (recorder, args_stats) = self.recorder.finish()?;
         reports.append(&mut self.retired_reports);
         let mut report = combine_reports(&reports);
-        if self.args_stats.args_incomplete > 0 {
+        if args_stats.args_incomplete > 0 {
             report.semantic_completeness =
                 worst(report.semantic_completeness, IntegrityLevel::Degraded);
             report.notes.push(format!(
                 "args payloads with incomplete field capture: {}",
-                self.args_stats.args_incomplete
+                args_stats.args_incomplete
             ));
         }
-        if self.args_stats.args_fallback_blob > 0 {
+        if args_stats.args_fallback_blob > 0 {
             report.semantic_completeness =
                 worst(report.semantic_completeness, IntegrityLevel::Degraded);
             report.notes.push(format!(
                 "args payloads kept as blobs (undecodable): {}",
-                self.args_stats.args_fallback_blob
+                args_stats.args_fallback_blob
             ));
         }
         if self.coverage_missing_calls == 0 {
@@ -904,8 +907,8 @@ impl CaptureSession {
         let trace_path = self.trace_path.clone();
         // L09: `profile` の集計は `finish` で Trace へ書く前に読む
         //（`finish` は recorder を消費する）。
-        let profile_summary = self.recorder.profile_summary();
-        let mut file = self.recorder.finish(&report)?;
+        let profile_summary = recorder.profile_summary();
+        let mut file = recorder.finish(&report)?;
         file.flush()?;
         self.state = SessionState::Finished;
         Ok(SessionSummary {
@@ -917,8 +920,8 @@ impl CaptureSession {
             rings_active,
             rings_never_initialized: rings_never,
             rings_stopped,
-            args_attached: self.args_stats.args_attached,
-            args_fallback_blob: self.args_stats.args_fallback_blob,
+            args_attached: args_stats.args_attached,
+            args_fallback_blob: args_stats.args_fallback_blob,
             hook_coverage: self.hook_coverage,
             com_factory_count: self.com_factory_count,
             winrt_activation_count: self.winrt_activation_count,
