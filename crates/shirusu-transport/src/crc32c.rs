@@ -1,4 +1,5 @@
-//! CRC32C (Castagnoli) のソフトウェア実装。overview の「チャンクの破損は CRC32C で検出」に対応。
+//! CRC32C (Castagnoli)。x86/x64 は実行時に SSE4.2 を確認して命令を使い、
+//! 非対応 CPU・その他のアーキテクチャではソフトウェア実装へフォールバックする。
 //! テーブルはコンパイル時に生成する。
 
 const POLY: u32 = 0x82F6_3B78; // reflected Castagnoli
@@ -29,9 +30,47 @@ pub fn crc32c(data: &[u8]) -> u32 {
 }
 
 pub fn crc32c_update(seed: u32, data: &[u8]) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: the runtime feature check guards every call, including on
+        // older x86 CPUs. Slice reads remain bounded and need no alignment.
+        return unsafe { hardware_update(seed, data) };
+    }
+    software_update(seed, data)
+}
+
+fn software_update(seed: u32, data: &[u8]) -> u32 {
     let mut crc = !seed;
     for &b in data {
         crc = TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+unsafe fn hardware_update(seed: u32, mut data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{_mm_crc32_u32, _mm_crc32_u8};
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64, _mm_crc32_u8};
+
+    let mut crc = !seed;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut wide = u64::from(crc);
+        while data.len() >= 8 {
+            wide = _mm_crc32_u64(wide, u64::from_le_bytes(data[..8].try_into().unwrap()));
+            data = &data[8..];
+        }
+        crc = wide as u32;
+    }
+    while data.len() >= 4 {
+        crc = _mm_crc32_u32(crc, u32::from_le_bytes(data[..4].try_into().unwrap()));
+        data = &data[4..];
+    }
+    for &byte in data {
+        crc = _mm_crc32_u8(crc, byte);
     }
     !crc
 }
@@ -52,11 +91,31 @@ mod tests {
         let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         let whole = crc32c(&data);
         let part = crc32c_update(crc32c(&data[..37]), &data[37..]);
-        // 注: 本実装の update は seed を初期内部状態として扱う簡易形のため、
-        // 連結検証は「分割して再計算しても検出できる」ことを別途確認する。
         let recomputed = crc32c(&[&data[..37], &data[37..]].concat());
         assert_eq!(whole, recomputed);
-        let _ = part;
+        assert_eq!(whole, part);
+    }
+    #[test]
+    fn accelerated_and_incremental_checks_match_software_for_all_tails() {
+        let data: Vec<u8> = (0..2056u32).map(|i| (i * 31 % 251) as u8).collect();
+        for offset in 0..8 {
+            for len in 0..=2048 {
+                let bytes = &data[offset..offset + len];
+                for seed in [0, 1, 0x1234_5678, u32::MAX] {
+                    let expected = software_update(seed, bytes);
+                    assert_eq!(
+                        crc32c_update(seed, bytes),
+                        expected,
+                        "offset={offset} len={len} seed={seed}"
+                    );
+                    let split = len / 2;
+                    assert_eq!(
+                        crc32c_update(crc32c_update(seed, &bytes[..split]), &bytes[split..]),
+                        expected
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn detects_single_bit_flip() {
