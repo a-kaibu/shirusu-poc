@@ -8,7 +8,8 @@
 //!
 //! 各検査は独立した Finding を返し、レポートの合否は「Fail が
 //! 1 件も無いこと」で決まる。Warn は適合を妨げないが、契約の
-//! 解釈が割れる境界（sequence の重複）を示すために残す。
+//! 解釈が割れる境界（sequence の重複、意味種別の無い旧来の Schema）を
+//! 示すために残す。
 //!
 //! 検査項目と、壊れたときに何が困るか（＝誰がこの規約に依存
 //! しているか）:
@@ -25,6 +26,12 @@
 //! - schemas-registered: 全イベントの Schema が登録済みで、
 //!   引数値列が Schema で復号できること。compare は Schema 名から
 //!   API 名を引くため、未登録は「比較できないイベント」になる。
+//! - semantic-kinds-declared: イベントが参照する Schema の全フィールドが
+//!   意味種別（CreatedObject / Handle / Pointer / Scalar）を宣言して
+//!   いること。宣言が無いと compare は型から推定する（`return` の U64 を
+//!   生成とみなす）ため、64bit のカウンタやサイズを生成と誤認し得る。
+//!   旧 Trace の互換のため Warn に留める（新しい共有 Schema では必須で、
+//!   shirusu-emit は宣言の無いフィールドを拒否する）。
 //! - sequence-monotonic: スレッドごとの sequence が後退しない
 //!   こと（形式仕様と Writer の不変条件）。重複は Warn。
 //! - enter-leave-pairing: Enter/Leave が call_id で対応すること。
@@ -173,6 +180,7 @@ pub fn check_trace(trace: &ReadTrace) -> ConformanceReport {
             check_finalization(trace),
             check_finalization_counts(trace),
             check_schemas(trace, &view),
+            check_semantic_kinds(trace),
             check_sequence_monotonic(trace),
             check_enter_leave_pairing(&view),
             check_blob_refs(trace, &view),
@@ -367,6 +375,52 @@ fn check_schemas(trace: &ReadTrace, view: &TraceView) -> CheckFinding {
                 "{} problem(s): {}",
                 problems.len(),
                 problems[..shown].join("; ")
+            ),
+        )
+    }
+}
+
+/// C11 意味種別の宣言: イベントが参照する Schema の全フィールドが
+/// CreatedObject / Handle / Pointer / Scalar のいずれかを宣言しているか。
+/// 宣言の無い旧来の Schema は compare が型から推定する（`return` の U64 を
+/// 生成とみなす）ため誤判定し得る。旧 Trace の互換のため Fail ではなく
+/// Warn とし、新しい共有 Schema では宣言を必須とする（shirusu-emit が拒否する）。
+fn check_semantic_kinds(trace: &ReadTrace) -> CheckFinding {
+    use shirusu_trace::schema::ValueKind;
+    let id = "semantic-kinds-declared";
+    let referenced: std::collections::BTreeSet<u32> = trace
+        .batches
+        .iter()
+        .flat_map(|b| b.events.iter().map(|e| e.schema_id))
+        .filter(|&id| id != 0)
+        .collect();
+    let mut missing: Vec<String> = Vec::new();
+    for schema_id in &referenced {
+        let Some(def) = trace.registry.get(*schema_id) else {
+            continue;
+        };
+        for field in &def.fields {
+            if ValueKind::from_flags(field.flags) == ValueKind::Unspecified {
+                missing.push(format!("{}.{}", def.name, field.name));
+            }
+        }
+    }
+    if missing.is_empty() {
+        CheckFinding::pass(
+            id,
+            format!(
+                "{} referenced schema(s) declare a value kind for every field",
+                referenced.len()
+            ),
+        )
+    } else {
+        let shown = missing.len().min(5);
+        CheckFinding::warn(
+            id,
+            format!(
+                "{} field(s) without a value kind; compare falls back to legacy type inference: {}",
+                missing.len(),
+                missing[..shown].join(", ")
             ),
         )
     }
@@ -674,17 +728,30 @@ mod tests {
     /// 規約どおりの最小 Trace（メモリ内 ReadTrace）。
     /// CreateFileW 風の Enter/Leave 1 組だけを含む。
     fn valid_trace() -> ReadTrace {
+        use shirusu_trace::schema::ValueKind;
+        trace_with_kinds(
+            ValueKind::Handle.flags(),
+            ValueKind::CreatedObject.flags(),
+            ValueKind::Scalar.flags(),
+        )
+    }
+
+    fn trace_with_kinds(handle: u32, created: u32, scalar: u32) -> ReadTrace {
         let mut registry = SchemaRegistry::new();
         registry
-            .register(make_schema(1, "x!Y/enter", vec![("h".into(), Ty::U64, 0)]))
+            .register(make_schema(
+                1,
+                "x!Y/enter",
+                vec![("h".into(), Ty::U64, handle)],
+            ))
             .unwrap();
         registry
             .register(make_schema(
                 2,
                 "x!Y/leave",
                 vec![
-                    ("return".into(), Ty::U64, 0),
-                    ("last_error".into(), Ty::U32, 0),
+                    ("return".into(), Ty::U64, created),
+                    ("last_error".into(), Ty::U32, scalar),
                 ],
             ))
             .unwrap();
@@ -743,6 +810,25 @@ mod tests {
         let report = check_trace(&valid_trace());
         assert!(report.conformant(), "{}", report.render_human("t"));
         for f in &report.findings {
+            assert_eq!(f.status, CheckStatus::Pass, "{}: {}", f.id, f.detail);
+        }
+    }
+
+    #[test]
+    fn legacy_schemas_without_value_kinds_warn_but_stay_conformant() {
+        let report = check_trace(&trace_with_kinds(0, 0, 0));
+        assert!(report.conformant(), "{}", report.render_human("t"));
+        assert_eq!(
+            status(&report, "semantic-kinds-declared"),
+            CheckStatus::Warn
+        );
+        let detail = &report.finding("semantic-kinds-declared").unwrap().detail;
+        assert!(detail.contains("x!Y/leave.return"), "{detail}");
+        for f in report
+            .findings
+            .iter()
+            .filter(|f| f.id != "semantic-kinds-declared")
+        {
             assert_eq!(f.status, CheckStatus::Pass, "{}: {}", f.id, f.detail);
         }
     }

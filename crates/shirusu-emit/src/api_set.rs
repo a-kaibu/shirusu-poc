@@ -11,16 +11,17 @@
 //!
 //! フィールド規約（compare が前提とする公開 Schema の規約）:
 //! - Leave の戻り値は `return` という名前で記録する。オブジェクト
-//!   （ハンドル）を生成する API は `return` を Ty::U64 とし、
-//!   0 / 全ビット 1 は「生成しなかった」として区別される。
+//!   （ハンドル）を生成する API は `return` を CreatedObject と宣言する
+//!   （型は U64）。0 / 全ビット 1 は「生成しなかった」として区別される。
 //! - Leave の最後のフィールドは `last_error`（Ty::U32）とする
 //!   （shirusu-hook の表と同じ規約）。
 //! - 各フィールドは意味種別 (ValueKind) を持つ。個数・カウンタは
 //!   Ty が U64 でも Scalar と宣言し、ハンドルは Handle、生成 API の
 //!   戻り値は CreatedObject と宣言する（compare の正規化は型では
-//!   なく意味種別で判断する。レビュー #4 の #7）。種別が無い旧来の
-//!   Schema に対しては、compare が「Ty::U64 はハンドル／ポインタ級」
-//!   という従来規約へフォールバックする。
+//!   なく意味種別で判断する。レビュー #4 の #7）。共有 API セットでは
+//!   種別の宣言が必須で、`ApiSet::add` は Unspecified のフィールドを
+//!   拒否する。種別が無い旧来の Trace に対してだけ、compare が
+//!   「Ty::U64 はハンドル／ポインタ級」という従来規約へフォールバックする。
 //! - 各フィールドは取得タイミング (CaptureTiming) を持つ。enter 側は
 //!   呼び出し前 (Before)、leave 側は呼び出し後 (After)。入出力が同じ
 //!   バッファなら Both、非同期 I/O の完了時取得は Completion と宣言
@@ -101,6 +102,21 @@ impl ApiSet {
         }
         if self.api_id(&spec.name).is_some() {
             return Err(EmitError::DuplicateApi(spec.name));
+        }
+        // 意味契約: 全フィールドが CreatedObject / Handle / Pointer / Scalar を
+        // 明示する。型だけで意味を伝える旧規約（U64 = 生成）は新しい共有
+        // Schema へ持ち込まない。
+        if let Some((field, ..)) = spec
+            .enter_fields
+            .iter()
+            .chain(&spec.leave_fields)
+            .find(|(_, _, kind, _)| *kind == ValueKind::Unspecified)
+        {
+            return Err(EmitError::InvalidSpec(format!(
+                "{}: field {field} must declare its value kind \
+                 (CreatedObject, Handle, Pointer or Scalar)",
+                spec.name
+            )));
         }
         self.specs.push(spec);
         Ok(self.specs.len() as u32)
@@ -444,6 +460,33 @@ mod tests {
             set.add(ApiSpec::new("", &[], &[])),
             Err(EmitError::InvalidSpec(_))
         ));
+    }
+
+    #[test]
+    fn add_rejects_fields_without_a_value_kind() {
+        let mut set = ApiSet::new();
+        let spec = ApiSpec::new(
+            "kernel32!GetFileSizeEx",
+            &[("hFile", Ty::U64, ValueKind::Handle, CaptureTiming::Before)],
+            &[(
+                "return",
+                Ty::U64,
+                ValueKind::Unspecified,
+                CaptureTiming::After,
+            )],
+        );
+        match set.add(spec) {
+            Err(EmitError::InvalidSpec(message)) => assert!(message.contains("return")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(set.is_empty());
+        // 64bit のカウンタも Scalar と宣言すれば共有セットに入れられる。
+        let counter = ApiSpec::new(
+            "kernel32!GetTickCount64",
+            &[],
+            &[("return", Ty::U64, ValueKind::Scalar, CaptureTiming::After)],
+        );
+        assert!(set.add(counter).is_ok());
     }
 
     /// 共有セットの互換の定義：本体フック表と content_hash が一致する。

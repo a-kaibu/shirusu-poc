@@ -62,3 +62,25 @@ Unsupported として生値を残す。名前の文字列やオブジェクト�
 契約ではなく、4 API の宣言的生成パイロットにも含めない。
 Microsoft の [CreateEventW の戻り値仕様](https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-createeventw)
 に基づき、同じ名前を再度開く Windows テストで ERROR_ALREADY_EXISTS を確認する。
+
+## 共有 Schema の意味種別（2026-11-13）
+
+外部互換実装と共有する Schema では、各フィールドが意味種別を宣言する。
+compare は型ではなくこの宣言で正規化する。
+
+| 意味種別 | 意味 | compare の扱い |
+| --- | --- | --- |
+| `CreatedObject` | 新しいオブジェクトの生成（生成 API の戻り値など） | 相関の起点。`(生成 API, 序数)` の ObjectKey に置き換える |
+| `Handle` | 既存オブジェクトへの参照 | 生成と相関させて ObjectKey へ解決する。解決できなければポインタ級 |
+| `Pointer` | メモリアドレス | 値は比較しない。0 は Null、番兵値は Invalid として区別する |
+| `Scalar` | 個数・サイズ・時刻・フラグ・真理値など | 値をそのまま比較する（U64 でも消さない） |
+
+- API Catalog（`shirusu-api-catalog`）の全 Schema は全フィールドで宣言済みで、
+  テスト `every_catalog_field_declares_its_value_kind` が検査する。
+- `shirusu-emit` の `ApiSet::add` は宣言の無いフィールド（Unspecified）を拒否する。
+- `shirusu-conformance` の `semantic-kinds-declared` は、宣言の無いフィールドを
+  Warn として報告する（旧 Trace の互換のため Fail にはしない）。
+- 宣言の無い旧来の Schema に対してだけ、compare は「`return` の U64 は生成、
+  U64 はハンドル／ポインタ級」と推定する。64bit のカウンタやサイズを返す API で
+  誤判定し得るため、この推定を新しい共有 API セットへ持ち込まない。型を変えて
+  意味を伝える旧規約（個数は U32 で記録する）も不要になった。

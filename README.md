@@ -57,7 +57,7 @@ Runtime 自身のエクスポートを追加する設定で、CRT 経由の Wind
 | `crates/shirusu-compare` | 正規化つき差分エンジン。非決定値の正規化とオブジェクト相関による Trace 間比較（Phase 4） | なし |
 | `crates/shirusu-test` | shirusu-test 基礎。言語非依存 JSON 仕様による Trace 期待ルールの評価（Phase 4）。JSON Runner と Probe exe 生成（L20）もここ | なし |
 | `crates/shirusu-emit` | 外部レコーダ向けエミッタキット（Phase 5）。shirusu 本体以外の実装（sake 等）が公開 Trace 仕様に適合した Trace を出すための高水準 API：セッション管理、共有 API セットの Schema 登録、sequence / call_id の自動採番、Enter/Leave 対応の保証 | なし |
-| `crates/shirusu-conformance` | 外部生成 Trace の適合性チェッカ（Phase 5）。形式仕様＋compare/test が依存する規約を 10 項目で検査する lib + CLI | なし |
+| `crates/shirusu-conformance` | 外部生成 Trace の適合性チェッカ（Phase 5）。形式仕様＋compare/test が依存する規約を 11 項目で検査する lib + CLI | なし |
 | `crates/shirusu-probe` | 差分→Probe 最小化（Phase 5）。compare の候補から回帰バンドル（ブリーフ＋shirusu-test ルール＋トリム済み Trace ペア）を生成する lib + CLI。契約は `docs/ippai-integration.md` | なし |
 | `crates/shirusu-loom-tests` | loom による公開/回収プロトコルの網羅検査モデル | なし |
 | `e2e/` | Test Supervisor / producer / consumer。同期ポイント経由のシナリオ群と、Windows でのプロセス間実テスト | 一部 |

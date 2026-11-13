@@ -35,3 +35,24 @@ pub fn eager_trace_schemas() -> Vec<SchemaDef> {
     schemas.extend(callback::callback_schemas());
     schemas
 }
+
+#[cfg(test)]
+mod tests {
+    use shirusu_trace::schema::ValueKind;
+
+    /// 共有 Schema の意味契約: 全フィールドが意味種別（CreatedObject /
+    /// Handle / Pointer / Scalar）を明示する。型からの推定は旧 Trace の
+    /// 互換のためだけに残し、新しい Schema へは持ち込まない。
+    #[test]
+    fn every_catalog_field_declares_its_value_kind() {
+        let mut unspecified = Vec::new();
+        for schema in super::all_trace_schemas() {
+            for field in &schema.fields {
+                if ValueKind::from_flags(field.flags) == ValueKind::Unspecified {
+                    unspecified.push(format!("{}.{}", schema.name, field.name));
+                }
+            }
+        }
+        assert!(unspecified.is_empty(), "unspecified: {unspecified:?}");
+    }
+}
