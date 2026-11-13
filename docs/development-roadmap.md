@@ -5,7 +5,7 @@
 1. **API 別 Coverage 台帳**：初版実装。Agent の IAT / Inline 設置結果を Trace に保存し、
    静的依存、観測、意味情報と並べる。範囲は [coverage-ledger.md](coverage-ledger.md)。
    DLL・delay import、共有 COM、設置後の変化を含む全経路の証明は未対応。
-2. **高頻度 Capture**：部品別計測と Host コピー削減まで実装。Windows の実アプリで
+2. **高頻度 Capture**：部品別計測、Host コピー削減、世代付き TLS Runtime キャッシュを実装。Windows の実アプリで
    高負荷時の欠落が残る。単独 Runtime 取得だけでなく、並行回収・変換・通知・待機を
    測る。TLS Writer / Runtime 参照の変更には終了・再 Attach・TLS 消失・SEH の寿命検証が必須。
 3. **差分から再現 Probe**：既存 compare / probe / 同期ファイル replay を接続する。
@@ -23,7 +23,9 @@
    作成・クローズを含む削減や入力値簡約、大域的な最小化は未完了。
 4. **宣言的な意味契約**：CreateFileW / ReadFile / WriteFile / CloseHandle の成功条件、
    入出力、長さ、所有権を契約にまとめ、既存 Golden と一致させる。SAL は副作用・
-   非同期完了の完全な仕様とは扱わない。未実装。
+   非同期完了の完全な仕様とは扱わない。初段として Schema と LastError 条件を
+   [宣言から生成](semantic-contracts.md)し、取得側も同じ条件を参照する。8 Schema の
+   移行前 Golden と一致。メモリ取得・長さ式・所有権・非同期完了の生成は未実装。
 5. **Windows 参照コーパス**：同じ Probe の OS build / architecture / 前提条件 / 結果を
    保存し、単一の Windows 実行を唯一の正解にしない。Runner に API が返した OS build と
    実行アーキテクチャの保存、削減時の環境変更の拒否を実装。自己申告として扱い、OS を

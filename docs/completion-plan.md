@@ -195,3 +195,20 @@ CreateFileW / ReadFile / WriteFile / CloseHandle の Schema と LastError 有効
 Golden と一致し、Capture の判定も同じ定義を参照する。未知の語彙や重複を拒否し、
 CI が生成物の更新漏れを確認する。メモリ取得・サイズ式・所有権・非同期処理と
 境界値テストの自動生成は未完了であり、意味契約の項目全体はまだ完了にしない。
+
+## TLS Runtime と意味契約のネイティブ検証
+
+`b0c7436` の [run 43397847010](https://github.com/a-kaibu/shirusu-poc/actions/runs/43397847010)
+で Windows x64 / x86-WoW64 / Server 2022 が成功。途中で発生した TLS destructor
+登録中の allocator 再入は、初期化順序と READY 判定で解消を確認した。
+スレッド終了時には TLS の破棄状態も確認し、READY の履歴だけでは記録を開始しない。
+
+| 環境 | Runtime ロック経路 / TLS (ns) | GUI 倍率 / integrity | 高負荷倍率 / integrity |
+| --- | --- | --- | --- |
+| Windows latest x64 | 10.26 / 7.82 | 1.651 / Complete | 152.265 / Degraded |
+| Windows Server 2022 x64 | 9.99 / 8.27 | 1.602 / Complete | 144.586 / Degraded |
+| Windows latest x86/WoW64 | 9.92 / 8.02 | 1.579 / Complete | 154.107 / Degraded |
+
+Runtime の値は同じ部品ベンチの異なる経路の中央値であり、アプリ全体の改善率ではない。
+高負荷の 5 倍目標とイベント完全性は未達。次の性能作業は Writer の共有状態、
+Host の並行回収・変換・通知と欠落を測定し、通常経路全体を対象にする。
