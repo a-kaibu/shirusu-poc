@@ -21,7 +21,7 @@
 use crate::trace_convert::{RecordMode, TraceBatchContext, TraceRecorder};
 pub use crate::trace_pipeline::HostPipelineStats;
 use crate::trace_pipeline::TracePipeline;
-use crate::{DrainWorker, IntegrityLevel, IntegrityReport, RingIdentity};
+use crate::{DrainWorker, IntegrityLevel, IntegrityReport};
 use shirusu_hook::api as hook_api;
 use shirusu_hook::callback as hook_callback;
 use shirusu_hook::com as hook_com;
@@ -744,14 +744,15 @@ impl CaptureSession {
                         self.config.ring_config,
                         ring.generation,
                     )
-                };
+                }
+                .without_completion_history();
                 // L11: セッション設定で Descriptor の global_order 検証を決める。
                 worker.set_global_order(self.config.order_global);
-                worker.set_identity(RingIdentity::new(
-                    crate::ProcessInstanceId(ring.spec.process_id),
-                    crate::RingId(ring.spec.thread_id),
-                    ring.generation,
-                ));
+                // This pipeline transfers each validated payload with its event;
+                // there is no separate pending-blob lookup. Do not enable the
+                // opt-in diagnostic key history: it would retain one unused key
+                // per payload for the entire Ring lifetime. Event context and
+                // generation validation remain independent of that history.
                 ring.worker = Some(worker);
             }
             let worker = ring.worker.as_mut().expect("worker just ensured");

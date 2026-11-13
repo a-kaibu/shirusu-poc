@@ -365,7 +365,7 @@ pub struct DrainWorker {
     total_bytes_copied: u64,
     prev_loss: LossCounters,
     open_calls: HashMap<u64, u64>, // call_id -> enter sequence
-    closed_calls: HashSet<u64>,
+    closed_calls: Option<HashSet<u64>>,
     identity: Option<RingIdentity>,
     /// 回収した格納済み Payload の一時キー（A72）。`identity` を設定した
     /// 場合にだけ生成する。欠落 Payload には生成されない。
@@ -378,6 +378,7 @@ pub struct DrainWorker {
     /// 完了した非同期 I/O（CallCompleted）の回収数（F27）。leave は
     /// 既に回収済みのため、呼び出しの開閉には通常影響しない。leave が
     /// 欠落していた場合にだけ開いた呼び出しを閉じる。
+    /// CaptureSession 内部ではこの診断集計を無効にし、イベント自体を保存する。
     pub completed_calls: u64,
     pub total_events: u64,
     /// 共有メモリの矛盾で Ring を停止したかどうか。
@@ -402,7 +403,7 @@ impl DrainWorker {
             total_bytes_copied: 0,
             prev_loss: LossCounters::default(),
             open_calls: HashMap::new(),
-            closed_calls: HashSet::new(),
+            closed_calls: Some(HashSet::new()),
             identity: None,
             payload_keys: Vec::new(),
             loss_events: Vec::new(),
@@ -413,6 +414,13 @@ impl DrainWorker {
             integrity_lost: false,
             degraded_seen: 0,
         }
+    }
+    /// CaptureSession writes completion events directly and never consumes the
+    /// diagnostic correlated-completion counter. Avoid retaining all closed IDs
+    /// there. Open-call tracking and unknown-termination detection stay enabled.
+    pub(crate) fn without_completion_history(mut self) -> Self {
+        self.closed_calls = None;
+        self
     }
     /// 共有メモリの矛盾で Ring を停止したかどうか。
     pub fn is_stopped(&self) -> bool {
@@ -609,7 +617,9 @@ impl DrainWorker {
             Some(EventKind::CallLeave)
                 if self.open_calls.remove(&e.descriptor.call_id).is_some() =>
             {
-                self.closed_calls.insert(e.descriptor.call_id);
+                if let Some(closed) = &mut self.closed_calls {
+                    closed.insert(e.descriptor.call_id);
+                }
             }
             // L08: 中断した呼び出しも「閉じた」ものとして扱う。Leave と
             // 同じく開いた呼び出しを閉じ、finalize での「終了不明」に
@@ -618,21 +628,26 @@ impl DrainWorker {
             Some(EventKind::CallAborted)
                 if self.open_calls.remove(&e.descriptor.call_id).is_some() =>
             {
-                self.closed_calls.insert(e.descriptor.call_id);
+                if let Some(closed) = &mut self.closed_calls {
+                    closed.insert(e.descriptor.call_id);
+                }
                 self.aborted_calls += 1;
             }
             // F27: 完了した非同期 I/O。leave は既に回収されて呼び出しを
             // 閉じているのが通常で、その場合は数を数えるだけ。leave が
             // 欠落してまだ開いている場合にだけ、Aborted と同じくここで
             // 閉じる。対応する Enter が無いものは無視する（孤立した
-            // Leave と同じ扱い）。完了は別スレッドで観測されることが
-            // あるが、ここは call_id だけで追跡するためスレッドは問わない。
+            // Leave と同じ扱い）。この診断は Ring 内の相関だけを扱い、
+            // 別スレッドの Ring で観測した完了との突き合わせは行わない。
             Some(EventKind::CallCompleted) => {
-                if self.open_calls.remove(&e.descriptor.call_id).is_some() {
-                    self.closed_calls.insert(e.descriptor.call_id);
-                }
-                if self.closed_calls.contains(&e.descriptor.call_id) {
-                    self.completed_calls += 1;
+                let was_open = self.open_calls.remove(&e.descriptor.call_id).is_some();
+                if let Some(closed) = &mut self.closed_calls {
+                    if was_open {
+                        closed.insert(e.descriptor.call_id);
+                    }
+                    if closed.contains(&e.descriptor.call_id) {
+                        self.completed_calls += 1;
+                    }
                 }
             }
             _ => {}
@@ -1036,6 +1051,30 @@ mod tests {
         assert_eq!(host.open_call_count(), 0);
         assert_eq!(host.completed_call_count(), 2);
         assert_eq!(host.finalize_thread(), Vec::<u64>::new());
+    }
+    #[test]
+    fn recording_without_closed_history_preserves_events_and_open_call_detection() {
+        let (_rg, mut w, host) = setup();
+        let mut host = host.without_completion_history();
+        for call in 1..=100 {
+            w.write(ev(EventKind::CallEnter, call, b"a"));
+            w.write(ev(EventKind::CallLeave, call, b"b"));
+            assert_eq!(host.drain_all().events.len(), 2);
+        }
+        w.write(ev(EventKind::CallEnter, 101, b"pending"));
+        w.write(ev(EventKind::CallCompleted, 101, b"complete"));
+        w.write(ev(EventKind::CallCompleted, 1, b"late complete"));
+        w.write(ev(EventKind::CallEnter, 102, b"unterminated"));
+        let batch = host.drain_all();
+        assert_eq!(batch.events.len(), 4);
+        assert_eq!(host.total_events, 204);
+        assert_eq!(host.open_call_count(), 1);
+        assert_eq!(host.finalize_thread(), vec![102]);
+        assert!(host.closed_calls.is_none());
+        assert!(host
+            .loss_events
+            .iter()
+            .any(|event| matches!(event, LossEvent::UnknownTermination { call_id: 102 })));
     }
     #[test]
     fn aborted_call_closes_open_call_not_unknown_termination() {

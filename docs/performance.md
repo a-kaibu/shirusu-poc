@@ -240,3 +240,18 @@ Writer が Chunk 分割時に算出済みの符号化サイズを、出力 Vec �
 中央値は 47.66→46.38ms。組ごとの比率は 0.89〜1.05 と重なるので、これだけで
 有意な性能改善とは判断しない。Trace の全テスト（サイズ上限、Chunk 分割、
 Golden、往復 PBT を含む）と Clippy を通し、Windows 全体は CI で追跡する。
+
+### 本番 Capture の未使用 Payload キー履歴
+
+CaptureSession は検証済みイベントと Payload の所有権を一緒に Writer へ渡すため、
+別途保存する TemporaryPayloadKey の履歴を参照しない。従来は RingIdentity を
+設定してこの診断用履歴を有効にし、Payload ごとに 5 個の u64 を Ring の寿命中
+保持していた。本番経路での有効化を除き、この未使用履歴の線形増加を止める。
+低レベル API の明示的なキー収集、世代・Sequence 検証、イベント内容は維持する。
+同様に、終了済み call ID の集合は低レベル診断の completed_calls 相関カウンタ
+だけが使用しており、本番 Capture の出力・完全性判定では参照しない。本番では
+この集合も保存しない。CallCompleted 自体は全件 Trace へ送り、Leave が欠けた
+開いた呼び出しを閉じる処理と UnknownTermination の検出は維持する。
+低レベル DrainWorker の既定の診断カウンタと明示的キー収集は変更しない。
+これは Host 全体のメモリ上限を保証する変更ではなく、未終了の呼び出しや損失履歴、
+Writer の索引等は別に残る。
