@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 /// L23: ロード済みモジュールの列挙・署名検証・API Set 契約の解決。
 pub mod modules;
+pub mod system;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WinError {

@@ -45,6 +45,7 @@ fn read_c_string(b: &[u8], off: usize, max: usize) -> Option<String> {
 }
 
 struct NtHeaders {
+    machine: u16,
     optional_off: usize,
     is64: bool,
     num_sections: usize,
@@ -73,6 +74,7 @@ fn nt_headers(b: &[u8]) -> Option<NtHeaders> {
         return None;
     }
     Some(NtHeaders {
+        machine: rd_u16(b, coff)?,
         optional_off,
         is64,
         num_sections,
@@ -94,6 +96,11 @@ fn data_directory(b: &[u8], h: &NtHeaders, index: usize) -> Option<(u32, u32)> {
 pub fn size_of_image(b: &[u8]) -> Option<u32> {
     let h = nt_headers(b)?;
     rd_u32(b, h.optional_off + 56)
+}
+
+/// COFF Machine identifier. Pointer width alone does not identify the ISA.
+pub fn machine(b: &[u8]) -> Option<u16> {
+    nt_headers(b).map(|h| h.machine)
 }
 
 /// 64bit PE (PE32+) かどうか。
@@ -306,6 +313,18 @@ mod tests {
         let base = opt + 112; // PE32+
         w32(b, base + index * 8, rva);
         w32(b, base + index * 8 + 4, size);
+    }
+
+    #[test]
+    fn machine_is_distinct_from_pointer_width() {
+        let mut image = synthetic_image(0x1000);
+        for machine_id in [0x8664, 0xaa64, 0x014c, 0xffff] {
+            w16(&mut image, 0x84, machine_id);
+            assert_eq!(machine(&image), Some(machine_id));
+            assert_eq!(is_pe64(&image), Some(true));
+        }
+        assert_eq!(machine(&[]), None);
+        assert_eq!(machine(&image[..0x85]), None);
     }
 
     #[test]

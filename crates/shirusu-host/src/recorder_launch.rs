@@ -732,6 +732,36 @@ fn inject_and_init(
     if let Some(width) = dll_pointer_width(&image) {
         session_cfg.environment.pointer_width = width;
     }
+    session_cfg.environment.cpu_arch = match (pe::machine(&image), dll_pointer_width(&image)) {
+        (Some(0x014c), Some(32)) => "x86",
+        (Some(0x8664), Some(64)) => "x86_64",
+        _ => "unknown",
+    }
+    .into();
+    session_cfg
+        .environment
+        .capture_config
+        .push_str("; cpu_arch_source=agent-pe-machine");
+    match win::system::windows_version() {
+        Ok(version) => {
+            session_cfg.environment.os_version =
+                format!("Windows NT {}.{}", version.major, version.minor);
+            session_cfg.environment.os_build = version.build;
+            session_cfg
+                .environment
+                .capture_config
+                .push_str("; os_version_source=RtlGetVersion");
+        }
+        Err(_) => {
+            // Do not retain a caller-supplied guess as measured OS evidence.
+            session_cfg.environment.os_version.clear();
+            session_cfg.environment.os_build = 0;
+            session_cfg
+                .environment
+                .capture_config
+                .push_str("; os_version_source=unavailable");
+        }
+    }
     let ring_len = session_cfg.ring_config.required_len();
 
     let notify = win::ProcessNotify::new()?;

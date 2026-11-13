@@ -469,7 +469,7 @@ mod tests {
                 .expect("exe name")
                 .to_string_lossy()
                 .to_ascii_lowercase();
-            assert!(names.iter().any(|n| *n == exe_name), "self: {names:?}");
+            assert!(names.contains(&exe_name), "self: {names:?}");
             // 全モジュールが非ゼロの範囲を持つこと。
             assert!(modules
                 .iter()

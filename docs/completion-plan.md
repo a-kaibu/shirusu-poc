@@ -3,8 +3,8 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
-現時点で全ジョブの成功を確認済みの基準は `b98c7ca` の
-[CI 43440514975](https://github.com/a-kaibu/shirusu-poc/actions/runs/43440514975)。
+現時点で全ジョブの成功を確認済みの基準は `1898616` の
+[CI 43444166213](https://github.com/a-kaibu/shirusu-poc/actions/runs/43444166213)。
 Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
 形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
 成功を新しいコードの合格証拠に流用しない。
@@ -690,3 +690,20 @@ Host FIFO 満杯は 45 / 48 / 49 回、drain 待機は 53.17 / 25.94 / 41.59ms�
 少なくとも Host 側の処理待ちが Ring 回収を止めていることが観測できる。
 x64 GUI は 1.502 倍で 3 件とも完全だが、x86 GUI は 1.396 倍でも 1 件に欠落があり、
 速度だけをもって GUI 全環境達成とは扱わない。高負荷は x64 76.198 倍 / x86 59.497 倍で未達。
+
+
+## Capture の OS ビルドと ISA の証拠
+
+実 Capture の Environment は OS 名・ビルド・CPU arch が空のままになっていた。
+Host が初期化前に RtlGetVersion から取得した major/minor/build を記録し、取得元を
+`os_version_source=RtlGetVersion` として残す。失敗時は推測値を引き継がず空／0と
+`unavailable` にする。Windows の販売名や、互換レイヤーではないという証明には使わない。
+
+ISA は pointer width だけで推定せず、Agent DLL の COFF Machine と optional header を
+照合する。I386 + PE32 は x86、AMD64 + PE32+ は x86_64、それ以外は unknown。
+同一ビットネス注入の現行制約を維持する。x86/x64 の Capture E2E で OS ビルド・ISA・
+pointer width・取得元が Trace に残ることを検証する。native 結果は次の CI で確認する。
+
+Loader Lock 修正 `1898616` は CI 43444166213 の全ジョブを通過した。
+x86 の GUI は 1.619 倍・3 件とも欠落なし、高負荷は 69.810 倍で欠落が残る。
+待機しない設定の有効化は完全性や速度目標の達成を意味しない。

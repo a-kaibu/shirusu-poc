@@ -235,6 +235,19 @@ mod win {
             "target exited successfully",
         );
         c.check(trace.finalization.is_some(), "trace finalized");
+        let version = shirusu_transport_win::system::windows_version().expect("native OS version");
+        c.check(
+            trace.environment.as_ref().is_some_and(|env| {
+                env.os_build == version.build
+                    && env.os_version == format!("Windows NT {}.{}", version.major, version.minor)
+                    && env.cpu_arch == std::env::consts::ARCH
+                    && env.pointer_width == usize::BITS
+                    && env
+                        .capture_config
+                        .contains("os_version_source=RtlGetVersion")
+            }),
+            "Trace records native OS build and target architecture evidence",
+        );
         c.check(
             summary.integrity.event_integrity != IntegrityLevel::Lost,
             "event integrity not lost",
