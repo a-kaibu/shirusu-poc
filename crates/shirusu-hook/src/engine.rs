@@ -2978,22 +2978,42 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
         Some(o) if o != 0 => o as usize,
         _ => return COM_E_FAIL,
     };
+    com_method_dispatch_with(this, method_index, args, original, None, |original| {
+        // SAFETY: the exclusive-object adapter supplies this exact ABI.
+        unsafe { call_com_original(original, this, args) }
+    })
+}
+
+/// Shared IUnknown adapters supply typed invokers and their installation's
+/// owner. Old cached wrappers never attach themselves to a newer session.
+pub(crate) fn com_method_dispatch_with(
+    this: usize,
+    method_index: u32,
+    args: &[usize],
+    original: usize,
+    owner: Option<&std::sync::Weak<HookRuntime>>,
+    invoke: impl FnOnce(usize) -> i32 + Copy,
+) -> i32 {
     let mut le = crate::runtime::LastErrorGuard::capture(WinLastError);
     let Some(mut guard) = ReentrancyGuard::try_enter() else {
         le.restore_before_original();
         // SAFETY: original はこの引数個数の COM メソッド。
-        return unsafe { call_com_original(original, this, args) };
+        return invoke(original);
     };
-    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
+    let rt = match owner {
+        Some(owner) => owner.upgrade(),
+        None => crate::runtime::runtime_slot().for_detour(),
+    };
+    let Some(rt) = rt else {
         le.restore_before_original();
         // SAFETY: 同上。
-        return unsafe { call_com_original(original, this, args) };
+        return invoke(original);
     };
     // COM methods are observable even when called through a runtime.
     let Some(flight) = crate::runtime::DetourFlight::begin(&rt) else {
         le.restore_before_original();
         // SAFETY: 同上。
-        return unsafe { call_com_original(original, this, args) };
+        return invoke(original);
     };
     let _flight = flight;
     // 追跡対象の確認：このセッションで追跡していないオブジェクトは
@@ -3011,7 +3031,7 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
         None => {
             le.restore_before_original();
             // SAFETY: original はこの引数個数の COM メソッド。
-            return unsafe { call_com_original(original, this, args) };
+            return invoke(original);
         }
     };
     let tid = crate::thread_id::current() as u64;
@@ -3047,13 +3067,14 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
     // SAFETY: original はこの引数個数の COM メソッド。
-    let (ret, (mut call_guard, rt, _flight, mut guard, instance)) = crate::seh::invoke(
-        original,
-        |_| unsafe { call_com_original(original, this, args) },
-        (call_guard, rt, _flight, guard, instance),
-    );
+    let (ret, (mut call_guard, rt, _flight, mut guard, instance)) =
+        crate::seh::invoke(original, invoke, (call_guard, rt, _flight, guard, instance));
     let last_error = le.capture_after_original();
     call_guard.complete();
+    if !crate::runtime::native_tls_available() {
+        le.restore_for_return();
+        return ret;
+    }
     guard.resume();
     let _ = last_error; // COM は HRESULT が誤りの経路。LastError は復元だけ行う。
     pop_call(call_id);

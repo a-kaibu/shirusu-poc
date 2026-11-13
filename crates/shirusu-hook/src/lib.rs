@@ -43,6 +43,8 @@ pub mod engine;
 #[cfg(windows)]
 mod seh;
 #[cfg(windows)]
+pub mod shared_com;
+#[cfg(windows)]
 mod thread_snapshot;
 
 // Windows native tests count allocator activity in the actual suspended interval.
