@@ -32,7 +32,7 @@ Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意�
 | Parquet 出力 | 型付きの検索用列と JSONL 互換のイベント内容、完全性メタデータを実装 | 境界値・NULL・空ファイル・複数 row group の回帰テスト、DuckDB での読み込み |
 | 公開 Trace、解析、修復 | Writer/Reader/CLI、復旧と不正入力検査を実装 | 形式適合性・破損復旧・Linux/macOS の解析 CI |
 | 比較と再実行可能な Probe | オブジェクト相関と同期ファイル I/O 再生を実装。一般 API、非同期、コールバックは未対応 | Windows Capture → 差分 → Probe 実行の E2E、不足条件を拒否するテスト |
-| 性能と完全性 | ベンチマーク・損失通知を実装 | GUI 3倍／高負荷5倍を同一条件で測定し、未達時は数値と原因を記録 |
+| 性能と完全性 | ベンチマーク・損失通知を実装 | GUI 3倍／高負荷3倍（full、2026-11-13 に5倍から変更）を同一条件で測定し、未達時は数値と原因を記録（下限の根拠は performance.md「記録経路の再設計」） |
 | Windows x86/x64 の検証 | ローカル compile と CI を分離。`e7e2fc2` で x86 Capture / ABI と x64 2 環境の全 CI シナリオ通過 | Windows 実行・Application Verifier・ABI・SEH・replay の通過 |
 
 優先順は観測境界と透明性、Windows 実走の失敗解消、Metadata 全体の
