@@ -14,5 +14,8 @@ fn schemas() -> String {
 }
 #[test]
 fn file_io_schema_wire_contract_is_unchanged() {
-    assert_eq!(schemas(), include_str!("golden/file-io-schemas.txt"));
+    assert_eq!(
+        schemas(),
+        include_str!("golden/file-io-schemas.txt").replace("\r\n", "\n")
+    );
 }

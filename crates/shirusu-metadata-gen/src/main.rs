@@ -170,7 +170,12 @@ fn file_io_contracts_run() -> Result<(), String> {
     let path = "crates/shirusu-hook/src/api_file_io_generated.inc";
     if args.is_empty() {
         std::fs::write(path, generated).map_err(|e| e.to_string())
-    } else if std::fs::read_to_string(path).ok().as_deref() == Some(&generated) {
+    } else if std::fs::read_to_string(path)
+        .map(|s| s.replace("\r\n", "\n"))
+        .ok()
+        .as_deref()
+        == Some(&generated)
+    {
         Ok(())
     } else {
         Err(format!("{path} is stale"))

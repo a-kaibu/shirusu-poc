@@ -121,7 +121,7 @@ mod tests {
     fn checked_in_contracts_are_current() {
         assert_eq!(
             emit_file_io_contracts(SOURCE).unwrap(),
-            include_str!("../../shirusu-hook/src/api_file_io_generated.inc")
+            include_str!("../../shirusu-hook/src/api_file_io_generated.inc").replace("\r\n", "\n")
         );
     }
     #[test]

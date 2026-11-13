@@ -145,12 +145,12 @@ impl ReentrancyGuard {
         // Rust rejects registering another destructor inside System allocation.
         let ready = RUNTIME_CACHE_READY
             .try_with(|ready| {
-                if !ready.get() {
-                    if DETOUR_RUNTIME.try_with(|_| ()).is_err() {
-                        return false;
-                    }
-                    ready.set(true);
+                // READY controls nested allocator access; it does not prove
+                // that this destructor-bearing key still exists at thread exit.
+                if DETOUR_RUNTIME.try_with(|_| ()).is_err() {
+                    return false;
                 }
+                ready.set(true);
                 true
             })
             .unwrap_or(false);
@@ -2412,4 +2412,34 @@ fn detours_stay_passthrough_after_capture_tls_destruction() {
     .join()
     .unwrap();
     assert_eq!(rx.recv().unwrap(), (true, true, 0));
+}
+
+#[test]
+fn capture_stops_after_runtime_cache_tls_destruction() {
+    struct Probe(std::sync::mpsc::Sender<(bool, bool, bool)>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0
+                .send((
+                    DETOUR_RUNTIME.try_with(|_| ()).is_err(),
+                    CALL_STACK.try_with(|_| ()).is_ok(),
+                    ReentrancyGuard::try_enter().is_none(),
+                ))
+                .unwrap();
+        }
+    }
+    thread_local! { static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) }; }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let guard = ReentrancyGuard::try_enter_with(|| {
+            CALL_STACK.try_with(|_| ()).is_ok() && shirusu_agent::current_thread_capture_available()
+        })
+        .unwrap();
+        PROBE.with(|p| *p.borrow_mut() = Some(Probe(tx)));
+        drop(guard);
+        drop(ReentrancyGuard::try_enter().unwrap());
+    })
+    .join()
+    .unwrap();
+    assert_eq!(rx.recv().unwrap(), (true, true, true));
 }
