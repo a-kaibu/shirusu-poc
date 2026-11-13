@@ -122,6 +122,20 @@ fn main() {
         shirusu_hook::last_error::set(black_box(value));
     });
 
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        measure("thread_id_windows_api_unhooked", || {
+            black_box(unsafe { GetCurrentThreadId() });
+        });
+        measure("thread_id_direct_teb", || {
+            black_box(shirusu_hook::thread_id::current());
+        });
+    }
+
     // Batch sizes stay below capacity. Production sizes are unchanged; no wait
     // for a consumer is measured here. Compare with native-performance losses.
     // SAFETY: Agent owns this registered ring until after worker is dropped;

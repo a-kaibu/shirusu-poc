@@ -1923,7 +1923,7 @@ fn prepare_com(factory_index: usize) -> ComPrepare {
     // COM methods are observable even when called through a runtime.
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
-            let tid = unsafe { GetCurrentThreadId() } as u64;
+            let tid = crate::thread_id::current() as u64;
             rt.ensure_thread(tid);
             ComPrepare::Record {
                 rt,
@@ -2181,7 +2181,7 @@ fn prepare_winrt(activation_index: usize) -> WinRtPrepare {
     // COM methods are observable even when called through a runtime.
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
-            let tid = unsafe { GetCurrentThreadId() } as u64;
+            let tid = crate::thread_id::current() as u64;
             rt.ensure_thread(tid);
             WinRtPrepare::Record {
                 rt,
@@ -2372,7 +2372,7 @@ fn prepare_callback_hook(hook_index: usize) -> CallbackPrepare {
     // COM methods are observable even when called through a runtime.
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
-            let tid = unsafe { GetCurrentThreadId() } as u64;
+            let tid = crate::thread_id::current() as u64;
             rt.ensure_thread(tid);
             CallbackPrepare::Proceed {
                 rt,
@@ -2407,7 +2407,7 @@ fn prepare_callback_dispatch(original: usize) -> CallbackPrepare {
     // ため通常は抑制されない。Runtime 分類の場合は記録しない。
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
-            let tid = unsafe { GetCurrentThreadId() } as u64;
+            let tid = crate::thread_id::current() as u64;
             rt.ensure_thread(tid);
             CallbackPrepare::Proceed {
                 rt,
@@ -2973,7 +2973,7 @@ fn com_method_dispatch(this: usize, method_index: u32, args: &[usize]) -> i32 {
             return unsafe { call_com_original(original, this, args) };
         }
     };
-    let tid = unsafe { GetCurrentThreadId() } as u64;
+    let tid = crate::thread_id::current() as u64;
     rt.ensure_thread(tid);
     let call_id = rt.alloc_call_id();
     // enter: QI では target_iid に要求された IID を読む。
@@ -3284,7 +3284,7 @@ fn prepare(api_id: u32) -> Prepare {
     }
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
-            let tid = unsafe { GetCurrentThreadId() } as u64;
+            let tid = crate::thread_id::current() as u64;
             rt.ensure_thread(tid);
             Prepare::Record {
                 rt,

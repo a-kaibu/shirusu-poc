@@ -34,6 +34,8 @@ pub mod last_error;
 pub mod pe;
 pub mod plan;
 pub mod runtime;
+#[cfg(windows)]
+pub mod thread_id;
 pub mod winrt;
 
 #[cfg(windows)]

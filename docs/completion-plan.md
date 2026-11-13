@@ -343,3 +343,16 @@ exercise all five dispositions, generated Capture → emitter → compare behavi
 contract binding rejection and the actual Windows Detour passing the original
 input. Old Trace Stale decisions are not retroactively rewritten, and CreateFileA
 and other APIs outside these four contracts still need input-dependent coverage.
+
+The corrected error/sharing Probe and CreateFileW input-dependent Capture tests
+passed on Windows latest x64, WoW64 x86 and Server 2022 in run `43410242785`
+(`cc86db2`). Fuzz was still running when these native results were checked.
+
+Detour preparation now reads ClientId.UniqueThread from the executing thread's
+TEB on x86/x64 instead of calling GetCurrentThreadId, which is itself selected
+for hooking. This removes the internal detour/passthrough traversal without
+excluding application GetCurrentThreadId calls. Direct reads use GS:0x48 on x64
+and FS:0x24 on x86/WoW64, with API fallback on other architectures. Native tests
+compare with Windows on eight simultaneously live threads and check LastError
+preservation. The component bench measures unhooked API and TEB reads separately;
+any injected performance effect must be established by the next native run.
