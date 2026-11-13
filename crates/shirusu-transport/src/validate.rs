@@ -420,7 +420,8 @@ impl ValidatingReader {
         if image.len() < cfg.required_len() || self.known.mapping_len < cfg.required_len() {
             return Err(IntegrityError::ImageTooSmall);
         }
-        let control_copy = image[..CONTROL_SIZE].to_vec();
+        let mut control_copy = [0u8; CONTROL_SIZE];
+        control_copy.copy_from_slice(&image[..CONTROL_SIZE]);
         let snap = validate_control(&control_copy, &self.known, self.prev.as_ref())?;
         if snap.generation != self.expected_generation {
             return Err(IntegrityError::GenerationMismatch {
@@ -466,7 +467,8 @@ impl ValidatingReader {
             return Err(IntegrityError::ImageTooSmall);
         }
         // 1. Control をコピーして検証（共有値を直接使わない）
-        let control_copy = image[..CONTROL_SIZE].to_vec();
+        let mut control_copy = [0u8; CONTROL_SIZE];
+        control_copy.copy_from_slice(&image[..CONTROL_SIZE]);
         let snap = validate_control(&control_copy, &self.known, self.prev.as_ref())?;
         if snap.generation != self.expected_generation {
             return Err(IntegrityError::GenerationMismatch {
@@ -487,7 +489,10 @@ impl ValidatingReader {
         while cursor < snap.write_cursor && events.len() < max {
             let idx = slot_index(cursor, self.known.descriptor_capacity) as usize;
             let off = cfg.descriptors_offset() + idx * 64;
-            let desc_copy = image[off..off + 64].to_vec();
+            // The image is already a stable Host-owned snapshot. Keep the
+            // defensive fixed-size copy without allocating for every event.
+            let mut desc_copy = [0u8; 64];
+            desc_copy.copy_from_slice(&image[off..off + 64]);
             // 仕様の Host 検証手順 4: 長さ・オフセット・Sequence を照合する。
             // Generation は Control 領域で既に照合済み（上記）。
             let expectation = DescriptorExpectation {

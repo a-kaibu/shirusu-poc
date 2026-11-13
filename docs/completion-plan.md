@@ -438,3 +438,13 @@ missing observations or changed workload results fail the experiment. Timing or
 loss differences are evidence for tuning, not proof of the 5x target. Capture
 metadata now records actual descriptor and payload capacities. Defaults have not
 been enlarged; native results are required before selecting a new configuration.
+
+### Fixed-size validation scratch storage (2026-11-13)
+
+ValidatingReader now keeps its 256-byte Control copy and 64-byte Descriptor copy
+in fixed-size arrays instead of allocating Vecs. The Host-owned snapshot,
+validation rules, payload ownership and cursor publication order are unchanged.
+This removes a source-level allocation per event, plus one per drain/resume.
+Transport and Host suites pass, including malformed images and resume checks.
+Local component timings are noisy (most cases improved, one large-batch case
+regressed); no application-level speedup is claimed without native measurements.
