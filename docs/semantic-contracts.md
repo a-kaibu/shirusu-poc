@@ -52,3 +52,13 @@ DependsOnInputs に使った場合は、生値を Unsupported として残し、
 書き換える機能ではなく、新しい Capture で反映される。CreateFileA の L1 Wrapper
 にも同じ条件を判定する手書きルールを適用する。それ以外の入力依存条件は
 まだ一般化していない。
+
+名前付き同期オブジェクトの L1 LastError も入力付きの手書き判定を持つ。
+CreateMutexW / CreateMutexExW / CreateEventW / CreateEventExW /
+CreateSemaphoreW は失敗時のエラーを Captured とする。成功時は lpName が NULL
+なら Stale、非 NULL で ERROR_ALREADY_EXISTS なら Captured とする。
+その他の名前付き成功や引数不足は、L1 だけで新規作成時の状態を断定せず
+Unsupported として生値を残す。名前の文字列やオブジェクト寿命を取得する L2
+契約ではなく、4 API の宣言的生成パイロットにも含めない。
+Microsoft の [CreateEventW の戻り値仕様](https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-createeventw)
+に基づき、同じ名前を再度開く Windows テストで ERROR_ALREADY_EXISTS を確認する。

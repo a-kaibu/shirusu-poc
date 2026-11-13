@@ -150,7 +150,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("lpMutexAttributes", Ty::U64, ValueKind::Pointer, BEFORE), ("bInitialOwner", Ty::I32, ValueKind::Scalar, BEFORE), ("lpName", Ty::U64, ValueKind::Pointer, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Handle, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+    last_error_meaning: LastErrorMeaning::DependsOnInputs,
 },
 ApiDef {
     api_id: 22,
@@ -160,7 +160,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("lpMutexAttributes", Ty::U64, ValueKind::Pointer, BEFORE), ("lpName", Ty::U64, ValueKind::Pointer, BEFORE), ("dwFlags", Ty::U32, ValueKind::Scalar, BEFORE), ("dwDesiredAccess", Ty::U32, ValueKind::Scalar, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Handle, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+    last_error_meaning: LastErrorMeaning::DependsOnInputs,
 },
 ApiDef {
     api_id: 23,
@@ -170,7 +170,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("lpEventAttributes", Ty::U64, ValueKind::Pointer, BEFORE), ("bManualReset", Ty::I32, ValueKind::Scalar, BEFORE), ("bInitialState", Ty::I32, ValueKind::Scalar, BEFORE), ("lpName", Ty::U64, ValueKind::Pointer, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Handle, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+    last_error_meaning: LastErrorMeaning::DependsOnInputs,
 },
 ApiDef {
     api_id: 24,
@@ -180,7 +180,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("lpEventAttributes", Ty::U64, ValueKind::Pointer, BEFORE), ("lpName", Ty::U64, ValueKind::Pointer, BEFORE), ("dwFlags", Ty::U32, ValueKind::Scalar, BEFORE), ("dwDesiredAccess", Ty::U32, ValueKind::Scalar, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Handle, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+    last_error_meaning: LastErrorMeaning::DependsOnInputs,
 },
 ApiDef {
     api_id: 25,
@@ -220,7 +220,7 @@ ApiDef {
     level_note: "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）",
     enter_fields: &[("lpSemaphoreAttributes", Ty::U64, ValueKind::Pointer, BEFORE), ("lInitialCount", Ty::I32, ValueKind::Scalar, BEFORE), ("lMaximumCount", Ty::I32, ValueKind::Scalar, BEFORE), ("lpName", Ty::U64, ValueKind::Pointer, BEFORE)],
     leave_fields: &[("return", Ty::U64, ValueKind::Handle, AFTER), ("last_error", Ty::U32, ValueKind::Scalar, AFTER)],
-    last_error_meaning: LastErrorMeaning::WhenReturnIsNull,
+    last_error_meaning: LastErrorMeaning::DependsOnInputs,
 },
 ApiDef {
     api_id: 29,

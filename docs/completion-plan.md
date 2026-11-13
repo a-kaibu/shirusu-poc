@@ -504,3 +504,16 @@ properties and explicit extreme values check equivalence to the prior percentage
 calculation. Local release component median was 3.41 ns before and 1.99 ns after;
 this small isolated improvement is not an application speedup claim. The native
 phase benchmark now records this component too.
+
+### Named synchronization object creation (2026-11-13)
+
+CreateMutexW/ExW, CreateEventW/ExW and CreateSemaphoreW previously marked successful
+ERROR_ALREADY_EXISTS as Stale under the generic NULL-only failure rule. Their
+schemas now declare input-dependent meaning. NULL failures are Captured; successful
+unnamed objects are Stale; successful named ERROR_ALREADY_EXISTS is Captured. Other
+named successes or missing inputs remain Unsupported with raw values preserved,
+without pretending the L1 capture knows all creation state. The regression checks
+all five generated lpName bindings and failed against the prior generated schemas.
+A native CreateEventW reopen test checks the real Windows error and encoded capture
+status. Linux Hook/generator suites and x86/x64 strict Clippy pass; native execution
+of the new test is pending CI.

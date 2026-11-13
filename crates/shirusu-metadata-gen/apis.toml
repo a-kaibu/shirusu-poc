@@ -82,18 +82,26 @@ last_error = "minus-one"
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"
 function = "CreateMutexW"
+# Named existing objects return ERROR_ALREADY_EXISTS on success.
+last_error = "depends-on-inputs"
 [[api]]
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"
 function = "CreateMutexExW"
+# Named existing objects return ERROR_ALREADY_EXISTS on success.
+last_error = "depends-on-inputs"
 [[api]]
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"
 function = "CreateEventW"
+# Named existing objects return ERROR_ALREADY_EXISTS on success.
+last_error = "depends-on-inputs"
 [[api]]
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"
 function = "CreateEventExW"
+# Named existing objects return ERROR_ALREADY_EXISTS on success.
+last_error = "depends-on-inputs"
 [[api]]
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"
@@ -110,6 +118,8 @@ function = "ReleaseMutex"
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"
 function = "CreateSemaphoreW"
+# Named existing objects return ERROR_ALREADY_EXISTS on success.
+last_error = "depends-on-inputs"
 [[api]]
 namespace = "Windows.Win32.System.Threading"
 module = "kernel32.dll"

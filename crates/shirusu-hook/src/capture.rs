@@ -595,11 +595,12 @@ pub fn generic_enter(api: &ApiDef, args: &[u64]) -> Vec<CapturedValue> {
 /// `last_error_value`（F20 の意味条件）で作る。void 戻りの API は
 /// `return` フィールドを持たず `last_error` だけになる。
 pub fn generic_leave(api: &ApiDef, return_value: u64, last_error: u32) -> Vec<CapturedValue> {
+    let meaning = generic_last_error_meaning(api, return_value, last_error, &[]);
     api.leave_fields
         .iter()
         .map(|(name, ty, _, _)| match *name {
             "return" => raw_to_value(api.function, name, *ty, return_value),
-            "last_error" => last_error_value(api.last_error_meaning, return_value, last_error),
+            "last_error" => last_error_value(meaning, return_value, last_error),
             other => panic!(
                 "{}: unexpected leave field {other} in generated table",
                 api.function
@@ -701,18 +702,7 @@ pub fn encode_generic_leave_with_inputs(
     last_error: u32,
     args: &[u64],
 ) -> GenericPayload<2> {
-    let meaning = if api.last_error_meaning == LastErrorMeaning::DependsOnInputs
-        && api.module.eq_ignore_ascii_case("kernel32.dll")
-        && api.function == "CreateFileA"
-    {
-        match args.get(4).copied().and_then(|v| u32::try_from(v).ok()) {
-            Some(2 | 4) => LastErrorMeaning::Always,
-            Some(_) => LastErrorMeaning::WhenReturnIsInvalidHandle,
-            None => LastErrorMeaning::DependsOnInputs,
-        }
-    } else {
-        api.last_error_meaning
-    };
+    let meaning = generic_last_error_meaning(api, return_value, last_error, args);
     assert!(
         api.leave_fields.len() <= 2,
         "generated leave capacity exceeded"
@@ -726,6 +716,43 @@ pub fn encode_generic_leave_with_inputs(
         });
     }
     payload
+}
+
+// Successful named-object creation can report ERROR_ALREADY_EXISTS. Other
+// successful named results need more semantic context; retain them Unsupported
+// rather than asserting that they are stale. Failure needs no name context.
+fn generic_last_error_meaning(
+    api: &ApiDef,
+    returned: u64,
+    raw_error: u32,
+    args: &[u64],
+) -> LastErrorMeaning {
+    if api.last_error_meaning != LastErrorMeaning::DependsOnInputs
+        || !api.module.eq_ignore_ascii_case("kernel32.dll")
+    {
+        return api.last_error_meaning;
+    }
+    if api.function == "CreateFileA" {
+        return match args.get(4).copied().and_then(|v| u32::try_from(v).ok()) {
+            Some(2 | 4) => LastErrorMeaning::Always,
+            Some(_) => LastErrorMeaning::WhenReturnIsInvalidHandle,
+            None => LastErrorMeaning::DependsOnInputs,
+        };
+    }
+    let name_index = match api.function {
+        "CreateMutexW" => 2,
+        "CreateMutexExW" | "CreateEventExW" => 1,
+        "CreateEventW" | "CreateSemaphoreW" => 3,
+        _ => return LastErrorMeaning::DependsOnInputs,
+    };
+    if returned == 0 {
+        return LastErrorMeaning::Always;
+    }
+    match args.get(name_index) {
+        Some(0) => LastErrorMeaning::Never,
+        Some(_) if raw_error == 183 => LastErrorMeaning::Always,
+        _ => LastErrorMeaning::DependsOnInputs,
+    }
 }
 
 /// 生の u64 値を Schema の型に沿った `CapturedValue` へ変換する。
@@ -781,6 +808,89 @@ mod tests {
             assert_eq!(values[1].capture, ValueCapture::Unsupported);
             assert_eq!(values[1].value, TypedValue::U32(183));
         }
+    }
+
+    #[test]
+    fn named_object_creation_preserves_already_exists_and_unknown_context() {
+        for (name, index) in [
+            ("CreateMutexW", 2),
+            ("CreateMutexExW", 1),
+            ("CreateEventW", 3),
+            ("CreateEventExW", 1),
+            ("CreateSemaphoreW", 3),
+        ] {
+            let api = api_by_name(name).unwrap();
+            assert_eq!(
+                api.enter_fields[index].0, "lpName",
+                "{name} contract binding"
+            );
+            let types = schema_types(&api.leave_schema()).unwrap();
+            for (returned, name_ptr, error, expected) in [
+                (0, 0, 5, ValueCapture::Captured),
+                (0, 0x1000, 6, ValueCapture::Captured),
+                (0x1234, 0, 183, ValueCapture::Stale),
+                (0x1234, 0x1000, 183, ValueCapture::Captured),
+                (0x1234, 0x1000, 0, ValueCapture::Unsupported),
+                (0x1234, 0x1000, 5, ValueCapture::Unsupported),
+            ] {
+                let mut args = vec![0; api.enter_fields.len()];
+                args[index] = name_ptr;
+                let bytes = encode_generic_leave_with_inputs(api, returned, error, &args);
+                let values = decode_values(&types, bytes.as_bytes()).unwrap();
+                assert_eq!(values[1].capture, expected, "{name}");
+                assert_eq!(values[1].value, TypedValue::U32(error));
+            }
+            let bytes = encode_generic_leave(api, 0x1234, 183);
+            assert_eq!(
+                decode_values(&types, bytes.as_bytes()).unwrap()[1].capture,
+                ValueCapture::Unsupported
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_named_event_reopen_reports_meaningful_already_exists() {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateEventW(
+                attributes: *const c_void,
+                manual: i32,
+                initial: i32,
+                name: *const u16,
+            ) -> *mut c_void;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+        let name: Vec<u16> = format!("Local\\shirusu-semantic-event-{}", std::process::id())
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: null attributes and a live, NUL-terminated UTF-16 name.
+        let first = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        assert!(!first.is_null());
+        crate::last_error::set(5);
+        let second = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        let error = crate::last_error::get();
+        // Close both independently acquired handles before assertions/encoding.
+        unsafe {
+            CloseHandle(first);
+            if !second.is_null() {
+                CloseHandle(second);
+            }
+        }
+        assert!(!second.is_null());
+        assert_eq!(error, 183);
+        let api = api_by_name("CreateEventW").unwrap();
+        let args = [0, 0, 0, name.as_ptr() as usize as u64];
+        let bytes = encode_generic_leave_with_inputs(api, second as usize as u64, error, &args);
+        let values = decode_values(
+            &schema_types(&api.leave_schema()).unwrap(),
+            bytes.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(values[1].capture, ValueCapture::Captured);
+        assert_eq!(values[1].value, TypedValue::U32(183));
     }
 
     #[test]
