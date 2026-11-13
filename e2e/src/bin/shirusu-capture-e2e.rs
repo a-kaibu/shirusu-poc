@@ -904,11 +904,11 @@ mod win {
                             // WM_CLOSE (0x0010) と WM_DESTROY (0x0002) は
                             // メッセージループの中で届く。
                             c.check(
-                                messages.iter().any(|m| *m == 0x0001),
+                                messages.contains(&0x0001),
                                 &format!("{app} WM_CREATE callback recorded"),
                             );
                             c.check(
-                                messages.iter().any(|m| *m == 0x0002),
+                                messages.contains(&0x0002),
                                 &format!("{app} WM_DESTROY callback recorded"),
                             );
                             c.check(

@@ -327,49 +327,49 @@ mod win {
         // SAFETY: 解決したアドレスを宣言した型の関数ポインタへ写す。
         // 名前と DLL が一致するため、型は対象 API のものと一致する。
         let create_file_w: CreateFileWFn = match resolve("kernel32.dll", "CreateFileW") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, CreateFileWFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress CreateFileW");
                 return 2;
             }
         };
         let write_file: WriteFileFn = match resolve("kernel32.dll", "WriteFile") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, WriteFileFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress WriteFile");
                 return 2;
             }
         };
         let read_file: ReadFileFn = match resolve("kernel32.dll", "ReadFile") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, ReadFileFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress ReadFile");
                 return 2;
             }
         };
         let set_file_pointer: SetFilePointerFn = match resolve("kernel32.dll", "SetFilePointer") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, SetFilePointerFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress SetFilePointer");
                 return 2;
             }
         };
         let close_handle: CloseHandleFn = match resolve("kernel32.dll", "CloseHandle") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, CloseHandleFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress CloseHandle");
                 return 2;
             }
         };
         let reg_create: RegCreateKeyExWFn = match resolve("advapi32.dll", "RegCreateKeyExW") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, RegCreateKeyExWFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress RegCreateKeyExW");
                 return 2;
             }
         };
         let reg_close: RegCloseKeyFn = match resolve("advapi32.dll", "RegCloseKey") {
-            Some(p) => unsafe { std::mem::transmute(p) },
+            Some(p) => unsafe { std::mem::transmute::<*mut c_void, RegCloseKeyFn>(p) },
             None => {
                 println!("TARGET_FAIL getprocaddress RegCloseKey");
                 return 2;
@@ -580,6 +580,8 @@ mod win {
     /// 浮動小数点レジスタ・スタックの整合性が壊れれば、Hook ありとなしで
     /// ビット列が変わる。`#[inline(never)]` で畳み込みを防ぐ。
     #[inline(never)]
+    // Nine arguments deliberately exercise register and stack ABI boundaries.
+    #[allow(clippy::too_many_arguments)]
     fn float_many_args(
         a: f64,
         b: f64,
@@ -593,7 +595,7 @@ mod win {
     ) -> Option<(u64, u32, u64)> {
         let x = 1.23456789012345f64;
         let y = 9.87654321098765f64;
-        let z = 3.14159265358979f32;
+        let z = std::f32::consts::PI;
         // フックされた呼び出しの前後で値を生かす。black_box で定数畳み込み
         // を防ぎ、計算が実行時に起きるようにする。
         let handle = create_file_w(path, 2 /* CREATE_ALWAYS */);
@@ -651,7 +653,7 @@ mod win {
         let handle = create_file_w(path, 2 /* CREATE_ALWAYS */);
         let s = ProbeStruct {
             tag: 0x0123_4567_89AB_CDEF,
-            ratio: 2.718281828459045,
+            ratio: std::f64::consts::E,
             lo: 0xDEAD_BEEF,
             hi: 0xCAFE_F00D,
         };
@@ -668,7 +670,7 @@ mod win {
         let s = struct_probe_inner(&path);
         let _ = std::fs::remove_file(&path);
         if s.tag != 0x0123_4567_89AB_CDEF
-            || s.ratio.to_bits() != 2.718281828459045f64.to_bits()
+            || s.ratio.to_bits() != std::f64::consts::E.to_bits()
             || s.lo != 0xDEAD_BEEF
             || s.hi != 0xCAFE_F00D
         {
