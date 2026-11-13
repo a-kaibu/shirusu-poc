@@ -85,6 +85,10 @@ pub fn descriptor_free(write_cursor: u64, read_cursor: u64, capacity: u64) -> Op
 pub fn slot_index(cursor: u64, capacity: u64) -> u64 {
     if capacity == 0 {
         0
+    } else if capacity.is_power_of_two() {
+        // Production capacities are powers of two: avoid a 64-bit division
+        // (tens of cycles) on every published event. Same result as `%`.
+        cursor & (capacity - 1)
     } else {
         cursor % capacity
     }

@@ -317,3 +317,67 @@ fixture での効果と、非対応 CPU のフォールバックは別に検証�
 GUI はそれぞれ 1.387 / 1.386 / 1.879 倍、全試行で Event Integrity が完全。
 高負荷は 44.485 / 37.711 / 45.168 倍で、いずれも欠落が残った。部品の CRC 高速化が
 Windows の全環境で同じ倍率改善につながったとは扱わず、5倍目標は引き続き未達。
+
+## 記録経路の再設計（高負荷目標 3倍、2026-11-13）
+
+高負荷の目標は 5倍から 3倍（full モード）へ引き上げた。CI の判定
+（`scripts/ci/native-performance.ps1`）も両 workload とも 3倍で読む。
+
+### 変更点
+
+- **イベント時刻**: Ring Writer ごとの `EventTimestamper`（`shirusu-transport::tsc`）が、
+  invariant TSC（CPUID 0x80000007 EDX bit 8）を持つ CPU で QPC を約 1ms ごとに
+  再アンカーし、間を TSC で補間する。単位は QPC のまま、Writer 内で単調。
+  アンカーは TSC と QPC の組を3回読み、TSC の幅が最も狭い組を使う。
+  補間誤差はアンカー間隔の小さな割合で、負荷の高いホストではペアリングの
+  揺らぎで大きくなる（テストは 30,000 tick の間隔に対し 300 tick 以内で判定）。
+  `SHIRUSU_EVENT_CLOCK=qpc` で直接 QPC に戻せる。
+- **Host の回収**: 回収スレッドは確定済みの Descriptor と参照先 Payload を
+  コピーして、すぐに読み位置を進める（`CommittedRangeCollector`）。検証
+  （`DrainWorker::ingest_chunk` → `ValidatingReader::drain_chunk`）と変換は
+  Trace worker で行う。コピーした内容は信用せず、`drain_image` と同じ検査で
+  矛盾を見つけたら Ring を停止し、以後の解放もしない。旧経路との違いは、
+  検証より先に空きを Writer へ返すこと。返すのは Host がすでにコピーした範囲だけ。
+- **キュー**: 16 件固定の有界キューをやめ、バイト上限（64bit 256 MiB、32bit
+  64 MiB）にした。上限を超えると回収側が待つ（`queue_full` / `drain_wait`）。
+  検証状態を読む前（世代交代と停止）にはバリアで全コマンドの処理を待つ。
+- **回収の間隔**: 容量の 1/8 未満しか回収できなかったら 20µs スピンしてから
+  次を回収する。ほぼ1件ごとの回収で Control のキャッシュラインが Writer と
+  奪い合いになるのを避ける。
+- **異常経路の Host 生存確認**: 欠落・劣化イベントごとに呼んでいたシステム
+  コール（`WaitForSingleObject`）を、最初の1件と以後 256 件に1回へ間引いた。
+- Agent: 落とした Enter が無い間はハッシュ照合を省略、TLS キャッシュから
+  Arc を複製せずに書く、生成 Detour のランタイム参照を1つに、ExitThread の
+  判定を ID 比較に、生成 API のスカラーを直接エンコード、Ring 位置の計算で
+  2 の冪の容量は除算をビット演算に置き換え。
+
+### 計測（`801b914`、CI run 43469123340、x64 Server 2022）
+
+| 項目 | 値 |
+| --- | --- |
+| Native high-load | 28.451倍（再設計前 約37〜45倍）、3試行中1回は欠落0・Event Integrity 完全 |
+| Native gui | 1.652倍、全試行完全 |
+| Host のキュー満杯 / 回収待ち | 0回 / 0ms |
+| `floor_raw_tsc` | 9.47 ns |
+| `floor_call_two_tsc_two_records` | 19.00 ns / 呼び出し |
+| `event_timestamp`（補間） / `timestamp`（QPC） | 9.50 / 23.54 ns |
+| `ring_publish_batch_3072` | 59.99 ns / イベント |
+| `host_collect_release_batch_3072` | 20.54 ns / イベント（旧 drain 125〜150） |
+| `typed_detour_two_events` | 190.04 ns / 呼び出し（再設計前 210） |
+
+latest x64 は TSC 補間テストの不安定さで失敗した（`fa76ae5` で修正）。
+x86 WoW64 は 35.892倍、`typed_detour_two_events` 272.85 ns。
+
+### 3倍の下限
+
+high-load のベースラインは 1呼び出しあたり約 10 ns（50,000 反復 × 3 API、
+中央値 約 1.5ms）。3倍に収めるには、追加を約 20 ns / 呼び出しに抑える必要がある。
+
+一方、記録を一切せずに「精密な時刻を2回読み、32 バイトを2回書く」だけの
+下限（`floor_call_two_tsc_two_records`）が、CI で 19.0 ns / 呼び出しだった。
+フックの入口、再入判定、引数のエンコード、Ring への公開を入れる前に、予算の
+9割以上を使い切る。呼び出しごとに Enter と Leave を精密な時刻つきで記録する
+full モードでは、この fixture の 3倍はハードウェアの下限で届かない。
+
+この判断は Windows CI の部品計測に基づく。実機の別 CPU では TSC の読み取りコストが
+異なり得るが、下限が 1/2 以下になる見込みはない。
