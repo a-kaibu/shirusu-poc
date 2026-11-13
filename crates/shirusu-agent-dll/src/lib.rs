@@ -206,6 +206,9 @@ mod win {
         let pool = Arc::new(SlotPool::new(0));
         let agent = Arc::new(
             Agent::new(pool, config, host_monitor)
+                // A detour can run from someone else's DllMain. Initialization
+                // outside Loader Lock does not prove later callers are outside.
+                .with_loader_lock_state(shirusu_transport::LoaderLockState::Unknown)
                 .with_timestamp_source(Arc::new(QpcTimestampSource::new()))
                 // L11: Host が Bootstrap v4 で指定した --order=global を Agent へ渡す。
                 .with_order_global(b.order_global != 0),

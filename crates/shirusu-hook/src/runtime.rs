@@ -12,7 +12,8 @@
 //!
 //! Loader Lock への配慮: ランタイムの構築とフックの設置は DLL 初期化
 //! 専用スレッド（DllMain の外）で行う。記録経路では Agent の
-//! WriterPolicy 既定（Loader Lock 保持が不明な書き込みは待機 0、A69）
+//! DLL が設定する LoaderLockState::Unknown と WriterPolicy 既定
+//! （Loader Lock 保持が不明な書き込みは待機 0、A69）
 //! に従い、ここでも待機する操作は行わない（SetEvent は待たない操作）。
 
 use crate::api::{ApiDef, API_COUNT};

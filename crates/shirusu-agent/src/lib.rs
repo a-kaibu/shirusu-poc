@@ -20,7 +20,9 @@ use shirusu_transport::context::{should_record, CallOrigin, HostMonitor, Publish
 use shirusu_transport::descriptor::{CaptureState, EventKind};
 use shirusu_transport::expansion::{ExpansionDelivery, EXPANDED_SLOT_GENERATION};
 use shirusu_transport::layout;
-use shirusu_transport::ring::{EventInput, RingWriter, SharedRegion, WriteOutcome, WriterPolicy};
+use shirusu_transport::ring::{
+    EventInput, LoaderLockState, RingWriter, SharedRegion, WriteOutcome, WriterPolicy,
+};
 use shirusu_transport::slot::{SlotHandle, SlotPool};
 use shirusu_transport::RingConfig;
 use shirusu_transport_win::{EventClock, EventObject, HandleValue, RingNotify, SharedMapping};
@@ -49,6 +51,7 @@ pub struct Agent {
     pool: Arc<SlotPool>,
     config: RingConfig,
     policy: WriterPolicy,
+    loader_lock_state: LoaderLockState,
     /// 書き手の既定 Clock (Ring ごとの `space_available` が結ばれていない
     /// Ring で使う)。`with_clock` で構築時に設定し、以後は不変。
     default_clock: Arc<dyn Clock>,
@@ -175,6 +178,7 @@ impl Agent {
             pool,
             config,
             policy: WriterPolicy::default(),
+            loader_lock_state: LoaderLockState::NotHeld,
             default_clock: system_clock(),
             timestamps: system_timestamp_source(),
             space_clocks: RwLock::new(HashMap::new()),
@@ -196,6 +200,13 @@ impl Agent {
     }
     pub fn with_policy(mut self, policy: WriterPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+    /// Assumption applied to every writer, including mapped/expanded slots.
+    /// API hooks without a per-call proof must use Unknown, so the default
+    /// zero-wait-on-unknown policy applies even when the Ring is full.
+    pub fn with_loader_lock_state(mut self, state: LoaderLockState) -> Self {
+        self.loader_lock_state = state;
         self
     }
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -408,7 +419,7 @@ impl Agent {
             .unwrap_or_else(|| Arc::clone(&self.default_clock));
         // SAFETY: region の base は config 分の共有領域を指し、
         // ThreadSlotState の生存期間中有効である。
-        let writer = unsafe {
+        let mut writer = unsafe {
             region.writer(
                 self.config,
                 self.policy.clone(),
@@ -416,6 +427,7 @@ impl Agent {
                 Arc::clone(&self.timestamps),
             )
         };
+        writer.set_loader_lock_state(self.loader_lock_state);
         let state = Arc::new(ThreadSlotState {
             handle,
             region,
@@ -994,6 +1006,39 @@ mod tests {
             RecordResult::Written(_)
         ));
     }
+    #[test]
+    fn unknown_loader_lock_disables_wait_for_each_new_writer() {
+        use shirusu_transport::clock::ManualClock;
+        for loader_lock in [LoaderLockState::Unknown, LoaderLockState::NotHeld] {
+            let clock = Arc::new(ManualClock::default());
+            let a = Agent::new(
+                Arc::new(SlotPool::new(2)),
+                RingConfig::new(2, 64),
+                Arc::new(HostMonitor::always_alive()),
+            )
+            .with_clock(clock.clone())
+            .with_loader_lock_state(loader_lock);
+            for tid in [1, 2] {
+                for call in 1..=3 {
+                    let _ = a.record_enter(tid, 1, 1, call, 0, b"x");
+                }
+                let state = a.state_for(tid).unwrap();
+                let writer = state.writer.lock().unwrap();
+                assert_eq!(writer.loader_lock_state(), loader_lock);
+                if loader_lock == LoaderLockState::Unknown {
+                    assert_eq!(writer.wait_count, 0);
+                } else {
+                    assert!(writer.wait_count > 0);
+                }
+            }
+            if loader_lock == LoaderLockState::Unknown {
+                assert_eq!(clock.now_ticks(), 0);
+            } else {
+                assert!(clock.now_ticks() > 0);
+            }
+        }
+    }
+
     #[test]
     fn host_stopped_passthrough() {
         let pool = Arc::new(SlotPool::new(2));
