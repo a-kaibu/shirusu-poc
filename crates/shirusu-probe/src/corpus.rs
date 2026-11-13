@@ -29,6 +29,9 @@ fn read(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 fn write(path: &Path, text: &str) -> Result<(), String> {
+    if text.len() as u64 > LIMIT {
+        return Err("corpus output exceeds 8 MiB".into());
+    }
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -439,10 +442,22 @@ mod tests {
         assert_eq!(differences.len(), 1);
         assert_eq!(get(&differences[0], "step"), Some(&J::U64(1)));
         assert!(write(&dir.join("entry.json"), "{}").is_err());
+        let oversized = dir.join("oversized.json");
+        assert!(write(&oversized, &" ".repeat(LIMIT as usize + 1)).is_err());
+        assert!(!oversized.exists());
         fs::write(dir.join("run/stdout.json"), format!("{raw} ")).unwrap();
         assert!(load(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn published_native_entries_remain_content_bound_and_comparable() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/windows/file-io-v1");
+        let result = compare(&root.join("26100-x86"), &root.join("20348-x64")).unwrap();
+        assert_eq!(get(&result, "differences"), Some(&J::Array(Vec::new())));
+        let result = compare(&root.join("26100-x64"), &root.join("20348-x64")).unwrap();
+        assert_eq!(get(&result, "differences"), Some(&J::Array(Vec::new())));
+    }
+
     #[test]
     fn record_executes_transport_and_refuses_reusing_an_entry() {
         let (spec, report) = fixture();

@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "name": "file-io-reference-v1",
+  "steps": [
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "dwCreationDisposition": 1,
+        "dwDesiredAccess": 3221225472,
+        "dwFlagsAndAttributes": 128,
+        "dwShareMode": 0,
+        "hTemplateFile": null,
+        "lpFileName": "probe-sample.txt",
+        "lpSecurityAttributes": null
+      },
+      "store": "hFile",
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "call": "kernel32!WriteFile",
+      "args": {
+        "hFile": {
+          "ref": "hFile"
+        },
+        "lpBuffer": {
+          "buffer": 14,
+          "fill_bytes": [
+            104,
+            101,
+            108,
+            108,
+            111,
+            32,
+            115,
+            104,
+            105,
+            114,
+            117,
+            115,
+            117,
+            10
+          ]
+        },
+        "lpNumberOfBytesWritten": {
+          "out": "u32"
+        },
+        "lpOverlapped": null,
+        "nNumberOfBytesToWrite": 14
+      },
+      "expect": {
+        "return": "nonzero",
+        "outputs": {
+          "lpNumberOfBytesWritten": 14
+        }
+      }
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "hFile"
+        }
+      },
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "call": "kernel32!CreateFileW",
+      "args": {
+        "dwCreationDisposition": 3,
+        "dwDesiredAccess": 2147483648,
+        "dwFlagsAndAttributes": 128,
+        "dwShareMode": 0,
+        "hTemplateFile": null,
+        "lpFileName": "probe-sample.txt",
+        "lpSecurityAttributes": null
+      },
+      "store": "hRead",
+      "expect": {
+        "return": "nonzero"
+      }
+    },
+    {
+      "call": "kernel32!ReadFile",
+      "args": {
+        "hFile": {
+          "ref": "hRead"
+        },
+        "lpBuffer": {
+          "buffer": 32
+        },
+        "lpNumberOfBytesRead": {
+          "out": "u32"
+        },
+        "lpOverlapped": null,
+        "nNumberOfBytesToRead": 32
+      },
+      "expect": {
+        "return": "nonzero",
+        "outputs": {
+          "lpBuffer": "68656c6c6f20736869727573750a",
+          "lpNumberOfBytesRead": 14
+        }
+      }
+    },
+    {
+      "call": "kernel32!CloseHandle",
+      "args": {
+        "hObject": {
+          "ref": "hRead"
+        }
+      },
+      "expect": {
+        "return": "nonzero"
+      }
+    }
+  ],
+  "rules": []
+}

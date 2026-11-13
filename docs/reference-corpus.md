@@ -47,6 +47,7 @@ Labels and execution metadata provide provenance context, not attestation.
 
 Windows CI records the same six-call write/reopen/read Probe on Windows x64,
 WoW64 x86 and Server 2022 and uploads `windows-reference-corpus-*` artifacts for
-30 days. These artifacts are initial reproducible samples, not a permanent
-public reference dataset or comprehensive API coverage. Broader probes, durable
-corpus publication and additional Windows releases remain future work.
+30 days. Initial real entries for builds 26100 (x86/x64) and 20348 (x64) are also retained in
+[`corpus/`](../corpus/README.md), with CI provenance and exact raw bytes. These
+are small reference samples, not comprehensive API coverage. Broader probes,
+additional Windows releases and automated corpus curation remain future work.

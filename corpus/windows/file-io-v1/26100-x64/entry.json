@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "label": "GitHub Actions 43405537057 b7a330063f4a2e74977f289b51c15b5f5aca25a8 x86_64-pc-windows-msvc",
+  "probe_digest": "2dfa2765e81455400805f0001e147f11eb739106c3cb62957188133682db7d76",
+  "report_digest": "04f4541d63bb195c25c53104224fef153fe924001438ab3c1a8af371a439861e",
+  "environment": {
+    "target_os": "windows",
+    "process_arch": "x86_64",
+    "pointer_width": 64,
+    "windows_version": "10.0.26100",
+    "windows_build": 26100,
+    "version_source": "RtlGetVersion"
+  },
+  "all_expectations_met": true,
+  "observations": [
+    {
+      "handle": "valid",
+      "last_error": null
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": 14,
+      "data": null
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    },
+    {
+      "handle": "valid",
+      "last_error": null
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": 14,
+      "data": "68656c6c6f20736869727573750a"
+    },
+    {
+      "succeeded": true,
+      "failure_error": null,
+      "transferred": null,
+      "data": null
+    }
+  ]
+}

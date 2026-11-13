@@ -1,0 +1,87 @@
+{
+  "spec": "file-io-reference-v1",
+  "executed": true,
+  "all_ok": true,
+  "steps": [
+    {
+      "index": 0,
+      "call": "kernel32!CreateFileW",
+      "ok": true,
+      "executed": true,
+      "returned": 208,
+      "last_error": 0,
+      "outputs": {},
+      "outputs_truncated": [],
+      "error": null
+    },
+    {
+      "index": 1,
+      "call": "kernel32!WriteFile",
+      "ok": true,
+      "executed": true,
+      "returned": 1,
+      "last_error": 0,
+      "outputs": {
+        "lpBuffer": "68656c6c6f20736869727573750a",
+        "lpNumberOfBytesWritten": 14
+      },
+      "outputs_truncated": [],
+      "error": null
+    },
+    {
+      "index": 2,
+      "call": "kernel32!CloseHandle",
+      "ok": true,
+      "executed": true,
+      "returned": 1,
+      "last_error": 0,
+      "outputs": {},
+      "outputs_truncated": [],
+      "error": null
+    },
+    {
+      "index": 3,
+      "call": "kernel32!CreateFileW",
+      "ok": true,
+      "executed": true,
+      "returned": 208,
+      "last_error": 0,
+      "outputs": {},
+      "outputs_truncated": [],
+      "error": null
+    },
+    {
+      "index": 4,
+      "call": "kernel32!ReadFile",
+      "ok": true,
+      "executed": true,
+      "returned": 1,
+      "last_error": 0,
+      "outputs": {
+        "lpBuffer": "68656c6c6f20736869727573750a000000000000000000000000000000000000",
+        "lpNumberOfBytesRead": 14
+      },
+      "outputs_truncated": [],
+      "error": null
+    },
+    {
+      "index": 5,
+      "call": "kernel32!CloseHandle",
+      "ok": true,
+      "executed": true,
+      "returned": 1,
+      "last_error": 0,
+      "outputs": {},
+      "outputs_truncated": [],
+      "error": null
+    }
+  ],
+  "environment": {
+    "target_os": "windows",
+    "process_arch": "x86_64",
+    "pointer_width": 64,
+    "windows_version": "10.0.26100",
+    "windows_build": 26100,
+    "version_source": "RtlGetVersion"
+  }
+}
