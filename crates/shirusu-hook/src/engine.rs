@@ -97,12 +97,14 @@ pub fn clear_runtime(rt: &Arc<HookRuntime>) -> bool {
 pub enum EngineError {
     /// モジュールイメージが PE として読めない
     NotPe,
-    /// 対象 API のインポートが 1 件も無い（計画が空）。計画（全 API
-    /// が missing）を一緒に返す。これは**初期化の失敗ではない**:
-    /// 対象 API を使わない正常なアプリが存在するため、呼び出し側は
-    /// 「0 件設置・全件欠落」として記録を継続してよい
+    /// 書き換え可能な IAT が無い。静的 import が無い場合に加え、既存
+    /// ラッパーを全件保持した場合も含む。計画の missing / preserved を
+    /// 区別して報告する。これは**初期化の失敗ではない**ため、呼び出し側は
+    /// 「IAT 0 件設置」として Inline の設置と記録を継続してよい
     /// (レビュー #4 の #8)。
     NoTargets(HookPlan),
+    /// ポインタ幅のアトミック更新に必要なアラインメントを満たさない
+    UnalignedIatSlot,
     /// IAT スロットの保護属性変更に失敗した
     ProtectFailed { iat_rva: u32 },
     /// 設置途中の失敗（レビュー第5回 #8）。既にパッチしたスロットは
@@ -174,7 +176,7 @@ unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), EngineError> 
     // Attach can run while application threads read the IAT. Publish one
     // aligned pointer atomically; never tear a malformed, unaligned slot.
     if (slot as usize) & (std::mem::align_of::<std::sync::atomic::AtomicUsize>() - 1) != 0 {
-        return Err(EngineError::ProtectFailed { iat_rva: 0 });
+        return Err(EngineError::UnalignedIatSlot);
     }
     let mut old: u32 = 0;
     // SAFETY: 呼び出し側の契約に従う。
@@ -4743,7 +4745,10 @@ mod tests {
     fn iat_write_rejects_unaligned_slots_without_touching_memory() {
         let mut storage = [0x55usize; 2];
         let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<usize>() };
-        assert!(unsafe { write_slot(slot, 0x1234) }.is_err());
+        assert_eq!(
+            unsafe { write_slot(slot, 0x1234) },
+            Err(EngineError::UnalignedIatSlot)
+        );
         assert_eq!(storage, [0x55; 2]);
     }
 

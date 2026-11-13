@@ -869,3 +869,84 @@ fn external_runner_cli_retains_verified_evidence_and_aborts_bad_processes() {
     assert!(!drift.join("trial-00003").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn reduction_removes_coupled_operations_when_neither_single_deletion_reproduces() {
+    use shirusu_probe::reduce::{reduce_file_io, TrialOutcome::*};
+    let result = reduce_file_io(reduction_fixture(), 20, |trial| {
+        assert_eq!(trial.source_steps[trial.target_replay_step], 5);
+        assert!(shirusu_test::runner_exec::plan_steps(&trial.spec.steps).is_ok());
+        for fixed in [0, 3, 4, 5, 6] {
+            assert!(trial.source_steps.contains(&fixed));
+        }
+        // Either keep both writes or remove both: dropping just one changes
+        // the observation. Single-deletion iteration cannot escape this state.
+        Ok::<_, ()>(
+            if trial.source_steps.contains(&1) == trial.source_steps.contains(&2) {
+                SameTargetDifference
+            } else {
+                DifferenceAbsent
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(result.replay.kept_steps, [0, 3, 4, 5, 6]);
+    assert_eq!(result.replay.target_replay_step, 3);
+    assert!(result.single_deletion_fixed_point);
+    assert!(result.trials <= 20);
+}
+
+#[test]
+fn grouped_reduction_requires_two_confirmations_within_budget() {
+    use shirusu_probe::reduce::{reduce_file_io, TrialOutcome::*};
+    for budget in [5, 20] {
+        let mut grouped_trials = 0;
+        let result = reduce_file_io(reduction_fixture(), budget, |trial| {
+            let a = trial.source_steps.contains(&1);
+            let b = trial.source_steps.contains(&2);
+            Ok::<_, ()>(if a && b {
+                SameTargetDifference
+            } else if a || b {
+                DifferenceAbsent
+            } else {
+                grouped_trials += 1;
+                if grouped_trials == 1 {
+                    SameTargetDifference
+                } else {
+                    Inconclusive
+                }
+            })
+        })
+        .unwrap();
+        assert_eq!(result.replay.kept_steps, [0, 1, 2, 3, 4, 5, 6]);
+        assert!(result.trials <= budget);
+        assert_eq!(grouped_trials, if budget == 5 { 0 } else { 2 });
+    }
+}
+
+#[test]
+fn grouped_reduction_checks_overlapping_windows_without_removing_prerequisites() {
+    use shirusu_probe::reduce::{reduce_file_io, TrialOutcome::*};
+    let mut replay = reduction_fixture();
+    replay.spec.steps.insert(3, replay.spec.steps[1].clone());
+    replay.source_steps = 8;
+    replay.kept_steps = (0..8).collect();
+    replay.target_source_step = 6;
+    replay.target_replay_step = 6;
+    let result = reduce_file_io(replay, 30, |trial| {
+        assert_eq!(trial.source_steps[trial.target_replay_step], 6);
+        Ok::<_, ()>(
+            if trial.source_steps.contains(&1)
+                && trial.source_steps.contains(&2) == trial.source_steps.contains(&3)
+            {
+                SameTargetDifference
+            } else {
+                DifferenceAbsent
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(result.replay.kept_steps, [0, 1, 4, 5, 6, 7]);
+    assert_eq!(result.replay.target_replay_step, 4);
+    assert!(result.single_deletion_fixed_point);
+}

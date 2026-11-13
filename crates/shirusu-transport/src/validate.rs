@@ -478,7 +478,6 @@ impl ValidatingReader {
         }
         self.prev = Some(snap);
         // 2. 確定した範囲の Descriptor だけをコピーして検証
-        let mut events = Vec::new();
         // Host 自身が前回までに読んだ位置を正とし、共有 read_cursor は検証材料にのみ使う。
         let mut cursor = self.read_cursor;
         if cursor > snap.write_cursor {
@@ -486,6 +485,13 @@ impl ValidatingReader {
                 which: "host read beyond write",
             });
         }
+        // Shared cursors are untrusted: cap reservation by the Host's known
+        // Ring capacity as well as the caller limit, even before the first
+        // descriptor has established sequence/payload continuity.
+        let count = (snap.write_cursor - cursor)
+            .min(self.known.descriptor_capacity)
+            .min(max as u64) as usize;
+        let mut events = Vec::with_capacity(count);
         while cursor < snap.write_cursor && events.len() < max {
             let idx = slot_index(cursor, self.known.descriptor_capacity) as usize;
             let off = cfg.descriptors_offset() + idx * 64;

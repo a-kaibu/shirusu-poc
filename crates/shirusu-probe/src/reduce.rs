@@ -3,7 +3,8 @@
 //! The oracle must execute both environments in fresh isolated directories and
 //! confirm the *same target difference*, not merely any failure/nonzero exit.
 //! This module does not launch a process or claim a global minimum. It removes
-//! individual non-target ReadFile/WriteFile steps; creation and cleanup remain.
+//! non-target ReadFile/WriteFile steps individually and in bounded groups;
+//! creation, stored results, the target and cleanup remain.
 use crate::replay::ReplaySlice;
 use shirusu_test::TestSpec;
 
@@ -135,11 +136,87 @@ pub fn reduce_file_io<E>(
             }
         }
         if !changed {
-            return Ok(Reduction {
-                replay,
-                trials,
-                single_deletion_fixed_point: true,
-            });
+            // A single-deletion fixed point can still contain coupled redundant
+            // operations. Try progressively smaller windows of removable
+            // steps; the execution oracle, not static independence, decides.
+            let eligible: Vec<usize> = replay
+                .spec
+                .steps
+                .iter()
+                .enumerate()
+                .filter(|(i, step)| {
+                    *i != replay.target_replay_step
+                        && step.store.is_none()
+                        && matches!(
+                            step.call.as_str(),
+                            "kernel32!ReadFile" | "kernel32!WriteFile"
+                        )
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let mut width = eligible.len();
+            'groups: while width >= 2 {
+                for removed in eligible.windows(width) {
+                    if max_trials - trials < 2 {
+                        return Ok(Reduction {
+                            replay,
+                            trials,
+                            single_deletion_fixed_point: true,
+                        });
+                    }
+                    let mut spec = replay.spec.clone();
+                    spec.steps = replay
+                        .spec
+                        .steps
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| removed.binary_search(i).is_err())
+                        .map(|(_, step)| step.clone())
+                        .collect();
+                    let kept: Vec<_> = replay
+                        .kept_steps
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| removed.binary_search(i).is_err())
+                        .map(|(_, source)| *source)
+                        .collect();
+                    let target = replay.target_replay_step
+                        - removed
+                            .iter()
+                            .filter(|&&i| i < replay.target_replay_step)
+                            .count();
+                    let mut accepted = true;
+                    for _ in 0..2 {
+                        trials += 1;
+                        if oracle(Trial {
+                            spec: &spec,
+                            source_steps: &kept,
+                            target_replay_step: target,
+                        })
+                        .map_err(ReductionError::Oracle)?
+                            != TrialOutcome::SameTargetDifference
+                        {
+                            accepted = false;
+                            break;
+                        }
+                    }
+                    if accepted {
+                        replay.spec = spec;
+                        replay.kept_steps = kept;
+                        replay.target_replay_step = target;
+                        changed = true;
+                        break 'groups;
+                    }
+                }
+                width = width.div_ceil(2);
+            }
+            if !changed {
+                return Ok(Reduction {
+                    replay,
+                    trials,
+                    single_deletion_fixed_point: true,
+                });
+            }
         }
         // Revisit earlier rejected removals after later changes. This matters for
         // file cursor and content dependencies; deletion predicates need not be monotone.
