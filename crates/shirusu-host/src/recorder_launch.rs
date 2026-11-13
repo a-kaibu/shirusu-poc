@@ -50,6 +50,24 @@ pub struct LaunchConfig {
     pub ring_count: usize,
     pub init_timeout: Duration,
 }
+/// Pause after a small collection. At the high-load rate (tens of ns per
+/// event) this lets at most a few thousand descriptors accumulate, well under
+/// the production Ring (4096 descriptors, 1 MiB payload).
+const COLLECTION_PACE: Duration = Duration::from_micros(20);
+
+/// Collections smaller than this are followed by [`COLLECTION_PACE`].
+fn collection_low_water(cfg: shirusu_transport::RingConfig) -> usize {
+    (cfg.descriptor_capacity / 8).max(1)
+}
+
+fn pace(duration: Duration) {
+    // Sleep granularity on Windows is about a millisecond: spin instead.
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
+    }
+}
+
 impl LaunchConfig {
     pub fn new(session: CaptureSessionConfig, dll_path: PathBuf) -> Self {
         Self {
@@ -205,9 +223,14 @@ impl LaunchedCapture {
             }
             let stats = self.session().poll_once()?;
             // Keep consuming while the producer is active. Sleeping after every
-            // nonempty batch needlessly lets a high-rate Ring fill again.
+            // nonempty batch needlessly lets a high-rate Ring fill again. But a
+            // tight loop of tiny collections bounces the Ring control lines
+            // between the writer's core and this one on nearly every event;
+            // after a small collection, pace briefly without touching the Ring.
             if stats.events == 0 {
                 self.data_ready.data_ready.wait_timeout(poll_interval);
+            } else if stats.events < collection_low_water(self.session().ring_config()) {
+                pace(COLLECTION_PACE);
             }
         }
         // 終了直前に書かれた分を拾い切る

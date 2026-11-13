@@ -574,6 +574,9 @@ impl CaptureSession {
     pub fn trace_path(&self) -> &Path {
         &self.trace_path
     }
+    pub fn ring_config(&self) -> RingConfig {
+        self.config.ring_config
+    }
     pub fn ring_count(&self) -> usize {
         self.rings.len()
     }
