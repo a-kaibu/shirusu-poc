@@ -278,12 +278,13 @@ pub(super) fn generic_detour_with<const N: usize>(
             .runtime()
             .record_enter(tid, api, call_id, bytes.as_bytes());
     }
-    if api.api_id == crate::api::EXIT_THREAD_API_ID {
-        // ExitThread does not unwind Rust frames. Release recorder ownership
-        // before entering the OS; otherwise DetourFlight and Arc references
-        // survive forever and shutdown cannot drain. There is no normal Leave.
-        // Stop capture before TLS/DllMain teardown starts, not only when this
-        // DLL's native thread-detach callback is eventually reached.
+    if crate::api::is_no_return_api(api.api_id) {
+        // ExitThread (the generated no-return API) does not unwind Rust
+        // frames. Release recorder ownership before entering the OS;
+        // otherwise DetourFlight and Arc references survive forever and
+        // shutdown cannot drain. There is no normal Leave. Stop capture
+        // before TLS/DllMain teardown starts, not only when this DLL's
+        // native thread-detach callback is eventually reached.
         ReentrancyGuard::mark_thread_exiting();
         drop(flight);
         drop(guard);
@@ -325,4 +326,31 @@ pub(super) fn generic_detour_with<const N: usize>(
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();
     ret
+}
+
+/// Typed invoker emitted for one generated API: restores the native argument
+/// types from their raw slots and calls the original with its exact ABI.
+pub(super) type GeneratedInvoke = unsafe fn(usize, &[u64]) -> u64;
+
+/// Shared body of every generated Detour. Thousands of broad-tier Detours
+/// would otherwise each instantiate the full recording path; this function is
+/// instantiated once per arity, and only the typed invoker is per API.
+#[inline(never)]
+pub(super) fn generated_detour(api_id: u32, args: &[u64], invoke: GeneratedInvoke) -> u64 {
+    macro_rules! by_arity {
+        ($($n:literal)*) => {
+            match args.len() {
+                $($n => {
+                    let fixed: &[u64; $n] = args.try_into().expect("matched arity");
+                    // SAFETY: the generator pairs this invoker with this
+                    // API's original function type and argument count.
+                    generic_detour_with(api_id, fixed, move |original| unsafe {
+                        invoke(original, args)
+                    })
+                })*
+                n => panic!("generated detour arity {n} exceeds 12"),
+            }
+        };
+    }
+    by_arity!(0 1 2 3 4 5 6 7 8 9 10 11 12)
 }

@@ -502,9 +502,11 @@ impl CaptureSession {
         )?;
         // L09: 記録モードを TraceRecorder へ渡す。
         recorder.set_record_mode(config.record_mode.clone());
-        for def in hook_api::all_schemas() {
+        for def in hook_api::eager_schemas() {
             recorder.register_schema(def)?;
         }
+        // The IAT-only broad tier is registered when an event first uses it.
+        recorder.set_lazy_schemas(hook_api::broad_schema);
         // L02: COM メソッドイベントの Schema も登録する（未登録だと
         // Payload が Blob へ逃げ、args として読めなくなる）。
         for def in hook_com::com_schemas() {

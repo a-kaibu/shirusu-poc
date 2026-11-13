@@ -6,14 +6,18 @@ shirusu coverage capture.trace --json
 ```
 
 静的依存、Hook 設置、観測、意味情報を別々の証拠として表示する。記録する Agent と
-Host は Bootstrap v12 の同じビルドを使う。結果欄は固定 256 スロットで、API を追加しても
-構造体サイズを暗黙に変えない。新しい Agent は旧版の小さい Bootstrap を
+Host は Bootstrap v13 の同じビルドを使う。結果欄は API ID で引く固定 8,192 スロット
+（IAT 1 バイト、Inline 理由コード 1 バイト）で、API を追加しても構造体サイズを暗黙に変えない。
+Inline の理由は追記のみの固定コード表で、表に無い理由は `unknown` と報告する。新しい Agent は旧版の小さい Bootstrap を
 全体コピーする前に version を検査して拒否する。
 
 - 静的依存：現在は起動対象 EXE の通常 import table のみ。source と名前／序数を残す。
   Attach、DLL 内の依存、delay-load、動的解決がないことを意味しない。
 - Hook：Win32 API ごとに IAT と Inline の結果、理由、範囲を保存する。
   IAT はメインモジュール、Inline は初期化時に解決した export が対象。
+  IAT 限定の広域層は Inline を設置せず `not-attempted-iat-only-scope` を残す。
+  メインモジュールが import していない広域層 API（数千件）は証拠の行を書かない。
+  台帳に行が無いことは、その API が呼ばれなかったことを意味しない。
   `already-hooked` も今回の設置成功とは扱わず、実際の見送り理由のまま残す。
   設置後のアンロード、全経路の捕捉、共有 COM メソッドの記録を保証しない。
 - 観測：保存された Enter / Leave / その他の件数。Profile の集計は別欄。

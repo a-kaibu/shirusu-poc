@@ -55,6 +55,46 @@ pub struct Config {
     /// 意図的に生成しない API（決定を記録するための一覧）。
     #[serde(default, rename = "skip")]
     pub skips: Vec<SkipConfig>,
+    /// IAT-only broad tier. Its selection is an append-only lock list so a
+    /// WinMD update cannot renumber existing API or Schema IDs.
+    #[serde(default)]
+    pub broad: Option<BroadConfig>,
+    /// Entries loaded from `broad.list` by [`load_config`].
+    #[serde(skip)]
+    pub broad_apis: Vec<ApiConfig>,
+}
+
+/// Configuration of the IAT-only broad tier.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BroadConfig {
+    /// First API ID of the tier. Curated IDs must stay below it.
+    pub first_api_id: u32,
+    /// IDs never assigned in this tier (special event IDs and IDs whose
+    /// enter/leave Schema IDs would collide with reserved Schema blocks).
+    #[serde(default)]
+    pub reserved_api_ids: Vec<u32>,
+    /// Lock list path, relative to the configuration file.
+    pub list: String,
+    /// Modules whose generatable exports `--refresh-broad` appends.
+    pub modules: Vec<String>,
+}
+
+/// Exports that never return to the detour. Their generated detours record
+/// Enter, release recorder ownership and then call the original.
+pub const NO_RETURN_FUNCTIONS: &[(&str, &str)] = &[
+    ("kernel32.dll", "ExitThread"),
+    ("kernel32.dll", "ExitProcess"),
+    ("kernel32.dll", "FatalExit"),
+    ("kernel32.dll", "FatalAppExitA"),
+    ("kernel32.dll", "FatalAppExitW"),
+    ("kernel32.dll", "FreeLibraryAndExitThread"),
+    ("kernel32.dll", "RaiseFailFastException"),
+];
+
+fn is_no_return(module: &str, function: &str) -> bool {
+    NO_RETURN_FUNCTIONS
+        .iter()
+        .any(|(m, f)| m.eq_ignore_ascii_case(module) && *f == function)
 }
 
 fn default_max_params() -> usize {
@@ -80,6 +120,11 @@ pub fn emit_api_inventory(index: &TypeIndex, config: &Config) -> String {
                     && a.module.eq_ignore_ascii_case(&module)
                     && a.function == function
             });
+            let broad = config.broad_apis.iter().find(|a| {
+                a.namespace == namespace
+                    && a.module.eq_ignore_ascii_case(&module)
+                    && a.function == function
+            });
             let skipped = config.skips.iter().find(|a| {
                 a.namespace == namespace
                     && a.module.eq_ignore_ascii_case(&module)
@@ -97,6 +142,8 @@ pub fn emit_api_inventory(index: &TypeIndex, config: &Config) -> String {
                     Ok(EntryOutcome::Emitted(_)) => (
                         if selected.is_some() {
                             "selected"
+                        } else if broad.is_some() {
+                            "selected-iat-only"
                         } else {
                             "generatable"
                         },
@@ -194,6 +241,10 @@ pub enum Flavor {
 /// 生成した API 1 件（`ApiDef` と Detour 生成の入力）。
 #[derive(Debug, Clone)]
 pub struct MappedApi {
+    /// Broad-tier API: installed through main-module IAT entries only.
+    pub iat_only: bool,
+    /// The original never returns (process or thread termination).
+    pub no_return: bool,
     pub calling_convention: &'static str,
     pub abi_params: Vec<&'static str>,
     pub abi_return: &'static str,
@@ -255,7 +306,120 @@ impl Generated {
 /// 設定ファイル (`apis.toml`) を読む。
 pub fn load_config(path: &str) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path} を読めない: {e}"))?;
-    toml::from_str(&text).map_err(|e| format!("{path} の解析に失敗: {e}"))
+    let mut config: Config =
+        toml::from_str(&text).map_err(|e| format!("{path} の解析に失敗: {e}"))?;
+    if let Some(broad) = &config.broad {
+        let list = broad_list_path(path, broad);
+        let text = match std::fs::read_to_string(&list) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{} を読めない: {e}", list.display())),
+        };
+        config.broad_apis = parse_broad_list(&text)?;
+    }
+    Ok(config)
+}
+
+/// Resolve the broad lock list relative to the configuration file.
+pub fn broad_list_path(config_path: &str, broad: &BroadConfig) -> std::path::PathBuf {
+    std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(&broad.list)
+}
+
+const BROAD_LIST_HEADER: &str = "namespace\tmodule\tfunction\n";
+
+/// Parse the append-only broad lock list (`namespace<TAB>module<TAB>function`).
+pub fn parse_broad_list(text: &str) -> Result<Vec<ApiConfig>, String> {
+    let mut out = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if index == 0 && line == BROAD_LIST_HEADER.trim_end() {
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        let [namespace, module, function] = fields[..] else {
+            return Err(format!("broad list line {}: expected 3 fields", index + 1));
+        };
+        out.push(ApiConfig {
+            namespace: namespace.into(),
+            module: module.into(),
+            function: function.into(),
+            last_error: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Append newly generatable exports of the configured modules to the broad
+/// list. Existing lines are retained verbatim and in order, including lines
+/// that a newer WinMD no longer supports; only new entries are added.
+pub fn refresh_broad_list(index: &TypeIndex, config: &Config) -> Result<String, String> {
+    let broad = config.broad.as_ref().ok_or("apis.toml に [broad] が無い")?;
+    let mut keys: std::collections::HashSet<(String, String)> = config
+        .apis
+        .iter()
+        .chain(config.broad_apis.iter())
+        .map(|a| (a.module.to_ascii_lowercase(), a.function.clone()))
+        .collect();
+    let skipped: std::collections::HashSet<(String, String)> = config
+        .skips
+        .iter()
+        .map(|a| (a.module.to_ascii_lowercase(), a.function.clone()))
+        .collect();
+    let modules: std::collections::HashSet<String> = broad
+        .modules
+        .iter()
+        .map(|m| m.to_ascii_lowercase())
+        .collect();
+    let mut candidates = Vec::new();
+    for (namespace, name, def) in index.iter() {
+        if name != "Apis" {
+            continue;
+        }
+        for method in def.methods() {
+            let Some(map) = method.impl_map() else {
+                continue;
+            };
+            let module = map.import_scope().name().to_ascii_lowercase();
+            if !modules.contains(&module) {
+                continue;
+            }
+            candidates.push((namespace.to_string(), module, method.name().to_string()));
+        }
+    }
+    candidates.sort();
+    let mut out = String::from(BROAD_LIST_HEADER);
+    for api in &config.broad_apis {
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            api.namespace, api.module, api.function
+        ));
+    }
+    for (namespace, module, function) in candidates {
+        let key = (module.clone(), function.clone());
+        if keys.contains(&key) || skipped.contains(&key) {
+            continue;
+        }
+        let candidate = ApiConfig {
+            namespace: namespace.clone(),
+            module: module.clone(),
+            function: function.clone(),
+            last_error: None,
+        };
+        if !matches!(
+            map_api(index, &candidate, 1, config.max_params),
+            Ok(EntryOutcome::Emitted(_))
+        ) {
+            continue;
+        }
+        keys.insert(key);
+        out.push_str(&format!("{namespace}\t{module}\t{function}\n"));
+    }
+    Ok(out)
 }
 
 /// 設定に従って Metadata から API を生成する。対応外の API は
@@ -270,17 +434,16 @@ pub fn generate(index: &TypeIndex, config: &Config) -> Result<Generated, String>
         entries: Vec::new(),
         intentional_skips: config.skips.clone(),
     };
-    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut next_id = config.first_api_id;
     for api in &config.apis {
         let key = (api.module.to_ascii_lowercase(), api.function.clone());
-        if seen.contains(&key) {
+        if !seen.insert(key) {
             return Err(format!(
                 "{}!{} が設定に重複している",
                 api.module, api.function
             ));
         }
-        seen.push(key);
         while config.reserved_api_ids.contains(&next_id) {
             next_id = next_id.checked_add(1).ok_or("API ID overflow")?;
         }
@@ -290,6 +453,45 @@ pub fn generate(index: &TypeIndex, config: &Config) -> Result<Generated, String>
                 out.entries.push(EntryOutcome::Emitted(mapped));
             }
             skipped @ EntryOutcome::Skipped { .. } => out.entries.push(skipped),
+        }
+    }
+    let Some(broad) = &config.broad else {
+        return Ok(out);
+    };
+    if next_id > broad.first_api_id {
+        return Err(format!(
+            "curated API IDs reach {} and overlap the broad tier at {}",
+            next_id - 1,
+            broad.first_api_id
+        ));
+    }
+    // Every lock-list line owns an ID, even if a newer WinMD cannot map it, so
+    // a later entry keeps its API and Schema IDs.
+    let mut next_id = broad.first_api_id;
+    for api in &config.broad_apis {
+        let key = (api.module.to_ascii_lowercase(), api.function.clone());
+        if !seen.insert(key) {
+            return Err(format!(
+                "{}!{} が設定に重複している",
+                api.module, api.function
+            ));
+        }
+        while broad.reserved_api_ids.contains(&next_id) {
+            next_id = next_id.checked_add(1).ok_or("API ID overflow")?;
+        }
+        let id = next_id;
+        next_id = next_id.checked_add(1).ok_or("API ID overflow")?;
+        match map_api(index, api, id, config.max_params) {
+            Ok(EntryOutcome::Emitted(mut mapped)) => {
+                mapped.iat_only = true;
+                out.entries.push(EntryOutcome::Emitted(mapped));
+            }
+            Ok(skipped @ EntryOutcome::Skipped { .. }) => out.entries.push(skipped),
+            Err(reason) => out.entries.push(EntryOutcome::Skipped {
+                module: api.module.clone(),
+                function: api.function.clone(),
+                reason,
+            }),
         }
     }
     Ok(out)
@@ -406,6 +608,8 @@ fn map_api(
         None => default_meaning(flavor),
     };
     Ok(EntryOutcome::Emitted(MappedApi {
+        iat_only: false,
+        no_return: is_no_return(&api.module, &api.function),
         calling_convention,
         abi_params,
         abi_return,
@@ -621,7 +825,19 @@ pub fn detour_fn_name(api: &MappedApi) -> String {
         .strip_suffix(".dll")
         .unwrap_or(&api.module)
         .to_ascii_lowercase();
-    format!("detour_generated_{}_{}", stem, snake_case(&api.function))
+    let snake = snake_case(&api.function);
+    if !snake.starts_with('_') && !snake.contains("__") {
+        return format!("detour_generated_{stem}_{snake}");
+    }
+    // Names such as `__WSAFDIsSet` or `HT_Get8BPPFormatPalette` would yield
+    // non-snake identifiers; collapse underscores and keep the ID for
+    // uniqueness.
+    let collapsed: Vec<&str> = snake.split('_').filter(|p| !p.is_empty()).collect();
+    format!(
+        "detour_generated_{stem}_{}_{}",
+        collapsed.join("_"),
+        api.api_id
+    )
 }
 
 fn rust_str(s: &str) -> String {
@@ -641,8 +857,19 @@ fn rust_str(s: &str) -> String {
 /// `api_generated.inc`（生成 API の `&[ApiDef]` 1 個の式）を出す。
 /// `api.rs` で `pub const GENERATED_API_TABLE: &[ApiDef] =
 /// include!("api_generated.inc");` として取り込む。`BEFORE` / `AFTER` /
-/// `Ty` 等は取り込み側のスコープで解決する。
+/// `Ty` 等は取り込み側のスコープで解決する。IAT 限定層は含めない。
 pub fn emit_api_inc(generated: &Generated, winmd_version: &str) -> String {
+    emit_api_table(generated, winmd_version, false)
+}
+
+/// `api_broad_generated.inc`: the IAT-only broad tier as one `&[ApiDef]`.
+pub fn emit_broad_api_inc(generated: &Generated, winmd_version: &str) -> String {
+    emit_api_table(generated, winmd_version, true)
+}
+
+const CURATED_NOTE: &str = "L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）";
+
+fn emit_api_table(generated: &Generated, winmd_version: &str, iat_only: bool) -> String {
     let mut out = String::new();
     out.push_str("// @generated by win32-metadata-gen — DO NOT EDIT.\n");
     out.push_str(&format!(
@@ -651,14 +878,19 @@ pub fn emit_api_inc(generated: &Generated, winmd_version: &str) -> String {
     out.push_str("// Regenerate: cargo run -p shirusu-metadata-gen -- --winmd <path> --config crates/shirusu-metadata-gen/apis.toml\n");
     out.push_str("&[\n");
     for api in generated.emitted() {
+        if api.iat_only != iat_only {
+            continue;
+        }
         out.push_str("ApiDef {\n");
         out.push_str(&format!("    api_id: {},\n", api.api_id));
         out.push_str(&format!("    module: {},\n", rust_str(&api.module)));
         out.push_str(&format!("    function: {},\n", rust_str(&api.function)));
         out.push_str("    level: 1,\n");
-        out.push_str(
-            "    level_note: \"L1（Win32 Metadata から生成）：型付き引数・戻り値のみ。文字列・バッファ・構造体の中身は取得しない（ポインタ値のみ）\",\n",
-        );
+        if iat_only {
+            out.push_str("    level_note: BROAD_LEVEL_NOTE,\n");
+        } else {
+            out.push_str(&format!("    level_note: {},\n", rust_str(CURATED_NOTE)));
+        }
         out.push_str("    enter_fields: &[");
         for (i, (name, ty, kind)) in api.enter_fields.iter().enumerate() {
             if i > 0 {
@@ -695,8 +927,22 @@ pub fn emit_api_inc(generated: &Generated, winmd_version: &str) -> String {
     out
 }
 
+fn raw_from_slot(ty: &str, slot: &str) -> String {
+    match ty {
+        "f32" => format!("f32::from_bits({slot} as u32)"),
+        "f64" => format!("f64::from_bits({slot})"),
+        "u64" => slot.to_string(),
+        "*mut core::ffi::c_void" => format!("{slot} as usize as *mut core::ffi::c_void"),
+        other => format!("{slot} as {other}"),
+    }
+}
+
 /// `engine_generated.inc`（生成 Detour と `detour_for_generated`）
 /// を出す。`engine.rs`（Windows のみ）で `include!` される断片。
+///
+/// Each Detour keeps the exact native signature and passes a small typed
+/// invoker to the shared, non-generic `generated_detour`; the recording body
+/// is instantiated once per arity instead of once per API.
 pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
     let mut out = String::new();
     out.push_str("// @generated by win32-metadata-gen — DO NOT EDIT.\n");
@@ -713,7 +959,6 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             .enumerate()
             .map(|(i, ty)| format!("a{i}: {ty}"))
             .collect();
-        let args: Vec<_> = (0..types.len()).map(|i| format!("a{i}")).collect();
         let raw: Vec<_> = types
             .iter()
             .enumerate()
@@ -724,26 +969,18 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
                 _ => format!("a{i} as u64"),
             })
             .collect();
+        let restored: Vec<_> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| raw_from_slot(ty, &format!("a[{i}]")))
+            .collect();
         let ret = api.abi_return;
         let declaration_ret = if api.return_ty.is_some() {
             format!(" -> {ret}")
         } else {
             String::new()
         };
-        out.push_str(&format!(
-            "unsafe extern \"{abi}\" fn {fname}({}){declaration_ret} {{\n",
-            params.join(", ")
-        ));
-        let binding = if api.return_ty.is_some() && ret != "u64" {
-            "let result = "
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "    {binding}generic_detour_with({}, &[{}], |original| {{\n        let original: unsafe extern \"{abi}\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n",
-            api.api_id, raw.join(", "), types.join(", ")
-        ));
-        let call = format!("unsafe {{ original({}) }}", args.join(", "));
+        let call = format!("unsafe {{ original({}) }}", restored.join(", "));
         let raw_return = match ret {
             "()" => format!("{call};\n        0"),
             "f32" => format!("({call}).to_bits() as u64"),
@@ -751,16 +988,29 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
             "u64" => call,
             _ => format!("({call}) as u64"),
         };
+        let args_name = if types.is_empty() { "_a" } else { "a" };
         out.push_str(&format!(
-            "        {raw_return}\n    }}){}\n",
-            if ret == "u64" { "" } else { ";" }
+            "unsafe extern \"{abi}\" fn {fname}({}){declaration_ret} {{\n",
+            params.join(", ")
         ));
-        if api.return_ty.is_some() && ret != "u64" {
+        out.push_str(&format!(
+            "    unsafe fn invoke(original: usize, {args_name}: &[u64]) -> u64 {{\n        let original: unsafe extern \"{abi}\" fn({}) -> {ret} = unsafe {{ std::mem::transmute(original) }};\n        {raw_return}\n    }}\n",
+            types.join(", ")
+        ));
+        let invoke = format!(
+            "generated_detour({}, &[{}], invoke)",
+            api.api_id,
+            raw.join(", ")
+        );
+        if api.return_ty.is_none() {
+            out.push_str(&format!("    {invoke};\n"));
+        } else {
             let returned = match ret {
-                "f32" => "f32::from_bits(result as u32)".into(),
-                "f64" => "f64::from_bits(result)".into(),
-                "u64" => "result".into(),
-                _ => format!("result as {ret}"),
+                "f32" => format!("f32::from_bits({invoke} as u32)"),
+                "f64" => format!("f64::from_bits({invoke})"),
+                "u64" => invoke,
+                "*mut core::ffi::c_void" => format!("{invoke} as usize as *mut core::ffi::c_void"),
+                _ => format!("{invoke} as {ret}"),
             };
             out.push_str(&format!("    {returned}\n"));
         }
@@ -778,6 +1028,26 @@ pub fn emit_engine_inc(generated: &Generated, winmd_version: &str) -> String {
     out.push_str("        _ => 0,\n");
     out.push_str("    }\n");
     out.push_str("}\n");
+    out
+}
+
+/// Detour-independent API facts shared by Linux tests and Windows engines:
+/// the no-return API IDs (`api_traits_generated.inc`).
+pub fn emit_traits_inc(generated: &Generated, winmd_version: &str) -> String {
+    let mut out = String::new();
+    out.push_str("// @generated by win32-metadata-gen — DO NOT EDIT.\n");
+    out.push_str(&format!(
+        "// Source: Windows.Win32.winmd (Microsoft.Windows.SDK.Win32Metadata {winmd_version}).\n"
+    ));
+    out.push_str("&[");
+    let ids: Vec<_> = generated
+        .emitted()
+        .into_iter()
+        .filter(|a| a.no_return)
+        .map(|a| a.api_id.to_string())
+        .collect();
+    out.push_str(&ids.join(", "));
+    out.push_str("]\n");
     out
 }
 
@@ -974,6 +1244,8 @@ mod tests {
     #[test]
     fn emit_api_inc_renders_api_def() {
         let api = MappedApi {
+            iat_only: false,
+            no_return: false,
             calling_convention: "system-unwind",
             api_id: 7,
             module: "advapi32.dll".into(),
@@ -1005,6 +1277,8 @@ mod tests {
         assert!(text.contains("71.0.45-preview"));
         // void 戻りの API は return フィールドを持たない。
         let api = MappedApi {
+            iat_only: false,
+            no_return: false,
             calling_convention: "system-unwind",
             api_id: 8,
             module: "kernel32.dll".into(),
@@ -1027,6 +1301,8 @@ mod tests {
     #[test]
     fn emit_engine_inc_renders_detours_and_dispatch() {
         let api = MappedApi {
+            iat_only: false,
+            no_return: false,
             calling_convention: "system-unwind",
             api_id: 7,
             module: "advapi32.dll".into(),
@@ -1038,6 +1314,8 @@ mod tests {
             last_error_meaning: LastErrorMeaning::Never,
         };
         let zero = MappedApi {
+            iat_only: false,
+            no_return: false,
             calling_convention: "system-unwind",
             api_id: 8,
             module: "kernel32.dll".into(),
@@ -1056,11 +1334,13 @@ mod tests {
         assert!(text.contains(
             "unsafe extern \"system-unwind\" fn detour_generated_advapi32_reg_close_key(a0: *mut core::ffi::c_void) -> u32"
         ));
-        assert!(text.contains("generic_detour_with(7, &[a0 as u64]"));
+        assert!(text.contains("generated_detour(7, &[a0 as u64], invoke)"));
+        assert!(text.contains("original(a[0] as usize as *mut core::ffi::c_void)"));
         assert!(text.contains(
             "unsafe extern \"system-unwind\" fn detour_generated_kernel32_get_current_process_id() -> u32"
         ));
-        assert!(text.contains("generic_detour_with(8, &[]"));
+        assert!(text.contains("generated_detour(8, &[], invoke)"));
+        assert!(text.contains("unsafe fn invoke(original: usize, _a: &[u64]) -> u64"));
         assert!(
             text.contains("7 => detour_generated_advapi32_reg_close_key as *const () as usize,")
         );
@@ -1094,7 +1374,14 @@ mod tests {
         let generated = generate(&index, &config).expect("シード設定を生成できる");
         let skipped = generated.skipped();
         assert!(skipped.is_empty(), "unexpected skip: {skipped:?}");
-        assert_eq!(generated.emitted().len(), config.apis.len());
+        assert_eq!(
+            generated.emitted().len(),
+            config.apis.len() + config.broad_apis.len()
+        );
+        assert_eq!(
+            generated.emitted().iter().filter(|a| a.iat_only).count(),
+            config.broad_apis.len()
+        );
         let emitted = generated.emitted();
         let reg_close = emitted
             .iter()

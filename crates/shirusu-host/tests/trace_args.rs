@@ -203,3 +203,45 @@ fn owned_and_borrowed_batches_preserve_args_fallbacks_and_modes() {
         shirusu_trace::read_trace(&b).unwrap();
     }
 }
+
+#[test]
+fn broad_tier_schemas_are_registered_on_first_use() {
+    // Registering every broad-tier Schema up front costs megabytes per Trace;
+    // the Host registers eager Schemas and adds broad ones when used.
+    let mut rec = TraceRecorder::from_environment(Vec::new(), environment()).unwrap();
+    for def in shirusu_hook::api::eager_schemas() {
+        rec.register_schema(def).unwrap();
+    }
+    rec.set_lazy_schemas(shirusu_hook::api::broad_schema);
+    let broad = &shirusu_hook::api::BROAD_API_TABLE[0];
+    let payload = shirusu_hook::capture::encode_generic_enter::<12>(
+        broad,
+        &vec![0u64; broad.enter_fields.len()],
+    )
+    .as_bytes()
+    .to_vec();
+    let mut ev = event(1, EventKind::CallEnter, broad.enter_schema_id(), payload);
+    ev.descriptor.api_id = broad.api_id;
+    let stats = rec.record_batch_with_args(&ctx(), &[ev]).unwrap();
+    assert_eq!(
+        stats.args_attached, 1,
+        "lazily registered Schema decodes args"
+    );
+    let bytes = rec.finish(&IntegrityReport::default()).unwrap();
+    eprintln!("eager + 1 broad schema trace: {} bytes", bytes.len());
+    assert!(bytes.len() < 512 * 1024, "{} bytes", bytes.len());
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(trace.registry.types(broad.enter_schema_id()).is_some());
+    let unused = &shirusu_hook::api::BROAD_API_TABLE[1];
+    assert!(trace.registry.types(unused.enter_schema_id()).is_none());
+    assert!(
+        shirusu_hook::api::broad_schema(1).is_none(),
+        "curated stays eager"
+    );
+    assert_eq!(
+        shirusu_hook::api::broad_schema(broad.leave_schema_id())
+            .unwrap()
+            .schema_id,
+        broad.leave_schema_id()
+    );
+}

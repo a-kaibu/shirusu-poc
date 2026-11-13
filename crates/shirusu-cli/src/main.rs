@@ -167,6 +167,10 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                                     "detailed_mode_only",
                                     JsonValue::Bool(shirusu_hook::api::is_internal_api(a.api_id)),
                                 ),
+                                (
+                                    "iat_only",
+                                    JsonValue::Bool(shirusu_hook::api::is_iat_only_api(a.api_id)),
+                                ),
                             ])
                         })
                         .collect(),
@@ -208,6 +212,8 @@ fn cmd_capabilities(args: &[String]) -> Result<(), ToolError> {
                 api.function,
                 if shirusu_hook::api::is_internal_api(api.api_id) {
                     " [detailed mode]"
+                } else if shirusu_hook::api::is_iat_only_api(api.api_id) {
+                    " [main-module IAT only]"
                 } else {
                     ""
                 }

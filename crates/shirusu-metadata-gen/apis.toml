@@ -881,3 +881,226 @@ namespace = "Windows.Win32.Graphics.Gdi"
 module = "gdi32.dll"
 function = "GetStockObject"
 last_error = "never"
+
+# ---- IAT 限定の広域層 (broad tier) ----
+# 下記モジュールの「生成可能」な export を、メインモジュールの IAT 経由に
+# 限って L1 で記録する。Inline Hook は設置しない（数千件の関数先頭を
+# 書き換えず、アプリ自身の静的 import だけを置き換える）。動的解決・
+# 他 DLL 経由の呼び出しは Coverage に `not-attempted-iat-only-scope` と残る。
+# 一覧は broad-apis.tsv（追記のみのロック一覧）で、行の順に api_id を
+# 割り当てる。WinMD 更新で対応外になった行も ID を保持する。
+# 追記: cargo run -p shirusu-metadata-gen -- --refresh-broad
+[broad]
+first_api_id = 1003
+# 5001..=5011 の enter/leave Schema ID は COM / WinRT / Callback の予約
+# Schema ID（10_001..=10_022）と重なるため割り当てない。
+reserved_api_ids = [5001, 5002, 5003, 5004, 5005, 5006, 5007, 5008, 5009, 5010, 5011]
+list = "broad-apis.tsv"
+modules = [
+    "kernel32.dll", "user32.dll", "gdi32.dll", "advapi32.dll",
+    "ole32.dll", "oleaut32.dll", "shell32.dll", "shlwapi.dll",
+    "comctl32.dll", "comdlg32.dll", "ws2_32.dll", "winmm.dll",
+    "version.dll", "imm32.dll", "uxtheme.dll", "dwmapi.dll",
+    "winhttp.dll", "wininet.dll", "crypt32.dll", "bcrypt.dll",
+    "secur32.dll", "psapi.dll", "userenv.dll",
+]
+
+# ---- 広域層から意図的に外す API ----
+# 手書き表・専用 Hook と同じ export。二重の Detour と記録を避ける。
+[[skip]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "CreateFileW"
+reason = "手書き L2 表 (api_id 1) が記録する"
+[[skip]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "ReadFile"
+reason = "手書き L2 表 (api_id 2) が記録する"
+[[skip]]
+namespace = "Windows.Win32.Storage.FileSystem"
+module = "kernel32.dll"
+function = "WriteFile"
+reason = "手書き L2 表 (api_id 3) が記録する"
+[[skip]]
+namespace = "Windows.Win32.Foundation"
+module = "kernel32.dll"
+function = "CloseHandle"
+reason = "手書き表 (api_id 4) が記録する"
+[[skip]]
+namespace = "Windows.Win32.System.IO"
+module = "kernel32.dll"
+function = "GetOverlappedResult"
+reason = "手書き表 (api_id 5) が非同期完了として記録する"
+[[skip]]
+namespace = "Windows.Win32.System.IO"
+module = "kernel32.dll"
+function = "GetQueuedCompletionStatus"
+reason = "手書き表 (api_id 6) が非同期完了として記録する"
+[[skip]]
+namespace = "Windows.Win32.System.Com"
+module = "ole32.dll"
+function = "CoCreateInstance"
+reason = "COM Factory Hook が型付きで記録し、返却インターフェイスを追跡する"
+[[skip]]
+namespace = "Windows.Win32.System.Com"
+module = "ole32.dll"
+function = "CoGetClassObject"
+reason = "COM Factory Hook が型付きで記録し、返却インターフェイスを追跡する"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "RegisterClassExW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "RegisterClassExA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "SetWindowLongW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "SetWindowLongA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "SetWindowLongPtrW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "SetWindowLongPtrA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetWindowLongW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetWindowLongA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetWindowLongPtrW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetWindowLongPtrA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetClassLongW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetClassLongA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetClassLongPtrW"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+[[skip]]
+namespace = "Windows.Win32.UI.WindowsAndMessaging"
+module = "user32.dll"
+function = "GetClassLongPtrA"
+reason = "コールバック検出 Hook が WndProc の登録・読み戻しとして扱う"
+# 戻らない・スタックや実行文脈を切り替える API。Detour のフレームが
+# 呼び出し元と元関数の間に入ると意味が変わる、または所有権を回収できない。
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlUnwind"
+reason = "呼び出し元フレームへ制御を移すため、間に入る Detour のフレームを壊す"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlUnwindEx"
+reason = "呼び出し元フレームへ制御を移すため、間に入る Detour のフレームを壊す"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlRestoreContext"
+reason = "呼び出し元フレームへ制御を移すため、間に入る Detour のフレームを壊す"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlCaptureContext"
+reason = "呼び出し元の文脈・スタックを取得する API で、Detour のフレームが結果に混入する"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlCaptureContext2"
+reason = "呼び出し元の文脈・スタックを取得する API で、Detour のフレームが結果に混入する"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlCaptureStackBackTrace"
+reason = "呼び出し元の文脈・スタックを取得する API で、Detour のフレームが結果に混入する"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlVirtualUnwind"
+reason = "呼び出し元の文脈・スタックを取得する API で、Detour のフレームが結果に混入する"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RaiseException"
+reason = "例外送出は呼び出し元フレームの unwind を伴い、IAT 限定層での透過性を実機で検証していない"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RtlRaiseException"
+reason = "例外送出は呼び出し元フレームの unwind を伴い、IAT 限定層での透過性を実機で検証していない"
+[[skip]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "SwitchToFiber"
+reason = "スタックを切り替える（DeleteFiber は現在の Fiber ならスレッドを終了する）ため、スレッド単位の呼び出し状態を保てない"
+[[skip]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "DeleteFiber"
+reason = "スタックを切り替える（DeleteFiber は現在の Fiber ならスレッドを終了する）ため、スレッド単位の呼び出し状態を保てない"
+[[skip]]
+namespace = "Windows.Win32.System.Threading"
+module = "kernel32.dll"
+function = "ExitProcess"
+reason = "戻らない API。Leave の無い Enter が全 Trace の完了判定を劣化させるため、ExitThread と同じ扱いにするかは実機検証後に決める"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "FatalExit"
+reason = "戻らない API。Leave の無い Enter が全 Trace の完了判定を劣化させるため、ExitThread と同じ扱いにするかは実機検証後に決める"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "FatalAppExitA"
+reason = "戻らない API。Leave の無い Enter が全 Trace の完了判定を劣化させるため、ExitThread と同じ扱いにするかは実機検証後に決める"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "FatalAppExitW"
+reason = "戻らない API。Leave の無い Enter が全 Trace の完了判定を劣化させるため、ExitThread と同じ扱いにするかは実機検証後に決める"
+[[skip]]
+namespace = "Windows.Win32.System.LibraryLoader"
+module = "kernel32.dll"
+function = "FreeLibraryAndExitThread"
+reason = "戻らない API。Leave の無い Enter が全 Trace の完了判定を劣化させるため、ExitThread と同じ扱いにするかは実機検証後に決める"
+[[skip]]
+namespace = "Windows.Win32.System.Diagnostics.Debug"
+module = "kernel32.dll"
+function = "RaiseFailFastException"
+reason = "戻らない API。Leave の無い Enter が全 Trace の完了判定を劣化させるため、ExitThread と同じ扱いにするかは実機検証後に決める"

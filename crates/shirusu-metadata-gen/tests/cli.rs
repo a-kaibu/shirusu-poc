@@ -181,7 +181,12 @@ fn generate_writes_files_identical_to_checked_in() {
         stderr(&out)
     );
     assert!(stdout(&out).contains("wrote "), "stdout: {}", stdout(&out));
-    for name in ["api_generated.inc", "engine_generated.inc"] {
+    for name in [
+        "api_generated.inc",
+        "api_broad_generated.inc",
+        "engine_generated.inc",
+        "api_traits_generated.inc",
+    ] {
         let generated = std::fs::read_to_string(dir.path().join(name)).expect("生成物を読む");
         let checked_in = std::fs::read_to_string(hook_src_dir().join(name)).expect("既存物を読む");
         assert_eq!(

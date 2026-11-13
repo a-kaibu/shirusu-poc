@@ -747,7 +747,9 @@ pub unsafe fn install_inline_hooks(rt: &HookRuntime) -> InlineInstallOutcome {
     unsafe {
         install_inline_hooks_for(
             rt,
-            api_table().filter(|api| !crate::api::is_internal_api(api.api_id)),
+            api_table().filter(|api| {
+                !crate::api::is_internal_api(api.api_id) && !crate::api::is_iat_only_api(api.api_id)
+            }),
         )
     }
 }

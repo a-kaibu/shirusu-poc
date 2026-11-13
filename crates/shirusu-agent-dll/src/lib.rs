@@ -424,16 +424,39 @@ mod win {
             })
             .count();
         // Preserve actual initialization evidence, independently of observations.
+        // Index outcomes once: the table holds thousands of APIs.
+        let preserved_ids: std::collections::HashSet<u32> = installed
+            .plan
+            .preserved
+            .iter()
+            .map(|e| e.api.api_id)
+            .collect();
+        let index_outcome = |outcome: &engine::InlineInstallOutcome| {
+            let mut reasons: std::collections::HashMap<u32, &'static str> =
+                std::collections::HashMap::new();
+            for (api_id, reason) in outcome.skipped.iter().rev() {
+                reasons.insert(*api_id, reason);
+            }
+            for hook in outcome.installed.iter().rev() {
+                reasons.insert(
+                    hook.api_id,
+                    if hook.maintenance_pending() {
+                        "installed-restoration-pending"
+                    } else {
+                        "installed"
+                    },
+                );
+            }
+            reasons
+        };
+        let inline_reasons = index_outcome(&inline_outcome);
+        let internal_reasons = index_outcome(&internal_hook_outcome);
         for api in api_table() {
             let id = api.api_id as usize;
-            b.result_iat[id] = if shirusu_hook::api::is_internal_api(api.api_id) {
+            let internal = shirusu_hook::api::is_internal_api(api.api_id);
+            b.result_iat[id] = if internal {
                 3
-            } else if installed
-                .plan
-                .preserved
-                .iter()
-                .any(|e| e.api.api_id == api.api_id)
-            {
+            } else if preserved_ids.contains(&api.api_id) {
                 if iat_ids.contains(&api.api_id) {
                     5
                 } else {
@@ -444,35 +467,20 @@ mod win {
             } else {
                 2
             };
-            let outcome = if shirusu_hook::api::is_internal_api(api.api_id) {
-                &internal_hook_outcome
-            } else {
-                &inline_outcome
-            };
-            let reason = if shirusu_hook::api::is_internal_api(api.api_id) && b.detailed_mode == 0 {
+            let reason = if internal && b.detailed_mode == 0 {
                 "detailed-mode-disabled"
-            } else if let Some(hook) = outcome.installed.iter().find(|h| h.api_id == api.api_id) {
-                if hook.maintenance_pending() {
-                    "installed-restoration-pending"
+            } else if shirusu_hook::api::is_iat_only_api(api.api_id) {
+                "not-attempted-iat-only-scope"
+            } else {
+                let reasons = if internal {
+                    &internal_reasons
                 } else {
-                    "installed"
-                }
-            } else {
-                outcome
-                    .skipped
-                    .iter()
-                    .find(|(api_id, _)| *api_id == api.api_id)
-                    .map(|(_, reason)| *reason)
-                    .unwrap_or("unknown")
+                    &inline_reasons
+                };
+                reasons.get(&api.api_id).copied().unwrap_or("unknown")
             };
-            // Known engine reasons fit this fixed protocol field; do not truncate
-            // a future reason into a different claim.
-            let reason = if reason.len() < b.result_inline[id].len() {
-                reason
-            } else {
-                "unknown"
-            };
-            b.result_inline[id][..reason.len()].copy_from_slice(reason.as_bytes());
+            // Reasons outside the fixed code table are reported as unknown.
+            b.result_inline[id] = shirusu_hook::bootstrap::inline_reason_code(reason);
         }
         // SAFETY: writable Bootstrap owned by Host until initialization returns.
         unsafe {

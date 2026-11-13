@@ -17,7 +17,7 @@
 //! に従う（SetEvent は待たない操作）。これは Ring 空き待ちの制約であり、
 //! 初回登録・管理用ロックやメモリ確保まで待機なしと保証するものではない。
 
-use crate::api::{ApiDef, API_COUNT};
+use crate::api::{ApiDef, MAX_API_ID};
 use crate::callback::{
     CALLBACK_API_ID, CALLBACK_ENTER_SCHEMA_ID, CALLBACK_HOOK_COUNT, CALLBACK_LEAVE_SCHEMA_ID,
 };
@@ -616,7 +616,7 @@ impl RuntimeSlot {
             return Err(rt);
         }
         if let Some(old) = &cur.retired {
-            for id in 0..=API_COUNT {
+            for id in 0..=MAX_API_ID {
                 if rt.original(id as u32) == 0 {
                     rt.set_original(id as u32, old.original(id as u32));
                 }
@@ -734,9 +734,9 @@ pub struct HookRuntime {
     /// 時点で、そのスレッド（Ring）へ結線する（R7 の Ring 単位結線）。
     space_notifies: Vec<Arc<RingNotify>>,
     data_ready: Option<ProcessNotify>,
-    originals: [AtomicUsize; API_COUNT + 1],
+    originals: Box<[AtomicUsize]>,
     /// Immutable target classification, computed before publishing this runtime.
-    runtime_targets: [bool; API_COUNT + 1],
+    runtime_targets: Box<[bool]>,
     next_call_id: AtomicU64,
     seen_threads: Mutex<HashSet<u64>>,
     /// 記録の有効/無効 (終了手順のゲート。レビュー #4 の #9)。
@@ -787,11 +787,15 @@ impl HookRuntime {
             agent,
             space_notifies,
             data_ready,
-            originals: std::array::from_fn(|_| AtomicUsize::new(0)),
-            runtime_targets: std::array::from_fn(|id| {
-                crate::api::api_by_id(id as u32)
-                    .is_some_and(|api| shirusu_trace::module::is_runtime_module(api.module))
-            }),
+            // Indexed by API ID; heap storage keeps thousands of slots off
+            // the initialization thread's stack.
+            originals: (0..=MAX_API_ID).map(|_| AtomicUsize::new(0)).collect(),
+            runtime_targets: (0..=MAX_API_ID)
+                .map(|id| {
+                    crate::api::api_by_id(id as u32)
+                        .is_some_and(|api| shirusu_trace::module::is_runtime_module(api.module))
+                })
+                .collect(),
             next_call_id: AtomicU64::new(NEXT_CALL_ID_SEED.fetch_add(1 << 32, Ordering::Relaxed)),
             seen_threads: Mutex::new(HashSet::new()),
             recording_enabled: AtomicBool::new(true),

@@ -23,7 +23,7 @@ Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意�
 | Runtime → Windows の標準記録 | 呼び出し元 Runtime の除外を廃止し、呼び出し先 Runtime の設定へ修正。共通 kernelbase 実装まで thunk を解決。x64 2 環境の CRT E2E 通過 | `--modules` E2E が既定／設定有効の両方で CRT 経由 CreateFileW を記録 |
 | 標準の呼び出し境界 | Nt は詳細モードに分離。公開 Windows API 同士の内部呼び出しは caller address による境界判定が未実装 | Application / Runtime 起点の記録と Windows 内部起点の除外、callback 内の再開を実走で比較 |
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
-| 全 Win32 の L0/L1 | 現在197件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
+| 全 Win32 の L0/L1 | 標準層197件に加え、主要23 DLL の生成可能 export 5,693 件を IAT 限定の広域層で記録（計5,890件）。広域層は動的解決・他 DLL 経由を捕捉しない。その他の DLL（約11,700件）、可変長引数、複合構造体の値渡し、13 引数以上が不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復、広域層の実機 Capture |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
 | COM の L1 と寿命追跡 | Factory、IID 名識別、image-backed 共有 IUnknown の QI/AddRef/Release は実装・実走済み。派生メソッドと private/heap vtable は未対応 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
 | 動的 API と既存プロセス Attach | Inline Hook は実装。新規スレッド競合・停止先ロックの制約が残る | 既存プロセスとスレッド生成中の透明性テスト、失敗時の安全な復元 |
@@ -108,6 +108,52 @@ RoGetActivationFactory の 3 引数転送、debug / release の native TLS
 欠落回帰テストが通過した。以前の WoW64 transport 検証と区別する。
 x64 は独立シナリオを最後まで実行してから失敗を集約するよう変更し、
 先行ケースの失敗で WinRT・callback・SEH・replay の問題を隠さない。
+
+## IAT 限定の広域層（2026-11-13）
+
+overview の「Metadata から全 API を浅く記録する」に向け、主要 23 DLL
+（kernel32 / user32 / gdi32 / advapi32 / ole32 / oleaut32 / shell32 / shlwapi /
+comctl32 / comdlg32 / ws2_32 / winmm / version / imm32 / uxtheme / dwmapi /
+winhttp / wininet / crypt32 / bcrypt / secur32 / psapi / userenv）の生成可能な
+export 5,693 件を L1 の広域層として追加した。標準層（197 件）と合わせて 5,890 件。
+
+- 設置はメインモジュールの IAT だけ。Inline Hook は設置しないため、数千件の
+  関数先頭は書き換えない。動的解決・他 DLL 経由の呼び出しは捕捉せず、
+  Coverage の Inline 欄に `not-attempted-iat-only-scope` を残す。
+- 選択は `crates/shirusu-metadata-gen/broad-apis.tsv`（追記のみのロック一覧）。
+  行の順に api_id 1003〜を割り当て、WinMD 更新で対応外になった行も ID を保持する。
+  `--refresh-broad` は新しい生成可能 export だけを末尾に追記し、CI は `--check` で
+  一覧の最新性を検査する。
+- ID 1000〜1002（COM / WinRT / Callback のイベント ID）と、Schema ID が予約
+  ブロック 10,001〜10,022 と重なる 5001〜5011 は割り当てない。実行時の API 別配列は
+  最大 ID で確保する（API 数ではない）。
+- 生成 Detour は元の型のまま、呼び出しは小さな型付き invoker に分け、記録処理は
+  引数個数ごとに 1 回だけ実体化する。5,877 個の生成 Detour が個別に記録経路を
+  複製しない。
+- 除外（`apis.toml` の `[[skip]]`、棚卸しの `excluded`、計 40 件）:
+  手書き表・COM Factory・コールバック検出 Hook と同じ export（二重記録の回避）、
+  呼び出し元フレームを移す／取得する API（RtlUnwind / RtlRestoreContext /
+  RtlCaptureContext / RtlCaptureStackBackTrace / RaiseException 等）、
+  SwitchToFiber / DeleteFiber、戻らない API（ExitProcess / FatalExit /
+  FatalAppExit / FreeLibraryAndExitThread / RaiseFailFastException）。
+  戻らない API は Leave の無い Enter が全 Trace の完了判定を劣化させるため、
+  ExitThread と同じ扱いにするかを実機検証後に決める。
+- Bootstrap v13: Hook 証拠は API ID で引く固定 8,192 スロットに拡大し、Inline の
+  理由は 1 バイトの固定コード表へ変更した（構造体は約 17 KiB）。
+- 全 Schema を開始時に登録すると 1 Trace あたり約 6.2 MB 増えた（11,780 Schema、
+  Linux debug 測定）。標準層は従来どおり開始時に登録し、広域層の Schema は
+  イベントが初めて参照した時点で登録する（Writer は使用する Event Chunk の前に
+  Schema Block を書く）。未使用の広域層 API は Trace に Schema を持たない。
+- Hook 証拠も、メインモジュールが import していない広域層 API の行は Trace に
+  書かない。import された広域層 API（設置・保持・一部設置）は従来どおり IAT と
+  Inline の 2 行を残す。
+- 棚卸し（18,364 メソッド）: selected 184、selected-iat-only 5,693、
+  generatable 11,713、excluded 40、unsupported 734。
+
+Linux では生成器、ID と Schema の割り当て、Bootstrap 証拠の往復、広域層の
+f32 / f64 / i64 / u16 を含む ABI 往復（system ABI）、全 Schema 登録時の Trace
+サイズを検査する。広域層は Windows の実アプリ Capture での透過性・性能を
+まだ測っていない。これを「全 Win32 API の L1 完成」とは扱わない。
 
 ## ANSI / ファイル API の拡張
 

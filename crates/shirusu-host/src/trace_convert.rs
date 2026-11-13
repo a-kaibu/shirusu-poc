@@ -270,7 +270,13 @@ pub struct TraceRecorder<W: DurableWrite> {
     profile: ProfileAggregator,
     /// 集計の所要時間換算に使う QPC 周波数（Environment 由来）。
     qpc_frequency: u64,
+    /// Schemas registered on first use instead of at session start (the
+    /// IAT-only broad tier would otherwise add megabytes to every Trace).
+    lazy_schemas: Option<LazySchemas>,
 }
+
+/// Provider of a Schema definition for an ID not registered up front.
+pub type LazySchemas = fn(u32) -> Option<shirusu_trace::proto::SchemaDef>;
 
 impl<W: DurableWrite> TraceRecorder<W> {
     pub fn new(writer: TraceWriter<W>) -> Self {
@@ -279,6 +285,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
             writer,
             mode: RecordMode::Full,
             profile: ProfileAggregator::default(),
+            lazy_schemas: None,
         }
     }
 
@@ -288,6 +295,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
             writer: TraceWriter::new(inner, environment)?,
             mode: RecordMode::Full,
             profile: ProfileAggregator::default(),
+            lazy_schemas: None,
         })
     }
 
@@ -303,6 +311,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
             writer: TraceWriter::with_options(inner, environment, options)?,
             mode: RecordMode::Full,
             profile: ProfileAggregator::default(),
+            lazy_schemas: None,
         })
     }
 
@@ -329,6 +338,23 @@ impl<W: DurableWrite> TraceRecorder<W> {
 
     pub fn register_schema(&mut self, def: SchemaDef) -> TraceResult<()> {
         self.writer.register_schema(def)
+    }
+
+    /// Register Schemas from `provider` the first time an event refers to
+    /// them. The Writer emits them before the Event Chunk that uses them, so
+    /// a Trace carries only the Schemas of APIs it actually observed.
+    pub fn set_lazy_schemas(&mut self, provider: LazySchemas) {
+        self.lazy_schemas = Some(provider);
+    }
+
+    fn ensure_schema(&mut self, schema_id: u32) -> TraceResult<()> {
+        if schema_id == 0 || self.writer.schema_types_ref(schema_id).is_some() {
+            return Ok(());
+        }
+        match self.lazy_schemas.and_then(|provider| provider(schema_id)) {
+            Some(def) => self.writer.register_schema(def),
+            None => Ok(()),
+        }
     }
 
     pub fn write_schema_checkpoint(&mut self) -> TraceResult<()> {
@@ -401,6 +427,9 @@ impl<W: DurableWrite> TraceRecorder<W> {
                 if !apis.contains(&d.api_id) {
                     continue;
                 }
+            }
+            if self.lazy_schemas.is_some() {
+                self.ensure_schema(d.schema_id)?;
             }
             let mut args = None;
             let payload = if d.payload_dropped() {

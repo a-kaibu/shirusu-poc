@@ -53,15 +53,54 @@ pub const SHUTDOWN_NOT_INITIALIZED: u32 = 2;
 /// v10: bounded per-API IAT and Inline installation evidence.
 /// v11: freeze evidence capacity independently of API_COUNT.
 /// v12: distinguish COM method return kinds from factory HRESULT payloads.
-pub const BOOTSTRAP_VERSION: u32 = 12;
+/// v13: 8,192 evidence slots for the IAT-only broad tier (IDs up to
+/// MAX_API_ID); Inline reasons are 1-byte codes of [`INLINE_REASONS`].
+pub const BOOTSTRAP_VERSION: u32 = 13;
 /// Initialization published hooks but could not complete installation. Only
 /// this failure status authorizes Host to retry this attempt's shutdown.
 pub const INIT_HOOK_FAILED: u32 = 3;
 // Fixed protocol capacity: adding an API must not silently enlarge the native
 // structure while keeping the same Bootstrap version.
-pub const HOOK_EVIDENCE_COUNT: usize = 256;
-const _: () = assert!(crate::api::API_COUNT < HOOK_EVIDENCE_COUNT);
-pub const HOOK_REASON_BYTES: usize = 48;
+pub const HOOK_EVIDENCE_COUNT: usize = 8192;
+const _: () = assert!(crate::api::MAX_API_ID < HOOK_EVIDENCE_COUNT);
+/// Inline evidence codes. Code `n` (1-based) names `INLINE_REASONS[n - 1]`;
+/// 0 means not written. Append only: a code keeps its meaning across builds.
+/// A reason outside this table is reported as `unknown`, never truncated
+/// into a different claim.
+pub const INLINE_REASONS: &[&str] = &[
+    "unknown",
+    "installed",
+    "installed-restoration-pending",
+    "detailed-mode-disabled",
+    "not-exported",
+    "read-failed",
+    "already-hooked",
+    "too-short",
+    "decode-failed",
+    "unrelocatable",
+    "invalid-bitness",
+    "alloc-failed",
+    "flush-failed",
+    "near-relay-unavailable",
+    "protect-failed",
+    "retained-trampoline-limit",
+    "target-changed",
+    "thread-context-unavailable",
+    "thread-in-target",
+    "thread-set-changed",
+    "thread-suspend-failed",
+    "trampoline-too-large",
+    "not-attempted-iat-only-scope",
+];
+
+/// Code of an Inline reason for [`AgentBootstrap::result_inline`].
+pub fn inline_reason_code(reason: &str) -> u8 {
+    let index = INLINE_REASONS
+        .iter()
+        .position(|r| *r == reason)
+        .unwrap_or(0);
+    (index + 1) as u8
+}
 pub const MAX_BOOTSTRAP_RINGS: usize = 32;
 
 #[repr(C)]
@@ -127,7 +166,7 @@ pub struct AgentBootstrap {
     pub result_callback_hook_count: u32,
     pub result_evidence_ready: u32,
     pub result_iat: [u8; HOOK_EVIDENCE_COUNT],
-    pub result_inline: [[u8; HOOK_REASON_BYTES]; HOOK_EVIDENCE_COUNT],
+    pub result_inline: [u8; HOOK_EVIDENCE_COUNT],
 }
 
 impl Default for AgentBootstrap {
@@ -156,7 +195,7 @@ impl Default for AgentBootstrap {
             result_callback_hook_count: 0,
             result_evidence_ready: 0,
             result_iat: [0; HOOK_EVIDENCE_COUNT],
-            result_inline: [[0; HOOK_REASON_BYTES]; HOOK_EVIDENCE_COUNT],
+            result_inline: [0; HOOK_EVIDENCE_COUNT],
         }
     }
 }
@@ -188,15 +227,14 @@ impl AgentBootstrap {
                 5 => "partially-installed-noncanonical-import-preserved",
                 _ => return None,
             };
-            let bytes = &self.result_inline[id];
-            let end = bytes.iter().position(|b| *b == 0)?;
-            if bytes[end..].iter().any(|b| *b != 0) {
-                return None;
+            // A broad-tier API absent from the main module's imports has no
+            // installation fact beyond its scope; omit thousands of such rows.
+            // Imported (installed or preserved) broad APIs keep full evidence.
+            if crate::api::is_iat_only_api(api.api_id) && self.result_iat[id] == 2 {
+                continue;
             }
-            let inline_reason = std::str::from_utf8(&bytes[..end]).ok()?;
-            if inline_reason.is_empty() {
-                return None;
-            }
+            let code = self.result_inline[id] as usize;
+            let inline_reason = *INLINE_REASONS.get(code.checked_sub(1)?)?;
             for (method, reason, scope) in [
                 ("iat", iat_reason, "main-module-at-initialization"),
                 (
@@ -437,10 +475,14 @@ mod tests {
         assert!(b.hook_evidence().is_none());
         for api in crate::api::api_table() {
             b.result_iat[api.api_id as usize] = 2;
-            b.result_inline[api.api_id as usize][..9].copy_from_slice(b"installed");
+            b.result_inline[api.api_id as usize] = inline_reason_code("installed");
         }
         let evidence = b.hook_evidence().unwrap();
-        assert_eq!(evidence.len(), crate::api::API_COUNT * 2);
+        // Non-imported broad-tier APIs are summarized away.
+        assert_eq!(
+            evidence.len(),
+            (crate::api::API_COUNT - crate::api::BROAD_API_TABLE.len()) * 2
+        );
         assert!(evidence
             .iter()
             .filter(|h| h.method == "inline")
@@ -462,9 +504,7 @@ mod tests {
             assert_eq!(iat.outcome, outcome);
             assert_eq!(iat.reason, reason);
         }
-        let pending = b"installed-restoration-pending";
-        b.result_inline[1].fill(0);
-        b.result_inline[1][..pending.len()].copy_from_slice(pending);
+        b.result_inline[1] = inline_reason_code("installed-restoration-pending");
         let report = b.hook_evidence().unwrap();
         let inline = report
             .iter()
@@ -472,18 +512,70 @@ mod tests {
             .unwrap();
         assert_eq!(inline.outcome, "partial");
         assert_eq!(inline.reason, "installed-restoration-pending");
-        b.result_inline[1][0] = 0xff;
+        b.result_inline[1] = 0xff;
         assert!(b.hook_evidence().is_none());
-        b.result_inline[1][0] = b'i';
+        b.result_inline[1] = 0;
+        assert!(b.hook_evidence().is_none());
+        b.result_inline[1] = inline_reason_code("installed");
         b.result_iat[1] = 255;
         assert!(b.hook_evidence().is_none());
+    }
+
+    #[test]
+    fn inline_reason_codes_round_trip_and_never_invent_claims() {
+        assert!(INLINE_REASONS.len() < u8::MAX as usize);
+        let unique: std::collections::HashSet<_> = INLINE_REASONS.iter().collect();
+        assert_eq!(unique.len(), INLINE_REASONS.len());
+        for (index, reason) in INLINE_REASONS.iter().enumerate() {
+            assert_eq!(inline_reason_code(reason) as usize, index + 1);
+        }
+        assert_eq!(
+            INLINE_REASONS[inline_reason_code("future-reason") as usize - 1],
+            "unknown"
+        );
+        // Every broad-tier API reports its scope instead of an Inline result.
+        let mut b = AgentBootstrap {
+            result_evidence_ready: 1,
+            ..AgentBootstrap::default()
+        };
+        for api in crate::api::api_table() {
+            b.result_iat[api.api_id as usize] = 2;
+            b.result_inline[api.api_id as usize] =
+                inline_reason_code(if crate::api::is_iat_only_api(api.api_id) {
+                    "not-attempted-iat-only-scope"
+                } else {
+                    "installed"
+                });
+        }
+        let broad = crate::api::BROAD_API_TABLE[0].api_id;
+        b.result_iat[broad as usize] = 1;
+        let evidence = b.hook_evidence().unwrap();
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|h| crate::api::is_iat_only_api(h.api_id))
+                .count(),
+            2,
+            "only the imported broad API is listed"
+        );
+        let of = |method: &str| {
+            evidence
+                .iter()
+                .find(|h| h.api_id == broad && h.method == method)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(of("iat").outcome, "installed");
+        assert_eq!(of("inline").outcome, "not-installed");
+        assert_eq!(of("inline").reason, "not-attempted-iat-only-scope");
+        assert_eq!(of("inline").semantic_detail, crate::api::BROAD_LEVEL_NOTE);
     }
 
     #[test]
     fn layout_is_fixed_size() {
         assert_eq!(
             std::mem::size_of::<AgentBootstrap>(),
-            (616 + HOOK_EVIDENCE_COUNT * (1 + HOOK_REASON_BYTES)).next_multiple_of(8)
+            (616 + HOOK_EVIDENCE_COUNT * 2).next_multiple_of(8)
         );
         assert_eq!(
             std::mem::offset_of!(AgentBootstrap, result_evidence_ready),

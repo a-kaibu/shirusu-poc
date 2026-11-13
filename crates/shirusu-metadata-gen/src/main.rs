@@ -15,16 +15,19 @@
 //! `target/winmd/Windows.Win32.winmd`。
 
 use shirusu_metadata_gen::{
-    emit_api_inc, emit_api_inventory, emit_com_catalog, emit_engine_inc, generate, load_config,
+    broad_list_path, emit_api_inc, emit_api_inventory, emit_broad_api_inc, emit_com_catalog,
+    emit_engine_inc, emit_traits_inc, generate, load_config, refresh_broad_list,
 };
 use windows_metadata::reader::TypeIndex;
 
 const API_INC: &str = "api_generated.inc";
 const ENGINE_INC: &str = "engine_generated.inc";
+const BROAD_INC: &str = "api_broad_generated.inc";
+const TRAITS_INC: &str = "api_traits_generated.inc";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--check]\n       win32-metadata-gen --file-io-contracts [--check]"
+        "usage: win32-metadata-gen [--winmd <path>] [--config <path>] [--out-dir <dir>] [--com-catalog <path>] [--inventory <tsv-path>] [--refresh-broad] [--check]\n       win32-metadata-gen --file-io-contracts [--check]"
     );
     std::process::exit(2);
 }
@@ -43,6 +46,7 @@ fn main() {
     let mut check = false;
     let mut catalog: Option<String> = None;
     let mut inventory: Option<String> = None;
+    let mut refresh = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -52,6 +56,7 @@ fn main() {
             "--check" => check = true,
             "--com-catalog" => catalog = Some(args.next().unwrap_or_else(|| usage())),
             "--inventory" => inventory = Some(args.next().unwrap_or_else(|| usage())),
+            "--refresh-broad" => refresh = true,
             _ => usage(),
         }
     }
@@ -61,7 +66,12 @@ fn main() {
     let winmd = winmd
         .or_else(|| std::env::var("SHIRUSU_WINMD").ok())
         .unwrap_or_else(|| "target/winmd/Windows.Win32.winmd".to_string());
-    let result = if let Some(path) = inventory {
+    let result = if refresh {
+        if inventory.is_some() || catalog.is_some() {
+            usage();
+        }
+        refresh_run(&winmd, &config_path, check)
+    } else if let Some(path) = inventory {
         inventory_run(&winmd, &config_path, &path, check)
     } else {
         run(&winmd, &config_path, &out_dir, check, catalog.as_deref())
@@ -70,6 +80,27 @@ fn main() {
         eprintln!("win32-metadata-gen: {e}");
         std::process::exit(1);
     }
+}
+
+fn refresh_run(winmd: &str, config_path: &str, check: bool) -> Result<(), String> {
+    let config = load_config(config_path)?;
+    let broad = config.broad.as_ref().ok_or("apis.toml に [broad] が無い")?;
+    let index = TypeIndex::read(winmd).ok_or_else(|| format!("cannot read WinMD: {winmd}"))?;
+    let content = refresh_broad_list(&index, &config)?;
+    let path = broad_list_path(config_path, broad);
+    if check {
+        if !matches!(std::fs::read_to_string(&path), Ok(have) if have == content) {
+            return Err(format!("broad list {} is stale", path.display()));
+        }
+        return Ok(());
+    }
+    std::fs::write(&path, &content).map_err(|e| format!("{}: {e}", path.display()))?;
+    println!(
+        "wrote {} ({} APIs)",
+        path.display(),
+        content.lines().count().saturating_sub(1)
+    );
+    Ok(())
 }
 
 fn inventory_run(winmd: &str, config_path: &str, path: &str, check: bool) -> Result<(), String> {
@@ -107,13 +138,27 @@ fn run(
         }
     }
     let generated = generate(&index, &config)?;
-    let api_inc = emit_api_inc(&generated, &config.winmd_version);
-    let engine_inc = emit_engine_inc(&generated, &config.winmd_version);
-    let api_path = format!("{out_dir}/{API_INC}");
-    let engine_path = format!("{out_dir}/{ENGINE_INC}");
+    let outputs = [
+        (
+            format!("{out_dir}/{API_INC}"),
+            emit_api_inc(&generated, &config.winmd_version),
+        ),
+        (
+            format!("{out_dir}/{BROAD_INC}"),
+            emit_broad_api_inc(&generated, &config.winmd_version),
+        ),
+        (
+            format!("{out_dir}/{ENGINE_INC}"),
+            emit_engine_inc(&generated, &config.winmd_version),
+        ),
+        (
+            format!("{out_dir}/{TRAITS_INC}"),
+            emit_traits_inc(&generated, &config.winmd_version),
+        ),
+    ];
     if check {
         let mut mismatch = false;
-        for (path, want) in [(&api_path, &api_inc), (&engine_path, &engine_inc)] {
+        for (path, want) in &outputs {
             match std::fs::read_to_string(path) {
                 Ok(have) if have == *want => println!("ok: {path} は最新"),
                 Ok(_) => {
@@ -132,11 +177,10 @@ fn run(
             );
         }
     } else {
-        std::fs::write(&api_path, &api_inc).map_err(|e| format!("{api_path} を書けない: {e}"))?;
-        std::fs::write(&engine_path, &engine_inc)
-            .map_err(|e| format!("{engine_path} を書けない: {e}"))?;
-        println!("wrote {api_path}");
-        println!("wrote {engine_path}");
+        for (path, content) in &outputs {
+            std::fs::write(path, content).map_err(|e| format!("{path} を書けない: {e}"))?;
+            println!("wrote {path}");
+        }
     }
     let emitted = generated.emitted();
     println!(

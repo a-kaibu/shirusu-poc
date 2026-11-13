@@ -1174,6 +1174,8 @@ fn capabilities_reports_api_support_separately_from_com_identification() {
     let text = String::from_utf8(result.stdout).unwrap();
     assert!(text.contains("\"function\": \"AngleArc\""));
     assert!(text.contains("\"function\": \"GetTickCount64\""));
+    assert!(text.contains("\"function\": \"MessageBeep\""));
+    assert!(text.contains("\"iat_only\": true"));
     assert!(text.contains("\"known_iids\": 7797"));
     assert!(text.contains("\"standard_method_interception\": true"));
     let bad = Command::new(env!("CARGO_BIN_EXE_shirusu"))

@@ -107,6 +107,8 @@ fn config_with(apis: Vec<ApiConfig>, max_params: usize) -> Config {
         winmd_version: "71.0.45-preview".to_string(),
         apis,
         skips: vec![],
+        broad: None,
+        broad_apis: vec![],
     }
 }
 
@@ -461,6 +463,8 @@ fn single_field_aggregate_is_not_a_scalar_typedef() {
 fn emit_api_inc_escapes_quotes_and_backslashes() {
     // lib.rs 535-536: rust_str の `"` と `\` のエスケープ。
     let api = MappedApi {
+        iat_only: false,
+        no_return: false,
         calling_convention: "system-unwind",
         api_id: 7,
         module: "we\"ird.dll".into(),
@@ -505,4 +509,142 @@ fn reserved_ids_preserve_handwritten_api_identity() {
             .collect::<Vec<_>>(),
         vec![78, 86]
     );
+}
+
+// ---- IAT-only broad tier ----
+
+fn broad_config(lines: &[(&str, &str, &str)], reserved: Vec<u32>) -> Config {
+    let mut config = config_with(
+        vec![api(
+            "Windows.Win32.System.Threading",
+            "kernel32.dll",
+            "Sleep",
+        )],
+        12,
+    );
+    config.broad = Some(shirusu_metadata_gen::BroadConfig {
+        first_api_id: 1003,
+        reserved_api_ids: reserved,
+        list: "unused.tsv".into(),
+        modules: vec!["kernel32.dll".into()],
+    });
+    config.broad_apis = lines.iter().map(|(n, m, f)| api(n, m, f)).collect();
+    config
+}
+
+#[test]
+fn broad_list_lines_keep_ids_across_unsupported_and_reserved_entries() {
+    require_winmd!();
+    let index = read_index();
+    let config = broad_config(
+        &[
+            ("Windows.Win32.System.Threading", "kernel32.dll", "SleepEx"),
+            // Present in the lock list but no longer mappable (varargs):
+            // it still owns its ID so the next line keeps 1005.
+            (
+                "Windows.Win32.UI.WindowsAndMessaging",
+                "user32.dll",
+                "wsprintfW",
+            ),
+            (
+                "Windows.Win32.System.Threading",
+                "kernel32.dll",
+                "GetCurrentThreadId",
+            ),
+            (
+                "Windows.Win32.System.Threading",
+                "kernel32.dll",
+                "SwitchToThread",
+            ),
+        ],
+        vec![1006],
+    );
+    let generated = generate(&index, &config).expect("generate");
+    let ids: Vec<_> = generated
+        .emitted()
+        .iter()
+        .map(|a| (a.function.clone(), a.api_id, a.iat_only))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("Sleep".to_string(), 7, false),
+            ("SleepEx".to_string(), 1003, true),
+            ("GetCurrentThreadId".to_string(), 1005, true),
+            ("SwitchToThread".to_string(), 1007, true),
+        ]
+    );
+    assert!(generated
+        .skipped()
+        .iter()
+        .any(|(_, f, reason)| *f == "wsprintfW" && reason.contains("VARARG")));
+    let broad = shirusu_metadata_gen::emit_broad_api_inc(&generated, "v");
+    assert!(broad.contains("level_note: BROAD_LEVEL_NOTE"));
+    assert!(broad.contains("function: \"SleepEx\""));
+    assert!(!broad.contains("function: \"Sleep\","));
+    let curated = emit_api_inc(&generated, "v");
+    assert!(!curated.contains("SleepEx"));
+}
+
+#[test]
+fn broad_tier_rejects_duplicates_and_curated_overlap() {
+    require_winmd!();
+    let index = read_index();
+    let dup = broad_config(
+        &[("Windows.Win32.System.Threading", "KERNEL32.dll", "Sleep")],
+        vec![],
+    );
+    assert!(generate(&index, &dup).unwrap_err().contains("重複"));
+    let mut overlap = broad_config(&[], vec![]);
+    overlap.broad.as_mut().unwrap().first_api_id = 7;
+    assert!(generate(&index, &overlap).unwrap_err().contains("overlap"));
+}
+
+#[test]
+fn broad_refresh_appends_only_and_honors_skips() {
+    require_winmd!();
+    let index = read_index();
+    let mut config = broad_config(
+        &[(
+            "Windows.Win32.System.Threading",
+            "kernel32.dll",
+            "SwitchToThread",
+        )],
+        vec![],
+    );
+    config.skips.push(shirusu_metadata_gen::SkipConfig {
+        namespace: "Windows.Win32.System.Threading".into(),
+        module: "kernel32.dll".into(),
+        function: "SwitchToFiber".into(),
+        reason: "test".into(),
+    });
+    let text = shirusu_metadata_gen::refresh_broad_list(&index, &config).expect("refresh");
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines[0], "namespace\tmodule\tfunction");
+    // Existing lines stay first and in order; new ones follow.
+    assert_eq!(
+        lines[1],
+        "Windows.Win32.System.Threading\tkernel32.dll\tSwitchToThread"
+    );
+    assert!(
+        lines.iter().all(|l| !l.ends_with("\tSleep")),
+        "curated stays out"
+    );
+    assert!(
+        lines.iter().all(|l| !l.ends_with("\tSwitchToFiber")),
+        "skip honored"
+    );
+    assert!(lines
+        .iter()
+        .any(|l| l.ends_with("\tkernel32.dll\tGetTickCount64")));
+    assert!(lines.iter().all(|l| !l.ends_with("\twsprintfW")));
+    let reparsed = shirusu_metadata_gen::parse_broad_list(&text).unwrap();
+    assert_eq!(reparsed.len(), lines.len() - 1);
+    config.broad_apis = reparsed;
+    assert_eq!(
+        shirusu_metadata_gen::refresh_broad_list(&index, &config).unwrap(),
+        text,
+        "refresh is idempotent"
+    );
+    assert!(shirusu_metadata_gen::parse_broad_list("a\tb\n").is_err());
 }

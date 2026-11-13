@@ -19,11 +19,12 @@ unsafe extern "system-unwind" fn set_event(handle: *mut c_void) -> i32 {
     assert_eq!(handle as usize, usize::MAX);
     -123
 }
-fn generic_detour_with<const N: usize>(
-    api_id: u32,
-    raw: &[u64; N],
-    invoke: impl FnOnce(usize) -> u64,
-) -> u64 {
+fn generated_detour(api_id: u32, raw: &[u64], invoke: unsafe fn(usize, &[u64]) -> u64) -> u64 {
+    let original = original_for(api_id, raw);
+    // SAFETY: the stand-in original has the generated function type.
+    unsafe { invoke(original, raw) }
+}
+fn original_for(api_id: u32, raw: &[u64]) -> usize {
     let api = shirusu_hook::api::api_by_id(api_id).unwrap();
     let original = match api.function {
         "Sleep" => sleep as *const () as usize,
@@ -47,15 +48,25 @@ fn generic_detour_with<const N: usize>(
         }
         "D2D1ComputeMaximumScaleFactor" => float_return as *const () as usize,
         "glDepthRange" => {
-            assert_eq!(
-                raw.as_slice(),
-                &[0x8000_0000_0000_0000, 0x7ff8_0000_0000_1234]
-            );
+            assert_eq!(raw, &[0x8000_0000_0000_0000, 0x7ff8_0000_0000_1234]);
             depth_range as *const () as usize
         }
+        "VarBoolFromDate" => {
+            assert_eq!(raw[0], (-0.0f64).to_bits());
+            var_bool_from_date as *const () as usize
+        }
+        "VarBoolFromR4" => {
+            assert_eq!(raw[0], 0x7fc0_4321);
+            var_bool_from_r4 as *const () as usize
+        }
+        "DeleteUrlCacheGroup" => {
+            assert_eq!(raw[0], i64::MIN as u64);
+            delete_url_cache_group as *const () as usize
+        }
+        "SetThreadUILanguage" => ui_language as *const () as usize,
         other => panic!("unexpected original: {other}"),
     };
-    invoke(original)
+    original
 }
 include!("../src/engine_generated.inc");
 
@@ -230,5 +241,58 @@ fn captured_floating_values_roundtrip_without_nan_canonicalization() {
         let decoded = decode_values(&schema_types(&api.enter_schema()).unwrap(), &bytes).unwrap();
         assert_eq!(decoded[0].value, TypedValue::F64Bits(bits));
         assert_eq!(decoded[1].value, TypedValue::F64Bits(bits));
+    }
+}
+
+// ---- IAT-only broad tier: the shared non-generic detour body ----
+unsafe extern "system-unwind" fn var_bool_from_date(date: f64, out: *mut c_void) -> i32 {
+    assert_eq!(date.to_bits(), (-0.0f64).to_bits());
+    unsafe { *out.cast::<i16>() = -1 };
+    0x0123_4567
+}
+unsafe extern "system-unwind" fn var_bool_from_r4(value: f32, out: *mut c_void) -> i32 {
+    assert_eq!(value.to_bits(), 0x7fc0_4321, "NaN payload must survive");
+    unsafe { *out.cast::<i16>() = 0 };
+    -1
+}
+unsafe extern "system-unwind" fn delete_url_cache_group(
+    group: i64,
+    flags: u32,
+    reserved: *mut c_void,
+) -> i32 {
+    assert_eq!(group, i64::MIN);
+    assert_eq!(flags, u32::MAX);
+    assert_eq!(reserved as usize, usize::MAX);
+    1
+}
+unsafe extern "system-unwind" fn ui_language(language: u16) -> u16 {
+    language.wrapping_add(1)
+}
+#[test]
+fn broad_tier_wrappers_preserve_wide_floating_and_narrow_values() {
+    let api = shirusu_hook::api::api_by_name("VarBoolFromR4").unwrap();
+    assert!(shirusu_hook::api::is_iat_only_api(api.api_id));
+    let mut out: i16 = 7;
+    unsafe {
+        let r = detour_generated_oleaut32_var_bool_from_date(-0.0, (&mut out as *mut i16).cast());
+        assert_eq!((r, out), (0x0123_4567, -1));
+        let r = detour_generated_oleaut32_var_bool_from_r4(
+            f32::from_bits(0x7fc0_4321),
+            (&mut out as *mut i16).cast(),
+        );
+        assert_eq!((r, out), (-1, 0));
+        assert_eq!(
+            detour_generated_wininet_delete_url_cache_group(
+                i64::MIN,
+                u32::MAX,
+                usize::MAX as *mut c_void
+            ),
+            1
+        );
+        assert_eq!(detour_generated_kernel32_set_thread_u_i_language(0xFFFF), 0);
+        assert_eq!(
+            detour_generated_kernel32_set_thread_u_i_language(0x0409),
+            0x040A
+        );
     }
 }
