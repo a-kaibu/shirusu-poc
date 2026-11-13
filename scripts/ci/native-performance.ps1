@@ -86,6 +86,9 @@ foreach ($workload in @("gui", "high-load")) {
                     paint_count = $measurement.paint_count; checksum = $measurement.checksum
                     trace_bytes = $(if ($summary) { (Get-Item $trace).Length } else { $null })
                     trace_events = $(if ($summary) { $summary.events } else { $null })
+                    # Preserve exact Host queue/writer counters and capture
+                    # settings beside the timing sample, not only in job logs.
+                    capture_environment = $(if ($summary) { $summary.environment } else { $null })
                     integrity = $(if ($summary) { $summary.integrity } else { $null })
                     apis = $(if ($summary) { $summary.api_stats } else { $null })
                     required_api = $requiredApi; required_api_observed = $requiredApiObserved

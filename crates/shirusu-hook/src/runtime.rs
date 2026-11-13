@@ -962,7 +962,12 @@ impl HookRuntime {
     }
 
     fn signal_if_needed(&self, result: &RecordResult) {
-        if let RecordResult::Written(WriteOutcome::Published { notify, .. }) = result {
+        // A payload-degraded event still publishes a descriptor. Forward its
+        // wakeup too, so the Host can drain it without waiting for the poll.
+        if let RecordResult::Written(
+            WriteOutcome::Published { notify, .. } | WriteOutcome::PublishedDegraded { notify, .. },
+        ) = result
+        {
             if *notify != NotifySignal::None {
                 if let Some(n) = &self.data_ready {
                     let _ = n.notify_data_ready();
@@ -1272,6 +1277,51 @@ mod tests {
         ));
         let rt = HookRuntime::new(Arc::clone(&agent), Vec::new(), None);
         (agent, rt)
+    }
+
+    #[test]
+    fn degraded_descriptor_wakes_waiting_host() {
+        let (agent, mut rt) = runtime();
+        rt.data_ready = Some(ProcessNotify::new().unwrap());
+        let tid = 4141;
+        rt.ensure_thread(tid);
+        // SAFETY: this test retains the Agent and is the only producer/reader.
+        let base = unsafe { agent.thread_region_base(tid) }.unwrap();
+        shirusu_transport::layout::store(
+            base,
+            shirusu_transport::layout::OFF_HOST_WAITING,
+            1,
+            Ordering::Relaxed,
+        );
+        let result = rt.record_enter(
+            tid,
+            api_by_id(API_CREATE_FILE_W).unwrap(),
+            rt.alloc_call_id(),
+            &[0; 4097],
+        );
+        assert!(matches!(
+            result,
+            RecordResult::Written(WriteOutcome::PublishedDegraded {
+                notify: NotifySignal::HostWaiting,
+                ..
+            })
+        ));
+        assert!(rt
+            .data_ready
+            .as_ref()
+            .unwrap()
+            .data_ready
+            .wait_timeout(Duration::ZERO));
+        let mut reader = unsafe { RingReader::new(base, agent.thread_config()) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 1);
+        assert!(batch.events[0].descriptor.payload_dropped());
+        assert!(!rt
+            .data_ready
+            .as_ref()
+            .unwrap()
+            .data_ready
+            .wait_timeout(Duration::ZERO));
     }
 
     #[test]

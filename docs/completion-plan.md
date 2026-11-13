@@ -253,3 +253,26 @@ release coverage and a broader API corpus remain incomplete. The preceding Host
 pipeline diagnostic change (`6372bf4`, run `43404035077`) passed the complete CI
 matrix, including fuzz. Queue backpressure was observed on all three Windows
 jobs; this measurement does not establish that the performance target is met.
+
+Native corpus execution passed on WoW64 (build 26100) and Server 2022 x64
+(build 20348) in run `43405537057`. Downloaded entries were independently loaded
+and compared on Linux: all six normalized observations matched. Exact reports,
+execution metadata and scratch files are now retained in `corpus/windows/` with
+source commit/run/artifact provenance; a regression test verifies their digests
+and comparison on every platform. This supersedes the initial artifact-only
+publication status above, without implying broad Windows/API coverage.
+
+A further high-load review reproduced a missing Host wakeup: Runtime forwarded
+`Published` notifications but discarded `PublishedDegraded` notifications even
+though a descriptor had been published. A real Ring regression test failed on
+the old implementation and passes after forwarding both outcomes. This preserves
+loss reporting and the existing bounded polling fallback; it is not evidence
+that the high-load performance target has been reached. Performance artifacts
+now also retain the full capture environment, including exact Host queue/writer
+counters, alongside each timing sample.
+
+The same corpus Probe also passed on Windows latest x64 (build 26100); its entry
+is retained beside the other two and all three compare equal. Native performance
+in this corpus CI run was GUI 1.598x / 1.701x / 1.641x with complete event integrity,
+and high-load 115.497x / 112.969x / 102.794x with degraded integrity (latest x64 /
+Server 2022 x64 / WoW64 respectively). This precedes the degraded-event wakeup fix.
