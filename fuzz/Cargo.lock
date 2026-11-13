@@ -142,6 +142,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shirusu-api-catalog"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "shirusu-trace",
+]
+
+[[package]]
+name = "shirusu-crc32c"
+version = "0.1.0"
+
+[[package]]
 name = "shirusu-fuzz"
 version = "0.1.0"
 dependencies = [
@@ -159,6 +171,7 @@ dependencies = [
  "cc",
  "iced-x86",
  "shirusu-agent",
+ "shirusu-api-catalog",
  "shirusu-trace",
  "shirusu-transport",
  "shirusu-transport-win",
@@ -171,12 +184,15 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ruzstd",
- "shirusu-transport",
+ "shirusu-crc32c",
 ]
 
 [[package]]
 name = "shirusu-transport"
 version = "0.1.0"
+dependencies = [
+ "shirusu-crc32c",
+]
 
 [[package]]
 name = "shirusu-transport-win"

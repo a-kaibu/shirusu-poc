@@ -10,6 +10,7 @@
 | `decode_payload` | Descriptor と Payload | 参照範囲と折り返しを正しく検証する |
 | `decode_compact` | SchemaSet (Protobuf) と値列 | Compact Binary 復号が panic せず、成功時は再符号化と冪等 |
 | `recover_trace` | Trace ファイル全体のバイト列 | 回復読みが panic せず、受理時は sequence 単調性などの不変条件を満たす |
+| `stream_trace` | Trace ファイル全体のバイト列 | ストリーミング Reader が全体読み込みと同じ受理可否・内容・issue を返す |
 | `proto_messages` | Trace メタデータの任意バイト列 | 全 16 型が panic せず、受理した値は再符号化→再復号で同じ値に戻る |
 | `pe_image` | PE のファイル配置／メモリ配置 | panic せず、IAT スロットとエクスポート RVA がイメージ内に収まる |
 | `inline_plan` | 関数先頭のバイト列・配置先アドレス | 盗む命令が命令境界で隙間なく並び、パッチが独立デコーダで Detour へ届く |

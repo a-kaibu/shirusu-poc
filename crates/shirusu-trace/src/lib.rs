@@ -27,6 +27,7 @@ pub mod proto;
 pub mod reader;
 pub mod schema;
 pub mod static_dep;
+pub mod stream;
 pub mod writer;
 
 pub use blob::{BlobId, BlobStore, BlobUpdate};

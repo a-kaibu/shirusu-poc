@@ -5,7 +5,8 @@
 //! 隔離し、issue として記録したうえで、読める内容を可能な限り返す。
 //! 失われたイベントを推測で作ることはしない。
 //!
-//! v1 はファイル全体をメモリに載せる前提（形式仕様の留保どおり）。
+//! このモジュールはファイル全体をメモリに載せる。大きな Trace を Block
+//! ごとに読むには [`crate::stream::TraceStream`] を使う（同じ回復意味論）。
 
 use crate::blob::{apply_update_to, BlobId, BlobUpdate};
 use crate::compact;

@@ -39,13 +39,36 @@ pub(crate) fn build_filter(parsed: &Parsed) -> Result<EventFilter, ToolError> {
     Ok(filter)
 }
 
+/// Trace をストリーミング読み取り用に開く（全体をメモリへ読み込まない）。
+pub(crate) fn open_trace_stream(
+    parsed: &Parsed,
+) -> Result<
+    (
+        String,
+        shirusu_trace::stream::TraceStream<std::io::BufReader<std::fs::File>>,
+    ),
+    ToolError,
+> {
+    let path = parsed
+        .positional
+        .first()
+        .ok_or_else(|| ToolError::Usage("missing <trace> path".to_string()))?
+        .clone();
+    if parsed.positional.len() > 1 {
+        return Err(ToolError::Usage("too many positional arguments".into()));
+    }
+    let file = std::fs::File::open(&path)
+        .map_err(|e| ToolError::Runtime(format!("cannot read {path}: {e}")))?;
+    let stream = shirusu_trace::stream::TraceStream::open(std::io::BufReader::new(file))
+        .map_err(|e| ToolError::Runtime(format!("{path} is not a readable trace: {e}")))?;
+    Ok((path, stream))
+}
+
 pub(crate) fn cmd_dump(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &["json"])?;
     parsed.validate_options(&[
         "json", "api", "kind", "seq", "thread", "text", "limit", "order",
     ])?;
-    let (_path, trace) = load_trace(&parsed)?;
-    let view = TraceView::build(&trace);
     let filter = build_filter(&parsed)?;
     // L11: --order=global は全スレッド共通の観測順序で並べ替える。
     // 値が global 以外なら使い方エラーにする。
@@ -65,7 +88,32 @@ pub(crate) fn cmd_dump(args: &[String]) -> Result<(), ToolError> {
         ),
         None => None,
     };
-    let mut matched: Vec<_> = view.events.iter().filter(|e| filter.matches(e)).collect();
+    // ストリーミング読み取り: Event Chunk を 1 つずつ復号し、条件に合う
+    // イベントだけを保持する。--order=global でなければ --limit に達した
+    // 時点で読み終える。
+    let (path, mut stream) = open_trace_stream(&parsed)?;
+    let read_error = |e: shirusu_trace::TraceError| ToolError::Runtime(format!("{path}: {e}"));
+    let mut matched: Vec<shirusu_analysis::EventView> = Vec::new();
+    let mut index = 0usize;
+    let wanted = if order_global {
+        usize::MAX
+    } else {
+        limit.unwrap_or(usize::MAX)
+    };
+    'read: while let Some(item) = stream.next_item().map_err(read_error)? {
+        if let shirusu_trace::stream::StreamItem::Events(batch) = item {
+            for e in &batch.events {
+                let ev = shirusu_analysis::EventView::of(stream.registry(), &batch, e, index);
+                index += 1;
+                if filter.matches(&ev) {
+                    matched.push(ev);
+                    if matched.len() >= wanted {
+                        break 'read;
+                    }
+                }
+            }
+        }
+    }
     if order_global {
         // 全体順序を持たないイベントが 1 件でもあれば、その Trace は
         // --order=global で記録されたものではない。

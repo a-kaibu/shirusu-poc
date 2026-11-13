@@ -677,8 +677,28 @@ overview「転送形式とディスク形式」節：`--order=global`を付け�
 ## 回復意味論（recover_trace）
 
 Reader は、信頼できない入力として Trace を扱う（overview の決定）。
-前提として、ファイル全体をメモリに載せる v1 実装であり、ストリー
-ミング読みは将来の拡張とする（留保として明記）。
+Reader は 2 種類ある。`read_trace`（`ReadTrace`）はファイル全体をメモリに
+載せ、全 Event Batch と Blob を展開する（Unit Test や小さな Trace の比較に
+使う）。`shirusu_trace::stream::TraceStream` は `Read + Seek` から Block を
+1 つずつ読むストリーミング Reader で、下の表と同じ回復意味論に従う
+（2026-11-13 追加）。
+
+- 保持するのは Schema 登録表、Block 位置の一覧（Index の照合用）、Blob ID
+  ごとの位置と最初の参照位置だけ。Event Batch は 1 件ずつ渡して捨てられ、
+  Blob の内容は `load_blob` で必要なときに読み直す（BlobUpdate の版は基底から
+  畳み込む）。`decode_events = false` では Event Chunk を CRC だけ検査して
+  復号しない（Header・Environment・Finalization・集計だけを読む用途）。
+- 欠落 Blob・前方参照・BlobUpdate の畳み込みの issue は `finish` でまとめて
+  記録する。畳み込みは更新されるリソースの内容だけを一時的に持つ。
+- Event の復号に使う Schema はその Event Chunk より前に現れたものだけ
+  （Writer は Schema を先に書く）。
+- 全体読み込みとの一致は、全バイト位置の 1 バイト破損・全長での切断・
+  上限・BlobUpdate の失敗の総当たりテスト（`tests/stream_reader.rs`）と
+  fuzz target `stream_trace` で検査する。
+- `shirusu dump` はストリーミング Reader を使い、条件に合うイベントだけを
+  保持する（`--order=global` が無ければ `--limit` に達した時点で読み終える）。
+  `inspect` / `export` / `coverage` などは全体読み込みのままで、必要な機能から
+  移行する。
 
 | 状況 | Reader の振る舞い |
 | --- | --- |

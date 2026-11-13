@@ -8,6 +8,6 @@ if ! cargo +nightly fuzz --version >/dev/null 2>&1; then
 fi
 fuzz/materialize-corpus.sh
 cd fuzz
-for t in validate_control decode_descriptor decode_payload snapshot_fragments decode_compact recover_trace blob_hex trace_budgets proto_messages pe_image inline_plan; do
+for t in validate_control decode_descriptor decode_payload snapshot_fragments decode_compact recover_trace stream_trace blob_hex trace_budgets proto_messages pe_image inline_plan; do
   cargo +nightly fuzz run "$t" -- -max_total_time=60 || exit 1
 done

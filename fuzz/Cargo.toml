@@ -59,6 +59,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "stream_trace"
+path = "fuzz_targets/stream_trace.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "blob_hex"
 path = "fuzz_targets/blob_hex.rs"
 test = false

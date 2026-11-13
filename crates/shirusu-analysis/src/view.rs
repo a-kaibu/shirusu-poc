@@ -6,9 +6,11 @@
 
 use crate::json::JsonValue;
 use shirusu_trace::compact::decode_values;
-use shirusu_trace::model::{PayloadLossReason, PayloadRef};
+use shirusu_trace::model::{EventBatch, PayloadLossReason, PayloadRef, TraceEvent};
 use shirusu_trace::reader::{ReadTrace, RecoveryIssue};
-use shirusu_trace::schema::{EventCapture, Ty, TypedValue, ValueCapture, ValueKind};
+use shirusu_trace::schema::{
+    EventCapture, SchemaRegistry, Ty, TypedValue, ValueCapture, ValueKind,
+};
 use shirusu_trace::BlobId;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -184,6 +186,41 @@ pub struct EventView {
     /// 引数の復号に失敗した理由（値列が壊れている等）。隠さず残す。
     pub args_error: Option<String>,
     pub payload: PayloadView,
+}
+
+impl EventView {
+    /// 1 件のイベントを、その Batch の文脈と Schema 登録表で復号する。
+    /// 全体読み込み（[`TraceView::build`]）とストリーミング読み取りの
+    /// 両方が使う。`index` はファイル順の通し番号。
+    pub fn of(registry: &SchemaRegistry, batch: &EventBatch, e: &TraceEvent, index: usize) -> Self {
+        let schema_name = registry.get(e.schema_id).map(|def| def.name.clone());
+        let api_name = schema_name
+            .as_deref()
+            .map(|n| api_name_of_schema(n).to_string());
+        let (fields, args_error) = decode_fields(registry, e.schema_id, e.args.as_deref());
+        EventView {
+            index,
+            session_id: batch.session_id,
+            process_id: batch.process_id,
+            raw_pid: batch.raw_pid,
+            thread_id: batch.thread_id,
+            qpc_frequency: batch.qpc_frequency,
+            kind: e.kind,
+            sequence: e.sequence,
+            global_order: e.global_order,
+            timestamp_qpc: e.timestamp_qpc,
+            call_id: e.call_id,
+            parent_call_id: e.parent_call_id,
+            api_id: e.api_id,
+            schema_id: e.schema_id,
+            api_name,
+            schema_name,
+            capture: e.capture,
+            fields,
+            args_error,
+            payload: PayloadView::of(&e.payload),
+        }
+    }
 }
 
 impl EventView {
@@ -644,33 +681,7 @@ impl<'a> TraceView<'a> {
         let mut events = Vec::new();
         for batch in &trace.batches {
             for e in &batch.events {
-                let schema_name = trace.registry.get(e.schema_id).map(|def| def.name.clone());
-                let api_name = schema_name
-                    .as_deref()
-                    .map(|n| api_name_of_schema(n).to_string());
-                let (fields, args_error) = decode_fields(trace, e.schema_id, e.args.as_deref());
-                events.push(EventView {
-                    index: events.len(),
-                    session_id: batch.session_id,
-                    process_id: batch.process_id,
-                    raw_pid: batch.raw_pid,
-                    thread_id: batch.thread_id,
-                    qpc_frequency: batch.qpc_frequency,
-                    kind: e.kind,
-                    sequence: e.sequence,
-                    global_order: e.global_order,
-                    timestamp_qpc: e.timestamp_qpc,
-                    call_id: e.call_id,
-                    parent_call_id: e.parent_call_id,
-                    api_id: e.api_id,
-                    schema_id: e.schema_id,
-                    api_name,
-                    schema_name,
-                    capture: e.capture,
-                    fields,
-                    args_error,
-                    payload: PayloadView::of(&e.payload),
-                });
+                events.push(EventView::of(&trace.registry, batch, e, events.len()));
             }
         }
         let integrity = IntegritySummary::of(trace);
@@ -718,20 +729,20 @@ impl<'a> TraceView<'a> {
 }
 
 fn decode_fields(
-    trace: &ReadTrace,
+    registry: &SchemaRegistry,
     schema_id: u32,
     args: Option<&[u8]>,
 ) -> (Vec<FieldView>, Option<String>) {
     let Some(bytes) = args else {
         return (Vec::new(), None);
     };
-    let Some(def) = trace.registry.get(schema_id) else {
+    let Some(def) = registry.get(schema_id) else {
         return (
             Vec::new(),
             Some(format!("schema {schema_id} not registered")),
         );
     };
-    let Some(types) = trace.registry.types(schema_id) else {
+    let Some(types) = registry.types(schema_id) else {
         return (
             Vec::new(),
             Some(format!("schema {schema_id} has unknown types")),
