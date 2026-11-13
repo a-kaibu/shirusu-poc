@@ -84,6 +84,12 @@ fn main() {
             black_box(shirusu_hook::api::api_by_id(black_box(id)));
         });
     }
+    measure("runtime_target_policy_by_name", || {
+        black_box(black_box(&rt).should_suppress_api(black_box(api.module)));
+    });
+    measure("runtime_target_policy_by_id", || {
+        black_box(black_box(&rt).should_suppress_api_id(black_box(api.api_id)));
+    });
     measure("runtime_passthrough_rwlock_arc", || {
         drop(black_box(slot.for_detour()));
     });

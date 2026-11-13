@@ -667,6 +667,8 @@ pub struct HookRuntime {
     space_notifies: Vec<Arc<RingNotify>>,
     data_ready: Option<ProcessNotify>,
     originals: [AtomicUsize; API_COUNT + 1],
+    /// Immutable target classification, computed before publishing this runtime.
+    runtime_targets: [bool; API_COUNT + 1],
     next_call_id: AtomicU64,
     seen_threads: Mutex<HashSet<u64>>,
     /// 記録の有効/無効 (終了手順のゲート。レビュー #4 の #9)。
@@ -718,6 +720,10 @@ impl HookRuntime {
             space_notifies,
             data_ready,
             originals: std::array::from_fn(|_| AtomicUsize::new(0)),
+            runtime_targets: std::array::from_fn(|id| {
+                crate::api::api_by_id(id as u32)
+                    .is_some_and(|api| shirusu_trace::module::is_runtime_module(api.module))
+            }),
             next_call_id: AtomicU64::new(NEXT_CALL_ID_SEED.fetch_add(1 << 32, Ordering::Relaxed)),
             seen_threads: Mutex::new(HashSet::new()),
             recording_enabled: AtomicBool::new(true),
@@ -843,6 +849,18 @@ impl HookRuntime {
         let target = shirusu_trace::module::is_runtime_module(module)
             .then_some(shirusu_trace::module::ModuleClass::Runtime);
         crate::caller::should_suppress_target(target, self.record_runtime_apis)
+    }
+
+    /// Apply the same Runtime-target policy using the immutable API index.
+    /// Unknown IDs remain fail-open; no caller module classification is implied.
+    #[inline]
+    pub fn should_suppress_api_id(&self, api_id: u32) -> bool {
+        !self.record_runtime_apis
+            && self
+                .runtime_targets
+                .get(api_id as usize)
+                .copied()
+                .unwrap_or(false)
     }
 
     /// 記録が有効か。終了手順 (shutdown_recording) が始まると false。
@@ -2280,6 +2298,26 @@ mod tests {
             HookRuntime::new(Arc::clone(&agent), Vec::new(), None).with_record_runtime_apis(true);
         assert!(!rt.should_suppress_api("ucrtbase.dll"));
         assert!(!rt.should_suppress_api("kernel32.dll"));
+    }
+
+    #[test]
+    fn indexed_target_policy_matches_module_policy_for_every_api_and_mode() {
+        let (agent, _) = runtime();
+        for record_runtime in [false, true] {
+            let rt = HookRuntime::new(agent.clone(), Vec::new(), None)
+                .with_record_runtime_apis(record_runtime);
+            for api in crate::api::api_table() {
+                assert_eq!(
+                    rt.should_suppress_api_id(api.api_id),
+                    rt.should_suppress_api(api.module),
+                    "{}!{}",
+                    api.module,
+                    api.function
+                );
+            }
+            assert!(!rt.should_suppress_api_id(0));
+            assert!(!rt.should_suppress_api_id(u32::MAX));
+        }
     }
 
     #[test]

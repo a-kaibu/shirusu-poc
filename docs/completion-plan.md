@@ -403,3 +403,13 @@ uses the existing mixed-codec container; validation, CRC, index and durability
 remain shared with the normal Writer path. Tests cover mixed-codec exact event
 roundtrips, rejected invalid batches and resuming normal policy. Native workload
 validation is still required; slower storage can change the performance tradeoff.
+
+### Runtime-target policy lookup (2026-11-13)
+
+Runtime construction now classifies the fixed API table once into an immutable
+boolean array. Detour entry indexes that array instead of rescanning module-name
+strings; record_runtime_apis remains authoritative and unknown IDs remain
+fail-open. The policy still concerns target APIs, not their callers. A parity test
+covers every API under both policy settings. Linux release component measurement
+for kernel32: name lookup 8.14 ns versus ID lookup 0.83 ns. This is a small isolated
+improvement, not a measured application-level speedup or source-boundary filter.

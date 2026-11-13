@@ -3270,7 +3270,7 @@ fn prepare(api_id: u32) -> Prepare {
     };
     // The option controls Runtime's own exported APIs, not Windows API calls
     // made by Runtime. Agent-originated calls are excluded by reentrancy above.
-    if rt.should_suppress_api(api.module) {
+    if rt.should_suppress_api_id(api.api_id) {
         le.restore_before_original();
         return Prepare::Passthrough { original };
     }
