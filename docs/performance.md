@@ -16,6 +16,31 @@
 - `full` は間引かないモードだが記録を保証するモードではない。欠落したら Trace
   は `incomplete` 扱いになる。
 
+## 短時間の高負荷に備えるバッファ
+
+Windows の `capture` / `attach` は `--buffer burst` を選べる。
+例えば `shirusu capture --buffer burst -- game.exe`。既定は
+`--buffer standard` で、記録する API や完全性の判定は変わらない。
+
+| 設定 | Ring ごとの Descriptor | Ring ごとの Payload | 初期8本の共有 Mapping |
+| --- | ---: | ---: | ---: |
+| standard | 4,096件 | 1 MiB | 約10 MiB |
+| burst | 65,536件 | 1 MiB | 約40 MiB |
+
+これは共有 Mapping の容量であり RSS ではない。Host の検証用コピー、
+回収済みイベントのキュー、変換用バッファなどは別途必要になる。
+子プロセスを追跡する場合はプロセスごとに必要。選択された容量は
+Trace の `capture_config` に保存し、`shirusu inspect` で確認できる。
+
+`8b6baac` の Windows x64 latest 容量比較では、同じ50,000反復で
+standard は3回とも欠落、65,536件構成は3回とも301,028イベントを
+欠落なしで保存した。対象内の測定時間はそれぞれ58.2〜60.1 msと
+47.0〜50.1 ms。これはライブラリ経由の当該 fixture の実測であり、
+高負荷5倍目標の達成や長時間の欠落防止を保証しない。大きいバッファは
+一時的な遅れを吸収するが、継続して生産速度が回収速度を上回れば満杯になる。
+CI の容量比較では burst 構成を CLI 経由でも実行し、容量の適用と
+対象の終了、観測内容を検査する。
+
 ## 測定器
 
 `e2e/src/bin/shirusu-perf-bench.rs`。

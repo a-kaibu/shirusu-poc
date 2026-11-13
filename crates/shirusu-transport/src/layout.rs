@@ -50,6 +50,12 @@ impl RingConfig {
         descriptor_capacity: 4096,
         payload_capacity: 1024 * 1024,
     };
+    /// Opt-in burst capacity: 5 MiB + Control per Ring. This absorbs short
+    /// producer bursts, but cannot guarantee loss-free sustained capture.
+    pub const BURST: Self = Self {
+        descriptor_capacity: 65536,
+        payload_capacity: 1024 * 1024,
+    };
     pub fn new(descriptor_capacity: usize, payload_capacity: usize) -> Self {
         assert!(descriptor_capacity >= 2, "descriptor capacity must be >= 2");
         assert!(payload_capacity >= 16, "payload capacity must be >= 16");

@@ -131,6 +131,7 @@ pub struct SlotPool {
     pub low_watermark: usize,
     /// 総メモリ上限（設定時のみ）。Slot 拡張の可否を決める。None なら上限なし。
     pub memory_limit_bytes: Option<u64>,
+    slot_memory_bytes: u64,
 }
 impl SlotPool {
     pub fn new(capacity: usize) -> Self {
@@ -148,6 +149,7 @@ impl SlotPool {
             expansion_request_count: AtomicU64::new(0),
             low_watermark,
             memory_limit_bytes: None,
+            slot_memory_bytes: SLOT_MEMORY_BYTES,
         }
     }
     /// 総メモリ上限を設定する（仕様: 総メモリ上限を設定できるようにする）。
@@ -156,9 +158,16 @@ impl SlotPool {
         self.memory_limit_bytes = Some(limit_bytes);
         self
     }
-    /// 現在の Pool が消費する共有メモリの概算（Slot 数 × 本番既定 1 Slot 分）。
+    /// Set the mapping size used for accounting and expansion limits before
+    /// sharing this pool. The Agent must use the same Ring configuration.
+    /// Existing constructors retain the production configuration by default.
+    pub fn with_ring_config(mut self, config: RingConfig) -> Self {
+        self.slot_memory_bytes = config.required_len() as u64;
+        self
+    }
+    /// Configured Ring mapping bytes; excludes Host copies and allocator costs.
     pub fn total_memory_bytes(&self) -> u64 {
-        self.slots.read().unwrap().len() as u64 * SLOT_MEMORY_BYTES
+        (self.slots.read().unwrap().len() as u64).saturating_mul(self.slot_memory_bytes)
     }
     /// もう 1 Slot 追加しても総メモリ上限に収まるか。上限なしなら常に true。
     pub fn can_add_slot(&self) -> bool {
@@ -167,7 +176,10 @@ impl SlotPool {
     fn can_add_slot_with_len(&self, len: usize) -> bool {
         match self.memory_limit_bytes {
             None => true,
-            Some(limit) => (len as u64 + 1) * SLOT_MEMORY_BYTES <= limit,
+            Some(limit) => (len as u64)
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(self.slot_memory_bytes))
+                .is_some_and(|bytes| bytes <= limit),
         }
     }
     /// 拡張で Slot を 1 本追加する (A70)。管理スレッドだけが呼ぶ。
@@ -434,6 +446,25 @@ mod tests {
         assert!(!pool.publish_slot(idx));
         // 範囲外 index は静かに false。
         assert!(!pool.publish_slot(999));
+    }
+    #[test]
+    fn custom_ring_size_controls_expansion_budget() {
+        for config in [RingConfig::new(16, 512), RingConfig::BURST] {
+            let bytes = config.required_len() as u64;
+            let pool = SlotPool::new(1)
+                .with_ring_config(config)
+                .with_memory_limit(2 * bytes - 1);
+            assert_eq!(pool.total_memory_bytes(), bytes);
+            assert!(!pool.can_add_slot());
+            assert_eq!(pool.add_slot(), None);
+            let pool = SlotPool::new(1)
+                .with_memory_limit(2 * bytes)
+                .with_ring_config(config);
+            assert_eq!(pool.add_slot(), Some(1));
+            assert_eq!(pool.total_memory_bytes(), 2 * bytes);
+            assert!(!pool.can_add_slot());
+            assert_eq!(pool.add_slot(), None);
+        }
     }
     #[test]
     fn add_slot_respects_memory_limit() {

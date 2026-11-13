@@ -22,12 +22,20 @@ try {
             Push-Location $dir
             try {
                 $trace = Join-Path $dir "capture.trace"
-                Invoke-NativeWithTimeout -FilePath $helper -ArgumentList @($Dll, $Fixture, $trace, "$capacity")
+                if ($capacity -eq 65536) {
+                    # Exercise the shipped CLI profile, not only the library helper.
+                    & $Cli capture --buffer burst --dll $Dll --output $trace -- $Fixture high-load | Tee-Object -Variable captureOutput
+                    if ($LASTEXITCODE -ne 0) { throw "burst CLI capture failed: $LASTEXITCODE" }
+                    if (-not ($captureOutput -match '^target exit code: 0 \(0x00000000\)$')) { throw "burst target did not exit successfully" }
+                } else {
+                    Invoke-NativeWithTimeout -FilePath $helper -ArgumentList @($Dll, $Fixture, $trace, "$capacity")
+                }
                 $measurement = Get-Content "measurement.json" -Raw | ConvertFrom-Json
                 if ($measurement.workload -ne "high-load" -or $measurement.ticks -le 0 -or $measurement.qpc_frequency -le 0) { throw "invalid buffer benchmark timing" }
                 $raw = & $Cli inspect $trace --json
                 if ($LASTEXITCODE -notin @(0,1)) { throw "buffer benchmark trace inspection failed" }
                 $summary = ($raw -join "`n") | ConvertFrom-Json
+                if ($summary.environment.capture_config -notmatch "ring_descriptors=$capacity; ring_payload_bytes=1048576") { throw "buffer configuration was not applied" }
                 $observed = @($summary.api_stats | Where-Object { $_.api -eq "kernel32!HeapAlloc" -and $_.enter -gt 0 }).Count -gt 0
                 $rows += [ordered]@{
                     round = $round; descriptor_capacity = $capacity; payload_capacity = 1048576

@@ -203,7 +203,7 @@ mod win {
         // 同じ登録経路）。Slot はスレッド終了 (FLS で検出) と Host の
         // drain 完了で回収され再利用される（レビュー #6 P1-4）。回収が
         // 間に合わない間の不足は Capture Coverage の欠落として数える。
-        let pool = Arc::new(SlotPool::new(0));
+        let pool = Arc::new(SlotPool::new(0).with_ring_config(config));
         let agent = Arc::new(
             Agent::new(pool, config, host_monitor)
                 // A detour can run from someone else's DllMain. Initialization

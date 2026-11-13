@@ -93,6 +93,7 @@ fn usage() -> &'static str {
      \n\
      capture / attach options:\n\
      \x20 --output <path>  --dll <path>  --timeout <secs> (init timeout, default 30)\n\
+     \x20 --buffer <standard|burst>  (burst uses ~40 MiB shared Rings/process; default: standard)\n\
      \x20 --order=global  (record with a global observation order, L11)\n\
      \x20 --module-class <module>=<class>  (repeatable; windows/runtime/application/unknown, L07)\n\
      \x20 --record-runtime-apis  (also record the Runtime's own APIs, L07; default: off)\n\
@@ -1318,12 +1319,13 @@ struct CaptureRequest {
     /// L05: 起動した対象の子プロセスも追跡するか
     /// （`--follow-children`。capture 専用）。
     follow_children: bool,
+    ring_config: shirusu_transport::RingConfig,
 }
 
 /// capture / attach の共通オプション（`--output` / `--dll` /
 /// `--timeout` / `--order=global` / `--module-class` /
 /// `--record-runtime-apis` / `--diagnostic-query-interface` /
-/// `--mode` / `--api` / `--follow-children`）。
+/// `--mode` / `--api` / `--follow-children` / `--buffer`）。
 struct CaptureOptions {
     output: Option<String>,
     dll: Option<PathBuf>,
@@ -1339,10 +1341,20 @@ struct CaptureOptions {
     api_names: Vec<String>,
     /// L05: 子プロセスも追跡するか（`--follow-children`）。
     follow_children: bool,
+    ring_config: shirusu_transport::RingConfig,
 }
 
 impl CaptureOptions {
     fn parse(parsed: &Parsed) -> Result<Self, ToolError> {
+        let ring_config = match parsed.opt("buffer") {
+            None | Some("standard") => shirusu_transport::RingConfig::PRODUCTION,
+            Some("burst") => shirusu_transport::RingConfig::BURST,
+            Some(other) => {
+                return Err(ToolError::Usage(format!(
+                    "unknown --buffer value: {other} (expected standard or burst)"
+                )))
+            }
+        };
         let timeout_secs = match parsed.opt("timeout") {
             Some(v) => v
                 .parse()
@@ -1405,6 +1417,7 @@ impl CaptureOptions {
             output: parsed.opt("output").map(str::to_string),
             dll: parsed.opt("dll").map(PathBuf::from),
             timeout_secs,
+            ring_config,
             order_global,
             module_classes,
             // L07: Runtime 独自の API を記録するか（既定は記録しない）。
@@ -1574,6 +1587,7 @@ fn cmd_capture(args: &[String]) -> Result<(), ToolError> {
         output,
         dll: opts.dll,
         timeout: Duration::from_secs(opts.timeout_secs),
+        ring_config: opts.ring_config,
         order_global: opts.order_global,
         module_classes: opts.module_classes,
         record_runtime_apis: opts.record_runtime_apis,
@@ -1622,6 +1636,7 @@ fn cmd_attach(args: &[String]) -> Result<(), ToolError> {
         output,
         dll: opts.dll,
         timeout: Duration::from_secs(opts.timeout_secs),
+        ring_config: opts.ring_config,
         order_global: opts.order_global,
         module_classes: opts.module_classes,
         record_runtime_apis: opts.record_runtime_apis,
@@ -1640,16 +1655,14 @@ fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
     use shirusu_host::recorder::CaptureSessionConfig;
     use shirusu_host::recorder_launch::{LaunchConfig, LaunchedCapture};
     use shirusu_trace::writer::Durability;
-    use shirusu_transport::RingConfig;
 
     let dll = resolve_dll(req.dll.as_deref())?;
     let session_id = new_session_id();
     let freq = qpc_frequency();
     let session_cfg = CaptureSessionConfig {
         session_id,
-        // e2e と同じ調整済みの既定値（A73）。CLI は Ring の詳細を
-        // 露出しない。
-        ring_config: RingConfig::PRODUCTION,
+        // Keep default capture costs unchanged; burst buffering is explicit.
+        ring_config: req.ring_config,
         environment: capture_environment(
             &req.mode,
             session_id,
@@ -1941,6 +1954,25 @@ mod tests {
         assert_eq!(opts.dll, None);
         assert_eq!(opts.timeout_secs, 30);
         assert!(!opts.order_global);
+        assert_eq!(opts.ring_config, shirusu_transport::RingConfig::PRODUCTION);
+    }
+
+    #[test]
+    fn capture_buffer_profiles_are_explicit_and_bounded() {
+        for (name, expected) in [
+            ("standard", shirusu_transport::RingConfig::PRODUCTION),
+            ("burst", shirusu_transport::RingConfig::BURST),
+        ] {
+            let parsed = parse_args(&args(&["--buffer", name]), &[]).unwrap();
+            let opts = CaptureOptions::parse(&parsed).unwrap();
+            assert_eq!(opts.ring_config, expected);
+            assert_eq!(opts.ring_config.payload_capacity, 1024 * 1024);
+        }
+        let parsed = parse_args(&args(&["--buffer=unlimited"]), &[]).unwrap();
+        assert!(matches!(
+            CaptureOptions::parse(&parsed),
+            Err(ToolError::Usage(_))
+        ));
     }
 
     #[test]

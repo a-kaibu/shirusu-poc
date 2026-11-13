@@ -733,3 +733,15 @@ Probe の fingerprint は、既知の初期状態から再生できる CREATE_NE
 失敗理由の変化と情報不足の拒否を検査する。Windows の同一 Runner を隔離して
 2 回実行するテストも CreateFileW を対象に追加し、差分を捏造しないことを確認する。
 実互換 Runner との再現検証・大域的最小性はこの実装の完了条件とは分けて残す。
+
+### バースト用バッファの選択
+
+`capture` / `attach --buffer burst` は Descriptor 65,536件 / Payload 1 MiBを
+明示的に選択する。既定の4,096件は維持。初期8 Ring の共有 Mapping は
+約10 MiBから約40 MiBとなり、Host のコピー・キュー等は別途必要。
+`8b6baac` の x64 latest では当該構成で容量比較3回とも欠落なしだったが、
+高負荷5倍目標や一般アプリの完全性の達成とは扱わない。CI はこの構成を
+CLI 経由でも実行し、Trace に保存した実容量・対象終了・観測内容を確認する。
+SlotPool には Ring 構成を使ったメモリ計算を追加し、Agent DLL は Bootstrap と
+同じ構成を渡す。カスタム構成を使うライブラリ利用者も共有前に
+`with_ring_config` を設定する必要がある。拡張予算の境界は大小の構成で検査する。
