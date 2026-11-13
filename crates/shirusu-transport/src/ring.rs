@@ -54,7 +54,7 @@ pub struct WriterPolicy {
     pub max_wait: Duration,
     /// OVERFLOW から復帰する使用率閾値（%）。例: 50。
     pub resume_threshold_percent: u64,
-    /// 通知の使用率閾値（%）。
+    /// 通知の使用率閾値（%）。Descriptor 件数と Payload バイト数を別々に判定する。
     pub notify_threshold_percent: u64,
     /// Loader Lock 等の危険経路では待機禁止。
     pub no_wait_dangerous_path: bool,
@@ -261,6 +261,7 @@ pub struct RingWriter {
     state: OverflowState,
     dropped_enter_calls: HashSet<u64>,
     notify_tracker: PublishNotifyTracker,
+    payload_notify_tracker: PublishNotifyTracker,
     pub last_wait_ns: u64,
     pub total_wait_ns: u64,
     pub wait_count: u64,
@@ -306,6 +307,7 @@ impl RingWriter {
             state: OverflowState::Normal,
             dropped_enter_calls: HashSet::new(),
             notify_tracker: PublishNotifyTracker::new(),
+            payload_notify_tracker: PublishNotifyTracker::new(),
             last_wait_ns: 0,
             total_wait_ns: 0,
             wait_count: 0,
@@ -382,6 +384,14 @@ impl RingWriter {
     fn publish(&mut self, desc: EventDescriptor, payload: Option<&[u8]>) -> NotifySignal {
         let wc = self.write_cursor();
         let used_before = wc.saturating_sub(self.read_cursor());
+        // Descriptor and payload capacities are independent. A large descriptor
+        // Ring can exhaust payload storage before its count watermark is reached.
+        let payload_usage = payload.filter(|p| !p.is_empty()).map(|p| {
+            let before = self
+                .payload_write_position
+                .saturating_sub(self.payload_read_position());
+            (before, before + p.len() as u64)
+        });
         if let Some(p) = payload {
             unsafe { copy_payload_write(self.base, self.cfg, desc.payload_position, p) };
             self.payload_write_position = desc.payload_position + p.len() as u64;
@@ -397,13 +407,27 @@ impl RingWriter {
         store(self.base, OFF_WRITE_CURSOR, wc + 1, Ordering::Release);
         let used_after = used_before + 1;
         let host_waiting = load(self.base, OFF_HOST_WAITING, Ordering::Relaxed) != 0;
-        self.notify_tracker.after_publish(
+        let descriptor_signal = self.notify_tracker.after_publish(
             used_before,
             used_after,
             self.cfg.descriptor_capacity as u64,
             self.policy.notify_threshold_percent,
             host_waiting,
-        )
+        );
+        let payload_signal = payload_usage.map(|(before, after)| {
+            self.payload_notify_tracker.after_publish(
+                before,
+                after,
+                self.cfg.payload_capacity as u64,
+                self.policy.notify_threshold_percent,
+                false,
+            )
+        });
+        if payload_signal == Some(NotifySignal::ThresholdCrossing) {
+            NotifySignal::ThresholdCrossing
+        } else {
+            descriptor_signal
+        }
     }
 
     fn make_desc(
@@ -838,6 +862,41 @@ mod tests {
             capture_state: CaptureState::Captured,
             global_order: 0,
         }
+    }
+
+    #[test]
+    fn payload_threshold_notifies_with_sparse_descriptors_and_rearms_after_drain() {
+        let (_region, mut writer, mut reader) = test_writer_reader(64, 128);
+        let payload = [7u8; 32];
+        let signals = [
+            NotifySignal::None,
+            NotifySignal::ThresholdCrossing,
+            NotifySignal::None,
+        ];
+        for (index, expected) in signals.into_iter().enumerate() {
+            let result = writer.write(input(EventKind::CallEnter, index as u64 + 1, &payload));
+            assert!(
+                matches!(result, WriteOutcome::Published { notify, .. } if notify == expected),
+                "{result:?}"
+            );
+        }
+        // Drain two payloads, leaving 25% payload usage but only one descriptor.
+        assert_eq!(reader.drain(2).events.len(), 2);
+        let result = writer.write(input(EventKind::CallEnter, 4, &payload));
+        assert!(
+            matches!(
+                result,
+                WriteOutcome::Published {
+                    notify: NotifySignal::ThresholdCrossing,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 2);
+        assert!(batch.events.iter().all(|event| event.payload == payload));
+        assert_eq!(writer.loss_counters().dropped_events, 0);
     }
 
     #[test]

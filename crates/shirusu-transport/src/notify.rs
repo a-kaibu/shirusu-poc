@@ -24,7 +24,7 @@ impl PublishNotifyTracker {
     pub fn new() -> Self {
         Self::default()
     }
-    /// 公開直後に呼ぶ。使用量は件数ベース。
+    /// 公開直後に呼ぶ。使用量と容量は同じ単位（件数またはバイト数）。
     pub fn after_publish(
         &mut self,
         used_before: u64,

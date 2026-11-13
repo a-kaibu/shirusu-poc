@@ -460,3 +460,18 @@ This removes a source-level allocation per event, plus one per drain/resume.
 Transport and Host suites pass, including malformed images and resume checks.
 Local component timings are noisy (most cases improved, one large-batch case
 regressed); no application-level speedup is claimed without native measurements.
+
+### Payload-pressure notification (2026-11-13)
+
+The first native capacity sweep on `9f8c2fd` found that enlarging descriptors alone
+could make losses worse. On x64 latest, 65536-descriptor samples lost roughly
+29k–62k counted events while 4096-descriptor samples lost 0–6.8k. These are noisy
+runs, not a causal proof. Inspection found a real notification gap: only descriptor
+occupancy could trigger a watermark notification, even when payload storage filled
+first. RingWriter now tracks payload occupancy with its own watermark edge and
+notifies after the same publication Release. Either edge wakes the Host; staying
+above a watermark does not repeatedly notify, and a partial drain rearms it.
+The regression fails before the fix with `notify: None` at 50% payload usage while
+descriptor usage is below 5%, and passes afterward including partial-drain rearming.
+Transport, Agent and Host suites pass. Defaults remain unchanged and native
+performance/loss impact still requires measurement.
