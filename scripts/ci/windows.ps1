@@ -40,6 +40,10 @@ try {
     Invoke-Native { cargo test --workspace --no-fail-fast --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
     Invoke-Native { cargo test -p shirusu-hook --release --target x86_64-pc-windows-msvc native_tls_vector_absence_bypasses_rust_tls_access } "native TLS availability (optimized, x64)"
     Invoke-Native { cargo build --workspace --target x86_64-pc-windows-msvc } "cargo build (workspace, x64)"
+    # Build per-package e2e binaries outside timed scenarios. `-p shirusu-e2e`
+    # resolves features apart from the workspace build and would otherwise
+    # recompile the generated Hook engine inside a scenario's 180 s budget.
+    Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --bins } "capture targets build (x64)"
     # L20: Probe exe 生成と JSON Runner の実動（サンプル仕様から x64 の
     # Probe exe を生成・実行し、Runner でも同じ仕様を実行する）。
     Invoke-CaptureScenario { pwsh -NoProfile -File (Join-Path $PSScriptRoot "probe-l20.ps1") -Target x86_64-pc-windows-msvc } "probe-exe + runner (L20, x64)"
