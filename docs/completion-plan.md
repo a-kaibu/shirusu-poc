@@ -3,14 +3,15 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
-現時点で全ジョブの成功を確認済みの基準は `1898616` の
-[CI 43444166213](https://github.com/a-kaibu/shirusu-poc/actions/runs/43444166213)。
+現時点で全ジョブの成功を確認済みの基準は `600b5b3` の
+[CI 43446254839](https://github.com/a-kaibu/shirusu-poc/actions/runs/43446254839)。
 Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
 形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
 成功を新しいコードの合格証拠に流用しない。
 
-性能は未完成。直前の `efb6e89` の Windows 3 環境では GUI が約 1.58〜1.65 倍で
-完全な記録を達成した一方、高負荷は約 79〜87 倍で欠落が残った。
+性能は未完成。`600b5b3` の Windows 3 環境では GUI が約 1.42〜1.70 倍で
+完全な記録を達成した一方、高負荷は約 40〜51 倍で欠落が残った。
+これは同じ fixture の今回の測定結果であり、他のアプリの完全性を保証しない。
 Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意味契約、
 2 Windows ビルドの参照コーパスは実装済みだが、下表の一般化・安全性・性能の
 残件があるため、全体の完成率を単純な実装件数から算出しない。
@@ -22,7 +23,7 @@ Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意�
 | LastError の透明性 | x86/x64 の TEB を直接読み書きする実装へ変更 | Windows API との往復、スレッド別値、Hook 有無の比較 |
 | 全 Win32 の L0/L1 | 現在197件。system/C の型付き Wrapper に対応。選択表外の API、可変長引数、複合構造体の値渡しが不足 | Metadata 全体の分類と未対応理由、対応 ABI 別のネイティブ往復 |
 | 高頻度 API を暗黙に除外しない full | GetLastError/SetLastError を選択表へ追加。短すぎる関数の Inline Hook は不足理由を残して拒否 | 再入なしの記録、短い関数への Inline Hook の透過性 |
-| COM の L1 と寿命追跡 | Factory と IID 名識別は実装。共有オブジェクトの通常メソッド追跡は未完成 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
+| COM の L1 と寿命追跡 | Factory、IID 名識別、image-backed 共有 IUnknown の QI/AddRef/Release は実装・実走済み。派生メソッドと private/heap vtable は未対応 | 共有オブジェクトの並行呼び出し、QI、AddRef/Release、既存ポインタ同一性を壊さない実機テスト |
 | 動的 API と既存プロセス Attach | Inline Hook は実装。新規スレッド競合・停止先ロックの制約が残る | 既存プロセスとスレッド生成中の透明性テスト、失敗時の安全な復元 |
 | 子プロセス／スレッド寿命 | PID の同一性検証と thread-exit queue を追加 | 再利用、短命スレッド、ファイバー削除、再 Attach の実機テスト |
 | L2/L3 の意味情報 | ファイル等の手書き対応。全 API の出力・資源意味は未対応 | SAL と手書き意味定義、引数／出力／資源の対応検査 |

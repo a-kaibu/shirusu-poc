@@ -392,8 +392,9 @@ impl<W: DurableWrite> TraceWriter<W> {
         self.flush_blobs()?;
         let mut start = 0;
         while start < batch.events.len() {
-            let end = self.chunk_end(batch, start);
-            let payload = compact::encode_event_chunk_slice(batch, &batch.events[start..end]);
+            let (end, capacity) = self.chunk_end(batch, start);
+            let payload =
+                compact::encode_event_chunk_slice(batch, &batch.events[start..end], capacity);
             self.write_block(BlockType::EventChunk, &payload, compress_events)?;
             start = end;
         }
@@ -527,7 +528,7 @@ impl<W: DurableWrite> TraceWriter<W> {
 
     /// [start..] のうち、符号化サイズの目安が目標以下に収まる範囲。
     /// 少なくとも 1 イベントは含む（巨大な単一イベントでも進む）。
-    fn chunk_end(&self, batch: &EventBatch, start: usize) -> usize {
+    fn chunk_end(&self, batch: &EventBatch, start: usize) -> (usize, usize) {
         // Batch Header（Protobuf）の見積もり。実サイズより小さくならない
         // よう余裕を持たせる（目安なので厳密さは要らない）。
         let mut est = 128usize;
@@ -557,7 +558,7 @@ impl<W: DurableWrite> TraceWriter<W> {
             prev_ts = event.timestamp_qpc;
             end += 1;
         }
-        end
+        (end, est)
     }
 
     fn flush_schemas(&mut self) -> Result<()> {

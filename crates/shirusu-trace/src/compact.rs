@@ -431,12 +431,16 @@ fn encode_event_fields_to(
 /// global_order は Batch 内で全件 Some なら Header に旗を立てて差分で
 /// 書く（先頭は絶対値）。混在は Writer が拒否するためここでは来ない。
 pub fn encode_event_chunk(batch: &EventBatch) -> Vec<u8> {
-    encode_event_chunk_slice(batch, &batch.events)
+    encode_event_chunk_slice(batch, &batch.events, 0)
 }
 
 /// Encode a chunk using batch identity and borrowed events, without copying
 /// every event's argument/payload buffers just to split a batch.
-pub(crate) fn encode_event_chunk_slice(batch: &EventBatch, events: &[TraceEvent]) -> Vec<u8> {
+pub(crate) fn encode_event_chunk_slice(
+    batch: &EventBatch,
+    events: &[TraceEvent],
+    capacity: usize,
+) -> Vec<u8> {
     let first_sequence = events.first().map_or(0, |e| e.sequence);
     let base_timestamp_qpc = events.first().map_or(0, |e| e.timestamp_qpc);
     let has_global_order = events.iter().any(|e| e.global_order.is_some());
@@ -452,7 +456,9 @@ pub(crate) fn encode_event_chunk_slice(batch: &EventBatch, events: &[TraceEvent]
         has_global_order,
     };
     let header_bytes = header.encode();
-    let mut out = Vec::new();
+    // Writer already estimated the chunk while choosing its boundary. Reuse
+    // that capacity instead of repeatedly growing and copying the output.
+    let mut out = Vec::with_capacity(capacity);
     write_uleb(&mut out, header_bytes.len() as u64);
     out.extend_from_slice(&header_bytes);
     let mut prev_seq = first_sequence;
