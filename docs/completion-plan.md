@@ -3,8 +3,8 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
-現時点で全ジョブの成功を確認済みの基準は `cde8d31` の
-[CI 43416317062](https://github.com/a-kaibu/shirusu-poc/actions/runs/43416317062)。
+現時点で全ジョブの成功を確認済みの基準は `0a25f55` の
+[CI 43421257820](https://github.com/a-kaibu/shirusu-poc/actions/runs/43421257820)。
 Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
 形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
 成功を新しいコードの合格証拠に流用しない。
