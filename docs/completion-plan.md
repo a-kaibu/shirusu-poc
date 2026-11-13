@@ -3,14 +3,16 @@
 要件の正は `overview.md`（2026-11-08）。2026-11-13 に現行実装と照合した。
 過去の実装件数、IID の名前件数、静的カバレッジを機能の完成率に読み替えない。
 
-現時点で全ジョブの成功を確認済みの基準は `8b6baac` の
-[CI 43453132419](https://github.com/a-kaibu/shirusu-poc/actions/runs/43453132419)。
+現時点で全ジョブの成功を確認済みの基準は `810efd6` の
+[CI 43456287737](https://github.com/a-kaibu/shirusu-poc/actions/runs/43456287737)。
 Windows x64 latest / Server 2022 / x86 WoW64、Linux、macOS、MSRV、
 形式検証と短時間 fuzz を含む。以降の修正の実機検証は別途追跡し、この基準の
 成功を新しいコードの合格証拠に流用しない。
 
-性能は未完成。`8b6baac` の Windows 3 環境では GUI が約 1.39〜1.88 倍で
-完全な記録を達成した一方、高負荷は約 38〜45 倍で欠落が残った。
+性能は未完成。`f3cc175` の Windows 3 環境では GUI が約 1.39〜2.04 倍で
+完全な記録を達成した一方、既定バッファの高負荷は約 37〜48 倍で欠落が残った。
+明示的な burst 構成は同じ高負荷 fixture の計9試行で Event Integrity Complete
+だったが、増加したメモリ量との交換であり、継続負荷の欠落防止や5倍目標ではない。
 これは同じ fixture の今回の測定結果であり、他のアプリの完全性を保証しない。
 Coverage 台帳、同期ファイル Probe の限定的な削減、4 API の意味契約、
 2 Windows ビルドの参照コーパスは実装済みだが、下表の一般化・安全性・性能の
@@ -770,3 +772,10 @@ capture / attach / inspect / coverage / dump / export / repair は未知の
 これは Runner 実行前の選択であり、その後の隔離実行2回ずつでの確認は省略しない。
 複数差分の記録順、同一結果の拒否、未知の初期状態の拒否と、テスト用外部 Runner
 による CLI 削減の接続を検証する。テスト用 Runner は互換実装の実測ではない。
+
+
+`f3cc175` の [CI 43458190540](https://github.com/a-kaibu/shirusu-poc/actions/runs/43458190540)
+では Windows x86 / x64 latest / Server 2022 のジョブが通過した。CLI 経由の
+burst 容量比較は各3回とも Event Integrity Complete・損失0・必要 API 観測あり。
+JSONL / repair のハードリンク入力保護・公開失敗時の保持・不正オプション拒否も
+x64 2環境の実テストで成功。macOS 等を含む全ジョブ完了とは別に記録する。
