@@ -724,7 +724,14 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     // Copy-only native TLS: no allocation or destructor registration in a Hook.
     static REGISTERED_THREAD: Cell<Option<(u64, u64, u64)>> = const { Cell::new(None) };
+    /// Call IDs reserved by this thread: (runtime_id, next, end).
+    static CALL_ID_BLOCK: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
 }
+/// Call IDs a thread reserves at once. A shared atomic add per call was a
+/// read-modify-write on a cache line every recording thread writes; one per
+/// block amortizes it. IDs stay unique within the session's 2^32 range; they
+/// are not ordered across threads (nothing orders them, `global_order` does).
+const CALL_ID_BLOCK_LEN: u64 = 256;
 
 pub struct HookRuntime {
     runtime_id: u64,
@@ -1009,7 +1016,20 @@ impl HookRuntime {
     }
 
     pub fn alloc_call_id(&self) -> u64 {
-        self.next_call_id.fetch_add(1, Ordering::Relaxed)
+        let reserved = CALL_ID_BLOCK.try_with(|block| {
+            let (owner, next, end) = block.get();
+            if owner == self.runtime_id && next < end {
+                block.set((owner, next + 1, end));
+                return next;
+            }
+            let start = self
+                .next_call_id
+                .fetch_add(CALL_ID_BLOCK_LEN, Ordering::Relaxed);
+            block.set((self.runtime_id, start + 1, start + CALL_ID_BLOCK_LEN));
+            start
+        });
+        // Thread teardown: no thread-local block, take one ID directly.
+        reserved.unwrap_or_else(|_| self.next_call_id.fetch_add(1, Ordering::Relaxed))
     }
 
     /// engine が IAT の元値を保存する。Detour はこれを元関数として呼ぶ。
