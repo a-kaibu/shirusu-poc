@@ -21,6 +21,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<u8, (u8, String)> {
+    if args.first().map(String::as_str) == Some("corpus") {
+        return run_corpus(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("reduce") {
         return run_reduction(&args[1..]);
     }
@@ -60,7 +63,7 @@ fn run(args: &[String]) -> Result<u8, (u8, String)> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: shirusu-probe <left.trace> <right.trace> --out <dir> [--candidate <n>] [--name <name>] [--json]\n       shirusu-probe reduce --help"
+                    "usage: shirusu-probe <left.trace> <right.trace> --out <dir> [--candidate <n>] [--name <name>] [--json]\n       shirusu-probe reduce --help\n       shirusu-probe corpus --help"
                 );
                 return Ok(0);
             }
@@ -237,5 +240,71 @@ fn run_reduction(args: &[String]) -> Result<u8, (u8, String)> {
     println!("verified replay: {} ({} source calls -> {} retained; {} paired trials; globally minimal: no)",
         out.join("reduced.json").display(), result.replay.source_steps,
         result.replay.spec.steps.len(), result.trials);
+    Ok(0)
+}
+
+fn run_corpus(args: &[String]) -> Result<u8, (u8, String)> {
+    const USAGE: &str = "usage: shirusu-probe corpus record <spec.json> --runner <executable> --out <new-dir> [--label <text>] [--timeout-ms N]\n       shirusu-probe corpus compare <left-entry> <right-entry>";
+    if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
+        println!("{USAGE}");
+        return Ok(0);
+    }
+    if args[0] == "compare" {
+        if args.len() != 3 {
+            return Err((2, USAGE.into()));
+        }
+        let result = shirusu_probe::corpus::compare(
+            std::path::Path::new(&args[1]),
+            std::path::Path::new(&args[2]),
+        )
+        .map_err(|e| (2, e))?;
+        println!("{}", result.render_pretty());
+        return Ok(0);
+    }
+    if args[0] != "record" || args.len() < 2 {
+        return Err((2, USAGE.into()));
+    }
+    let mut options = std::collections::BTreeMap::new();
+    let mut i = 2;
+    while i < args.len() {
+        let key = args[i].as_str();
+        if !matches!(key, "--runner" | "--out" | "--label" | "--timeout-ms") {
+            return Err((2, format!("unknown option: {key}")));
+        }
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| (2, format!("{key} requires a value")))?;
+        if options.insert(key, value.as_str()).is_some() {
+            return Err((2, format!("duplicate option: {key}")));
+        }
+        i += 2;
+    }
+    let required = |key: &str| {
+        options
+            .get(key)
+            .copied()
+            .ok_or_else(|| (2, format!("{key} is required")))
+    };
+    let runner =
+        shirusu_probe::external::RunnerCommand::new(std::path::Path::new(required("--runner")?))
+            .map_err(|e| (2, e))?;
+    let out = required("--out")?;
+    let ms: u64 = options
+        .get("--timeout-ms")
+        .unwrap_or(&"30000")
+        .parse()
+        .map_err(|_| (2, "invalid timeout".into()))?;
+    if !(1..=3_600_000).contains(&ms) {
+        return Err((2, "timeout-ms must be 1..3600000".into()));
+    }
+    shirusu_probe::corpus::record(
+        std::path::Path::new(&args[1]),
+        &runner,
+        std::path::Path::new(out),
+        options.get("--label").unwrap_or(&""),
+        std::time::Duration::from_millis(ms),
+    )
+    .map_err(|e| (1, e))?;
+    println!("reference entry: {out}");
     Ok(0)
 }

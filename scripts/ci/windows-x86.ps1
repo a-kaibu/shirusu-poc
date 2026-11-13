@@ -60,3 +60,5 @@ Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (
 Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "thread-churn.ps1"), "-Target", "i686-pc-windows-msvc")
 
 Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1"), "-Target", "i686-pc-windows-msvc")
+
+Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "corpus-record.ps1"), "-Target", "i686-pc-windows-msvc")

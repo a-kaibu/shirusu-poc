@@ -125,6 +125,7 @@ try {
     if ($captureFailures.Count -gt 0) {
         throw ("Windows scenarios failed:`n" + ($captureFailures -join "`n"))
     }
+    Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "corpus-record.ps1"))
     $ciComplete = $true
 } finally {
     try {

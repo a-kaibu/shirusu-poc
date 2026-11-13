@@ -23,6 +23,7 @@
 
 pub mod brief;
 pub mod bundle;
+pub mod corpus;
 pub mod external;
 pub mod oracle;
 pub mod reduce;

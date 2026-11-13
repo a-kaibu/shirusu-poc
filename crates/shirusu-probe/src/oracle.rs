@@ -129,7 +129,7 @@ fn complete(step: &StepOutcome) -> bool {
     step.executed && step.returned.is_some() && step.outputs_truncated.is_empty()
 }
 
-fn observe(step: &Step, result: &StepOutcome) -> Option<TargetObservation> {
+pub(crate) fn observe(step: &Step, result: &StepOutcome) -> Option<TargetObservation> {
     if !complete(result)
         || !matches!(
             step.call.as_str(),

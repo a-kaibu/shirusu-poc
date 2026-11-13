@@ -240,3 +240,16 @@ CI マシン差もあるため、前回との倍率差を厳密な改善率と�
 Host キューの満杯回数・送信待ち時間・worker の処理時間を SessionSummary と Trace に
 保存し、CLI の結果へ表示する。変換・I/O が回収を止めているのかを実測するための診断で、
 wall-clock の重なりを加算した CPU 時間やアプリ区間の性能値とは扱わない。
+
+### Windows reference corpus v1
+
+`shirusu-probe corpus record/compare` now provides immutable entries bound to
+canonical Probe inputs and raw Runner reports, recomputed normalized file-I/O
+observations, Windows build/process identity and explicit provenance labels.
+The Windows CI matrix records the same six-call Probe and preserves entries as
+30-day artifacts. See [reference-corpus.md](reference-corpus.md). Native validation
+of this addition is tracked by its CI run; permanent publication, wider Windows
+release coverage and a broader API corpus remain incomplete. The preceding Host
+pipeline diagnostic change (`6372bf4`, run `43404035077`) passed the complete CI
+matrix, including fuzz. Queue backpressure was observed on all three Windows
+jobs; this measurement does not establish that the performance target is met.
