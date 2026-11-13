@@ -637,6 +637,34 @@ mod imp {
         Ok(hv(dup))
     }
 
+    /// Give `target_pid` a handle to the current (Host) process that can only
+    /// wait for its exit. The Agent uses it for liveness checks; it must not
+    /// receive VM write, thread creation or handle duplication rights.
+    pub fn duplicate_self_synchronize_to_process(target_pid: u32) -> Result<HandleValue> {
+        use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+        let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, target_pid) };
+        if target.is_null() {
+            return Err(last_err("OpenProcess"));
+        }
+        let mut dup: HANDLE = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentProcess(),
+                target,
+                &mut dup,
+                PROCESS_SYNCHRONIZE,
+                0,
+                0,
+            )
+        };
+        unsafe { CloseHandle(target) };
+        if ok == 0 {
+            return Err(last_err("DuplicateHandle(host liveness)"));
+        }
+        Ok(hv(dup))
+    }
+
     pub fn write_process_memory(
         process: HandleValue,
         dest: usize,
@@ -824,8 +852,13 @@ mod imp {
         Ok(out)
     }
 
-    /// 対象プロセスのモジュール一覧から、名前でモジュールのベースを引く。
-    pub fn module_base(pid: u32, module_name: &str) -> Result<usize> {
+    /// 対象プロセスのモジュール一覧から、絶対パスが一致するモジュールの
+    /// ベースを引く。ファイル名だけで照合すると、対象の検索順で読み込まれた
+    /// 同名の別 DLL を Host が解析した DLL と取り違える。
+    pub fn module_base(pid: u32, module_path: &str) -> Result<usize> {
+        if !super::is_absolute_windows_path(module_path) {
+            return Err(WinError::InvalidArgument("module path must be absolute"));
+        }
         use windows_sys::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
             TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
@@ -841,13 +874,13 @@ mod imp {
         unsafe {
             if Module32FirstW(snap, &mut entry) != 0 {
                 loop {
-                    let name_len = entry
-                        .szModule
+                    let path_len = entry
+                        .szExePath
                         .iter()
                         .position(|&c| c == 0)
-                        .unwrap_or(entry.szModule.len());
-                    let name = String::from_utf16_lossy(&entry.szModule[..name_len]);
-                    if name.eq_ignore_ascii_case(module_name) {
+                        .unwrap_or(entry.szExePath.len());
+                    let path = String::from_utf16_lossy(&entry.szExePath[..path_len]);
+                    if super::same_windows_path(&path, module_path) {
                         result = Ok(entry.modBaseAddr as usize);
                         break;
                     }
@@ -1107,6 +1140,9 @@ mod imp {
     ) -> Result<HandleValue> {
         Err(WinError::Unsupported)
     }
+    pub fn duplicate_self_synchronize_to_process(_target_pid: u32) -> Result<HandleValue> {
+        Err(WinError::Unsupported)
+    }
     pub fn write_process_memory(
         _process: HandleValue,
         _dest: usize,
@@ -1129,7 +1165,7 @@ mod imp {
     pub fn remote_load_library(_process: HandleValue, _dll_path: &str) -> Result<()> {
         Err(WinError::Unsupported)
     }
-    pub fn module_base(_pid: u32, _module_name: &str) -> Result<usize> {
+    pub fn module_base(_pid: u32, _module_path: &str) -> Result<usize> {
         Err(WinError::Unsupported)
     }
     /// スタブ: プロセス一覧は Windows の概念のため Unsupported。
@@ -1152,12 +1188,37 @@ mod imp {
 }
 
 pub use imp::{
-    close_handle_value, duplicate_handle_to_process, enumerate_processes, module_base,
-    open_process_for_injection, process_creation_time, process_exit_code, process_exited,
-    read_process_memory, remote_alloc, remote_call, remote_free, remote_load_library,
-    resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process, wait_process,
-    write_process_memory, EventObject, SharedMapping,
+    close_handle_value, duplicate_handle_to_process, duplicate_self_synchronize_to_process,
+    enumerate_processes, module_base, open_process_for_injection, process_creation_time,
+    process_exit_code, process_exited, read_process_memory, remote_alloc, remote_call, remote_free,
+    remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process,
+    wait_process, write_process_memory, EventObject, SharedMapping,
 };
+
+/// `C:\...` or `\\server\share\...` (either separator). Relative and
+/// drive-relative paths are resolved by the target's own search rules.
+pub fn is_absolute_windows_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+        || (b.len() >= 3 && matches!(b[0], b'\\' | b'/') && matches!(b[1], b'\\' | b'/'))
+}
+
+/// Compare loader paths the way NTFS names compare in practice for this use:
+/// separators are equivalent and ASCII case is ignored.
+pub fn same_windows_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.chars()
+            .map(|c| {
+                if c == '/' {
+                    '\\'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect::<String>()
+    };
+    norm(a) == norm(b)
+}
 
 /// プロセス単位の通知イベント群。data_ready は auto-reset。
 pub struct ProcessNotify {
@@ -1369,6 +1430,22 @@ mod tests {
             process_exited(0).is_err(),
             "invalid handle must not mean alive"
         );
+    }
+
+    #[test]
+    fn host_liveness_handle_only_allows_waiting() {
+        let handle = duplicate_self_synchronize_to_process(std::process::id()).unwrap();
+        assert!(!process_exited(handle).unwrap());
+        let value = 0u8;
+        assert!(
+            write_process_memory(handle, &value as *const u8 as usize, &value, 1).is_err(),
+            "liveness handle must not grant PROCESS_VM_WRITE"
+        );
+        assert!(
+            remote_alloc(handle, 4096).is_err(),
+            "liveness handle must not grant PROCESS_VM_OPERATION"
+        );
+        close_handle_value(handle);
     }
 
     #[test]
@@ -1692,5 +1769,42 @@ mod portable_tests {
         assert!(!stub.wait_timeout(Duration::from_millis(1)));
         stub.set().unwrap();
         assert!(stub.wait_timeout(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{is_absolute_windows_path, same_windows_path};
+
+    #[test]
+    fn only_fully_qualified_paths_are_absolute() {
+        for p in [
+            r"C:\a\agent.dll",
+            "c:/a/agent.dll",
+            r"\\server\share\agent.dll",
+        ] {
+            assert!(is_absolute_windows_path(p), "{p}");
+        }
+        for p in [
+            "agent.dll",
+            r".\agent.dll",
+            r"C:agent.dll",
+            r"\agent.dll",
+            "",
+        ] {
+            assert!(!is_absolute_windows_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn module_paths_compare_full_path_not_file_name() {
+        assert!(same_windows_path(
+            r"C:\Tools\Agent.DLL",
+            "c:/tools/agent.dll"
+        ));
+        assert!(!same_windows_path(
+            r"C:\App\agent.dll",
+            r"C:\Tools\agent.dll"
+        ));
     }
 }

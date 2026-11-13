@@ -33,7 +33,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -65,20 +65,20 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - if: ${{ matrix.java }}
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: "21"
       - if: ${{ !matrix.java }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.toolchain }}
           targets: ${{ matrix.targets }}
           components: ${{ matrix.components }}
       - if: ${{ !matrix.java }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.name }}
           # Preserve freshly compiled dependencies even when a later E2E fails.
@@ -89,12 +89,12 @@ jobs:
             fuzz -> target
           cache-directories: ${{ matrix.name == 'kani' && '~/.kani' || '' }}
       - if: ${{ matrix.name == 'linux' }}
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/winmd
           key: winmd-${{ hashFiles('scripts/ci/fetch-winmd.sh') }}
       - if: ${{ matrix.java }}
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: tla/tla2tools.jar
           key: tla-tools-${{ hashFiles('scripts/ci/tla.sh') }}
@@ -105,7 +105,7 @@ jobs:
         run: ${{ matrix.run }}
       - name: Preserve native performance measurements
         if: ${{ always() && runner.os == 'Windows' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-performance-${{ matrix.name }}
           path: |
@@ -115,7 +115,7 @@ jobs:
           retention-days: 14
       - name: Preserve Windows reference corpus
         if: ${{ always() && runner.os == 'Windows' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-reference-corpus-${{ matrix.name }}
           path: target/windows-reference-corpus
@@ -123,7 +123,7 @@ jobs:
           retention-days: 30
       - name: Preserve Windows capture diagnostics
         if: ${{ failure() && runner.os == 'Windows' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: capture-diagnostics-${{ matrix.name }}
           path: target/ci-diagnostics

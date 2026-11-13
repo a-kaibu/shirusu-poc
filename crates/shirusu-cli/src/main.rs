@@ -1484,22 +1484,47 @@ fn split_dashdash(args: &[String]) -> (&[String], &[String]) {
     }
 }
 
-/// Windows のコマンドライン文字列へ組み立てる。空白・引用符を含む要素は
-/// 二重引用符で囲み、内側の引用符は `\"` にする。完全な引用規則は対象の
-/// CRT に依存するため、ここでは空白を含む場合だけを扱う（CreateProcess
-/// の慣習に沿う最小限の引用）。
+/// Windows のコマンドライン文字列へ組み立てる。MSVC CRT /
+/// `CommandLineToArgvW` の規則で各要素がそのまま復元されるように引用する:
+/// 空文字列は `""`、空白・タブ・引用符を含む要素は二重引用符で囲み、
+/// 引用符の直前と閉じ引用符の直前にある `\` の連続は倍にする。
 fn build_cmdline(parts: &[String]) -> String {
     parts
         .iter()
-        .map(|p| {
-            if p.chars().any(|c| c.is_whitespace() || c == '"') {
-                format!("\"{}\"", p.replace('"', "\\\""))
-            } else {
-                p.clone()
-            }
-        })
+        .map(|p| quote_windows_arg(p))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg
+            .chars()
+            .any(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '"'))
+    {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 /// capture の既定の出力パス：exe のファイル stem に `.trace` を付けたもの。
@@ -1920,6 +1945,73 @@ mod tests {
     #[test]
     fn cmdline_escapes_inner_quotes() {
         assert_eq!(build_cmdline(&args(&["say \"hi\""])), "\"say \\\"hi\\\"\"");
+    }
+
+    /// Reference decoder for the argument rules of `CommandLineToArgvW`
+    /// (arguments after the program name).
+    fn parse_windows_args(cmdline: &str) -> Vec<String> {
+        let chars: Vec<char> = cmdline.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        loop {
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                i += 1;
+            }
+            if i >= chars.len() {
+                return out;
+            }
+            let mut arg = String::new();
+            let mut quoted = false;
+            while i < chars.len() && (quoted || !matches!(chars[i], ' ' | '\t')) {
+                let mut slashes = 0;
+                while i < chars.len() && chars[i] == '\\' {
+                    slashes += 1;
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '"' {
+                    arg.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        arg.push('"');
+                    } else if quoted && i + 1 < chars.len() && chars[i + 1] == '"' {
+                        arg.push('"');
+                        i += 1;
+                    } else {
+                        quoted = !quoted;
+                    }
+                    i += 1;
+                } else {
+                    arg.extend(std::iter::repeat_n('\\', slashes));
+                    if i < chars.len() && (quoted || !matches!(chars[i], ' ' | '\t')) {
+                        arg.push(chars[i]);
+                        i += 1;
+                    }
+                }
+            }
+            out.push(arg);
+        }
+    }
+
+    #[test]
+    fn cmdline_roundtrips_backslashes_quotes_and_empty_args() {
+        let cases = args(&[
+            "",
+            r"C:\dir with space\",
+            r"trailing\\",
+            r"a\b",
+            r#"a\"b"#,
+            r#"a\\"b c"#,
+            "tab\there",
+            "plain",
+            r#"""#,
+            r"\\server\share\x y",
+        ]);
+        let line = build_cmdline(&cases);
+        assert_eq!(parse_windows_args(&line), cases, "{line}");
+        assert_eq!(build_cmdline(&args(&["a.exe", "", "b"])), "a.exe \"\" b");
+        assert_eq!(
+            build_cmdline(&args(&[r"C:\dir with space\"])),
+            r#""C:\dir with space\\""#
+        );
     }
 
     #[test]

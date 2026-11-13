@@ -248,6 +248,24 @@ fn generated_replay_executes_and_refuses_to_overwrite() {
 }
 
 #[test]
+fn partial_write_is_rejected_instead_of_emitting_unreproducible_expectation() {
+    use shirusu_trace::{
+        compact::{decode_values, encode_values},
+        schema::Ty,
+    };
+    let mut trace = record(1, 42);
+    let leave = &mut trace.batches[0].events[3];
+    let types = [Ty::I32, Ty::U32, Ty::U32];
+    let mut values = decode_values(&types, leave.args.as_ref().unwrap()).unwrap();
+    assert_eq!(values[1].value, V::U32(1));
+    values[1].value = V::U32(0);
+    leave.args = Some(encode_values(&types, &values).unwrap());
+    assert!(generate_replay(&trace)
+        .unwrap_err()
+        .contains("partial synchronous writes"));
+}
+
+#[test]
 fn explicit_overlapped_offset_is_not_silently_replayed_at_current_position() {
     use shirusu_trace::{
         compact::{decode_values, encode_values},

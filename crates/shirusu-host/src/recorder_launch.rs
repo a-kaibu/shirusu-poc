@@ -734,8 +734,16 @@ fn inject_and_init(
     process: win::HandleValue,
     pid: u32,
 ) -> Result<InjectedTarget, SessionError> {
+    // The Host parses this file and the target loads the same absolute path.
+    // A relative path would be resolved by the target's DLL search order and
+    // could select a different module than the one whose exports we parse.
+    let dll_path = std::path::absolute(&cfg.dll_path)?;
+    let dll_path_str = dll_path
+        .to_str()
+        .ok_or_else(|| SessionError::Injection("agent dll path is not valid Unicode".into()))?
+        .to_owned();
     // Agent DLL の PE は先に読んでおく (後段のエクスポート解決でも使う)。
-    let file_bytes = std::fs::read(&cfg.dll_path)?;
+    let file_bytes = std::fs::read(&dll_path)?;
     let image = pe::map_file_to_image(&file_bytes)
         .ok_or_else(|| SessionError::Injection("agent dll is not a valid PE".into()))?;
     // Trace の CaptureEnvironment.pointer_width は、呼び出し側の申告
@@ -782,10 +790,9 @@ fn inject_and_init(
     let notify = win::ProcessNotify::new()?;
     let init_done = win::EventObject::new(false, false)?;
     // Host プロセスへのハンドルを対象へ渡す（Agent の生存確認用）
-    let host_proc = win::open_process_for_injection(std::process::id())?;
-    let host_dup = win::duplicate_handle_to_process(host_proc, pid);
-    win::close_handle_value(host_proc);
-    let host_dup = host_dup?;
+    // The target only waits on this handle. Never hand it VM write, thread
+    // creation or handle duplication rights over the Host.
+    let host_dup = win::duplicate_self_synchronize_to_process(pid)?;
 
     let mut rings = Vec::with_capacity(cfg.ring_count);
     let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(cfg.ring_count);
@@ -825,14 +832,9 @@ fn inject_and_init(
         crate::trace_convert::RecordMode::Detailed
     ));
 
-    let dll_path_str = cfg.dll_path.to_string_lossy().into_owned();
     win::remote_load_library(process, &dll_path_str)?;
-    let dll_name = cfg
-        .dll_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| SessionError::Injection("dll path has no file name".into()))?;
-    let base = win::module_base(pid, &dll_name)?;
+    // Match the loaded module by full path, not by file name.
+    let base = win::module_base(pid, &dll_path_str)?;
     let rva = INIT_EXPORT_CANDIDATES
         .iter()
         .find_map(|name| pe::find_export(&image, name))

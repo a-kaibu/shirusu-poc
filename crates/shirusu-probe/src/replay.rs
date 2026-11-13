@@ -165,6 +165,11 @@ pub fn generate_replay(trace: &ReadTrace) -> Result<TestSpec, String> {
                     if bytes.len() != requested as usize {
                         return Err("write input is incomplete".into());
                     }
+                    // The runner passes the whole recorded buffer. A short
+                    // synchronous write cannot be reproduced by replaying it.
+                    if count != requested {
+                        return Err("partial synchronous writes cannot be replayed".into());
+                    }
                     // Bound retained model data independently of the input Trace size.
                     if end > 1024 * 1024 {
                         return Err("file model exceeds 1 MiB replay budget".into());

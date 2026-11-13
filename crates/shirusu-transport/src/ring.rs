@@ -375,6 +375,12 @@ impl RingWriter {
         let used = wc.saturating_sub(self.read_cursor());
         usage_percent(used, self.cfg.descriptor_capacity as u64)
     }
+    fn payload_usage_percent(&self) -> u64 {
+        let used = self
+            .payload_write_position
+            .saturating_sub(self.payload_read_position());
+        usage_percent(used, self.cfg.payload_capacity as u64)
+    }
     fn set_state(&mut self, s: OverflowState) {
         self.state = s;
         store(self.base, OFF_OVERFLOW_STATE, s.to_u64(), Ordering::Relaxed);
@@ -524,8 +530,12 @@ impl RingWriter {
             w.descriptor_free() >= need_desc
                 && (payload_len == 0 || w.payload_free() >= payload_len)
         };
+        // Leave OVERFLOW only when both independent capacities have drained.
+        // Checking descriptors alone sends a payload-starved writer back to
+        // NORMAL on every event, so each call pays the full bounded wait.
         if self.state == OverflowState::Overflow
             && self.usage_percent() < self.policy.resume_threshold_percent
+            && self.payload_usage_percent() < self.policy.resume_threshold_percent
         {
             self.set_state(OverflowState::Normal);
         }
@@ -533,8 +543,11 @@ impl RingWriter {
             if fits(self) {
                 return self.publish_normal(seq, &input);
             }
+            // A payload larger than the whole Ring can never fit: waiting only
+            // delays the caller before the same degradation.
+            let can_ever_fit = payload_len <= self.cfg.payload_capacity as u64;
             // 容量不足 → BOUNDED_WAIT（危険経路/0ms では待たず OVERFLOW へ）
-            if self.bounded_wait(need_desc, payload_len) && fits(self) {
+            if can_ever_fit && self.bounded_wait(need_desc, payload_len) && fits(self) {
                 self.set_state(OverflowState::Normal);
                 return self.publish_normal(seq, &input);
             }
@@ -897,6 +910,57 @@ mod tests {
         assert_eq!(batch.events.len(), 2);
         assert!(batch.events.iter().all(|event| event.payload == payload));
         assert_eq!(writer.loss_counters().dropped_events, 0);
+    }
+
+    fn writer_with_manual_clock(cap: usize, pcap: usize) -> (SharedRegion, RingWriter) {
+        let region = SharedRegion::new(RingConfig::new(cap, pcap), 1, 100);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let w = unsafe { region.writer(WriterPolicy::default(), clock) };
+        (region, w)
+    }
+
+    #[test]
+    fn payload_starved_overflow_does_not_wait_on_every_event() {
+        // Descriptor usage stays low while payload space is exhausted.
+        let (_region, mut w) = writer_with_manual_clock(64, 64);
+        let payload = [0u8; 48];
+        for call in 1..=10 {
+            let _ = w.write(input(EventKind::CallEnter, call, &payload));
+        }
+        assert_eq!(w.state(), OverflowState::Overflow);
+        assert_eq!(
+            w.wait_count, 1,
+            "only the transition into OVERFLOW may wait"
+        );
+    }
+
+    #[test]
+    fn overflow_resumes_after_payload_drains() {
+        let region = SharedRegion::new(RingConfig::new(64, 64), 1, 100);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut w = unsafe { region.writer(WriterPolicy::default(), clock) };
+        let mut rd = unsafe { region.reader() };
+        let payload = [0u8; 48];
+        w.write(input(EventKind::CallEnter, 1, &payload));
+        w.write(input(EventKind::CallEnter, 2, &payload));
+        assert_eq!(w.state(), OverflowState::Overflow);
+        rd.drain_all();
+        assert!(matches!(
+            w.write(input(EventKind::CallEnter, 3, &payload)),
+            WriteOutcome::Published { .. }
+        ));
+        assert_eq!(w.state(), OverflowState::Normal);
+    }
+
+    #[test]
+    fn payload_larger_than_ring_degrades_without_waiting() {
+        let (_region, mut w) = writer_with_manual_clock(8, 16);
+        let payload = [0u8; 17];
+        assert!(matches!(
+            w.write(input(EventKind::CallEnter, 1, &payload)),
+            WriteOutcome::PublishedDegraded { .. }
+        ));
+        assert_eq!(w.wait_count, 0);
     }
 
     #[test]

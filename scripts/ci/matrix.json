@@ -100,7 +100,7 @@
       "toolchain": "1.87"
     },
     {
-      "allow_failure": true,
+      "allow_failure": false,
       "components": "",
       "java": false,
       "name": "kani",

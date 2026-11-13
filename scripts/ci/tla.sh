@@ -5,8 +5,20 @@
 # 競合を表現できる証跡) の両方を確認する。
 set -euo pipefail
 cd "$(dirname "$0")/../../tla"
+TLA_TOOLS_SHA256="e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f"
+# A cached or downloaded jar runs as CI code: verify it every time.
+if [ -f tla2tools.jar ] && [ "$(sha256sum tla2tools.jar | cut -d' ' -f1)" != "$TLA_TOOLS_SHA256" ]; then
+  echo "tla2tools.jar sha256 mismatch, re-downloading" >&2
+  rm -f tla2tools.jar
+fi
 if [ ! -f tla2tools.jar ]; then
-  curl -fsSL -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+  curl -fsSL -o tla2tools.jar.tmp https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+  if [ "$(sha256sum tla2tools.jar.tmp | cut -d' ' -f1)" != "$TLA_TOOLS_SHA256" ]; then
+    echo "tla2tools.jar sha256 mismatch (expected $TLA_TOOLS_SHA256)" >&2
+    rm -f tla2tools.jar.tmp
+    exit 1
+  fi
+  mv tla2tools.jar.tmp tla2tools.jar
 fi
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config ShirusuTransport.cfg ShirusuTransport
 

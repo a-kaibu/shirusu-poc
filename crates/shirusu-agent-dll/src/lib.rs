@@ -32,6 +32,18 @@ pub const STATUS_MAPPING_FAILED: u32 = 2;
 pub const STATUS_HOOK_FAILED: u32 = shirusu_hook::bootstrap::INIT_HOOK_FAILED;
 pub const STATUS_ALREADY_INITIALIZED: u32 = 4;
 pub const STATUS_UNSUPPORTED: u32 = 5;
+/// Initialization panicked. The panic was contained inside the DLL so it did
+/// not unwind across `extern "system"` (which aborts the target process).
+pub const STATUS_PANICKED: u32 = 6;
+/// Shutdown panicked. The Host must not treat this as a confirmed shutdown.
+pub const SHUTDOWN_PANICKED: u32 = 3;
+
+/// Run an exported entry point without letting a Rust panic unwind into the
+/// caller's (non-Rust) frame.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn contain_panic(on_panic: u32, f: impl FnOnce() -> u32) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(on_panic)
+}
 
 /// 終了手順の状態コード決定（純粋関数。レビュー第5回 #6）。
 /// - セッションが無い → `SHUTDOWN_NOT_INITIALIZED`
@@ -67,7 +79,7 @@ fn shutdown_status(has_session: bool, drained: bool, unrestored: usize) -> u32 {
 pub extern "system" fn shirusu_agent_init(bootstrap: *const AgentBootstrap) -> u32 {
     #[cfg(windows)]
     {
-        win::init(bootstrap)
+        contain_panic(STATUS_PANICKED, || win::init(bootstrap))
     }
     #[cfg(not(windows))]
     {
@@ -90,7 +102,7 @@ pub extern "system" fn shirusu_agent_init(bootstrap: *const AgentBootstrap) -> u
 pub extern "system" fn shirusu_agent_shutdown() -> u32 {
     #[cfg(windows)]
     {
-        win::shutdown()
+        contain_panic(SHUTDOWN_PANICKED, win::shutdown)
     }
     #[cfg(not(windows))]
     {
@@ -153,7 +165,9 @@ mod win {
             engine::clear_runtime(rt);
         } else {
             // Recovery includes old flights even when all pointer restores won.
-            *STATE.lock().unwrap() = Some(DllState {
+            *STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DllState {
                 installed: pending,
                 inline: Vec::new(),
                 com_factories: Vec::new(),
@@ -183,8 +197,14 @@ mod win {
             Ok(c) => c,
             Err(_) => return STATUS_BAD_BOOTSTRAP,
         };
-        let _control = CONTROL.lock().unwrap();
-        if STATE.lock().unwrap().is_some() {
+        let _control = CONTROL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
             return STATUS_ALREADY_INITIALIZED;
         }
         // Host 生存確認： Bootstrap で渡された Host プロセスへのハンドルが
@@ -487,7 +507,9 @@ mod win {
                 callback_outcome.installed.len() as u32,
             );
         }
-        *STATE.lock().unwrap() = Some(DllState {
+        *STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DllState {
             installed,
             inline: inline_outcome.installed,
             com_factories: com_factory_outcome.installed,
@@ -515,9 +537,13 @@ mod win {
 
     fn shutdown_with_timeout(timeout: std::time::Duration) -> u32 {
         let _shutdown_guard = shirusu_hook::runtime::ReentrancyGuard::try_enter();
-        let _control = CONTROL.lock().unwrap();
+        let _control = CONTROL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         shirusu_hook::fls::drain_pending_exits();
-        let mut state_slot = STATE.lock().unwrap();
+        let mut state_slot = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = state_slot.as_mut() else {
             return shutdown_status(false, false, 0);
         };
@@ -671,6 +697,23 @@ mod tests {
                 STATUS_BAD_BOOTSTRAP
             );
         }
+    }
+
+    #[test]
+    fn exported_entry_points_contain_panics() {
+        assert_eq!(contain_panic(STATUS_PANICKED, || STATUS_OK), STATUS_OK);
+        assert_eq!(
+            contain_panic(STATUS_PANICKED, || panic!("injected init panic")),
+            STATUS_PANICKED
+        );
+        assert_eq!(
+            contain_panic(SHUTDOWN_PANICKED, || panic!("injected shutdown panic")),
+            SHUTDOWN_PANICKED
+        );
+        assert!(
+            ![SHUTDOWN_OK, SHUTDOWN_INCOMPLETE, SHUTDOWN_NOT_INITIALIZED]
+                .contains(&SHUTDOWN_PANICKED)
+        );
     }
 
     #[test]

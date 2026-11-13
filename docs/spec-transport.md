@@ -118,8 +118,8 @@ v0.1は「Hostが待機前にフラグを立ててRingを再確認し、書き�
 | 状態 | 入る条件 | 動作 | 抜ける条件 |
 | --- | --- | --- | --- |
 | NORMAL | — | すべて記録する | 容量不足 |
-| BOUNDED\_WAIT | 容量不足 | 上限（既定1ms、危険な経路や0ms）まで待つ | 空いた→NORMAL、時間切れ→OVERFLOW |
-| OVERFLOW | 待機の時間切れ | 待たずに下の順で劣化させる | 使用率が復帰閾値（例：50%）を下回った→NORMAL |
+| BOUNDED\_WAIT | 容量不足 | 上限（既定1ms、危険な経路や0ms）まで待つ。Payload Ring 全体より大きい Payload は待っても入らないため待たない | 空いた→NORMAL、時間切れ→OVERFLOW |
+| OVERFLOW | 待機の時間切れ | 待たずに下の順で劣化させる | Descriptor と Payload の使用率が両方とも復帰閾値（例：50%）を下回った→NORMAL |
 
 Overflow中の劣化の順序は次のとおりとする。Payload Ringの方が先に埋まりやすいので、Descriptorだけは書けることが多い。
 
