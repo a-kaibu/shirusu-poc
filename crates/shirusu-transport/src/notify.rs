@@ -16,6 +16,19 @@ pub enum NotifySignal {
     ThresholdCrossing,
 }
 
+// Preserve usage_percent's saturation and zero-capacity semantics without
+// division on each publication. floor(n / d) >= t iff n >= t*d; an
+// overflowing product cannot be reached by the saturated u64 numerator.
+#[inline]
+fn usage_at_least(used: u64, capacity: u64, threshold: u64) -> bool {
+    if capacity == 0 {
+        return threshold <= 100;
+    }
+    threshold
+        .checked_mul(capacity)
+        .is_some_and(|minimum| used.saturating_mul(100) >= minimum)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PublishNotifyTracker {
     above_threshold: bool,
@@ -33,9 +46,8 @@ impl PublishNotifyTracker {
         threshold_percent: u64,
         host_waiting: bool,
     ) -> NotifySignal {
-        let pct = |u: u64| crate::layout::usage_percent(u, capacity);
-        let was_above = pct(used_before) >= threshold_percent && used_before > 0;
-        let is_above = pct(used_after) >= threshold_percent;
+        let was_above = used_before > 0 && usage_at_least(used_before, capacity, threshold_percent);
+        let is_above = usage_at_least(used_after, capacity, threshold_percent);
         // The consumer can drain below the threshold between publications.
         // Its current read cursor (used_before) rearms the edge even when no
         // producer event was published while occupancy was below threshold.
@@ -52,7 +64,7 @@ impl PublishNotifyTracker {
     }
     /// 読み手が回収して使用率が下がったことを反映する。
     pub fn observe_used(&mut self, used: u64, capacity: u64, threshold_percent: u64) {
-        self.above_threshold = crate::layout::usage_percent(used, capacity) >= threshold_percent;
+        self.above_threshold = usage_at_least(used, capacity, threshold_percent);
     }
 }
 
@@ -87,6 +99,33 @@ impl ReCheckPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    proptest::proptest! {
+        #[test]
+        fn division_free_watermark_matches_saturated_percentage(
+            used in proptest::prelude::any::<u64>(),
+            capacity in proptest::prelude::any::<u64>(),
+            threshold in proptest::prelude::any::<u64>(),
+        ) {
+            proptest::prop_assert_eq!(usage_at_least(used, capacity, threshold),
+                crate::layout::usage_percent(used, capacity) >= threshold);
+        }
+    }
+
+    #[test]
+    fn watermark_extremes_preserve_zero_capacity_and_saturation() {
+        let edges = [0, 1, 49, 50, 99, 100, u64::MAX / 100, u64::MAX];
+        for used in edges {
+            for capacity in edges {
+                for threshold in edges {
+                    assert_eq!(
+                        usage_at_least(used, capacity, threshold),
+                        crate::layout::usage_percent(used, capacity) >= threshold
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn notifies_when_host_waiting() {
         let mut t = PublishNotifyTracker::new();

@@ -485,3 +485,22 @@ Its metadata override is now `never`: capture preserves the raw value as Stale
 on both success and failure. A regression failed on the old generated table and
 passes with NULL/non-NULL results and four residual values. Hook and generator
 suites, strict Clippy and generated-file consistency checks pass.
+
+### Native confirmation and watermark arithmetic (2026-11-13)
+
+`8df6862`, CI 43419161805, passed all three native Windows jobs. GUI ratios were
+1.551x (latest x64), 1.836x (Server 2022), 1.572x (x86), each Complete. Default-ring
+high-load ratios were 64.307x, 63.067x, 65.369x respectively, each with losses.
+The capacity sweep did not produce an all-platform, all-sample loss-free setting:
+65536 descriptors eliminated losses in all three x86 samples, but not all x64
+samples. Production defaults therefore remain unchanged. This comparison includes
+both fixed-size validation scratch buffers and payload notifications, and is not
+an isolated attribution to either change. The fuzz job was still pending when
+these native results were collected.
+
+Watermark comparisons now avoid division using checked threshold multiplication,
+retaining the prior saturating numerator and zero-capacity behavior. Random u64
+properties and explicit extreme values check equivalence to the prior percentage
+calculation. Local release component median was 3.41 ns before and 1.99 ns after;
+this small isolated improvement is not an application speedup claim. The native
+phase benchmark now records this component too.

@@ -109,6 +109,16 @@ fn main() {
     measure("call_id_atomic", || {
         black_box(rt.alloc_call_id());
     });
+    let mut notify = shirusu_transport::notify::PublishNotifyTracker::new();
+    measure("notification_watermark", || {
+        black_box(notify.after_publish(
+            black_box(49),
+            black_box(50),
+            black_box(100),
+            black_box(50),
+            false,
+        ));
+    });
     measure("timestamp", || {
         black_box(timestamps.now_qpc());
     });
