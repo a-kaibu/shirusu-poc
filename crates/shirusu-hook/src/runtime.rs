@@ -35,7 +35,7 @@ use shirusu_transport_win::{ProcessNotify, RingNotify};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 thread_local! {
@@ -477,7 +477,16 @@ impl Drop for DetourFlight {
 /// - 2 回目の設置では、復元済み IAT から元関数ポインタを読み直す
 ///   （install_hooks が毎回スロット実値を読む）ため、旧セッションの
 ///   ポインタが残ることはない。
+// Globally unique revisions also distinguish slots reconstructed at the same address.
+// Exhaustion refuses publication rather than wrapping into an old TLS identity.
+static NEXT_RUNTIME_REVISION: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static DETOUR_RUNTIME: RefCell<(u64, Weak<HookRuntime>)> =
+        const { RefCell::new((0, Weak::new())) };
+}
+
 pub struct RuntimeSlot {
+    revision: AtomicU64,
     current: RwLock<RuntimeState>,
 }
 struct RuntimeState {
@@ -488,6 +497,7 @@ struct RuntimeState {
 impl RuntimeSlot {
     pub const fn new() -> Self {
         Self {
+            revision: AtomicU64::new(0),
             current: RwLock::new(RuntimeState {
                 active: None,
                 retired: None,
@@ -524,7 +534,12 @@ impl RuntimeSlot {
                 }
             }
         }
+        #[allow(deprecated)] // fetch_update supports the Rust 1.87 MSRV.
+        let revision = NEXT_RUNTIME_REVISION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .expect("runtime revision exhausted");
         cur.active = Some(rt);
+        self.revision.store(revision, Ordering::Release);
         Ok(())
     }
 
@@ -535,6 +550,30 @@ impl RuntimeSlot {
 
     /// Late detours retain a disabled runtime even after IAT restoration.
     pub fn for_detour(&self) -> Option<Arc<HookRuntime>> {
+        // The weak cache never keeps a session's Agent/mappings alive. Upgrade
+        // acquires ownership before use; there are no borrowed atomic pointers.
+        // An entry concurrent with replacement may still take the old runtime,
+        // whose recording gate is disabled before unregister publishes retirement.
+        if ReentrancyGuard::is_active() {
+            if let Ok(Some(rt)) = DETOUR_RUNTIME.try_with(|cache| {
+                let mut cache = cache.try_borrow_mut().ok()?;
+                let revision = self.revision.load(Ordering::Acquire);
+                if revision != 0 && cache.0 == revision {
+                    if let Some(rt) = cache.1.upgrade() {
+                        return Some(rt);
+                    }
+                }
+                let state = self.current.read().unwrap();
+                let rt = state.active.as_ref().or(state.retired.as_ref())?.clone();
+                // Load under the lock: the revision must describe this snapshot.
+                let revision = self.revision.load(Ordering::Relaxed);
+                drop(state); // replacing a Weak may deallocate and reenter a hook
+                *cache = (revision, Arc::downgrade(&rt));
+                Some(rt)
+            }) {
+                return Some(rt);
+            }
+        }
         let state = self.current.read().unwrap();
         state.active.as_ref().or(state.retired.as_ref()).cloned()
     }
@@ -1590,6 +1629,76 @@ mod tests {
         assert!(rt.wait_in_flight_drained(Duration::from_secs(5)));
         holder.join().unwrap();
         assert_eq!(rt.in_flight(), 0);
+    }
+
+    #[test]
+    fn cached_runtime_tracks_replacement_without_retaining_session() {
+        let _guard = ReentrancyGuard::try_enter().unwrap();
+        let slot = RuntimeSlot::new();
+        let (_, old) = runtime();
+        let old = Arc::new(old);
+        let weak = Arc::downgrade(&old);
+        assert!(slot.register(old.clone()).is_ok());
+        assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &old));
+        // A hot cache must not acquire the shared lock.
+        let lock = slot.current.write().unwrap();
+        assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &old));
+        drop(lock);
+        assert!(slot.unregister(&old));
+        assert!(!slot.for_detour().unwrap().recording_active());
+        let (_, new) = runtime();
+        let new = Arc::new(new);
+        assert!(slot.register(new.clone()).is_ok());
+        assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &new));
+        assert!(slot.unregister(&new)); // releases the previous retired session
+        drop(old);
+        assert!(weak.upgrade().is_none());
+        drop(new);
+        drop(slot);
+        assert!(DETOUR_RUNTIME.with(|c| c.borrow().1.upgrade().is_none()));
+    }
+
+    #[test]
+    fn cached_reader_observes_shutdown_and_reattach_from_another_thread() {
+        let slot = Arc::new(RuntimeSlot::new());
+        let (_, old) = runtime();
+        let old = Arc::new(old);
+        assert!(slot.register(old.clone()).is_ok());
+        let (_, new) = runtime();
+        let new = Arc::new(new);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let reader = {
+            let slot = slot.clone();
+            let old = old.clone();
+            let new = new.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let _guard = ReentrancyGuard::try_enter().unwrap();
+                let held = slot.for_detour().unwrap();
+                assert!(Arc::ptr_eq(&held, &old));
+                barrier.wait();
+                barrier.wait();
+                assert!(DetourFlight::begin(&held).is_none());
+                assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &new));
+            })
+        };
+        barrier.wait();
+        assert!(slot.unregister(&old));
+        assert!(slot.register(new).is_ok());
+        barrier.wait();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn cached_runtime_never_aliases_another_slot() {
+        let _guard = ReentrancyGuard::try_enter().unwrap();
+        for _ in 0..32 {
+            let slot = RuntimeSlot::new();
+            let (_, rt) = runtime();
+            let rt = Arc::new(rt);
+            assert!(slot.register(rt.clone()).is_ok());
+            assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &rt));
+        }
     }
 
     #[test]

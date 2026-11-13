@@ -142,10 +142,14 @@ Rust 1.87、x86/x64 のクロスチェックで検証する。1075 イベント�
 新しい境界値テストで Writer が global_order=0 を許して Reader が拒否する不一致も
 見つかったため、書き込み前に拒否するよう修正し、拒否後の正常書き込みも検証した。
 
-通常経路の共通ロックをなくす要件も残る。`RuntimeSlot::for_detour` は現在
-セッション参照に RwLock を使っている。セッション差し替え・終了後の素通し・
-ネイティブ TLS がない経路を壊さずに、読み手の所有権を保護する方式が必要。
-性能値だけを理由に既存の寿命保護を外さない。
+`RuntimeSlot::for_detour` は記録ガード内の通常経路を TLS Weak キャッシュへ変更した。
+登録ごとにプロセス内で一意な世代番号を発行し、再接続時にはロック下で新しい
+参照を取得する。Weak の upgrade で所有権を確保し、古いキャッシュは Agent や
+共有メモリを生存させない。終了後の古い参照は既存の recording gate で記録を拒否する。
+ガード外の素通し、TLS 不在・破棄済み・再入借用中は従来の RwLock 経路を使う。
+Linux の isolated component 測定は通常経路 4.72 ns、素通しロック経路 9.28 ns
+（5 回の中央値）。Windows 全体の速度目標やイベント欠落改善の達成を意味しない。
+Writer 経路や Host 処理を含む性能要件は引き続き未達。
 
 `c0e21a9` の [CI run `43286917384`](https://github.com/a-kaibu/shirusu-poc/actions/runs/43286917384)
 は全ジョブ通過（Windows x86/x64、Server 2022、Linux、macOS、MSRV、Kani、TLA、fuzz）。

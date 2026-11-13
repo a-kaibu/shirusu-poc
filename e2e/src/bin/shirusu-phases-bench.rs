@@ -84,9 +84,15 @@ fn main() {
             black_box(shirusu_hook::api::api_by_id(black_box(id)));
         });
     }
-    measure("runtime_rwlock_arc", || {
+    measure("runtime_passthrough_rwlock_arc", || {
         drop(black_box(slot.for_detour()));
     });
+    {
+        let _guard = ReentrancyGuard::try_enter().unwrap();
+        measure("runtime_tls_weak_upgrade", || {
+            drop(black_box(slot.for_detour()));
+        });
+    }
     measure("reentrancy_guard", || {
         drop(black_box(ReentrancyGuard::try_enter().unwrap()));
     });
