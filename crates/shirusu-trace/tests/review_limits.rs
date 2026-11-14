@@ -108,3 +108,18 @@ fn non_ascii_hex_is_rejected_without_panicking() {
         }
     }
 }
+
+/// P1-3: 既定の上限は入力の大きさに合わせて広がり、小さい入力では
+/// 従来の既定値を下回らない。
+#[test]
+fn reader_limits_scale_with_input_size() {
+    let base = ReaderLimits::default();
+    let small = ReaderLimits::for_input_len(1024);
+    assert_eq!(small.max_blocks, base.max_blocks);
+    assert_eq!(small.max_decoded_bytes, base.max_decoded_bytes);
+    let big = ReaderLimits::for_input_len(8 * 1024 * 1024 * 1024);
+    // 8GiB の Trace は 32 バイトの Block を最大 2.7 億個持てる。
+    assert!(big.max_blocks as u64 >= 8 * 1024 * 1024 * 1024 / 32);
+    assert!(big.max_decoded_bytes >= 64 * 8 * 1024 * 1024 * 1024);
+    assert!(big.max_events > base.max_events);
+}

@@ -93,23 +93,53 @@ pub(crate) fn cmd_dump(args: &[String]) -> Result<(), ToolError> {
     // 時点で読み終える。
     let (path, mut stream) = open_trace_stream(&parsed)?;
     let read_error = |e: shirusu_trace::TraceError| ToolError::Runtime(format!("{path}: {e}"));
-    let mut matched: Vec<shirusu_analysis::EventView> = Vec::new();
+    let write_error = |e: std::io::Error| ToolError::Runtime(format!("write failed: {e}"));
+    let json = parsed.has("json");
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    // P1-4: --order=global でなければ一致したイベントをすぐ書き出す
+    // (以前は全件を EventView の Vec に溜めてから出力していた)。
+    // --order=global は並べ替えのため、出力行と順序だけを保持する。
+    let mut ordered: Vec<(u64, String)> = Vec::new();
+    let mut written = 0usize;
+    let mut missing_global = false;
     let mut index = 0usize;
-    let wanted = if order_global {
-        usize::MAX
-    } else {
-        limit.unwrap_or(usize::MAX)
-    };
+    let wanted = limit.unwrap_or(usize::MAX);
+    if json && !order_global {
+        out.write_all(b"[").map_err(write_error)?;
+    }
+    let mut stopped_early = false;
     'read: while let Some(item) = stream.next_item().map_err(read_error)? {
         if let shirusu_trace::stream::StreamItem::Events(batch) = item {
             for e in &batch.events {
                 let ev = shirusu_analysis::EventView::of(stream.registry(), &batch, e, index);
                 index += 1;
-                if filter.matches(&ev) {
-                    matched.push(ev);
-                    if matched.len() >= wanted {
-                        break 'read;
+                if !filter.matches(&ev) {
+                    continue;
+                }
+                let rendered = if json {
+                    ev.to_json().render()
+                } else {
+                    ev.line()
+                };
+                if order_global {
+                    match ev.global_order {
+                        Some(g) => ordered.push((g, rendered)),
+                        None => missing_global = true,
                     }
+                    continue;
+                }
+                if json && written > 0 {
+                    out.write_all(b",").map_err(write_error)?;
+                }
+                out.write_all(rendered.as_bytes()).map_err(write_error)?;
+                if !json {
+                    out.write_all(b"\n").map_err(write_error)?;
+                }
+                written += 1;
+                if written >= wanted {
+                    stopped_early = true;
+                    break 'read;
                 }
             }
         }
@@ -117,31 +147,58 @@ pub(crate) fn cmd_dump(args: &[String]) -> Result<(), ToolError> {
     if order_global {
         // 全体順序を持たないイベントが 1 件でもあれば、その Trace は
         // --order=global で記録されたものではない。
-        if matched.iter().any(|e| e.global_order.is_none()) {
+        if missing_global {
             return Err(ToolError::Runtime(
                 "this trace was not recorded with --order=global".into(),
             ));
         }
         // global_order はイベントごとに一意なので安定ソートで十分。
-        matched.sort_by_key(|e| e.global_order.unwrap());
-    }
-    let matched: Vec<_> = matched
-        .into_iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    if parsed.has("json") {
-        let array = JsonValue::Array(matched.iter().map(|e| e.to_json()).collect());
-        writeln!(lock, "{}", array.render())
-            .map_err(|e| ToolError::Runtime(format!("write failed: {e}")))?;
-    } else {
-        for ev in matched {
-            writeln!(lock, "{}", ev.line())
-                .map_err(|e| ToolError::Runtime(format!("write failed: {e}")))?;
+        ordered.sort_by_key(|(g, _)| *g);
+        if json {
+            out.write_all(b"[").map_err(write_error)?;
         }
+        for (i, (_, rendered)) in ordered.iter().take(wanted).enumerate() {
+            if json && i > 0 {
+                out.write_all(b",").map_err(write_error)?;
+            }
+            out.write_all(rendered.as_bytes()).map_err(write_error)?;
+            if !json {
+                out.write_all(b"\n").map_err(write_error)?;
+            }
+        }
+        if json {
+            out.write_all(b"]\n").map_err(write_error)?;
+        }
+    } else if json {
+        out.write_all(b"]\n").map_err(write_error)?;
+    }
+    out.flush().map_err(write_error)?;
+    if !stopped_early {
+        report_stream_issues(&path, stream.issues())?;
     }
     Ok(())
+}
+
+/// P1-3: 読み終えた Trace の問題を stderr に出す。Reader の上限で読み
+/// 止めた場合は出力が途中までなので失敗として返す (以前は黙って出力を
+/// 止め、終了コード 0 だった)。
+pub(crate) fn report_stream_issues(
+    path: &str,
+    issues: &[shirusu_trace::RecoveryIssue],
+) -> Result<(), ToolError> {
+    let mut limit = None;
+    for issue in issues {
+        eprintln!("warning: {path}: {issue:?}");
+        if let shirusu_trace::RecoveryIssue::LimitExceeded { what } = issue {
+            limit = Some(*what);
+        }
+    }
+    match limit {
+        Some(what) => Err(ToolError::Runtime(format!(
+            "{path}: reader limit reached ({what}); output is incomplete"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Build output beside its destination and publish only after writing succeeds.

@@ -47,6 +47,9 @@ pub(crate) struct RepairReport {
     pub(crate) loss_records: usize,
     pub(crate) issues: Vec<String>,
     pub(crate) lost_by_cause: Vec<(String, u64)>,
+    /// P1-3: 入力を Reader の上限で読み止めた (以降のイベントは数え
+    /// られず、出力に含まれない)。
+    pub(crate) stopped_at_limit: Option<&'static str>,
 }
 
 pub(crate) fn add_lost(report: &mut RepairReport, cause: &str, n: u64) {
@@ -123,6 +126,10 @@ pub(crate) fn repair_trace(
         input: input.to_string(),
         scanned: trace.total_events(),
         issues: trace.issues.iter().map(format_issue).collect(),
+        stopped_at_limit: trace.issues.iter().find_map(|i| match i {
+            RecoveryIssue::LimitExceeded { what } => Some(*what),
+            _ => None,
+        }),
         ..Default::default()
     };
     // Environment が無い入力でも Header の session_id だけは分かる
@@ -235,6 +242,13 @@ pub(crate) fn repair_trace(
         .write_loss_records(&trace.loss_records)
         .map_err(|e| ToolError::Runtime(format!("cannot write loss records: {e}")))?;
     report.loss_records = trace.loss_records.len();
+    // P2-15: profile モードの Trace は ProfileSummary だけで中身が成り立つ。
+    // 引き継がないと修復後は空になり、それでも "lost 0" と表示していた。
+    if let Some(summary) = &trace.profile_summary {
+        writer
+            .write_profile_summary(summary)
+            .map_err(|e| ToolError::Runtime(format!("cannot write profile summary: {e}")))?;
+    }
     let (capture_coverage, mut event_integrity, semantic_completeness, mut notes) =
         match &trace.finalization {
             Some(f) => (
@@ -247,6 +261,16 @@ pub(crate) fn repair_trace(
         };
     if report.lost > 0 && event_integrity == 0 {
         event_integrity = 1;
+    }
+    if let Some(what) = report.stopped_at_limit {
+        // 上限より後ろは読んでいない。失った数は分からないので
+        // Complete とは言えない (P1-3)。
+        if event_integrity == 0 {
+            event_integrity = 1;
+        }
+        notes.push(format!(
+            "repair read stopped at the reader limit ({what}); later events are not included"
+        ));
     }
     notes.push(format!(
         "repaired from {}: {} events recovered, {} lost; {} recovery issues",
@@ -273,6 +297,11 @@ pub(crate) fn repair_lines(report: &RepairReport) -> Vec<String> {
         "events: {} recovered, {} lost (scanned {})",
         report.recovered, report.lost, report.scanned
     ));
+    if let Some(what) = report.stopped_at_limit {
+        out.push(format!(
+            "incomplete: input read stopped at the reader limit ({what}); events after it are not counted"
+        ));
+    }
     out.push(format!(
         "batches: {} written, {} skipped",
         report.batches_written, report.batches_skipped
@@ -332,6 +361,13 @@ pub(crate) fn repair_json(report: &RepairReport) -> JsonValue {
             JsonValue::U64(report.loss_records as u64),
         ),
         (
+            "stopped_at_limit",
+            match report.stopped_at_limit {
+                Some(what) => JsonValue::Str(what.to_string()),
+                None => JsonValue::Null,
+            },
+        ),
+        (
             "recovery_issues",
             JsonValue::Array(report.issues.iter().cloned().map(JsonValue::Str).collect()),
         ),
@@ -376,6 +412,107 @@ pub(crate) fn cmd_repair(args: &[String]) -> Result<(), ToolError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shirusu_trace::proto::{ApiProfile, ProfileSummary};
+    use shirusu_trace::reader::{read_trace, read_trace_with_limits, ReaderLimits};
+
+    fn env() -> CaptureEnvironment {
+        CaptureEnvironment {
+            session: SessionMetadata {
+                session_id: 5,
+                created_by: "repair-test".into(),
+                qpc_frequency: 1000,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// P2-15: ProfileSummary を引き継ぐ。
+    #[test]
+    fn repair_keeps_profile_summary() {
+        let mut w = TraceWriter::new(Vec::new(), env()).unwrap();
+        let summary = ProfileSummary {
+            qpc_frequency: 1000,
+            total_events_seen: 3,
+            apis: vec![ApiProfile {
+                api_id: 7,
+                calls: 3,
+                ..Default::default()
+            }],
+        };
+        w.write_profile_summary(&summary).unwrap();
+        let bytes = w.finish(FinalizationInfo::default()).unwrap();
+        let input = read_trace(&bytes).unwrap();
+        let (out, report) = repair_trace("in", &input).unwrap();
+        assert!(report.stopped_at_limit.is_none());
+        let out = read_trace(&out).unwrap();
+        assert_eq!(out.profile_summary, Some(summary));
+    }
+
+    /// P1-3: Reader の上限で読み止めた入力は Complete と言わず、報告に残す。
+    #[test]
+    fn repair_reports_input_stopped_at_reader_limit() {
+        let mut w = TraceWriter::new(Vec::new(), env()).unwrap();
+        for seq in 1..=10u64 {
+            w.write_batch(&EventBatch {
+                session_id: 5,
+                process_id: 1,
+                raw_pid: 1,
+                thread_id: 1,
+                qpc_frequency: 1000,
+                events: vec![TraceEvent {
+                    kind: 1,
+                    sequence: seq,
+                    timestamp_qpc: seq,
+                    call_id: seq,
+                    parent_call_id: 0,
+                    api_id: 1,
+                    schema_id: 0,
+                    capture: shirusu_trace::schema::EventCapture::Captured,
+                    payload: PayloadRef::None,
+                    args: None,
+                    global_order: None,
+                }],
+            })
+            .unwrap();
+        }
+        let bytes = w.finish(FinalizationInfo::default()).unwrap();
+        let input = read_trace_with_limits(
+            &bytes,
+            ReaderLimits {
+                max_blocks: 5,
+                ..ReaderLimits::default()
+            },
+        )
+        .unwrap();
+        let (out, report) = repair_trace("in", &input).unwrap();
+        assert_eq!(report.stopped_at_limit, Some("blocks"));
+        assert!(repair_lines(&report)
+            .iter()
+            .any(|l| l.starts_with("incomplete: input read stopped")));
+        let out = read_trace(&out).unwrap();
+        let fin = out.finalization.unwrap();
+        assert_ne!(fin.event_integrity, 0, "a cut input is not Complete");
+        assert!(fin.notes.iter().any(|n| n.contains("reader limit")));
+    }
+
+    /// P1-3: dump は上限で読み止めたら失敗を返す。
+    #[test]
+    fn stream_issues_fail_only_on_reader_limit() {
+        use shirusu_trace::RecoveryIssue;
+        assert!(
+            crate::dump_export::report_stream_issues("t", &[RecoveryIssue::IndexMismatch]).is_ok()
+        );
+        assert!(crate::dump_export::report_stream_issues(
+            "t",
+            &[RecoveryIssue::LimitExceeded { what: "blocks" }]
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]

@@ -135,8 +135,16 @@ pub struct TraceStream<R: Read + Seek> {
 
 impl<R: Read + Seek> TraceStream<R> {
     /// 既定の設定で開く。先頭が Header Block でなければ `NotATrace`。
-    pub fn open(inner: R) -> Result<Self> {
-        Self::with_options(inner, StreamOptions::default())
+    /// 上限は入力の大きさに合わせる ([`ReaderLimits::for_input_len`]、P1-3)。
+    pub fn open(mut inner: R) -> Result<Self> {
+        let len = inner.seek(SeekFrom::End(0))?;
+        Self::with_options(
+            inner,
+            StreamOptions {
+                limits: ReaderLimits::for_input_len(len),
+                ..StreamOptions::default()
+            },
+        )
     }
 
     pub fn with_options(mut inner: R, options: StreamOptions) -> Result<Self> {

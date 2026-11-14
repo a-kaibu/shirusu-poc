@@ -45,6 +45,36 @@ impl Default for ReaderLimits {
     }
 }
 
+impl ReaderLimits {
+    /// 入力の大きさに合わせた上限 (2026-11-14 レビュー P1-3)。固定の既定値
+    /// (Block 100 万個、展開後 1GiB、Blob 512MiB) は数分の記録で届き、
+    /// 正常な長い Trace を全ツールが破損として読み止めていた。
+    ///
+    /// - Block 数: 1 Block は最低でもヘッダー分の大きさを持つため、
+    ///   ファイル長 / ヘッダー長を超えることはない。
+    /// - 展開後の累計: 圧縮率の上限として格納サイズの 64 倍まで (展開爆弾の
+    ///   歯止めは保つ)。
+    /// - 保持する Blob の内容: 格納サイズの 16 倍まで。
+    /// - Event 数: 格納 1 バイトあたり 1 件まで。
+    ///
+    /// どれも既定値を下回らない。
+    pub fn for_input_len(len: u64) -> Self {
+        let base = Self::default();
+        let header = crate::container::HEADER_LEN as u64;
+        Self {
+            max_blocks: base
+                .max_blocks
+                .max(usize::try_from(len / header + 1).unwrap_or(usize::MAX)),
+            max_events: base.max_events.max(len),
+            max_blobs: base
+                .max_blobs
+                .max(usize::try_from(len / 36).unwrap_or(usize::MAX)),
+            max_decoded_bytes: base.max_decoded_bytes.max(len.saturating_mul(64)),
+            max_blob_bytes: base.max_blob_bytes.max(len.saturating_mul(16)),
+        }
+    }
+}
+
 /// 走査中に見つけた問題。破損の種類と位置を値として残す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryIssue {
@@ -183,9 +213,9 @@ impl ReadTrace {
     }
 }
 
-/// 既定の上限で読む。
+/// 入力の大きさに合わせた上限 ([`ReaderLimits::for_input_len`]) で読む。
 pub fn read_trace(data: &[u8]) -> Result<ReadTrace> {
-    read_trace_with_limits(data, ReaderLimits::default())
+    read_trace_with_limits(data, ReaderLimits::for_input_len(data.len() as u64))
 }
 
 pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadTrace> {

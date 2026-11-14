@@ -730,8 +730,14 @@ CRC が一致」の全てを満たす場合にだけ Block として受理し直
 
 上限（決定）: ファイルサイズ自体の上限は設けないが、Block 数は
 1,000,000、イベント総数は 100,000,000、Blob 総数は 10,000,000 を
-Reader の既定上限とし、超過したら破損として停止する（DoS 対策の
-目安値であり、設定で変更可能にする）。
+Reader の最低限の上限とし、超過したら `LimitExceeded` で停止する（DoS 対策の
+目安値。ライブラリは `read_trace_with_limits` と `StreamOptions::limits` で変更できる）。
+2026-11-14 レビュー P1-3 により、`read_trace` と `TraceStream::open` は
+`ReaderLimits::for_input_len` で入力の大きさに合わせて上限を広げる。Block 数は
+ファイル長 / 32、展開後の累計は格納サイズの 64 倍、保持する Blob の内容は 16 倍、
+Event 数は格納 1 バイトあたり 1 件までで、どれも上の既定値を下回らない。
+`dump` は上限で読み止めたら警告を出して終了コード 1 を返し、`repair` は
+上限で読み止めた入力の出力を Complete とせず、報告に `incomplete:` 行を出す。
 
 ## repair（L12）
 
