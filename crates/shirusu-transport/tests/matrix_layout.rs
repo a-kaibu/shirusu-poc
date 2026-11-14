@@ -664,3 +664,14 @@ diff_case!(
     lc(u64::MAX, 1, 1),
     Some(lc(0, 1, 1))
 );
+
+/// 既定と BURST の容量は文書の数値どおり（BURST は Ring あたり
+/// Descriptor 64K 件 × 64 B = 4 MiB と Payload 1 MiB の計 5 MiB + Control）。
+#[test]
+fn burst_capacity_matches_the_documented_size() {
+    use shirusu_transport::layout::{RingConfig, CONTROL_SIZE};
+    let burst = RingConfig::BURST;
+    assert_eq!(burst.descriptor_capacity, 65536);
+    assert_eq!(burst.payload_capacity, 1 << 20);
+    assert_eq!(burst.required_len(), CONTROL_SIZE + (5 << 20));
+}

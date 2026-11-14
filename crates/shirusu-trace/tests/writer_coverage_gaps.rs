@@ -468,3 +468,143 @@ fn flush_blobs_split_write_error_propagates() {
         .expect_err("split BlobChunk write must fail");
     assert!(matches!(err, shirusu_trace::TraceError::Io(_)));
 }
+
+// ---------------------------------------------------------------------------
+// ミューテーションテスト（cargo-mutants）で生き残った分岐を固定する。
+// ---------------------------------------------------------------------------
+
+fn blob_chunk_entry_counts(bytes: &[u8]) -> Vec<(u32, usize)> {
+    use shirusu_trace::container::{decode_payload, parse_header, BlockType, HEADER_LEN};
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + HEADER_LEN <= bytes.len() {
+        let stored = u32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap()) as usize;
+        let payload = &bytes[at + HEADER_LEN..at + HEADER_LEN + stored];
+        let (header, ok) = parse_header(&bytes[at..], payload).unwrap();
+        assert!(ok);
+        if header.block_type == BlockType::BlobChunk {
+            let raw = decode_payload(&header, payload).unwrap();
+            let mut pos = 0;
+            let mut n = 0;
+            while pos < raw.len() {
+                let len = u32::from_le_bytes(raw[pos + 32..pos + 36].try_into().unwrap()) as usize;
+                pos += 36 + len;
+                n += 1;
+            }
+            out.push((header.raw_len, n));
+        }
+        at += HEADER_LEN + stored;
+    }
+    out
+}
+
+/// Blob は貯めた量が目安に達した時点で書き出し、Blob Chunk は目安を
+/// 超えないように詰める（1 エントリだけで目安を超える場合を除く）。
+/// 目安を超えない範囲で次のエントリを入れられたなら、同じ Chunk に入る。
+#[test]
+fn blob_chunks_are_greedy_and_bounded_by_the_target() {
+    let target = 200;
+    let sizes = [10usize, 50, 70, 300, 5, 5, 100, 64, 1, 150, 30];
+    let (probe, state) = ProbeWriter::new();
+    let mut w =
+        TraceWriter::with_options(probe, env(42), options(Durability::Buffered, target)).unwrap();
+    let mut pending = 0usize;
+    for (i, size) in sizes.iter().enumerate() {
+        let before = state.writes.get();
+        w.add_payload(&vec![i as u8; *size]).unwrap();
+        pending += 36 + size;
+        let flushed = state.writes.get() > before;
+        assert_eq!(flushed, pending >= target, "payload {i}: pending {pending}");
+        if flushed {
+            pending = 0;
+        }
+    }
+    let bytes = w.finish(FinalizationInfo::default()).unwrap().inner;
+    let chunks = blob_chunk_entry_counts(&bytes);
+    assert_eq!(chunks.iter().map(|c| c.1).sum::<usize>(), sizes.len());
+    for (raw, entries) in &chunks {
+        assert!(*raw as usize <= target || *entries == 1, "{chunks:?}");
+    }
+    let read = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(read.issues.is_empty(), "{:?}", read.issues);
+    assert_eq!(read.blobs.len(), sizes.len());
+    // 同じ内容の 2 回目は貯めない（目安の計算に入らない）。
+    let (probe, state) = ProbeWriter::new();
+    let mut w =
+        TraceWriter::with_options(probe, env(42), options(Durability::Buffered, 100)).unwrap();
+    w.add_payload(&[1; 40]).unwrap();
+    let before = state.writes.get();
+    w.add_payload(&[1; 40]).unwrap();
+    assert_eq!(
+        state.writes.get(),
+        before,
+        "duplicate must not count toward the target"
+    );
+}
+
+#[test]
+fn schema_types_accessors_return_registered_types() {
+    let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    assert_eq!(w.schema_types(1), None);
+    assert_eq!(w.schema_types_ref(1), None);
+    w.register_schema(make_schema(
+        1,
+        "test!Two",
+        vec![("a".into(), Ty::U32, 0), ("b".into(), Ty::Str16, 0)],
+    ))
+    .unwrap();
+    assert_eq!(w.schema_types(1), Some(vec![Ty::U32, Ty::Str16]));
+    assert_eq!(w.schema_types_ref(1), Some(&[Ty::U32, Ty::Str16][..]));
+}
+
+/// 同じ Schema の再登録は受理するが、Schema Block には 1 回だけ書く。
+#[test]
+fn identical_schema_registration_is_written_once() {
+    let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    w.register_schema(schema_one()).unwrap();
+    w.register_schema(schema_one()).unwrap();
+    w.write_batch(&batch(vec![event(1, PayloadRef::None)]))
+        .unwrap();
+    w.register_schema(schema_one()).unwrap();
+    let bytes = w.finish(FinalizationInfo::default()).unwrap();
+    let read = shirusu_trace::read_trace(&bytes).unwrap();
+    assert_eq!(read.schemas.len(), 1, "{:?}", read.schemas);
+}
+
+/// 同じスレッドで Sequence が等しいイベントは退行ではない（重複は
+/// 適合性検査で Warn にする規約で、Writer は拒否しない）。
+#[test]
+fn equal_sequence_is_not_a_regression() {
+    let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    w.write_batch(&batch(vec![event(5, PayloadRef::None)]))
+        .unwrap();
+    w.write_batch(&batch(vec![
+        event(5, PayloadRef::None),
+        event(5, PayloadRef::None),
+    ]))
+    .unwrap();
+    assert!(w
+        .write_batch(&batch(vec![event(4, PayloadRef::None)]))
+        .is_err());
+}
+
+/// 1 イベントだけで目安を超える Batch も、1 イベントずつの Chunk に
+/// 分けて書き終える（空の Chunk を作らず、止まらない）。Block の
+/// sequence はファイル内で 0 から 1 ずつ増える。
+#[test]
+fn tiny_chunk_target_still_makes_progress_and_numbers_blocks() {
+    let mut w =
+        TraceWriter::with_options(Vec::new(), env(42), options(Durability::Buffered, 1)).unwrap();
+    w.register_schema(schema_one()).unwrap();
+    let events: Vec<_> = (1..=5)
+        .map(|s| event(s, PayloadRef::Inline(vec![s as u8; 8])))
+        .collect();
+    w.write_batch(&batch(events)).unwrap();
+    let bytes = w.finish(FinalizationInfo::default()).unwrap();
+    let read = shirusu_trace::read_trace(&bytes).unwrap();
+    assert!(read.issues.is_empty(), "{:?}", read.issues);
+    assert_eq!(read.batches.len(), 5);
+    assert!(read.batches.iter().all(|b| b.events.len() == 1));
+    let seqs: Vec<u64> = read.blocks.iter().map(|b| b.sequence).collect();
+    assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+}

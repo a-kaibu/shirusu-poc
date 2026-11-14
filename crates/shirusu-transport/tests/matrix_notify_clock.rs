@@ -395,3 +395,27 @@ fn monitor_force_dead_is_not_revived_by_alive_probe() {
     assert!(m.check_on_abnormal_path());
     assert!(!m.recording_enabled());
 }
+
+/// `depth_cell` はこのスレッドの公開深さカウンタそのものを指す（Agent は
+/// これを自分のスレッドローカルに控えて読む）。ガードの出入りが同じ
+/// ポインタ越しに見え、別スレッドのカウンタとは別物。
+#[test]
+fn depth_cell_points_at_this_threads_publish_depth() {
+    let cell = PublishGuard::depth_cell();
+    assert!(!cell.is_null());
+    assert_eq!(cell, PublishGuard::depth_cell(), "stable for the thread");
+    // SAFETY: このスレッドのカウンタで、スレッドの寿命の間有効。
+    let depth = unsafe { &*cell };
+    let base = depth.get();
+    {
+        let _outer = PublishGuard::enter();
+        assert_eq!(depth.get(), base + 1);
+        let _inner = PublishGuard::enter();
+        assert_eq!(depth.get(), base + 2);
+    }
+    assert_eq!(depth.get(), base);
+    let other = std::thread::spawn(|| PublishGuard::depth_cell() as usize)
+        .join()
+        .unwrap();
+    assert_ne!(other, cell as usize);
+}

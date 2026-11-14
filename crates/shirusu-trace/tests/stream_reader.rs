@@ -826,3 +826,129 @@ fn malformed_blob_chunk_entries_are_isolated_like_the_full_reader() {
             .any(|i| matches!(i, RecoveryIssue::CorruptBlock { .. })));
     }
 }
+
+/// 再同期の境界（ストリーミング側の候補検査）を全体読み込みと突き合わせる:
+/// 最後の Block の破損、長さ上限超えや CRC 不一致の偽の候補、ちょうど
+/// 32 バイトの末尾 Block。どれも両 Reader で同じ結果になる。
+#[test]
+fn resync_boundaries_recover_like_the_full_reader() {
+    use shirusu_trace::container::{
+        serialize_header, BlockHeader, BlockType, Compression, MAX_RAW_LEN, MAX_STORED_LEN,
+    };
+    let (bytes, ..) = rich_trace();
+    let mut offs = Vec::new();
+    let mut at = 0usize;
+    while at + 32 <= bytes.len() {
+        offs.push(at);
+        at += 32 + u32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap()) as usize;
+    }
+    let header = |raw_len: u32, stored_len: u32, sequence: u64| BlockHeader {
+        block_type: BlockType::Unknown(200),
+        compression: Compression::None,
+        sequence,
+        stored_len,
+        raw_len,
+    };
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+    // 最後の 3 Block のどれかを壊す（再同期が末尾まで探す）。
+    for &start in offs.iter().rev().take(3) {
+        let mut d = bytes.clone();
+        d[start + 24] ^= 0x11;
+        cases.push(d.clone());
+        d.extend_from_slice(b"SBL\0tail garbage without any block header....SBLK");
+        cases.push(d);
+    }
+    // 2 番目の Block を壊し、その直後に偽の候補を置く。
+    let second = offs[1];
+    let mut broken = bytes[..second].to_vec();
+    broken.extend_from_slice(b"SBLK\x00\x00\x00\x00");
+    broken.extend_from_slice(&[0u8; 24]);
+    for fake in [
+        serialize_header(&header(MAX_RAW_LEN + 1, 0, 70), &[]).to_vec(),
+        serialize_header(&header(0, MAX_STORED_LEN + 1, 71), &[]).to_vec(),
+        {
+            // CRC 不一致の候補（長さは妥当）。
+            let mut h = serialize_header(&header(4, 4, 72), b"abcd").to_vec();
+            h[24] ^= 1;
+            h.extend_from_slice(b"abcd");
+            h
+        },
+        {
+            // payload がファイル末尾を越える候補。
+            serialize_header(&header(1 << 20, 1 << 20, 73), &[]).to_vec()
+        },
+        {
+            // header_len の不正な候補（CRC は付け直してある）。
+            let mut h = serialize_header(&header(0, 0, 74), &[]).to_vec();
+            h[6] = 40;
+            h[24..28].copy_from_slice(&[0; 4]);
+            let crc = shirusu_crc32c::crc32c(&h);
+            h[24..28].copy_from_slice(&crc.to_le_bytes());
+            h
+        },
+    ] {
+        let mut d = broken.clone();
+        d.extend_from_slice(&fake);
+        d.extend_from_slice(&bytes[second..]);
+        cases.push(d);
+    }
+    // ちょうど 32 バイトの末尾 Block。
+    let mut d = bytes.clone();
+    d.extend_from_slice(&serialize_header(&header(0, 0, 999), &[]));
+    cases.push(d);
+    for data in &cases {
+        assert_equivalent(data, ReaderLimits::default());
+        let full = read_trace(data).unwrap();
+        assert!(
+            full.blocks.iter().all(|b| !(70..=74).contains(&b.sequence)),
+            "fake candidate accepted: {:?}",
+            full.blocks
+        );
+    }
+}
+
+/// CRC は正しいが内容が ID と合わない Blob エントリ。全体読み込みは
+/// BlobHashMismatch として取り込まず、`load_blob` もその ID を返さない
+/// （同じ Chunk の後ろのエントリは読める）。
+#[test]
+fn blob_entry_with_wrong_content_is_not_loaded() {
+    use shirusu_trace::container::{serialize_header, BlockHeader, BlockType, Compression};
+    let (bytes, ..) = rich_trace();
+    let claimed = BlobId::of_content(b"claimed content");
+    let after = b"entry after the bad one";
+    let after_id = BlobId::of_content(after);
+    let mut payload = claimed.as_bytes().to_vec();
+    payload.extend_from_slice(&6u32.to_le_bytes());
+    payload.extend_from_slice(b"forged");
+    payload.extend_from_slice(after_id.as_bytes());
+    payload.extend_from_slice(&(after.len() as u32).to_le_bytes());
+    payload.extend_from_slice(after);
+    let header = BlockHeader {
+        block_type: BlockType::BlobChunk,
+        compression: Compression::None,
+        sequence: 600,
+        stored_len: payload.len() as u32,
+        raw_len: payload.len() as u32,
+    };
+    let mut data = bytes.clone();
+    data.extend_from_slice(&serialize_header(&header, &payload));
+    data.extend_from_slice(&payload);
+    let full = read_trace(&data).unwrap();
+    assert!(full
+        .issues
+        .iter()
+        .any(|i| matches!(i, RecoveryIssue::BlobHashMismatch { id, .. } if *id == claimed)));
+    assert!(!full.blobs.contains_key(&claimed));
+    assert_eq!(
+        full.blobs.get(&after_id).map(Vec::as_slice),
+        Some(&after[..])
+    );
+    assert_equivalent(&data, ReaderLimits::default());
+    let mut stream = TraceStream::open(Cursor::new(&data)).unwrap();
+    while stream.next_item().unwrap().is_some() {}
+    assert_eq!(stream.load_blob(&claimed).unwrap(), None);
+    assert_eq!(
+        stream.load_blob(&after_id).unwrap().as_deref(),
+        Some(&after[..])
+    );
+}
