@@ -419,3 +419,15 @@ fn depth_cell_points_at_this_threads_publish_depth() {
         .unwrap();
     assert_ne!(other, cell as usize);
 }
+
+/// 容量 0 の閾値: 100% 以下は常に到達（最小使用量 0）、100% を超える
+/// 閾値には到達しない（u64::MAX）。
+#[test]
+fn threshold_min_used_for_zero_capacity() {
+    use shirusu_transport::notify::threshold_min_used;
+    assert_eq!(threshold_min_used(0, 0), 0);
+    assert_eq!(threshold_min_used(0, 100), 0);
+    assert_eq!(threshold_min_used(0, 101), u64::MAX);
+    assert_eq!(threshold_min_used(10, 75), 8);
+    assert_eq!(threshold_min_used(u64::MAX, 200), u64::MAX);
+}

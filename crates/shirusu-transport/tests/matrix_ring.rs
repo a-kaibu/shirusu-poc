@@ -679,3 +679,68 @@ fn reader_usage_drops_after_drain() {
     assert_eq!(r.descriptor_used(), 0);
     assert_eq!(r.payload_used(), 0);
 }
+
+/// Host の待機中フラグは、公開した書き手が 1 回だけ消費する（swap で 0 に
+/// 戻す）。次の公開は、閾値未満なら通知しない。
+#[test]
+fn host_waiting_flag_is_consumed_once() {
+    let (region, mut w, _r, _clock) = setup(64, 4096, no_wait());
+    store(
+        region.base(),
+        OFF_HOST_WAITING,
+        1,
+        std::sync::atomic::Ordering::Release,
+    );
+    let first = w.write(input(EventKind::CallEnter, 1, b"x"));
+    assert!(
+        matches!(
+            first,
+            WriteOutcome::Published {
+                notify: NotifySignal::HostWaiting,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    assert_eq!(
+        load(
+            region.base(),
+            OFF_HOST_WAITING,
+            std::sync::atomic::Ordering::Acquire
+        ),
+        0,
+        "flag consumed"
+    );
+    let second = w.write(input(EventKind::CallLeave, 1, b"y"));
+    assert!(
+        matches!(
+            second,
+            WriteOutcome::Published {
+                notify: NotifySignal::None,
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+}
+
+/// `set_clock` 後の待機は新しい時計で測る（古い時計は進まない）。
+#[test]
+fn set_clock_replaces_the_wait_clock() {
+    let policy = WriterPolicy {
+        max_wait: Duration::from_millis(1),
+        ..Default::default()
+    };
+    let (_region, mut w, _r, old) = setup(2, 64, policy);
+    let new = Arc::new(ManualClock::new());
+    w.set_clock(new.clone() as Arc<dyn Clock>);
+    for call in 1..=3 {
+        w.write(input(EventKind::CallEnter, call, b"payload"));
+    }
+    assert_eq!(old.now_ticks(), 0, "old clock must not be used");
+    assert!(
+        new.now_ticks() >= Duration::from_millis(1).as_nanos() as u64,
+        "the bounded wait ran on the new clock: {}",
+        new.now_ticks()
+    );
+}
