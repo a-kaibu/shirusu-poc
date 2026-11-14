@@ -99,8 +99,27 @@ pub struct LaunchedCapture {
     /// Agent 側の終了手順を呼ばずに従来どおり閉じる。
     shutdown_addr: Option<usize>,
     shutdown_outcome: Option<ShutdownOutcome>,
-    module_scan: Option<std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>>,
+    module_scan: Option<ModuleScan>,
     data_ready: win::ProcessNotify,
+}
+
+/// The module watcher thread and its stop request.
+struct ModuleScan {
+    handle: std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ModuleScan {
+    fn request_stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+    fn join(self) -> std::thread::Result<Vec<shirusu_trace::module::ModuleClassification>> {
+        self.request_stop();
+        self.handle.join()
+    }
 }
 
 impl LaunchedCapture {
@@ -306,6 +325,10 @@ impl LaunchedCapture {
         // 続ける（対象が終了処理中などで応答しない場合がある）が、
         // 「正常終了として確定」はしない。
         let outcome = self.shutdown_once();
+        // Take the last module snapshot now; the watcher ends after it.
+        if let Some(scan) = &self.module_scan {
+            scan.request_stop();
+        }
         // Keep draining even if signature verification outlives a short target.
         while self
             .module_scan
@@ -1178,18 +1201,31 @@ fn inject_and_init(
     })
 }
 
+/// How often the module list is enumerated again while recording.
+const MODULE_RESCAN_INTERVAL: Duration = Duration::from_millis(500);
+
 fn start_module_scan(
     pid: u32,
     pre_modules: Vec<shirusu_transport_win::modules::LoadedModule>,
-) -> Option<std::thread::JoinHandle<Vec<shirusu_trace::module::ModuleClassification>>> {
-    std::thread::Builder::new()
+) -> Option<ModuleScan> {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
         .name("shirusu-module-scan".into())
         .spawn(move || {
             let settled = crate::modules::enumerate_modules_settled(pid);
             let merged = crate::modules::merge_module_snapshots(pre_modules, settled);
-            crate::modules::classify_module_list(&merged)
+            // Keep watching for DLLs loaded later (review 2026-11-14 P3-18).
+            crate::modules::watch_modules_with(
+                merged,
+                || shirusu_transport_win::modules::enumerate_modules(pid).ok(),
+                crate::modules::classify_module_list,
+                &flag,
+                MODULE_RESCAN_INTERVAL,
+            )
         })
-        .ok()
+        .ok()?;
+    Some(ModuleScan { handle, stop })
 }
 
 /// Create and connect the consumer immediately; module discovery runs separately.

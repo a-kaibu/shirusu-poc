@@ -200,6 +200,48 @@ fn snapshot_paths(modules: &[LoadedModule]) -> Vec<String> {
     paths
 }
 
+/// 記録の間、モジュール一覧を `interval` ごとに列挙し直し、新しく
+/// 現れたモジュールだけを分類して足す（2026-11-14 レビュー P3-18:
+/// 開始時の 200ms だけでは、後から読み込まれた DLL が分類に載らなかった）。
+/// `stop` が立ったら最後にもう 1 回列挙して返す。列挙できなくなったら
+/// （対象の終了）、それまでの分を返す。分類（署名確認）は 1 パスに 1 回。
+pub fn watch_modules_with(
+    initial: Vec<LoadedModule>,
+    mut enumerate: impl FnMut() -> Option<Vec<LoadedModule>>,
+    mut classify: impl FnMut(&[LoadedModule]) -> Vec<ModuleClassification>,
+    stop: &std::sync::atomic::AtomicBool,
+    interval: std::time::Duration,
+) -> Vec<ModuleClassification> {
+    use std::sync::atomic::Ordering;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut add = |modules: Vec<LoadedModule>, out: &mut Vec<ModuleClassification>| {
+        let fresh: Vec<LoadedModule> = modules
+            .into_iter()
+            .filter(|m| seen.insert(m.path.to_ascii_lowercase()))
+            .collect();
+        if !fresh.is_empty() {
+            out.extend(classify(&fresh));
+        }
+    };
+    add(initial, &mut out);
+    let slice = interval.min(std::time::Duration::from_millis(50));
+    loop {
+        let deadline = std::time::Instant::now() + interval;
+        while !stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(slice);
+        }
+        let stopping = stop.load(Ordering::Acquire);
+        match enumerate() {
+            Some(modules) => add(modules, &mut out),
+            None => return out,
+        }
+        if stopping {
+            return out;
+        }
+    }
+}
+
 /// Windows 以外では安定化待ち列挙はできない（空を返す）。
 #[cfg(not(windows))]
 pub fn enumerate_modules_settled(_pid: u32) -> Vec<LoadedModule> {
@@ -210,6 +252,46 @@ pub fn enumerate_modules_settled(_pid: u32) -> Vec<LoadedModule> {
 mod tests {
     use super::*;
     use shirusu_trace::module::ModuleClass;
+
+    #[test]
+    fn modules_loaded_during_recording_are_classified_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let m = |path: &str| LoadedModule::new(path.len(), 1, path);
+        let stop = AtomicBool::new(false);
+        let mut rounds = vec![
+            Some(vec![m("C:\\app.exe"), m("C:\\late.dll")]),
+            Some(vec![
+                m("C:\\APP.exe"),
+                m("C:\\late.dll"),
+                m("C:\\later.dll"),
+            ]),
+            None,
+        ]
+        .into_iter();
+        let mut classified = Vec::new();
+        let out = watch_modules_with(
+            vec![m("C:\\app.exe")],
+            || rounds.next().flatten(),
+            |fresh| {
+                classified.extend(fresh.iter().map(|f| f.path.clone()));
+                classify_loaded_modules(fresh, &no_resolve, &mut |_| None)
+            },
+            &stop,
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(out.len(), 3, "the process exit ends the watch");
+        assert_eq!(classified, ["C:\\app.exe", "C:\\late.dll", "C:\\later.dll"]);
+        // A stop request still takes one final snapshot.
+        stop.store(true, Ordering::Release);
+        let out = watch_modules_with(
+            Vec::new(),
+            || Some(vec![m("C:\\last.dll")]),
+            |fresh| classify_loaded_modules(fresh, &no_resolve, &mut |_| None),
+            &stop,
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(out.len(), 1);
+    }
 
     fn no_resolve(_name: &str) -> Option<String> {
         None
