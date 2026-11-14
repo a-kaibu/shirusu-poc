@@ -245,6 +245,7 @@ pub fn read_trace_with_limits(data: &[u8], limits: ReaderLimits) -> Result<ReadT
         blob_bytes: 0,
         stopped_by_limit: false,
         resync_end: 0,
+        resync_crc_bytes: 0,
     };
     let header = scan.read_file_header()?;
     scan.run();
@@ -468,6 +469,8 @@ struct Scan<'a> {
     stopped_by_limit: bool,
     /// 直近の再同期で受理した Block の末尾位置（走査再開位置）。
     resync_end: u64,
+    /// 再同期で CRC を計算した累計 (P2-11)。
+    resync_crc_bytes: u64,
 }
 
 impl<'a> Scan<'a> {
@@ -644,6 +647,18 @@ impl<'a> Scan<'a> {
                 q += 1;
                 continue;
             }
+            if !container::plausible_lengths(&raw) {
+                q += 1;
+                continue;
+            }
+            self.resync_crc_bytes += raw.stored_len as u64;
+            if self.resync_crc_bytes > container::resync_crc_budget(data.len() as u64) {
+                self.issues.push(RecoveryIssue::LimitExceeded {
+                    what: "resync work",
+                });
+                self.stopped_by_limit = true;
+                return false;
+            }
             let payload = &data[payload_start..payload_end];
             if !container::raw_header_crc_matches(&raw, &data[q..q + HEADER_LEN], payload) {
                 q += 1;
@@ -793,7 +808,14 @@ impl<'a> Scan<'a> {
                 Err(e) => corrupt(&mut self.issues, format!("finalization proto: {e}")),
             },
             BlockType::Loss => match crate::proto::decode_loss_block(&raw_payload) {
-                Ok(records) => self.loss_records.extend(records),
+                Ok(records) => {
+                    // P2-11: charge what the records occupy, not only their
+                    // encoded bytes (a 2-byte record is an ~80-byte struct).
+                    self.decoded_bytes = self.decoded_bytes.saturating_add(
+                        (records.len() * std::mem::size_of::<crate::proto::LossRecord>()) as u64,
+                    );
+                    self.loss_records.extend(records)
+                }
                 Err(e) => corrupt(&mut self.issues, format!("loss proto: {e}")),
             },
             // L09: 復号できた集計は最後の 1 件を保持する（正しくは

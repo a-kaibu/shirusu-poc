@@ -192,6 +192,25 @@ pub struct RawBlockHeader {
 
 /// 先頭 32 バイトを生フィールドとして読む。Magic が違う、または
 /// 32 バイトに満たない場合は None（Block の開始ではない）。
+/// 再同期で候補の CRC を計算してよい累計バイト数 (2026-11-14 レビュー
+/// P2-11)。偽の `SBLK` ヘッダーを詰めたファイルでは候補ごとに最大 512MiB
+/// の CRC を計算し、作業量が候補数 × ファイル長になっていた。入力長の
+/// 4 倍 (+64MiB) までに抑える。通常の破損からの回復には十分足りる。
+pub fn resync_crc_budget(input_len: u64) -> u64 {
+    input_len.saturating_mul(4).saturating_add(64 * 1024 * 1024)
+}
+
+/// 格納サイズと展開後サイズの組が Writer の書き得るものか。無圧縮なら
+/// 一致し、Zstd なら展開後のほうが大きい (Writer は縮まなければ無圧縮で
+/// 書く)。再同期で CRC を計算する前の安い足切りに使う。
+pub fn plausible_lengths(raw: &RawBlockHeader) -> bool {
+    match Compression::from_code(raw.compression_code) {
+        Some(Compression::None) => raw.stored_len == raw.raw_len,
+        Some(Compression::Zstd) => raw.stored_len < raw.raw_len,
+        None => false,
+    }
+}
+
 pub fn parse_raw_header(bytes: &[u8]) -> Option<RawBlockHeader> {
     if bytes.len() < HEADER_LEN || bytes[0..4] != BLOCK_MAGIC {
         return None;

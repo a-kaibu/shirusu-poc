@@ -130,6 +130,8 @@ pub struct TraceStream<R: Read + Seek> {
     stored_index: Option<(u64, BlockIndex)>,
     total_events: u64,
     decoded_bytes: u64,
+    /// 再同期で CRC を計算した累計 (P2-11)。
+    resync_crc_bytes: u64,
     done: bool,
 }
 
@@ -198,6 +200,7 @@ impl<R: Read + Seek> TraceStream<R> {
             stored_index: None,
             total_events: 0,
             decoded_bytes: 0,
+            resync_crc_bytes: 0,
             done: false,
         })
     }
@@ -581,6 +584,13 @@ impl<R: Read + Seek> TraceStream<R> {
         let Some((raw, head)) = self.read_candidate_header(offset)? else {
             return Ok(false);
         };
+        if !container::plausible_lengths(&raw) {
+            return Ok(false);
+        }
+        self.resync_crc_bytes += raw.stored_len as u64;
+        if self.resync_crc_bytes > container::resync_crc_budget(self.len) {
+            return Ok(false);
+        }
         let mut crc = container::header_crc_seed(&head);
         let mut left = raw.stored_len as usize;
         let mut buf = vec![0u8; left.min(CHUNK)];
@@ -702,6 +712,12 @@ impl<R: Read + Seek> TraceStream<R> {
                     let candidate = q + i as u64;
                     if self.verifies_at(candidate)? {
                         return Ok(Some(candidate));
+                    }
+                    if self.resync_crc_bytes > container::resync_crc_budget(self.len) {
+                        self.issues.push(RecoveryIssue::LimitExceeded {
+                            what: "resync work",
+                        });
+                        return Ok(None);
                     }
                 }
                 i += 1;
@@ -847,7 +863,13 @@ impl<R: Read + Seek> TraceStream<R> {
                 }
             },
             BlockType::Loss => match crate::proto::decode_loss_block(&raw) {
-                Ok(records) => Some(StreamItem::Loss(records)),
+                Ok(records) => {
+                    // P2-11: the caller keeps these; charge their size.
+                    self.decoded_bytes = self.decoded_bytes.saturating_add(
+                        (records.len() * std::mem::size_of::<crate::proto::LossRecord>()) as u64,
+                    );
+                    Some(StreamItem::Loss(records))
+                }
                 Err(e) => {
                     self.corrupt(offset, format!("loss proto: {e}"));
                     None

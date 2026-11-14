@@ -20,6 +20,9 @@ pub enum ProtoError {
     TruncatedFixed,
     /// 文字列フィールドが UTF-8 でない。
     InvalidUtf8,
+    /// 1 つのメッセージの繰り返しフィールドが上限を超えた（2026-11-14
+    /// レビュー P2-11: 数 KB の圧縮 Block から億単位の構造体を作らない）。
+    TooManyEntries { limit: usize },
 }
 
 impl fmt::Display for ProtoError {
@@ -33,6 +36,9 @@ impl fmt::Display for ProtoError {
             Self::InvalidFieldNumber => write!(f, "field number 0 is invalid"),
             Self::TruncatedFixed => write!(f, "fixed-width field truncated"),
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
+            Self::TooManyEntries { limit } => {
+                write!(f, "more than {limit} repeated entries in one message")
+            }
         }
     }
 }

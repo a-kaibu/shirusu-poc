@@ -499,13 +499,34 @@ impl SchemaDef {
                 (1, WIRE_VARINT) => m.schema_id = r.value_u64()? as u32,
                 (2, WIRE_LEN) => m.name = r.value_string()?,
                 (3, WIRE_VARINT) => m.content_hash = r.value_u64()?,
-                (4, WIRE_LEN) => m.fields.push(FieldDef::decode(r.value_bytes()?)?),
+                (4, WIRE_LEN) => push_bounded(
+                    &mut m.fields,
+                    FieldDef::decode(r.value_bytes()?)?,
+                    MAX_FIELDS_PER_SCHEMA,
+                )?,
                 (5, WIRE_LEN) => m.annotation = r.value_string()?,
                 _ => r.skip(wire)?,
             }
         }
         Ok(m)
     }
+}
+
+/// 1 Block の繰り返しフィールドの上限（2026-11-14 レビュー P2-11）。
+/// 最小の要素は 2 バイトで符号化できるため、上限が無いと 256MiB に展開
+/// された Block 1 つから 1 億件を超える構造体（Loss なら約 10GB）を作る。
+/// Writer が書く量（Index は既定で 2^20 件、Loss は数百件ずつ）より十分大きい。
+pub const MAX_LOSS_RECORDS_PER_BLOCK: usize = 1 << 20;
+pub const MAX_INDEX_ENTRIES_PER_BLOCK: usize = 1 << 22;
+pub const MAX_SCHEMAS_PER_BLOCK: usize = 1 << 16;
+pub const MAX_FIELDS_PER_SCHEMA: usize = 1 << 12;
+
+fn push_bounded<T>(out: &mut Vec<T>, value: T, limit: usize) -> Result<(), ProtoError> {
+    if out.len() >= limit {
+        return Err(ProtoError::TooManyEntries { limit });
+    }
+    out.push(value);
+    Ok(())
 }
 
 impl SchemaSet {
@@ -521,7 +542,11 @@ impl SchemaSet {
         let mut r = ProtoReader::new(buf);
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
-                (1, WIRE_LEN) => m.schemas.push(SchemaDef::decode(r.value_bytes()?)?),
+                (1, WIRE_LEN) => push_bounded(
+                    &mut m.schemas,
+                    SchemaDef::decode(r.value_bytes()?)?,
+                    MAX_SCHEMAS_PER_BLOCK,
+                )?,
                 _ => r.skip(wire)?,
             }
         }
@@ -614,7 +639,11 @@ pub fn decode_loss_block(buf: &[u8]) -> Result<Vec<LossRecord>, ProtoError> {
     let mut r = ProtoReader::new(buf);
     while let Some((f, wire)) = r.next_field()? {
         match (f, wire) {
-            (1, WIRE_LEN) => out.push(LossRecord::decode(r.value_bytes()?)?),
+            (1, WIRE_LEN) => push_bounded(
+                &mut out,
+                LossRecord::decode(r.value_bytes()?)?,
+                MAX_LOSS_RECORDS_PER_BLOCK,
+            )?,
             _ => r.skip(wire)?,
         }
     }
@@ -650,7 +679,7 @@ impl BlockIndex {
                             _ => er.skip(ewire)?,
                         }
                     }
-                    m.entries.push(e);
+                    push_bounded(&mut m.entries, e, MAX_INDEX_ENTRIES_PER_BLOCK)?;
                 }
                 _ => r.skip(wire)?,
             }

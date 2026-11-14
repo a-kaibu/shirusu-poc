@@ -117,6 +117,12 @@ pub fn is_pe64(b: &[u8]) -> Option<bool> {
 /// ならず、その呼び出しは Capture Coverage の欠落として数える側に
 /// 倒す。L13 の静的依存記録も同じ境界である（理由と合わせて
 /// `shirusu_trace::static_dep` のモジュールドキュメントに明記）。
+/// 1 つのイメージから読む Import の総数の上限（2026-11-14 レビュー
+/// P2-11）。記述子 4,096 個と各 16,384 項目の上限だけでは、記述子が同じ
+/// 表を指す 1MB 未満の細工したイメージから約 6,700 万件（6GB 以上）を
+/// 作れた。実在のモジュールは数千件に収まる。
+pub const MAX_IMPORT_SITES: usize = 1 << 16;
+
 pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
     let mut out = Vec::new();
     let Some(h) = nt_headers(image) else {
@@ -162,6 +168,9 @@ pub fn parse_imports(image: &[u8]) -> Vec<ImportSite> {
             first_thunk
         };
         for i in 0..16384usize {
+            if out.len() >= MAX_IMPORT_SITES {
+                return out;
+            }
             let Some(entry_off) = (lookup_rva as usize).checked_add(i * thunk_size) else {
                 break;
             };
@@ -362,6 +371,27 @@ mod tests {
         assert_eq!(sites[2].dll_name, "user32.dll");
         assert_eq!(sites[2].func_name.as_deref(), Some("MessageBoxW"));
         assert_eq!(sites[2].iat_rva, 0x1280);
+    }
+
+    #[test]
+    fn imports_from_repeated_descriptors_are_bounded() {
+        // P2-11: 4,096 descriptors sharing one 16,384-entry table.
+        let table = 0x20_000usize;
+        let entries = 16_384usize;
+        let mut img = synthetic_image(table + (entries + 1) * 8 + 0x100);
+        let dir = 0x1000;
+        set_dir(&mut img, 1, dir as u32, 4096 * 20);
+        wstr(&mut img, 0x800, "a.dll");
+        for d in 0..4095 {
+            let at = dir + d * 20;
+            w32(&mut img, at, table as u32);
+            w32(&mut img, at + 12, 0x800);
+            w32(&mut img, at + 16, table as u32);
+        }
+        for i in 0..entries {
+            w64(&mut img, table + i * 8, 0x8000_0000_0000_0000 | 1);
+        }
+        assert_eq!(parse_imports(&img).len(), MAX_IMPORT_SITES);
     }
 
     #[test]
