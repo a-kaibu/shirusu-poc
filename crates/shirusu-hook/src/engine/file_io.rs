@@ -81,7 +81,7 @@ pub(super) enum Prepare {
 /// hand-written detours (`prepare`) and the generated ones (`prepare_generic`).
 pub(super) enum PrepareInner {
     Ready {
-        rt: Arc<HookRuntime>,
+        rt: crate::runtime::RuntimeRef,
         original: usize,
         api: &'static ApiDef,
         guard: ReentrancyGuard,
@@ -106,7 +106,7 @@ pub(super) fn prepare_inner(api_id: u32) -> PrepareInner {
     // だけ Detour 側が suspend する）。再入の判定はこの入口に集約し、
     // 各 Detour は Prepare の結果に従うだけにする。
     let Some(guard) = ReentrancyGuard::try_enter() else {
-        let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
+        let Some(rt) = crate::runtime::runtime_slot().for_detour_ref() else {
             return PrepareInner::Unavailable;
         };
         let original = rt.original(api_id);
@@ -116,7 +116,7 @@ pub(super) fn prepare_inner(api_id: u32) -> PrepareInner {
         le.restore_before_original();
         return PrepareInner::Passthrough { original };
     };
-    let Some(rt) = crate::runtime::runtime_slot().for_detour() else {
+    let Some(rt) = crate::runtime::runtime_slot().for_detour_ref() else {
         return PrepareInner::Unavailable;
     };
     let original = rt.original(api_id);
@@ -161,6 +161,7 @@ pub(super) fn prepare(api_id: u32) -> Prepare {
         PrepareInner::Passthrough { original } => return Prepare::Passthrough { original },
         PrepareInner::Unavailable => return Prepare::Unavailable,
     };
+    let rt = rt.to_arc(); // hand-written detours keep a shared reference
     match crate::runtime::DetourFlight::begin(&rt) {
         Some(flight) => {
             let tid = crate::thread_id::current() as u64;
@@ -211,7 +212,7 @@ pub(super) fn prepare_generic(api_id: u32) -> GenericPrepare {
         PrepareInner::Passthrough { original } => return GenericPrepare::Passthrough { original },
         PrepareInner::Unavailable => return GenericPrepare::Unavailable,
     };
-    match crate::runtime::DetourFlight::begin_owned(rt) {
+    match crate::runtime::DetourFlight::begin_ref(rt) {
         Some(flight) => {
             let tid = crate::thread_id::current() as u64;
             flight.runtime().ensure_thread(tid);

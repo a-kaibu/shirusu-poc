@@ -22,6 +22,8 @@
 //! logical thread takes the exclusive path.
 
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -46,7 +48,7 @@ pub(crate) struct WriterCell {
     exclusive: Mutex<()>,
 }
 
-// SAFETY: the writer is only reached through `with_owner` (its owning OS
+// SAFETY: the writer is only reached through `try_owner` (its owning OS
 // thread, excluded from remote users by the handshake) or `exclusive`
 // (serialized by the mutex and the handshake). RingWriter is Send.
 unsafe impl Sync for WriterCell {}
@@ -69,21 +71,15 @@ impl WriterCell {
         }
     }
 
-    /// Run `f` on the owner fast path. Gives `f` back when the caller is not
-    /// the owning OS thread or a remote user is pending; then use
-    /// [`WriterCell::exclusive`]. Must not be called re-entrantly from `f`.
-    #[inline]
-    pub(crate) fn with_owner<R, F: FnOnce(&mut RingWriter) -> R>(&self, f: F) -> Result<R, F> {
+    /// Enter the owner fast path. `None` when the caller is not the owning OS
+    /// thread or a remote user is pending; then use [`WriterCell::exclusive`].
+    /// The guard must not be held across another entry on the same cell.
+    #[inline(always)]
+    pub(crate) fn try_owner(&self) -> Option<OwnerGuard<'_>> {
         let me = thread_token();
         let owner = self.owner.load(Ordering::Relaxed);
-        if owner != me
-            && (owner != 0
-                || self
-                    .owner
-                    .compare_exchange(0, me, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err())
-        {
-            return Err(f);
+        if owner != me && (owner != 0 || !self.claim(me)) {
+            return None;
         }
         self.owner_busy.store(true, Ordering::Relaxed);
         shirusu_transport_win::asymmetric_fence_light();
@@ -91,15 +87,33 @@ impl WriterCell {
         // updates are visible before the owner touches the writer again.
         if self.remote.load(Ordering::Acquire) {
             self.owner_busy.store(false, Ordering::Release);
-            return Err(f);
+            return None;
         }
-        let _done = ClearOnDrop(&self.owner_busy);
-        // SAFETY: owner_busy is set and no remote user is active; a remote
-        // user arriving now waits for owner_busy to clear.
-        Ok(f(unsafe { &mut *self.writer.get() }))
+        Some(OwnerGuard {
+            cell: self,
+            _not_send: PhantomData,
+        })
+    }
+
+    #[cold]
+    fn claim(&self, me: usize) -> bool {
+        self.owner
+            .compare_exchange(0, me, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Run `f` on the owner fast path, or give it back (see `try_owner`).
+    #[cfg(test)]
+    pub(crate) fn with_owner<R, F: FnOnce(&mut RingWriter) -> R>(&self, f: F) -> Result<R, F> {
+        match self.try_owner() {
+            Some(mut guard) => Ok(f(&mut guard)),
+            None => Err(f),
+        }
     }
 
     /// Run `f` with exclusive access from any thread (management path).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn exclusive<R>(&self, f: impl FnOnce(&mut RingWriter) -> R) -> R {
         let _serialized = self.exclusive.lock().unwrap_or_else(|e| e.into_inner());
         self.remote.store(true, Ordering::Relaxed);
@@ -114,12 +128,44 @@ impl WriterCell {
     }
 
     /// Fast path when possible, otherwise exclusive.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut RingWriter) -> R) -> R {
-        match self.with_owner(f) {
-            Ok(r) => r,
-            Err(f) => self.exclusive(f),
+        match self.try_owner() {
+            Some(mut guard) => f(&mut guard),
+            None => self.exclusive(f),
         }
+    }
+}
+
+/// Owner access to the writer; clears `owner_busy` (Release) on drop. Not
+/// `Send`: the handshake is tied to the owning OS thread.
+pub(crate) struct OwnerGuard<'a> {
+    cell: &'a WriterCell,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Deref for OwnerGuard<'_> {
+    type Target = RingWriter;
+    #[inline(always)]
+    fn deref(&self) -> &RingWriter {
+        // SAFETY: owner_busy is set and no remote user is active; a remote
+        // user arriving now waits for owner_busy to clear.
+        unsafe { &*self.cell.writer.get() }
+    }
+}
+
+impl DerefMut for OwnerGuard<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut RingWriter {
+        // SAFETY: as in `deref`; the guard is the only owner access.
+        unsafe { &mut *self.cell.writer.get() }
+    }
+}
+
+impl Drop for OwnerGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.cell.owner_busy.store(false, Ordering::Release);
     }
 }
 

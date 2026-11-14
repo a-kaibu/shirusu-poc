@@ -70,9 +70,11 @@ pub struct ApiDef {
 
 impl ApiDef {
     /// ファイル内 Schema ID: 表の順に enter = 2n-1, leave = 2n。
+    #[inline]
     pub fn enter_schema_id(&self) -> u32 {
         (self.api_id - 1) * 2 + 1
     }
+    #[inline]
     pub fn leave_schema_id(&self) -> u32 {
         (self.api_id - 1) * 2 + 2
     }
@@ -424,6 +426,7 @@ pub fn is_iat_only_api(api_id: u32) -> bool {
 }
 
 /// The original never returns to the Detour (thread or process exit).
+#[inline]
 pub fn is_no_return_api(api_id: u32) -> bool {
     NO_RETURN_API_IDS.contains(&api_id)
 }
@@ -431,6 +434,7 @@ pub fn is_no_return_api(api_id: u32) -> bool {
 /// L15: 詳細調査モード専用の内部 API（Nt*）かどうか。詳細調査モードが
 /// 無効な場合、この API の呼び出しは記録しない（素通しにする）。
 /// Coverage の欠落にも数えない。
+#[inline]
 pub fn is_internal_api(api_id: u32) -> bool {
     (INTERNAL_API_ID_BASE..INTERNAL_API_ID_BASE + INTERNAL_API_COUNT as u32).contains(&api_id)
 }
@@ -487,6 +491,7 @@ pub const EXIT_THREAD_API_ID: u32 = {
     found
 };
 
+#[inline]
 pub fn api_by_id(api_id: u32) -> Option<&'static ApiDef> {
     API_BY_ID.get(api_id as usize).copied().flatten()
 }

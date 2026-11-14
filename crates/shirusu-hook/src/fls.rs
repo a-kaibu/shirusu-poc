@@ -30,22 +30,30 @@ static PENDING: std::sync::atomic::AtomicPtr<ExitNode> =
 /// Run exit handlers outside the native TLS callback. That callback holds the
 /// loader lock, so it must not allocate, free, or acquire runtime locks.
 /// Call from the recording management path or explicit shutdown.
+#[inline]
 pub fn drain_pending_exits() {
     #[cfg(windows)]
     {
         use std::sync::atomic::Ordering;
         // The ordinary recording path only reads the cache line. Avoid an
         // inter-thread read/modify/write when there are no detach notices.
-        if PENDING.load(Ordering::Acquire).is_null() {
-            return;
+        if !PENDING.load(Ordering::Acquire).is_null() {
+            drain_pending_exits_slow();
         }
-        let mut node = PENDING.swap(std::ptr::null_mut(), Ordering::Acquire);
-        while !node.is_null() {
-            // The atomic swap grants sole ownership of this detached list.
-            let owned = unsafe { Box::from_raw(node) };
-            node = owned.next;
-            notify_exit(owned.thread_id);
-        }
+    }
+}
+
+#[cfg(windows)]
+#[cold]
+#[inline(never)]
+fn drain_pending_exits_slow() {
+    use std::sync::atomic::Ordering;
+    let mut node = PENDING.swap(std::ptr::null_mut(), Ordering::Acquire);
+    while !node.is_null() {
+        // The atomic swap grants sole ownership of this detached list.
+        let owned = unsafe { Box::from_raw(node) };
+        node = owned.next;
+        notify_exit(owned.thread_id);
     }
 }
 

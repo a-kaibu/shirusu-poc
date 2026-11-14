@@ -28,7 +28,7 @@ use shirusu_transport::ring::{
 use shirusu_transport::slot::{SlotHandle, SlotPool};
 use shirusu_transport::RingConfig;
 use shirusu_transport_win::{EventClock, EventObject, HandleValue, RingNotify, SharedMapping};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -164,9 +164,35 @@ static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     /// OS スレッドごとに「直前に使った書き手」を 1 件だけキャッシュする。
-    /// (Agent ID, 論理スレッド ID, 状態)。借用は取得・格納の瞬間だけ。
-    static TLS_STATE: RefCell<Option<(u64, u64, Arc<ThreadSlotState>)>> =
-        const { RefCell::new(None) };
+    /// 借用は取得・格納の瞬間と、キャッシュ経由の 1 回の記録の間だけ。
+    static TLS_STATE: RefCell<Option<CachedState>> = const { RefCell::new(None) };
+}
+
+/// The thread's last-used writer: (Agent ID, logical thread ID, state), plus
+/// this thread's [`PublishGuard`] depth counter, so the record fast path
+/// reaches both through one thread-local access in this crate.
+struct CachedState {
+    agent: u64,
+    thread_id: u64,
+    state: Arc<ThreadSlotState>,
+    publish_depth: *const Cell<u32>,
+}
+
+/// The publish section on a cached depth counter; same counting as
+/// [`PublishGuard`].
+struct PublishSection<'a>(&'a Cell<u32>);
+impl<'a> PublishSection<'a> {
+    #[inline(always)]
+    fn enter(depth: &'a Cell<u32>) -> Self {
+        depth.set(depth.get() + 1);
+        Self(depth)
+    }
+}
+impl Drop for PublishSection<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 /// Capture must not re-enter the Agent after its thread-local writer cache has
@@ -295,12 +321,12 @@ impl Agent {
             .try_with(|c| {
                 let c = c.borrow();
                 match &*c {
-                    Some((agent, tid, state))
-                        if *agent == self.id
-                            && *tid == thread_id
-                            && !state.retired.load(Ordering::Acquire) =>
+                    Some(c)
+                        if c.agent == self.id
+                            && c.thread_id == thread_id
+                            && !c.state.retired.load(Ordering::Acquire) =>
                     {
-                        Some(Arc::clone(state))
+                        Some(Arc::clone(&c.state))
                     }
                     _ => None,
                 }
@@ -312,7 +338,12 @@ impl Agent {
         let state = self.state_for_slow(thread_id)?;
         TLS_STATE
             .try_with(|c| {
-                *c.borrow_mut() = Some((self.id, thread_id, Arc::clone(&state)));
+                *c.borrow_mut() = Some(CachedState {
+                    agent: self.id,
+                    thread_id,
+                    state: Arc::clone(&state),
+                    publish_depth: PublishGuard::depth_cell(),
+                });
             })
             .ok()?;
         Some(state)
@@ -463,27 +494,34 @@ impl Agent {
     /// 通常経路は全体ロックを取らない (R1): 書き手の取得は TLS キャッシュ
     /// または登録表の短い読みロックで済み、書き込み中はその Ring の書き手
     /// Mutex だけを保持する。満杯 Ring の待機が他スレッドを止めることはない。
+    #[inline]
     pub fn record(&self, thread_id: u64, origin: CallOrigin, input: EventInput) -> RecordResult {
-        if !should_record(origin) {
+        if origin == CallOrigin::AgentInternal {
             return RecordResult::SkippedAgentInternal;
-        }
-        if !self.host_monitor.recording_enabled() {
-            return RecordResult::PassthroughHostStopped;
         }
         // Fast path: write through the TLS-cached state without cloning its
         // Arc (no shared reference-count traffic per event). Only nested
-        // records could reach TLS_STATE meanwhile, and PublishGuard rejects
-        // those before they touch the cache.
+        // records could reach TLS_STATE meanwhile, and the publish depth
+        // rejects those before they write.
         let cached = TLS_STATE
             .try_with(|c| {
                 let c = c.try_borrow().ok()?;
                 match &*c {
-                    Some((agent, tid, state))
-                        if *agent == self.id
-                            && *tid == thread_id
-                            && !state.retired.load(Ordering::Acquire) =>
+                    Some(c)
+                        if c.agent == self.id
+                            && c.thread_id == thread_id
+                            && !c.state.retired.load(Ordering::Acquire) =>
                     {
-                        Some(self.write_to(state, input.clone()))
+                        // SAFETY: the cache is this thread's, and so is the
+                        // counter it stored (valid for the thread's lifetime).
+                        let depth = unsafe { &*c.publish_depth };
+                        Some(if depth.get() > 0 {
+                            RecordResult::SkippedAgentInternal
+                        } else if !self.host_monitor.recording_enabled() {
+                            RecordResult::PassthroughHostStopped
+                        } else {
+                            self.write_to(&c.state, depth, input.clone())
+                        })
                     }
                     _ => None,
                 }
@@ -493,40 +531,75 @@ impl Agent {
         if let Some(result) = cached {
             return result;
         }
+        self.record_uncached(thread_id, input)
+    }
+
+    /// First record of a thread, or one after its cached state retired.
+    #[cold]
+    #[inline(never)]
+    fn record_uncached(&self, thread_id: u64, input: EventInput) -> RecordResult {
+        if !should_record(CallOrigin::Application) {
+            return RecordResult::SkippedAgentInternal;
+        }
+        if !self.host_monitor.recording_enabled() {
+            return RecordResult::PassthroughHostStopped;
+        }
         let Some(state) = self.state_for(thread_id) else {
             return RecordResult::NoSlot;
         };
-        self.write_to(&state, input)
+        // SAFETY: this thread's counter, used on this thread only.
+        let depth = unsafe { &*PublishGuard::depth_cell() };
+        self.write_to(&state, depth, input)
     }
 
-    #[inline]
-    fn write_to(&self, state: &ThreadSlotState, input: EventInput) -> RecordResult {
-        let outcome = state.writer.with(|writer| {
-            if writer.is_detached() {
-                return None;
-            }
-            let _guard = PublishGuard::enter(); // 公開区間だけのガード
-                                                // L11: 書き込みが確定する直前に全体順序を採番する。
-                                                // 採番は観測点（この record 呼び出し）の順序を反映する。
-                                                // 欠落したイベントの分は欠番になる（Sequence の欠番と同じ扱い）。
-            let mut input = input;
-            if self.order_global {
-                input.global_order = self.next_global_order.fetch_add(1, Ordering::Relaxed);
-            }
-            Some(if input.capture_state == CaptureState::Captured {
-                writer.write_captured(
-                    input.kind,
-                    input.api_id,
-                    input.schema_id,
-                    input.call_id,
-                    input.parent_call_id,
-                    input.global_order,
-                    input.payload,
-                )
-            } else {
-                writer.write(input)
-            })
-        });
+    /// One publication with the writer held.
+    #[inline(always)]
+    fn write_locked(
+        &self,
+        writer: &mut RingWriter,
+        depth: &Cell<u32>,
+        input: EventInput,
+    ) -> Option<WriteOutcome> {
+        if writer.is_detached() {
+            return None;
+        }
+        let _guard = PublishSection::enter(depth); // 公開区間だけのガード
+                                                   // L11: 書き込みが確定する直前に全体順序を採番する。
+                                                   // 採番は観測点（この record 呼び出し）の順序を反映する。
+                                                   // 欠落したイベントの分は欠番になる（Sequence の欠番と同じ扱い）。
+        let mut input = input;
+        if self.order_global {
+            input.global_order = self.next_global_order.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(if input.capture_state == CaptureState::Captured {
+            writer.write_captured(
+                input.kind,
+                input.api_id,
+                input.schema_id,
+                input.call_id,
+                input.parent_call_id,
+                input.global_order,
+                input.payload,
+            )
+        } else {
+            writer.write(input)
+        })
+    }
+
+    #[inline(always)]
+    fn write_to(
+        &self,
+        state: &ThreadSlotState,
+        depth: &Cell<u32>,
+        input: EventInput,
+    ) -> RecordResult {
+        // The owner fast path inlines the write; the exclusive path is cold.
+        let outcome = match state.writer.try_owner() {
+            Some(mut writer) => self.write_locked(&mut writer, depth, input),
+            None => state
+                .writer
+                .exclusive(|writer| self.write_locked(writer, depth, input)),
+        };
         let Some(outcome) = outcome else {
             self.pool.note_call_after_detach(&state.handle);
             return RecordResult::AfterDetach;
@@ -542,6 +615,7 @@ impl Agent {
         RecordResult::Written(outcome)
     }
 
+    #[inline]
     pub fn record_enter(
         &self,
         thread_id: u64,
@@ -566,6 +640,7 @@ impl Agent {
             },
         )
     }
+    #[inline]
     pub fn record_leave(
         &self,
         thread_id: u64,
@@ -823,8 +898,8 @@ mod tests {
             black_box(TLS_STATE.try_with(|c| {
                 let c = c.try_borrow().ok()?;
                 match &*c {
-                    Some((agent, t, s)) if *agent == a.id && *t == tid => {
-                        Some(s.retired.load(Ordering::Acquire))
+                    Some(c) if c.agent == a.id && c.thread_id == tid => {
+                        Some(c.state.retired.load(Ordering::Acquire))
                     }
                     _ => None,
                 }
@@ -835,8 +910,9 @@ mod tests {
             black_box(state.writer.with(|w| w.is_detached()));
         });
         time("agent_part_publish_guard", &mut |_| {
-            black_box(should_record(CallOrigin::Application));
-            let _g = black_box(PublishGuard::enter());
+            let depth = unsafe { &*PublishGuard::depth_cell() };
+            black_box(depth.get() > 0);
+            let _g = black_box(PublishSection::enter(depth));
         });
         time("agent_part_write_captured", &mut |i| {
             black_box(state.writer.with(|w| {
@@ -1102,6 +1178,29 @@ mod tests {
             a.record_enter(1, 1, 1, 1, 0, b"x"),
             RecordResult::SkippedAgentInternal
         );
+    }
+    #[test]
+    fn record_inside_publish_guard_is_skipped_on_the_cached_path() {
+        let a = agent(2);
+        assert!(matches!(
+            a.record_enter(1, 1, 1, 1, 0, b"x"),
+            RecordResult::Written(_)
+        ));
+        {
+            let _g = PublishGuard::enter();
+            assert_eq!(
+                a.record_enter(1, 1, 1, 2, 0, b"x"),
+                RecordResult::SkippedAgentInternal
+            );
+        }
+        assert!(
+            !PublishGuard::is_active(),
+            "the record left the depth as it was"
+        );
+        assert!(matches!(
+            a.record_enter(1, 1, 1, 3, 0, b"x"),
+            RecordResult::Written(_)
+        ));
     }
     #[test]
     fn dead_host_monitor_short_circuits_before_slot_use() {

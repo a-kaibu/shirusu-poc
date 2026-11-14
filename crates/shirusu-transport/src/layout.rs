@@ -76,12 +76,15 @@ impl RingConfig {
 }
 
 /// 純粋な Cursor 演算（Kani / PBT の対象）。
+#[inline]
 pub fn occupancy(write_cursor: u64, read_cursor: u64) -> Option<u64> {
     write_cursor.checked_sub(read_cursor)
 }
+#[inline]
 pub fn descriptor_free(write_cursor: u64, read_cursor: u64, capacity: u64) -> Option<u64> {
     capacity.checked_sub(occupancy(write_cursor, read_cursor)?)
 }
+#[inline]
 pub fn slot_index(cursor: u64, capacity: u64) -> u64 {
     if capacity == 0 {
         0
@@ -93,9 +96,11 @@ pub fn slot_index(cursor: u64, capacity: u64) -> u64 {
         cursor % capacity
     }
 }
+#[inline]
 pub fn payload_index(position: u64, capacity: u64) -> u64 {
     slot_index(position, capacity)
 }
+#[inline]
 pub fn usage_percent(used: u64, capacity: u64) -> u64 {
     used.saturating_mul(100)
         .checked_div(capacity)
@@ -103,6 +108,7 @@ pub fn usage_percent(used: u64, capacity: u64) -> u64 {
 }
 
 /// 書き手が空き待ち中かどうか（Host が space_available の通知要否を判断する）。
+#[inline]
 pub fn writer_waiting(base: *const u8) -> bool {
     load(base, OFF_WRITER_WAITING, Ordering::Acquire) != 0
 }
@@ -120,18 +126,22 @@ pub(crate) unsafe fn atomic_at<'a>(base: *const u8, offset: usize) -> &'a Atomic
 /// (Miri 検出済み)。実ベースは File Mapping か 64 バイト整列の確保であり、
 /// テストで画像を自前確保する場合は u64 バッファ等で整列を保証すること。
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
+#[inline]
 pub fn load(base: *const u8, offset: usize, order: Ordering) -> u64 {
     unsafe { atomic_at(base, offset) }.load(order)
 }
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
+#[inline]
 pub fn store(base: *mut u8, offset: usize, v: u64, order: Ordering) {
     unsafe { atomic_at(base, offset) }.store(v, order)
 }
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
+#[inline]
 pub fn swap(base: *mut u8, offset: usize, v: u64, order: Ordering) -> u64 {
     unsafe { atomic_at(base, offset) }.swap(v, order)
 }
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
+#[inline]
 pub fn fetch_add(base: *mut u8, offset: usize, v: u64) -> u64 {
     unsafe { atomic_at(base, offset) }.fetch_add(v, Ordering::Relaxed)
 }

@@ -369,19 +369,24 @@ impl RingWriter {
     pub fn mark_detached(&mut self) {
         self.detached = true;
     }
+    #[inline]
     pub fn is_detached(&self) -> bool {
         self.detached
     }
+    #[inline]
     fn write_cursor(&self) -> u64 {
         load(self.base, OFF_WRITE_CURSOR, Ordering::Relaxed)
     }
+    #[inline]
     fn read_cursor(&self) -> u64 {
         load(self.base, OFF_READ_CURSOR, Ordering::Acquire)
     }
+    #[inline]
     fn payload_read_position(&self) -> u64 {
         load(self.base, OFF_PAYLOAD_READ_POSITION, Ordering::Acquire)
     }
     /// Reload both Host read positions (Acquire) into the cache.
+    #[inline]
     fn refresh_read_positions(&mut self) {
         self.cached_read_cursor = self.read_cursor();
         self.cached_payload_read_position = self.payload_read_position();
@@ -389,6 +394,7 @@ impl RingWriter {
     /// Capacity check. Loads the Host read positions once per write; the
     /// publication's notify decision reuses them instead of loading again.
     /// A regressed (corrupted) read cursor is seen here and drops the event.
+    #[inline]
     fn fits_cached(&mut self, need_desc: u64, payload_len: u64) -> bool {
         let fits = |w: &Self| {
             let wc = w.write_cursor();

@@ -37,7 +37,7 @@ use shirusu_transport_win::{ProcessNotify, RingNotify};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 thread_local! {
@@ -304,7 +304,7 @@ impl FlightCallGuard {
         }
     }
 
-    pub fn runtime(&self) -> &Arc<HookRuntime> {
+    pub fn runtime(&self) -> &HookRuntime {
         self.flight.runtime()
     }
 
@@ -491,7 +491,7 @@ impl Drop for ComCallGuard {
 /// 終了手順はこの数が 0 になるまで IAT を復元しないため、復元は
 /// 進行中の呼び出しと競合しない。Drop で自動的に退出する。
 pub struct DetourFlight {
-    rt: Arc<HookRuntime>,
+    rt: RuntimeRef,
 }
 
 impl DetourFlight {
@@ -504,39 +504,100 @@ impl DetourFlight {
     /// 次が保証される: begin が Some を返した Detour は、待つ側から
     /// 必ず数えられる (か、無効化を観測して自分で退出する)。
     pub fn begin(rt: &Arc<HookRuntime>) -> Option<Self> {
-        if !rt.recording_enabled.load(Ordering::SeqCst) {
-            return None;
-        }
-        rt.in_flight.fetch_add(1, Ordering::SeqCst);
-        if !rt.recording_enabled.load(Ordering::SeqCst) {
-            rt.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(Self { rt: Arc::clone(rt) })
+        Self::begin_owned(Arc::clone(rt))
     }
 
     /// [`DetourFlight::begin`] that takes over the caller's reference instead
     /// of cloning it (one fewer shared reference-count update per call).
     pub fn begin_owned(rt: Arc<HookRuntime>) -> Option<Self> {
+        Self::begin_ref(RuntimeRef::Shared(rt))
+    }
+
+    /// Enter with a reference from [`RuntimeSlot::for_detour_ref`]. A hazard
+    /// reference is already counted as in flight (it was published before
+    /// this gate check, see [`crate::hazard`]); a shared one adds to the
+    /// counter and re-checks the gate.
+    #[inline]
+    pub fn begin_ref(rt: RuntimeRef) -> Option<Self> {
         if !rt.recording_enabled.load(Ordering::SeqCst) {
             return None;
         }
-        rt.in_flight.fetch_add(1, Ordering::SeqCst);
-        if !rt.recording_enabled.load(Ordering::SeqCst) {
-            rt.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return None;
+        if let RuntimeRef::Shared(shared) = &rt {
+            shared.in_flight.fetch_add(1, Ordering::SeqCst);
+            if !shared.recording_enabled.load(Ordering::SeqCst) {
+                shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return None;
+            }
         }
         Some(Self { rt })
     }
 
-    pub fn runtime(&self) -> &Arc<HookRuntime> {
+    #[inline]
+    pub fn runtime(&self) -> &HookRuntime {
         &self.rt
     }
 }
 
 impl Drop for DetourFlight {
+    #[inline]
     fn drop(&mut self) {
-        self.rt.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if let RuntimeRef::Shared(shared) = &self.rt {
+            shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        // A hazard reference withdraws its hazard when `rt` drops.
+    }
+}
+
+/// A Detour's reference to its runtime: a shared `Arc`, or a pointer kept
+/// valid by this thread's published hazard ([`crate::hazard`]), which costs
+/// no shared read-modify-write. Not `Send`: a hazard belongs to its thread.
+pub enum RuntimeRef {
+    Shared(Arc<HookRuntime>),
+    Hazard {
+        rt: std::ptr::NonNull<HookRuntime>,
+        slot: u32,
+        /// false when an outer Detour on this thread already publishes the
+        /// same runtime; the outer one withdraws it.
+        owned: bool,
+    },
+}
+
+impl RuntimeRef {
+    /// A shared reference to the same runtime.
+    pub fn to_arc(&self) -> Arc<HookRuntime> {
+        match self {
+            Self::Shared(rt) => Arc::clone(rt),
+            // SAFETY: the hazard keeps the allocation (and a strong count
+            // held by the slot) alive; this adds one strong reference.
+            Self::Hazard { rt, .. } => unsafe {
+                Arc::increment_strong_count(rt.as_ptr());
+                Arc::from_raw(rt.as_ptr())
+            },
+        }
+    }
+}
+
+impl std::ops::Deref for RuntimeRef {
+    type Target = HookRuntime;
+    #[inline]
+    fn deref(&self) -> &HookRuntime {
+        match self {
+            Self::Shared(rt) => rt,
+            // SAFETY: valid while the hazard is published (see `to_arc`).
+            Self::Hazard { rt, .. } => unsafe { rt.as_ref() },
+        }
+    }
+}
+
+impl Drop for RuntimeRef {
+    #[inline]
+    fn drop(&mut self) {
+        if let Self::Hazard {
+            slot, owned: true, ..
+        } = self
+        {
+            crate::hazard::clear(*slot);
+        }
     }
 }
 
@@ -566,11 +627,40 @@ static NEXT_RUNTIME_REVISION: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static RUNTIME_CACHE_READY: Cell<bool> = const { Cell::new(false) };
     static RUNTIME_CACHE_BUSY: Cell<bool> = const { Cell::new(false) };
-    static DETOUR_RUNTIME: RefCell<(u64, Weak<HookRuntime>)> =
-        const { RefCell::new((0, Weak::new())) };
+    static DETOUR_RUNTIME: RefCell<RuntimeCache> = const { RefCell::new(RuntimeCache::EMPTY) };
 }
 
-// Rust registers a destructor on first access to the Weak-bearing TLS key.
+/// This thread's last runtime: the slot revision it was read under, an
+/// uncounted pointer (dereferenced only behind a published hazard after the
+/// revision re-check), and the thread's hazard slot.
+struct RuntimeCache {
+    revision: u64,
+    runtime: *const HookRuntime,
+    hazard: u32,
+}
+/// No hazard slot claimed yet.
+const NO_HAZARD: u32 = u32::MAX;
+/// The table was full: this thread keeps the shared path.
+const HAZARD_EXHAUSTED: u32 = u32::MAX - 1;
+impl RuntimeCache {
+    const EMPTY: Self = Self {
+        revision: 0,
+        runtime: std::ptr::null(),
+        hazard: NO_HAZARD,
+    };
+    fn hazard_slot(&self) -> Option<u32> {
+        (self.hazard < HAZARD_EXHAUSTED).then_some(self.hazard)
+    }
+}
+impl Drop for RuntimeCache {
+    fn drop(&mut self) {
+        if let Some(slot) = self.hazard_slot() {
+            crate::hazard::release(slot);
+        }
+    }
+}
+
+// Rust registers a destructor on first access to the cache's TLS key.
 // That registration can allocate and enter HeapAlloc's detour before the
 // RefCell borrow exists. Guard the *TLS access*, not just its contents.
 struct RuntimeCacheAccess;
@@ -595,6 +685,9 @@ pub struct RuntimeSlot {
 struct RuntimeState {
     active: Option<Arc<HookRuntime>>,
     retired: Option<Arc<HookRuntime>>,
+    /// Replaced runtimes a thread's hazard may still publish; freed once no
+    /// hazard does ([`RuntimeSlot::reclaim`]).
+    graveyard: Vec<Arc<HookRuntime>>,
 }
 
 impl RuntimeSlot {
@@ -604,6 +697,7 @@ impl RuntimeSlot {
             current: RwLock::new(RuntimeState {
                 active: None,
                 retired: None,
+                graveyard: Vec::new(),
             }),
         }
     }
@@ -653,10 +747,19 @@ impl RuntimeSlot {
 
     /// Late detours retain a disabled runtime even after IAT restoration.
     pub fn for_detour(&self) -> Option<Arc<HookRuntime>> {
-        // The weak cache never keeps a session's Agent/mappings alive. Upgrade
-        // acquires ownership before use; there are no borrowed atomic pointers.
-        // An entry concurrent with replacement may still take the old runtime,
-        // whose recording gate is disabled before unregister publishes retirement.
+        self.for_detour_ref().map(|rt| rt.to_arc())
+    }
+
+    /// [`RuntimeSlot::for_detour`] for the recording path: on a warm cache
+    /// the reference is a published hazard, with no shared reference-count
+    /// update. An entry concurrent with replacement may still take the old
+    /// runtime, whose recording gate is disabled before unregister publishes
+    /// retirement.
+    #[inline]
+    pub fn for_detour_ref(&self) -> Option<RuntimeRef> {
+        // The cache never keeps a session's Agent/mappings alive: its pointer
+        // is uncounted and used only behind a hazard after the revision
+        // re-check; a replaced runtime is freed once no hazard publishes it.
         if let Some(_access) = (ReentrancyGuard::is_active()
             && RUNTIME_CACHE_READY.try_with(Cell::get).unwrap_or(false))
         .then(RuntimeCacheAccess::enter)
@@ -665,24 +768,82 @@ impl RuntimeSlot {
             if let Ok(Some(rt)) = DETOUR_RUNTIME.try_with(|cache| {
                 let mut cache = cache.try_borrow_mut().ok()?;
                 let revision = self.revision.load(Ordering::Acquire);
-                if revision != 0 && cache.0 == revision {
-                    if let Some(rt) = cache.1.upgrade() {
+                if revision != 0 && cache.revision == revision {
+                    if let Some(rt) = Self::cached_hazard(&cache, || {
+                        self.revision.load(Ordering::Acquire) == revision
+                    }) {
                         return Some(rt);
                     }
                 }
-                let state = self.current.read().unwrap();
-                let rt = state.active.as_ref().or(state.retired.as_ref())?.clone();
-                // Load under the lock: the revision must describe this snapshot.
-                let revision = self.revision.load(Ordering::Relaxed);
-                drop(state); // replacing a Weak may deallocate and reenter a hook
-                *cache = (revision, Arc::downgrade(&rt));
-                Some(rt)
+                self.fill_cache(&mut cache)
             }) {
                 return Some(rt);
             }
         }
         let state = self.current.read().unwrap();
-        state.active.as_ref().or(state.retired.as_ref()).cloned()
+        state
+            .active
+            .as_ref()
+            .or(state.retired.as_ref())
+            .cloned()
+            .map(RuntimeRef::Shared)
+    }
+
+    #[inline(always)]
+    fn cached_hazard(
+        cache: &RuntimeCache,
+        still_current: impl FnOnce() -> bool,
+    ) -> Option<RuntimeRef> {
+        let slot = cache.hazard_slot()?;
+        let rt = std::ptr::NonNull::new(cache.runtime as *mut HookRuntime)?;
+        let published = crate::hazard::published(slot);
+        if std::ptr::eq(published, rt.as_ptr()) {
+            // An outer Detour of this thread publishes it and outlives us.
+            return Some(RuntimeRef::Hazard {
+                rt,
+                slot,
+                owned: false,
+            });
+        }
+        if !published.is_null() {
+            return None; // the outer Detour uses another runtime
+        }
+        crate::hazard::publish(slot, rt.as_ptr());
+        if !still_current() {
+            crate::hazard::clear(slot);
+            return None;
+        }
+        Some(RuntimeRef::Hazard {
+            rt,
+            slot,
+            owned: true,
+        })
+    }
+
+    #[cold]
+    fn fill_cache(&self, cache: &mut RuntimeCache) -> Option<RuntimeRef> {
+        let state = self.current.read().unwrap();
+        let rt = state.active.as_ref().or(state.retired.as_ref())?.clone();
+        // Load under the lock: the revision must describe this snapshot.
+        let revision = self.revision.load(Ordering::Relaxed);
+        drop(state);
+        if cache.hazard == NO_HAZARD {
+            cache.hazard = crate::hazard::claim().unwrap_or(HAZARD_EXHAUSTED);
+        }
+        cache.revision = revision;
+        cache.runtime = Arc::as_ptr(&rt);
+        Some(RuntimeRef::Shared(rt))
+    }
+
+    /// Free graveyard runtimes no hazard publishes. Runs outside the lock:
+    /// dropping a runtime can call hooked HeapFree.
+    fn reclaim(&self, mut graveyard: Vec<Arc<HookRuntime>>) {
+        // Each was replaced under an older revision; entering threads
+        // re-check the revision after publishing (see `crate::hazard`).
+        graveyard.retain(|rt| crate::hazard::count(Arc::as_ptr(rt)) > 0);
+        if !graveyard.is_empty() {
+            self.current.write().unwrap().graveyard.extend(graveyard);
+        }
     }
 
     /// 登録解除は「自分が登録したランタイム」に対してだけ行う
@@ -693,11 +854,31 @@ impl RuntimeSlot {
             rt.shutdown_recording();
             let retired = cur.active.take();
             let previous = std::mem::replace(&mut cur.retired, retired);
+            let mut graveyard = std::mem::take(&mut cur.graveyard);
+            graveyard.extend(previous);
             drop(cur); // dropping an old runtime can itself call hooked HeapFree
-            drop(previous);
+            self.reclaim(graveyard);
             true
         } else {
             false
+        }
+    }
+}
+
+impl Drop for RuntimeSlot {
+    fn drop(&mut self) {
+        let state = self.current.get_mut().unwrap_or_else(|e| e.into_inner());
+        let runtimes = state
+            .active
+            .take()
+            .into_iter()
+            .chain(state.retired.take())
+            .chain(std::mem::take(&mut state.graveyard));
+        for rt in runtimes {
+            if crate::hazard::count(Arc::as_ptr(&rt)) > 0 {
+                // A thread still publishes it: leak rather than free under it.
+                std::mem::forget(rt);
+            }
         }
     }
 }
@@ -986,8 +1167,11 @@ impl HookRuntime {
     }
 
     /// 現在記録区間に入っている Detour の数。
+    /// Detours in the recording section: shared references counted at entry
+    /// plus threads whose hazard publishes this runtime. Call it after
+    /// disabling recording to get an upper bound that only decreases.
     pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::SeqCst)
+        self.in_flight.load(Ordering::SeqCst) + crate::hazard::count(self)
     }
 
     /// 終了手順の開始 (レビュー #4 の #9): 新規の記録を無効化する。
@@ -1054,6 +1238,7 @@ impl HookRuntime {
     /// スレッド初回記録時の管理パス： Slot を取得し、その Slot の
     /// space_available 通知を Ring へ結線する。2 回目以降は何もしない
     /// （記録の通常経路はここを通らない）。
+    #[inline]
     pub fn ensure_thread(&self, thread_id: u64) {
         if !native_tls_available() {
             return;
@@ -1067,6 +1252,12 @@ impl HookRuntime {
         {
             return;
         }
+        self.register_thread(thread_id, key);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn register_thread(&self, thread_id: u64, key: (u64, u64, u64)) {
         {
             let seen = self.seen_threads.lock().unwrap();
             if seen.contains(&thread_id) {
@@ -1884,12 +2075,12 @@ mod tests {
                 true
             })
             .unwrap();
-            assert_eq!(DETOUR_RUNTIME.with(|c| c.borrow().0), 0);
+            assert_eq!(DETOUR_RUNTIME.with(|c| c.borrow().revision), 0);
             drop(guard);
             let _guard = ReentrancyGuard::try_enter().unwrap();
             assert!(RUNTIME_CACHE_READY.with(Cell::get));
             assert!(Arc::ptr_eq(&slot.for_detour().unwrap(), &rt));
-            assert_ne!(DETOUR_RUNTIME.with(|c| c.borrow().0), 0);
+            assert_ne!(DETOUR_RUNTIME.with(|c| c.borrow().revision), 0);
         })
         .join()
         .unwrap();
@@ -1934,7 +2125,6 @@ mod tests {
         assert!(weak.upgrade().is_none());
         drop(new);
         drop(slot);
-        assert!(DETOUR_RUNTIME.with(|c| c.borrow().1.upgrade().is_none()));
     }
 
     #[test]
@@ -1966,6 +2156,129 @@ mod tests {
         assert!(slot.register(new).is_ok());
         barrier.wait();
         reader.join().unwrap();
+    }
+
+    /// A warm cache takes the hazard path: no shared counter, still counted.
+    fn warm_hazard(slot: &RuntimeSlot) -> RuntimeRef {
+        let first = slot.for_detour_ref().unwrap();
+        assert!(matches!(first, RuntimeRef::Shared(_)), "cold cache fills");
+        drop(first);
+        let warm = slot.for_detour_ref().unwrap();
+        assert!(matches!(warm, RuntimeRef::Hazard { owned: true, .. }));
+        warm
+    }
+
+    #[test]
+    fn hazard_flight_is_counted_until_it_leaves() {
+        std::thread::spawn(|| {
+            let _guard = ReentrancyGuard::try_enter().unwrap();
+            let slot = RuntimeSlot::new();
+            let (_, rt) = runtime();
+            let rt = Arc::new(rt);
+            assert!(slot.register(rt.clone()).is_ok());
+            let flight = DetourFlight::begin_ref(warm_hazard(&slot)).unwrap();
+            assert_eq!(rt.in_flight.load(Ordering::SeqCst), 0, "no shared counter");
+            assert_eq!(rt.in_flight(), 1);
+            {
+                // A nested Detour of the same thread shares the outer hazard.
+                let nested = slot.for_detour_ref().unwrap();
+                assert!(matches!(nested, RuntimeRef::Hazard { owned: false, .. }));
+                let inner = DetourFlight::begin_ref(nested).unwrap();
+                assert_eq!(rt.in_flight(), 1);
+                drop(inner);
+                assert_eq!(rt.in_flight(), 1, "the outer hazard stays published");
+            }
+            assert_eq!(rt.shutdown_recording(), 1);
+            assert!(!rt.wait_in_flight_drained(Duration::from_millis(5)));
+            drop(flight);
+            assert_eq!(rt.in_flight(), 0);
+            assert!(DetourFlight::begin_ref(slot.for_detour_ref().unwrap()).is_none());
+            assert_eq!(
+                rt.in_flight(),
+                0,
+                "a refused entry leaves nothing published"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn replaced_runtime_is_freed_only_after_its_hazard_clears() {
+        let slot = Arc::new(RuntimeSlot::new());
+        let (_, old) = runtime();
+        let old = Arc::new(old);
+        let weak = Arc::downgrade(&old);
+        assert!(slot.register(old.clone()).is_ok());
+        let (entered, release) = (
+            Arc::new(std::sync::Barrier::new(2)),
+            Arc::new(std::sync::Barrier::new(2)),
+        );
+        let holder = {
+            let (slot, entered, release) = (slot.clone(), entered.clone(), release.clone());
+            std::thread::spawn(move || {
+                let _guard = ReentrancyGuard::try_enter().unwrap();
+                let held = warm_hazard(&slot);
+                entered.wait();
+                release.wait();
+                // Still the old runtime, still readable.
+                assert!(!held.recording_active());
+                drop(held);
+            })
+        };
+        entered.wait();
+        assert!(slot.unregister(&old));
+        drop(old);
+        let (_, mid) = runtime();
+        let mid = Arc::new(mid);
+        assert!(slot.register(mid.clone()).is_ok());
+        assert!(slot.unregister(&mid)); // retires mid; old goes to the graveyard
+        assert!(weak.upgrade().is_some(), "a published hazard keeps it");
+        release.wait();
+        holder.join().unwrap();
+        let (_, last) = runtime();
+        let last = Arc::new(last);
+        assert!(slot.register(last.clone()).is_ok());
+        assert!(slot.unregister(&last)); // the next reclaim frees it
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn shutdown_never_misses_a_hazard_flight() {
+        let slot = Arc::new(RuntimeSlot::new());
+        let (_, rt) = runtime();
+        let rt = Arc::new(rt);
+        assert!(slot.register(rt.clone()).is_ok());
+        let drained = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let (slot, drained) = (slot.clone(), drained.clone());
+                std::thread::spawn(move || {
+                    let _guard = ReentrancyGuard::try_enter().unwrap();
+                    let mut entered = 0u32;
+                    loop {
+                        let Some(rt) = slot.for_detour_ref() else {
+                            break;
+                        };
+                        let Some(flight) = DetourFlight::begin_ref(rt) else {
+                            break;
+                        };
+                        assert!(!drained.load(Ordering::SeqCst), "entered after drain");
+                        std::hint::spin_loop();
+                        assert!(!drained.load(Ordering::SeqCst), "in flight after drain");
+                        drop(flight);
+                        entered += 1;
+                    }
+                    entered
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(20));
+        rt.shutdown_recording();
+        assert!(rt.wait_in_flight_drained(Duration::from_secs(5)));
+        drained.store(true, Ordering::SeqCst);
+        let entered: u32 = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert!(entered > 0);
     }
 
     #[test]

@@ -21,15 +21,26 @@ thread_local! {
 /// 公開区間だけ張る再入ガード。Drop で必ず外れる。
 pub struct PublishGuard;
 impl PublishGuard {
+    #[inline]
     pub fn enter() -> Self {
         PUBLISH_DEPTH.with(|d| d.set(d.get() + 1));
         Self
     }
+    #[inline]
     pub fn is_active() -> bool {
         PUBLISH_DEPTH.with(|d| d.get() > 0)
     }
+    /// This thread's publish depth counter, for a caller that caches it in its
+    /// own thread-local state (an access to this crate's thread-local from
+    /// another crate is a call). The counter has no destructor, so the pointer
+    /// stays valid for the calling thread's lifetime; use it only on that thread.
+    #[inline]
+    pub fn depth_cell() -> *const Cell<u32> {
+        PUBLISH_DEPTH.with(|d| d as *const Cell<u32>)
+    }
 }
 impl Drop for PublishGuard {
+    #[inline]
     fn drop(&mut self) {
         PUBLISH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
@@ -37,6 +48,7 @@ impl Drop for PublishGuard {
 
 /// 記録すべき呼出か。公開区間の中での Agent 由来呼出は記録しないが、
 /// ガードを外した後（= 元の API 実行中）のアプリ由来入れ子は記録する。
+#[inline]
 pub fn should_record(origin: CallOrigin) -> bool {
     match origin {
         CallOrigin::AgentInternal => false,
@@ -69,6 +81,7 @@ impl HostMonitor {
     pub fn always_alive() -> Self {
         Self::new(|| true)
     }
+    #[inline]
     pub fn recording_enabled(&self) -> bool {
         !self.recording_disabled.load(Ordering::Relaxed)
     }

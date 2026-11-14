@@ -33,6 +33,7 @@ mod callsite;
 pub mod capture;
 pub mod com;
 pub mod fls;
+mod hazard;
 pub mod inline;
 #[cfg(windows)]
 pub mod last_error;
