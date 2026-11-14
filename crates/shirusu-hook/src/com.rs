@@ -632,10 +632,23 @@ pub enum QueryInterfaceOutcome {
     Failed,
 }
 
+/// Retired (Release(0) or unloaded) records kept before they are dropped.
+pub const MAX_RETIRED_COM_RECORDS: usize = 4096;
+
+fn group_key(group: &Arc<()>) -> usize {
+    Arc::as_ptr(group) as usize
+}
+
 /// 追跡対象インターフェイスの登録表（セッション単位。HookRuntime が持つ）。
 #[derive(Debug, Default)]
 pub struct ComTracker {
     objects: HashMap<u64, ComObject>,
+    /// Records per QI-equivalence group (keyed by the group allocation), so
+    /// confirming an identity touches one group, not the whole table
+    /// (review 2026-11-14 P2-6: QI(IUnknown) scanned every record).
+    groups: HashMap<usize, Vec<u64>>,
+    /// Records whose lifetime ended since the last prune.
+    retired_records: usize,
     /// 診断用オプション：有効な場合、Interceptor は新規発見の
     /// インターフェイスに対して自身で `QueryInterface(IID_IUnknown)`
     /// を呼んで同一性を確認する（既定は false。標準では呼ばない）。
@@ -681,14 +694,19 @@ impl ComTracker {
     /// Release return value. A later discovery must create a new instance.
     pub fn note_implementation_unloaded(&mut self, ptr: u64) {
         if let Some(object) = self.objects.get_mut(&ptr) {
+            let was_live = !object.destroyed;
             object.destroyed = true;
             object.refcount = None;
             object.iunknown_intercepted = false;
             object.interception_skip_reason = Some("implementation-unloaded");
+            if was_live {
+                self.note_retired();
+            }
         }
     }
 
-    /// Number of indexed addresses, including retired records until reuse.
+    /// Number of indexed addresses, including retired records until reuse
+    /// or until [`MAX_RETIRED_COM_RECORDS`] of them are pruned.
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
@@ -707,8 +725,41 @@ impl ComTracker {
 
     fn insert(&mut self, obj: ComObject) -> u64 {
         let identity = obj.identity;
-        self.objects.insert(obj.ptr, obj);
+        let (ptr, key) = (obj.ptr, group_key(&obj.identity_group));
+        if let Some(old) = self.objects.insert(ptr, obj) {
+            self.unindex(ptr, group_key(&old.identity_group));
+        }
+        self.groups.entry(key).or_default().push(ptr);
         identity
+    }
+
+    fn unindex(&mut self, ptr: u64, key: usize) {
+        if let Some(members) = self.groups.get_mut(&key) {
+            members.retain(|&p| p != ptr);
+            if members.is_empty() {
+                self.groups.remove(&key);
+            }
+        }
+    }
+
+    /// A record's lifetime ended. Retired records stay for lookups until
+    /// [`MAX_RETIRED_COM_RECORDS`] accumulate, then all are dropped
+    /// (review 2026-11-14 P2-6: the table grew for the whole session).
+    fn note_retired(&mut self) {
+        self.retired_records += 1;
+        if self.retired_records > MAX_RETIRED_COM_RECORDS {
+            let retired: Vec<(u64, usize)> = self
+                .objects
+                .values()
+                .filter(|o| o.destroyed)
+                .map(|o| (o.ptr, group_key(&o.identity_group)))
+                .collect();
+            for (ptr, key) in retired {
+                self.objects.remove(&ptr);
+                self.unindex(ptr, key);
+            }
+            self.retired_records = 0;
+        }
     }
 
     /// Register a factory result. Preserve an already-live object, but a
@@ -783,15 +834,33 @@ impl ComTracker {
                 .map(|o| Arc::clone(&o.identity_group))
                 .or_else(|| groups.first().cloned())
                 .unwrap_or_else(|| Arc::new(()));
-            for o in self.objects.values_mut() {
-                if !o.destroyed
-                    && groups
+            let canonical_key = group_key(&canonical_group);
+            let mut members: Vec<u64> = Vec::new();
+            for group in &groups {
+                if let Some(m) = self.groups.get(&group_key(group)) {
+                    members.extend_from_slice(m);
+                }
+            }
+            members.sort_unstable();
+            members.dedup();
+            for ptr in members {
+                let Some(o) = self.objects.get_mut(&ptr) else {
+                    continue;
+                };
+                if o.destroyed
+                    || !groups
                         .iter()
                         .any(|group| Arc::ptr_eq(group, &o.identity_group))
                 {
-                    o.identity = out;
-                    o.identity_confirmed = true;
+                    continue;
+                }
+                o.identity = out;
+                o.identity_confirmed = true;
+                let old_key = group_key(&o.identity_group);
+                if old_key != canonical_key {
                     o.identity_group = Arc::clone(&canonical_group);
+                    self.unindex(ptr, old_key);
+                    self.groups.entry(canonical_key).or_default().push(ptr);
                 }
             }
             if !self.objects.get(&out).is_some_and(|o| !o.destroyed) {
@@ -880,7 +949,11 @@ impl ComTracker {
             Some(o) => {
                 o.refcount = Some(new_count);
                 if new_count == 0 {
+                    let was_live = !o.destroyed;
                     o.destroyed = true;
+                    if was_live {
+                        self.note_retired();
+                    }
                     true
                 } else {
                     false
@@ -1006,6 +1079,54 @@ mod tests {
         tracker.note_factory_result(123, iid, "CoCreateInstance");
         assert_eq!(tracker.lookup(123).unwrap().interface_name, "IStream");
         assert!(!tracker.lookup(123).unwrap().intercepted);
+    }
+
+    #[test]
+    fn retired_records_are_pruned_and_groups_stay_indexed() {
+        // P2-6: Release(0) records no longer accumulate for the session.
+        let mut t = ComTracker::new();
+        let base = 0x10_0000u64;
+        for i in 0..(MAX_RETIRED_COM_RECORDS as u64 + 1) {
+            let ptr = base + i * 16;
+            t.note_factory_result(ptr, IID_ISHELL_LINK_W, "CoCreateInstance");
+            assert!(t.note_release(ptr, 0));
+        }
+        let live = 0x9000u64;
+        t.note_factory_result(live, IID_ISHELL_LINK_W, "CoCreateInstance");
+        assert_eq!(t.object_count(), 1, "retired records were pruned");
+        assert_eq!(t.groups.len(), 1);
+        assert_eq!(t.groups.values().map(Vec::len).sum::<usize>(), 1);
+        assert!(t.lookup(live).is_some());
+    }
+
+    #[test]
+    fn identity_confirmation_touches_only_its_groups() {
+        let mut t = ComTracker::new();
+        for i in 0..64u64 {
+            let link = 0x1000 + i * 0x100;
+            t.note_factory_result(link, IID_ISHELL_LINK_W, "CoCreateInstance");
+            t.note_query_interface(link, link + 8, IID_IPERSIST_FILE, true);
+        }
+        // Confirm one object's identity through its IPersistFile face.
+        t.note_query_interface(0x1008, 0x1000, IID_IUNKNOWN, true);
+        for ptr in [0x1000, 0x1008] {
+            let o = t.lookup(ptr).unwrap();
+            assert_eq!(o.identity, 0x1000);
+            assert!(o.identity_confirmed);
+        }
+        let other = t.lookup(0x1108).unwrap();
+        assert_eq!(other.identity, 0x1100);
+        assert!(!other.identity_confirmed);
+        // Merging two groups re-indexes the members under one key.
+        t.note_query_interface(0x1108, 0x1000, IID_IUNKNOWN, true);
+        let merged = t.lookup(0x1100).unwrap();
+        assert_eq!(merged.identity, 0x1000);
+        let key = group_key(&t.lookup(0x1000).unwrap().identity_group);
+        let mut members = t.groups[&key].clone();
+        members.sort_unstable();
+        assert_eq!(members, vec![0x1000, 0x1008, 0x1100, 0x1108]);
+        let indexed: usize = t.groups.values().map(Vec::len).sum();
+        assert_eq!(indexed, t.object_count());
     }
 
     #[test]

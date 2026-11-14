@@ -400,8 +400,18 @@ pub unsafe fn intercept_object(
     if interface_by_iid(&iid).is_none() {
         return ComInterceptOutcome::UnknownInterface;
     }
-    if rt.with_com_tracker(|t| t.lookup(ptr as u64).is_some_and(|o| o.intercepted)) {
-        return ComInterceptOutcome::AlreadyIntercepted;
+    // The standard path sets `iunknown_intercepted`; checking only
+    // `intercepted` reinstalled (3 VirtualQuery, 4 ReadProcessMemory) on
+    // every QI of a known object (review 2026-11-14 P2-6).
+    let known = rt.with_com_tracker(|t| {
+        t.lookup(ptr as u64)
+            .filter(|o| !o.destroyed)
+            .map(|o| (o.intercepted, o.iunknown_intercepted))
+    });
+    match known {
+        Some((true, _)) => return ComInterceptOutcome::AlreadyIntercepted,
+        Some((_, true)) => return ComInterceptOutcome::IUnknownAlreadyIntercepted,
+        _ => {}
     }
     match unsafe { crate::shared_com::install(rt, ptr) } {
         Ok(installed) => {
