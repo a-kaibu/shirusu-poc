@@ -385,40 +385,38 @@ fn combine_reports(reports: &[IntegrityReport]) -> IntegrityReport {
     out
 }
 
-/// 世代交代した Ring の旧 Worker を確定させる (レビュー #6
-/// P1-4)。`stop` での確定と同じ手順: スレッド表を閉じ、完全性
-/// 報告を保持し、Loss を記録する。`ring.generation` は共有
-/// Control の現在値へ進める。
-fn retire_ring_worker(
-    recorder: &mut TracePipeline<File>,
-    retired_reports: &mut Vec<IntegrityReport>,
-    retired_loss_records: &mut u64,
-    coverage_missing_calls: u64,
-    ring: &mut RingEndpoint,
-) -> Result<(), SessionError> {
+/// 世代交代で外した旧 Worker。検証が追いつくまで確定を待つ (P2-4)。
+struct RetiringWorker {
+    worker: SharedDrainWorker,
+    stopped: bool,
+    process_id: u64,
+    trace_thread_id: u64,
+}
+
+/// 世代交代した Ring の旧 Worker を外す (レビュー #6 P1-4)。確定
+/// （スレッド表を閉じ、完全性報告を保持し、Loss を記録する）は
+/// `CaptureSession::settle_retiring` が、その Worker 宛ての Chunk を
+/// 検証し終えてから行う。以前はここで変換キュー全体の Barrier を待ち、
+/// その間すべての Ring の回収が止まっていた (レビュー 2026-11-14 P2-4)。
+/// `ring.generation` は共有 Control の現在値へ進める。
+fn retire_ring_worker(retiring: &mut Vec<RetiringWorker>, ring: &mut RingEndpoint) {
     let Some(shared) = ring.worker.take() else {
-        return Ok(());
+        return;
     };
+    let stopped = ring.stopped || ring.collector.as_ref().is_some_and(|c| c.is_stopped());
     ring.collector = None;
-    // Every chunk collected from this incarnation must be validated first.
-    recorder.barrier()?;
-    let mut worker = lock_worker(&shared);
-    ring.events += worker.total_events;
-    let _ = worker.finalize_thread();
-    retired_reports
-        .push(worker.integrity_report(coverage_missing_calls, ring.stopped || worker.is_stopped()));
-    *retired_loss_records += worker.loss_event_count();
-    let losses = worker.take_loss_events();
-    if !losses.is_empty() {
-        recorder.record_losses(losses, ring.spec.process_id, ring.trace_thread_id)?;
-    }
+    retiring.push(RetiringWorker {
+        worker: shared,
+        stopped,
+        process_id: ring.spec.process_id,
+        trace_thread_id: ring.trace_thread_id,
+    });
     ring.stopped = false;
     ring.generation = layout::load(
         ring.mapping.base(),
         layout::OFF_GENERATION,
         Ordering::Acquire,
     );
-    Ok(())
 }
 
 fn lock_worker(worker: &SharedDrainWorker) -> std::sync::MutexGuard<'_, DrainWorker> {
@@ -461,6 +459,10 @@ pub struct CaptureSession {
     /// 世代交代で張り替えた旧 Worker の Loss 件数。`stop` の
     /// `total_loss_records` へ合算する。
     retired_loss_records: u64,
+    /// 確定済みの旧 Worker が回収したイベント数。
+    retired_events: u64,
+    /// 外したが、まだ確定していない旧 Worker (P2-4)。
+    retiring: Vec<RetiringWorker>,
     /// 世代交代した Ring へ割り当てる次の合成 Trace スレッド ID。
     /// `add_ring` で全 spec の最大値 + 1 へ追随させる。
     next_trace_thread_id: u64,
@@ -524,6 +526,8 @@ impl CaptureSession {
             shutdown_outcome: None,
             retired_reports: Vec::new(),
             retired_loss_records: 0,
+            retired_events: 0,
+            retiring: Vec::new(),
             next_trace_thread_id: 0,
             uninjectable_children: Vec::new(),
         })
@@ -778,10 +782,11 @@ impl CaptureSession {
             // 回収して別のスレッドが同じ Mapping を再初期化すると
             // Control の世代が進む。Worker を張り替えないと世代
             // 不一致で Ring が止まってしまうため、旧 Worker を
-            // ここで確定させる。なお、再初期化が進行中の drain と
-            // 競合した場合は従来どおり当該 Ring の完全性喪失として
-            // 閉じる (fail-closed)。張り替えは世代が安定してから
-            // 次の poll で効く。
+            // ここで外す。再初期化の途中 (Magic が 0、または世代が
+            // 変わった Control) を回収側が見た場合は、矛盾ではなく
+            // 世代交代として何も返さない (レビュー 2026-11-14 P2-4、
+            // `CommittedRangeCollector::collect`)。張り替えは世代が
+            // 安定してから次の poll で効く。
             if ring.worker.is_some() && ring.mapping.agent_initialized() {
                 let found = layout::load(
                     ring.mapping.base(),
@@ -789,13 +794,7 @@ impl CaptureSession {
                     Ordering::Acquire,
                 );
                 if found != ring.generation {
-                    retire_ring_worker(
-                        &mut self.recorder,
-                        &mut self.retired_reports,
-                        &mut self.retired_loss_records,
-                        self.coverage_missing_calls,
-                        ring,
-                    )?;
+                    retire_ring_worker(&mut self.retiring, ring);
                     // 新しい incarnation は Trace 上の別スレッドとして
                     // 記録する (Sequence が 1 から再開するため)。
                     ring.trace_thread_id = self.next_trace_thread_id;
@@ -861,7 +860,37 @@ impl CaptureSession {
                 stats.active_rings += 1;
             }
         }
+        self.settle_retiring(false)?;
         Ok(stats)
+    }
+
+    /// 外した旧 Worker を確定させる。`all` が偽なら、宛ての Chunk を
+    /// 検証し終えたものだけ (Barrier 後に呼ぶときは真)。
+    fn settle_retiring(&mut self, all: bool) -> Result<(), SessionError> {
+        let mut i = 0;
+        while i < self.retiring.len() {
+            if !all && !self.retiring[i].worker.is_settled() {
+                i += 1;
+                continue;
+            }
+            let retired = self.retiring.swap_remove(i);
+            let losses = {
+                let mut worker = lock_worker(&retired.worker);
+                self.retired_events += worker.total_events;
+                let _ = worker.finalize_thread();
+                self.retired_reports.push(worker.integrity_report(
+                    self.coverage_missing_calls,
+                    retired.stopped || worker.is_stopped(),
+                ));
+                self.retired_loss_records += worker.loss_event_count();
+                worker.take_loss_events()
+            };
+            if !losses.is_empty() {
+                self.recorder
+                    .record_losses(losses, retired.process_id, retired.trace_thread_id)?;
+            }
+        }
+        Ok(())
     }
 
     /// 記録を止め、最終回収・Loss 確定・Finalization までを行って
@@ -883,6 +912,7 @@ impl CaptureSession {
         // Every collected chunk must be validated before reading the workers.
         self.recorder.barrier()?;
         self.observe_process_missing_calls();
+        self.settle_retiring(true)?;
         let mut reports = Vec::new();
         // 世代交代で確定済みの旧 Worker 分も集計へ含める (P1-4)。
         let mut total_loss_records = self.retired_loss_records;
@@ -999,7 +1029,8 @@ impl CaptureSession {
                 ));
             }
         }
-        let total_events: u64 = self.rings.iter().map(|r| r.events).sum();
+        let total_events: u64 =
+            self.retired_events + self.rings.iter().map(|r| r.events).sum::<u64>();
         let trace_path = self.trace_path.clone();
         // L09: `profile` の集計は `finish` で Trace へ書く前に読む
         //（`finish` は recorder を消費する）。

@@ -125,6 +125,9 @@ pub(crate) type SharedDrainWorker = Arc<RingValidation>;
 pub(crate) struct RingValidation {
     worker: Mutex<DrainWorker>,
     stopped: std::sync::atomic::AtomicBool,
+    /// Chunks queued for this validator and not yet validated. Zero means
+    /// the validator reflects every chunk sent so far (no barrier needed).
+    pending: AtomicUsize,
 }
 
 impl RingValidation {
@@ -132,13 +135,21 @@ impl RingValidation {
         Arc::new(Self {
             stopped: std::sync::atomic::AtomicBool::new(worker.is_stopped()),
             worker: Mutex::new(worker),
+            pending: AtomicUsize::new(0),
         })
     }
     /// Whether validation stopped this Ring (no lock).
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
     }
-    /// Validation state. Call only after a pipeline barrier.
+    /// Whether every chunk sent for this validator has been validated, so
+    /// its state may be read without a pipeline barrier (review 2026-11-14
+    /// P2-4: retiring one Ring must not wait for the whole queue).
+    pub(crate) fn is_settled(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+    /// Validation state. Call only after a pipeline barrier, or once
+    /// [`Self::is_settled`].
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, DrainWorker> {
         // A panic while validating leaves no half-applied state that matters
         // here: the pipeline worker failure itself forbids Finalization.
@@ -268,6 +279,8 @@ fn materialize(command: Command) -> (Command, Option<Command>) {
                     (Vec::new(), None)
                 }
             };
+            // After the validator lock is released (pairs with is_settled).
+            worker.pending.fetch_sub(1, Ordering::AcqRel);
             let losses = losses.map(|l| Command::Losses(l, context.process_id, context.thread_id));
             (Command::Events(context, events), losses)
         }
@@ -539,6 +552,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
         worker: &SharedDrainWorker,
         chunk: CommittedChunk,
     ) -> Result<(), TraceError> {
+        worker.pending.fetch_add(1, Ordering::AcqRel);
         self.send(Command::Chunk(*context, Arc::clone(worker), chunk))
     }
 

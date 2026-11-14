@@ -371,18 +371,20 @@ pub struct CommittedRangeCollector {
     stopped: bool,
     /// Loss counters of the last Control copy handed to the validator.
     reported_loss: [u64; 3],
+    /// Generation of the incarnation this collector reads.
+    generation: u64,
 }
 // SAFETY: same contract as DrainWorker (single reader per Ring, base valid).
 unsafe impl Send for CommittedRangeCollector {}
 
-/// Writer-maintained loss counters. A change is collected even when no new
-/// descriptor was committed (see [`CommittedRangeCollector::collect`]).
 /// 1 本の Ring で追跡する未終了呼び出しの上限（レビュー 2026-11-14 P2-3）。
 /// Leave を失った呼び出しは閉じられずに残るため、過負荷が続くと
 /// `open_calls` が時間に比例して増える。上限を越えたら古い半分を
 /// 「終了不明」として確定させる。実際の入れ子はこれよりずっと浅い。
 pub const MAX_OPEN_CALLS: usize = 1 << 16;
 
+/// Writer-maintained loss counters. A change is collected even when no new
+/// descriptor was committed (see [`CommittedRangeCollector::collect`]).
 const LOSS_COUNTER_OFFSETS: [usize; 3] = [
     layout::OFF_DROPPED_EVENTS,
     layout::OFF_DROPPED_PAYLOAD_BYTES,
@@ -401,7 +403,18 @@ impl CommittedRangeCollector {
             payload_read_position: 0,
             stopped: false,
             reported_loss: [0; 3],
+            generation: layout::load(base, layout::OFF_GENERATION, Ordering::Acquire),
         }
+    }
+
+    /// Whether the Agent is reinitializing (or has reinitialized) this
+    /// Control for a new incarnation (review 2026-11-14 P2-4). The Agent
+    /// reuses a Slot only once its Ring was drained, so what this collector
+    /// still sees is the new incarnation, not a contradiction: it yields
+    /// nothing and leaves the Ring to be retired on its generation change.
+    fn superseded(&self) -> bool {
+        layout::load(self.base, layout::OFF_MAGIC, Ordering::Acquire) != layout::MAGIC
+            || layout::load(self.base, layout::OFF_GENERATION, Ordering::Acquire) != self.generation
     }
 
     /// Whether a structural contradiction stopped collection.
@@ -424,7 +437,7 @@ impl CommittedRangeCollector {
     /// Control-only chunk: without it, a Ring that never publishes again would
     /// hide them and the Trace could be finalized as complete.
     pub fn collect(&mut self, notify_space: impl Fn()) -> Option<CommittedChunk> {
-        if self.stopped {
+        if self.stopped || self.superseded() {
             return None;
         }
         // 1. Commit boundary (pairs with the writer's publication order).
@@ -450,6 +463,12 @@ impl CommittedRangeCollector {
         for (off, value) in LOSS_COUNTER_OFFSETS.iter().zip(loss) {
             control[*off..*off + 8].copy_from_slice(&value.to_le_bytes());
         }
+        // The Control copy must belong to this incarnation (checked after it
+        // was taken: a reinitialization zeroes Magic first and publishes the
+        // new Generation before Magic again).
+        if self.superseded() {
+            return None;
+        }
         self.reported_loss = loss;
         let mut chunk = CommittedChunk {
             control,
@@ -463,6 +482,8 @@ impl CommittedRangeCollector {
             // Only the loss counters changed: nothing to copy or release.
             Some(0) => return Some(chunk),
             Some(count) if count <= capacity => count,
+            // Reinitialized under us: not evidence of anything.
+            _ if self.superseded() => return None,
             // Contradictory cursors: hand the evidence to the validator.
             _ => {
                 self.stopped = true;
@@ -506,6 +527,7 @@ impl CommittedRangeCollector {
             {
                 end
             }
+            _ if self.superseded() => return None,
             _ => {
                 // The validator reports the inconsistent descriptor.
                 self.stopped = true;
@@ -528,6 +550,12 @@ impl CommittedRangeCollector {
                     .payload
                     .extend_from_slice(std::slice::from_raw_parts(src, span - first));
             }
+        }
+        // A copy taken while the Control was being reinitialized may mix two
+        // incarnations; the old one was already drained, so drop it. Never
+        // write the old read positions into the new incarnation.
+        if self.superseded() {
+            return None;
         }
         // 4. Release the copied range to the writer.
         self.read_cursor = write_cursor;

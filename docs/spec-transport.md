@@ -193,6 +193,7 @@ v0.3の予備Queueは、確定しないセルをHostが10msで放棄して再利
 - RingにはGeneration番号を持たせ、同じThread IDを再利用した新しいスレッドと古いRingを混同しない。
 - Agentは`DLL_THREAD_DETACH`でRingの状態だけを変える（Loader Lock中なので待たない）。`TerminateThread`などで通知なしに終わったスレッドは、Agentがスレッドの複製Handle（`SYNCHRONIZE`）の終了で検出する（v0.5、下記「強制終了した書き手」）。Hostが公開済みデータを回収し終えるまで、SlotのGenerationを変えて再利用しない。
 - 対象プロセスがクラッシュしても、Hostが共有メモリのHandleを持っていれば公開済みのイベントを回収できる。
+- 再利用時、AgentはControlをゼロクリアしてから新しいGenerationとMagicを公開する。Hostの回収側は、Magicが0の間やGenerationが変わった後のControlを矛盾として扱わず、何も回収せずに次の回収で世代交代として旧Workerを外す（2026-11-14 レビュー P2-4）。旧Workerの確定（終了不明の確定、完全性報告、Loss の記録）は、その Worker 宛ての回収分を検証し終えた時点で行い、変換キュー全体の完了は待たない。
 
 Ringを再利用できるのは、スレッドの終了をThread HandleのSignal（または終了通知）で確認し、Hostが公開済みデータを回収し終えた後だけである。`DLL_THREAD_DETACH`はDRAININGへの移行の合図にすぎない。DETACHの後も、他のDLLの終了処理がそのスレッドでHook対象のAPIを呼ぶことがあるためである。DETACH後の呼び出しは記録せず欠落として数える。
 

@@ -13,8 +13,8 @@
 //! Linux では到達不能として残すもの（別途テスト不能な理由つき）：
 //! - `retire_ring_worker` の worker なし早期 return（367 行目相当）：
 //!   `poll_once` は `worker.is_some()` のときだけ呼ぶ。
-//! - `poll_once` の retire 失敗 `?`（662 行目相当）：TraceWriter の
-//!   失敗をセッション途中で注入する手段がない（`CaptureSession` は
+//! - 旧 Worker 確定時の Loss 記録失敗 `?`：TraceWriter の失敗を
+//!   セッション途中で注入する手段がない（`CaptureSession` は
 //!   `W = File` に固定）。`/dev/full` は構築時にしか失敗させられない。
 //! - `space_notify` の `Some` 腕（699〜703 行目相当）：`Some` を渡せる
 //!   のは cfg(windows) の `add_shared_mapping` だけ。
@@ -379,6 +379,57 @@ fn generation_change_retires_worker_and_records_loss() {
     assert_eq!(summary.total_loss_records, 1);
     assert_eq!(summary.rings_active, 1);
     assert_eq!(summary.rings_stopped, 0);
+}
+
+/// P2-4: Slot の再利用で Agent が Control を初期化している途中
+/// （Magic と書き位置が 0 に戻った状態）を回収側が見ても、矛盾として
+/// Ring を止めず、世代交代として扱う。
+#[test]
+fn reinitialization_in_progress_is_not_an_integrity_loss() {
+    let path = temp_trace("reinit-in-progress");
+    let (agent, generation, base) = agent_and_region(12);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    let len = RingConfig::new(64, 4096).required_len();
+    unsafe {
+        session
+            .add_borrowed_ring(base, len, spec(generation))
+            .unwrap();
+    }
+    session.start().unwrap();
+    let cf = api_by_id(API_CREATE_FILE_W).unwrap();
+    let mut mem = MapMemory::new();
+    let units: Vec<u16> = "C:\\game\\a.dat".encode_utf16().chain([0]).collect();
+    mem.write_u16s(0x1000, &units);
+    let enter = capture::create_file_w_enter(&mem, 0x1000, 0xC000_0000, 0, 0, 2, 0x80, 0);
+    let payload = capture::encode_enter(cf, &enter).unwrap();
+    for call in 1..=2 {
+        assert!(matches!(
+            agent.record_enter(12, cf.api_id, cf.enter_schema_id(), call, 0, &payload),
+            shirusu_agent::RecordResult::Written(_)
+        ));
+    }
+    assert_eq!(session.poll_once().unwrap().events, 2);
+
+    // 初期化の途中: ゼロクリア済みで Magic はまだ公開されていない。
+    layout::store(base, layout::OFF_MAGIC, 0, Ordering::Release);
+    layout::store(base, layout::OFF_WRITE_CURSOR, 0, Ordering::Release);
+    let stats = session.poll_once().unwrap();
+    assert_eq!(
+        stats.stopped_rings, 0,
+        "a reinitializing Ring is not stopped"
+    );
+
+    // 新しい世代で公開されたら、旧 Worker は確定し新しい incarnation を読む。
+    layout::init_control(base, RingConfig::new(64, 4096), generation + 1, 12);
+    let stats = session.poll_once().unwrap();
+    assert_eq!(stats.stopped_rings, 0);
+
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.total_events, 2);
+    assert_eq!(summary.rings_stopped, 0);
+    assert_ne!(summary.integrity.event_integrity, IntegrityLevel::Lost);
+    // Leave のない 2 件だけが終了不明になる。
+    assert_eq!(summary.total_loss_records, 2);
 }
 
 #[test]
