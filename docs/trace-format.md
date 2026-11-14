@@ -674,6 +674,23 @@ overview「転送形式とディスク形式」節：`--order=global`を付け�
   スレッド単位の呼び出し構造で行い、全体順序は実行ごとの観測順序で
   あって比較対象の契約ではないため）。
 
+## ディスク満杯（2026-11-14 レビュー P2-10）
+
+- Writer は `WriterOptions::reserve_bytes` だけ書き出し先を先に確保する
+  （Host の Capture Session は 32MiB）。NTFS では非スパースのファイルを
+  伸ばすと領域が割り当てられるため、確保の中への書き込みは空き不足で失敗
+  しない。確保を広げられなくなったら、残りが 1MiB を割る前にデータ Block
+  を `StorageFull` で拒否し、Index（入らなければ省略して注記）と
+  Finalization を残りへ書く。確保した末尾は `finish` で切り詰める。
+- Host の変換スレッドは `StorageFull` を失敗ではなく「以後を捨てて数える」
+  として扱い、停止時に Event Integrity を Lost にして捨てた件数を注記する。
+- Block の書き込みに失敗したら、書き出し先を Block の先頭まで切り詰めて
+  書きかけを捨てる（`DurableWrite::truncate_to`）。捨てられない書き出し先
+  では、以後の書き込みを拒否する（位置のずれた Trace を作らない）。
+  書けなかった Schema と Blob は待ち列へ戻す。
+- 確保付きで記録中に異常終了した Trace には、0 で埋まった末尾が残る。
+  Reader はそこを途中の破損として扱い、`repair` で取り除ける。
+
 ## 回復意味論（recover_trace）
 
 Reader は、信頼できない入力として Trace を扱う（overview の決定）。

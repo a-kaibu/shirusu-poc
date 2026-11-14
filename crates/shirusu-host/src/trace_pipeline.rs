@@ -61,19 +61,27 @@ fn write_staged<W: DurableWrite>(
     state: &WorkerState,
     staged: Staged,
 ) -> Result<(), TraceError> {
-    if !staged.events.is_empty() {
+    if !staged.events.is_empty() && totals.storage_full {
+        totals.storage_full_dropped_events += staged.events.len() as u64;
+    } else if !staged.events.is_empty() {
+        let count = staged.events.len() as u64;
         let backlogged =
             state.queued_bytes.load(Ordering::Acquire) > state.byte_budget / BACKLOG_FRACTION;
-        let stats = if backlogged {
+        let written = if backlogged {
             totals.metrics.compression_bypass_requests =
                 totals.metrics.compression_bypass_requests.saturating_add(1);
-            recorder.record_owned_batch_uncompressed(&staged.context, staged.events)?
+            recorder.record_owned_batch_uncompressed(&staged.context, staged.events)
         } else {
-            recorder.record_owned_batch_with_args(&staged.context, staged.events)?
+            recorder.record_owned_batch_with_args(&staged.context, staged.events)
         };
-        totals.args.args_attached += stats.args_attached;
-        totals.args.args_incomplete += stats.args_incomplete;
-        totals.args.args_fallback_blob += stats.args_fallback_blob;
+        match written {
+            Ok(stats) => {
+                totals.args.args_attached += stats.args_attached;
+                totals.args.args_incomplete += stats.args_incomplete;
+                totals.args.args_fallback_blob += stats.args_fallback_blob;
+            }
+            Err(e) => absorb_storage_full(totals, Err(e), count, 0)?,
+        }
     }
     for bytes in staged.bytes {
         state.release(bytes);
@@ -100,6 +108,21 @@ fn flush_staged<W: DurableWrite>(
         write_staged(recorder, totals, state, group)?;
     }
     Ok(())
+}
+
+fn record_losses<W: DurableWrite>(
+    recorder: &mut TraceRecorder<W>,
+    totals: &mut PipelineReport,
+    losses: &[LossEvent],
+    process: u64,
+    thread: u64,
+) -> Result<(), TraceError> {
+    if totals.storage_full {
+        totals.storage_full_dropped_losses += losses.len() as u64;
+        return Ok(());
+    }
+    let r = recorder.record_losses(losses, process, thread);
+    absorb_storage_full(totals, r, 0, losses.len() as u64)
 }
 
 /// Conversion counts as behind once this fraction of the queue budget waits.
@@ -206,6 +229,30 @@ pub struct HostPipelineStats {
 pub(crate) struct PipelineReport {
     pub args: ArgsConversionStats,
     pub metrics: HostPipelineStats,
+    /// The Trace ran out of space (review 2026-11-14 P2-10). Everything
+    /// after that was dropped so that Finalization can still be written.
+    pub storage_full: bool,
+    pub storage_full_dropped_events: u64,
+    pub storage_full_dropped_losses: u64,
+}
+
+/// Turn running out of space into "drop and count" (P2-10): the Writer kept
+/// room for Finalization, so the Trace can still be closed as degraded.
+fn absorb_storage_full(
+    totals: &mut PipelineReport,
+    result: Result<(), TraceError>,
+    events: u64,
+    losses: u64,
+) -> Result<(), TraceError> {
+    match result {
+        Err(e) if shirusu_trace::writer::is_storage_full(&e) => {
+            totals.storage_full = true;
+            totals.storage_full_dropped_events += events;
+            totals.storage_full_dropped_losses += losses;
+            Ok(())
+        }
+        other => other,
+    }
 }
 type Finished<W> = Result<(TraceRecorder<W>, PipelineReport), TraceError>;
 
@@ -418,10 +465,19 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                             flush_staged(&mut recorder, &mut totals, &state, &mut staged, false)?;
                             match other {
                                 Command::Losses(losses, process, thread) => {
-                                    recorder.record_losses(&losses, process, thread)?;
+                                    record_losses(
+                                        &mut recorder,
+                                        &mut totals,
+                                        &losses,
+                                        process,
+                                        thread,
+                                    )?;
                                 }
                                 Command::Environment(environment) => {
-                                    recorder.update_environment(&environment)?;
+                                    if !totals.storage_full {
+                                        let r = recorder.update_environment(&environment);
+                                        absorb_storage_full(&mut totals, r, 0, 0)?;
+                                    }
                                 }
                                 Command::Barrier(reached) => barrier_reached = Some(reached),
                                 Command::Events(..) | Command::Chunk(..) => unreachable!(),
@@ -432,7 +488,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     if let Some(Command::Losses(losses, process, thread)) = early_losses {
                         // After the events they describe, like a Loss command.
                         flush_staged(&mut recorder, &mut totals, &state, &mut staged, false)?;
-                        recorder.record_losses(&losses, process, thread)?;
+                        record_losses(&mut recorder, &mut totals, &losses, process, thread)?;
                     }
                     // Acknowledge only after the barrier's own accounting is
                     // released: a caller reading the queue after the barrier
@@ -751,6 +807,10 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             match self.mode.swap(0, Ordering::SeqCst) {
                 1 => return Err(io::Error::other("injected disk failure")),
+                4 => {
+                    self.mode.store(4, Ordering::SeqCst);
+                    return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
+                }
                 2 => panic!("injected worker panic"),
                 3 => {
                     self.blocked.send(()).unwrap();
@@ -768,6 +828,10 @@ mod tests {
     impl DurableWrite for ControlledWriter {
         fn sync_all(&mut self) -> io::Result<()> {
             Ok(())
+        }
+        fn truncate_to(&mut self, len: u64) -> io::Result<bool> {
+            self.bytes.lock().unwrap().truncate(len as usize);
+            Ok(true)
         }
     }
     fn controlled() -> (ControlledWriter, mpsc::Receiver<()>, mpsc::Sender<()>) {
@@ -838,6 +902,29 @@ mod tests {
             1
         );
         drop(pipeline);
+    }
+
+    #[test]
+    fn running_out_of_space_drops_and_counts_instead_of_failing() {
+        // P2-10: the worker keeps going (dropping) so stop can finalize.
+        let (writer, _, _) = controlled();
+        let flag = writer.mode.clone();
+        let mut pipeline = TracePipeline::new(recorder(writer, RecordMode::Full)).unwrap();
+        flag.store(4, Ordering::SeqCst);
+        for call in 1..=3 {
+            pipeline
+                .record_owned_batch_with_args(&context(), events(call))
+                .unwrap();
+            pipeline.barrier().unwrap();
+        }
+        pipeline
+            .record_losses(vec![LossEvent::SequenceGap { count: 1 }], 1, 1)
+            .unwrap();
+        pipeline.update_environment(&environment()).unwrap();
+        let (_recorder, report) = pipeline.finish().expect("not a worker failure");
+        assert!(report.storage_full);
+        assert_eq!(report.storage_full_dropped_events, 6);
+        assert_eq!(report.storage_full_dropped_losses, 1);
     }
 
     #[test]

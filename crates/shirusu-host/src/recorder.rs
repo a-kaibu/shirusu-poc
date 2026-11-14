@@ -419,6 +419,9 @@ fn retire_ring_worker(retiring: &mut Vec<RetiringWorker>, ring: &mut RingEndpoin
     );
 }
 
+/// Space the Trace file keeps allocated ahead of its end (P2-10).
+const TRACE_RESERVE_BYTES: u64 = 32 * 1024 * 1024;
+
 fn lock_worker(worker: &SharedDrainWorker) -> std::sync::MutexGuard<'_, DrainWorker> {
     worker.lock()
 }
@@ -496,6 +499,8 @@ impl CaptureSession {
             config.environment.clone(),
             WriterOptions {
                 durability: config.durability,
+                // P2-10: keep room to close the Trace when the disk fills.
+                reserve_bytes: TRACE_RESERVE_BYTES,
                 ..Default::default()
             },
         )?;
@@ -953,10 +958,25 @@ impl CaptureSession {
             host_pipeline.commands_processed, host_pipeline.events_received,
             host_pipeline.conversion_wall_ns, host_pipeline.queue_full_count, host_pipeline.drain_wait_ns, host_pipeline.merged_event_commands, host_pipeline.compression_bypass_requests, host_pipeline.peak_queued_bytes,
         ));
-        recorder.update_environment(&self.config.environment)?;
+        match recorder.update_environment(&self.config.environment) {
+            // Out of space: the final environment is not essential.
+            Err(e)
+                if pipeline_report.storage_full && shirusu_trace::writer::is_storage_full(&e) => {}
+            other => other?,
+        }
         reports.append(&mut self.retired_reports);
         let reports_were_empty = reports.is_empty();
         let mut report = combine_reports(&reports);
+        if pipeline_report.storage_full {
+            // P2-10: the Writer kept room for Finalization; what came after
+            // the disk filled up is gone.
+            report.event_integrity = worst(report.event_integrity, IntegrityLevel::Lost);
+            report.notes.push(format!(
+                "storage full: {} events and {} loss records not written",
+                pipeline_report.storage_full_dropped_events,
+                pipeline_report.storage_full_dropped_losses
+            ));
+        }
         if args_stats.args_incomplete > 0 {
             report.semantic_completeness =
                 worst(report.semantic_completeness, IntegrityLevel::Degraded);

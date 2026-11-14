@@ -359,7 +359,9 @@ fn write_loss_records_and_profile_write_errors_propagate() {
             apis: Vec::new(),
         })
         .expect_err("ProfileSummary block write must fail");
-    assert!(matches!(err, shirusu_trace::TraceError::Io(_)));
+    // P2-10: this sink cannot discard the partial Loss Block, so the Writer
+    // refuses to write after it rather than misplace later Blocks.
+    assert!(matches!(err, shirusu_trace::TraceError::WriterInvariant(_)));
 }
 
 #[test]

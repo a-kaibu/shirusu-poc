@@ -81,11 +81,37 @@ pub enum Durability {
 pub trait DurableWrite: Write {
     /// 書き出した内容を永続化する。メモリ上の書き先では何もしない。
     fn sync_all(&mut self) -> std::io::Result<()>;
+    /// 書き出し先の長さを `len` に切り詰め、書き位置もそこへ戻す
+    /// （2026-11-14 レビュー P2-10: 書き込みに失敗した Block の書きかけを
+    /// 捨てる）。できない書き出し先は `Ok(false)`。
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<bool> {
+        let _ = len;
+        Ok(false)
+    }
+    /// 書き出し先を `len` まで先に確保する（書き位置は変えない）。
+    /// Finalization のための空きを残すのに使う。できない書き出し先は
+    /// `Ok(false)`。
+    fn reserve_to(&mut self, len: u64) -> std::io::Result<bool> {
+        let _ = len;
+        Ok(false)
+    }
 }
 
 impl DurableWrite for std::fs::File {
     fn sync_all(&mut self) -> std::io::Result<()> {
         std::fs::File::sync_all(self)
+    }
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<bool> {
+        use std::io::Seek;
+        self.set_len(len)?;
+        self.seek(std::io::SeekFrom::Start(len))?;
+        Ok(true)
+    }
+    fn reserve_to(&mut self, len: u64) -> std::io::Result<bool> {
+        // NTFS allocates the clusters of a non-sparse file extended this
+        // way, so later writes inside it cannot fail for lack of space.
+        self.set_len(len)?;
+        Ok(true)
     }
 }
 
@@ -93,11 +119,20 @@ impl DurableWrite for Vec<u8> {
     fn sync_all(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<bool> {
+        self.truncate(len as usize);
+        Ok(true)
+    }
 }
 
 impl DurableWrite for std::io::Cursor<Vec<u8>> {
     fn sync_all(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<bool> {
+        self.get_mut().truncate(len as usize);
+        self.set_position(len);
+        Ok(true)
     }
 }
 
@@ -106,6 +141,11 @@ impl<W: DurableWrite> DurableWrite for std::io::BufWriter<W> {
         self.flush()?;
         self.get_mut().sync_all()
     }
+}
+
+/// 書き出し先の空きが尽きた (`StorageFull`) ことによる失敗か (P2-10)。
+pub fn is_storage_full(error: &TraceError) -> bool {
+    matches!(error, TraceError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull)
 }
 
 /// Writer が Index に載せる Block 数の上限 (2026-11-14 レビュー P1-2)。
@@ -133,7 +173,18 @@ pub struct WriterOptions {
     pub chunk_raw_target: usize,
     /// Index に載せる Block 数の上限。`0` は [`MAX_INDEX_ENTRIES`]。
     pub max_index_entries: usize,
+    /// 書き出し先を先に確保しておく量（P2-10）。`0` は確保しない。
+    /// 確保できなくなったら（ディスク満杯）、残りが
+    /// [`FINAL_RESERVE_BYTES`] を割る前にデータ Block を
+    /// `StorageFull` で拒否し、Finalization を書ける空きを残す。
+    /// 確保した末尾は `finish` で切り詰める。異常終了した Trace には
+    /// 0 で埋まった末尾が残る（Reader は途中の破損として扱う）。
+    pub reserve_bytes: u64,
 }
+
+/// [`WriterOptions::reserve_bytes`] を使い切る前に残す量。Finalization と
+/// （入るなら）Index を書くための空き。
+pub const FINAL_RESERVE_BYTES: u64 = 1024 * 1024;
 
 /// `finish` に渡す完全性情報。Host の IntegrityReport からの写像は
 /// Host 側（shirusu-host の変換層）が行い、本クレートは数値で受け取る。
@@ -176,6 +227,13 @@ pub struct TraceWriter<W: DurableWrite> {
     /// Event / Blob Chunk の非圧縮サイズの目安（`WriterOptions` 由来。
     /// `0` は既定値に解決済み）。
     chunk_raw_target: usize,
+    /// 先に確保する量（0 = 確保しない）と、確保済みの末尾 (P2-10)。
+    reserve_bytes: u64,
+    reserved_end: u64,
+    /// 確保を広げられなくなった (ディスク満杯)。
+    reserve_failed: bool,
+    /// 書きかけの Block を捨てられず、以後の書き込みが位置をずらす。
+    torn: bool,
 }
 
 impl<W: DurableWrite> TraceWriter<W> {
@@ -224,6 +282,10 @@ impl<W: DurableWrite> TraceWriter<W> {
             } else {
                 options.chunk_raw_target
             },
+            reserve_bytes: options.reserve_bytes,
+            reserved_end: 0,
+            reserve_failed: false,
+            torn: false,
         };
         let header = FileHeader::new(session_id);
         w.write_block(BlockType::Header, &header.encode(), false)?;
@@ -451,10 +513,24 @@ impl<W: DurableWrite> TraceWriter<W> {
     /// 未書出しの Schema / Blob を流し、Index と Finalization を書いて
     /// 内側の Writer を返す。Finalization Block の存在が正常終了の印。
     pub fn finish(mut self, info: FinalizationInfo) -> Result<W> {
-        self.flush_schemas()?;
-        self.flush_blobs()?;
         let mut notes = info.notes;
-        if self.index_overflowed {
+        // P2-10: out of space, the pending Schemas and Blobs are given up so
+        // that Finalization still fits; their events were refused as well.
+        match self.flush_schemas().and_then(|()| self.flush_blobs()) {
+            Err(e) if self.reserve_failed && is_storage_full(&e) => {
+                notes.push("storage full: pending schemas or blobs not written".into());
+                self.unwritten_schemas.clear();
+                self.pending_blobs.clear();
+            }
+            other => other?,
+        }
+        let index_len = self.index.len() as u64 * 24 + 64;
+        if self.reserve_failed
+            && !self.index_overflowed
+            && self.offset + index_len + FINAL_RESERVE_BYTES / 2 > self.reserved_end
+        {
+            notes.push("index omitted: storage full; readers scan the file instead".into());
+        } else if self.index_overflowed {
             // Index は省略可能 (trace-format)。Reader は走査結果を使う。
             notes.push(format!(
                 "index omitted: more than {} blocks; readers scan the file instead",
@@ -481,6 +557,10 @@ impl<W: DurableWrite> TraceWriter<W> {
         self.write_block(BlockType::Finalization, &payload, false)?;
         self.finished = true;
         self.inner.flush()?;
+        if self.reserved_end > self.offset {
+            // Give the unused reservation back.
+            self.inner.truncate_to(self.offset)?;
+        }
         // `Buffered` 以外は、最後の flush で OS へ渡した分まで永続化する。
         // `SyncPerBlock` でもここで 1 回 sync する（最終 flush が運んだ分
         // が Block 書き込み後の sync の後になるため）。
@@ -601,7 +681,11 @@ impl<W: DurableWrite> TraceWriter<W> {
             schemas: std::mem::take(&mut self.unwritten_schemas),
         };
         let payload = set.encode();
-        self.write_block(BlockType::Schema, &payload, false)?;
+        if let Err(e) = self.write_block(BlockType::Schema, &payload, false) {
+            // Still unwritten (P2-10): a later flush must write them.
+            self.unwritten_schemas = set.schemas;
+            return Err(e);
+        }
         // F22: Schema Block の直後に、その時点までの全定義の複製を
         // Schema Checkpoint Block として書く。Reader はファイル全体
         // から 1 つのレジストリを構築するため、Schema Block と
@@ -616,18 +700,85 @@ impl<W: DurableWrite> TraceWriter<W> {
         let pending = std::mem::take(&mut self.pending_blobs);
         self.pending_blob_raw = 0;
         let mut cur: Vec<u8> = Vec::new();
-        for (id, data) in pending {
+        // First pending Blob not yet in a written Block.
+        let mut first_unwritten = 0;
+        let mut result = Ok(());
+        for (i, (id, data)) in pending.iter().enumerate() {
             let entry_len = 36 + data.len();
             if !cur.is_empty() && cur.len() + entry_len > self.chunk_raw_target {
                 let payload = std::mem::take(&mut cur);
-                self.write_block(BlockType::BlobChunk, &payload, true)?;
+                result = self.write_block(BlockType::BlobChunk, &payload, true);
+                if result.is_err() {
+                    break;
+                }
+                first_unwritten = i;
             }
             cur.extend_from_slice(id.as_bytes());
             cur.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            cur.extend_from_slice(&data);
+            cur.extend_from_slice(data);
         }
-        if !cur.is_empty() {
-            self.write_block(BlockType::BlobChunk, &cur, true)?;
+        if result.is_ok() && !cur.is_empty() {
+            result = self.write_block(BlockType::BlobChunk, &cur, true);
+            if result.is_ok() {
+                first_unwritten = pending.len();
+            }
+        } else if result.is_ok() {
+            first_unwritten = pending.len();
+        }
+        if result.is_err() {
+            // Keep what was not written (P2-10): events referring to these
+            // Blobs are already accepted, so a later flush must write them.
+            self.pending_blobs = pending.into_iter().skip(first_unwritten).collect();
+            self.pending_blob_raw = self
+                .pending_blobs
+                .iter()
+                .fold(0usize, |n, (_, d)| n.saturating_add(36 + d.len()));
+        }
+        result
+    }
+
+    /// Keep [`WriterOptions::reserve_bytes`] allocated ahead of the end
+    /// (P2-10). Once it cannot grow, data Blocks are refused before the
+    /// last [`FINAL_RESERVE_BYTES`] so Finalization still fits.
+    fn ensure_reserve(&mut self, block_type: BlockType, block_len: u64) -> Result<()> {
+        if self.reserve_bytes == 0 {
+            return Ok(());
+        }
+        let end = self.offset + block_len;
+        if !self.reserve_failed && end + self.reserve_bytes / 2 > self.reserved_end {
+            let target = end + self.reserve_bytes;
+            match self
+                .inner
+                .flush()
+                .and_then(|()| self.inner.reserve_to(target))
+            {
+                Ok(true) => self.reserved_end = target,
+                Ok(false) => {
+                    // The sink cannot reserve: write as if unreserved.
+                    self.reserve_bytes = 0;
+                    return Ok(());
+                }
+                Err(_) => self.reserve_failed = true,
+            }
+        }
+        let final_block = matches!(
+            block_type,
+            BlockType::Header
+                | BlockType::Environment
+                | BlockType::ProfileSummary
+                | BlockType::Index
+                | BlockType::Finalization
+        );
+        let limit = if final_block {
+            self.reserved_end
+        } else {
+            self.reserved_end.saturating_sub(FINAL_RESERVE_BYTES)
+        };
+        if self.reserve_failed && end > limit {
+            return Err(TraceError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "storage full: the rest is kept for finalization",
+            )));
         }
         Ok(())
     }
@@ -674,16 +825,36 @@ impl<W: DurableWrite> TraceWriter<W> {
         };
         let header_bytes = crate::container::serialize_header(&header, &stored);
         debug_assert_eq!(header_bytes.len(), HEADER_LEN);
-        if stored.len() <= SMALL_BLOCK_COALESCE {
+        if self.torn {
+            return Err(TraceError::WriterInvariant(
+                "an earlier block write failed and could not be discarded".into(),
+            ));
+        }
+        let block_len = (HEADER_LEN + stored.len()) as u64;
+        self.ensure_reserve(block_type, block_len)?;
+        let written = if stored.len() <= SMALL_BLOCK_COALESCE {
             // 小さい Block はヘッダーと合わせて 1 回で書く (P1-2: 直接
             // File へ書くため、Block ごとに syscall が 2 回だった)。
             let mut one = Vec::with_capacity(HEADER_LEN + stored.len());
             one.extend_from_slice(&header_bytes);
             one.extend_from_slice(&stored);
-            self.inner.write_all(&one)?;
+            self.inner.write_all(&one)
         } else {
-            self.inner.write_all(&header_bytes)?;
-            self.inner.write_all(&stored)?;
+            self.inner
+                .write_all(&header_bytes)
+                .and_then(|()| self.inner.write_all(&stored))
+        };
+        if let Err(e) = written {
+            // P2-10: drop the partial Block so the Writer stays at a Block
+            // boundary (a retry, or Finalization, continues from there).
+            let restored = self.inner.flush().is_ok()
+                && matches!(self.inner.truncate_to(self.offset), Ok(true));
+            if restored && self.reserved_end > self.offset {
+                // Truncation released the reservation as well.
+                self.reserved_end = self.offset;
+            }
+            self.torn = !restored;
+            return Err(e.into());
         }
         // 書けた Block だけを Index に載せる (P2-10: 書き込みに失敗した
         // Block が Index に残ると、再試行後の位置がずれる)。
