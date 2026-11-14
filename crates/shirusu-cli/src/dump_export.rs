@@ -242,17 +242,36 @@ pub(crate) fn cmd_export(args: &[String]) -> Result<(), ToolError> {
             "Parquet export requires --output <path>".into(),
         ));
     }
-    let (path, trace) = load_trace(&parsed)?;
-    let view = TraceView::build(&trace);
+    // P1-4: 1 Block ずつ読み、イベントを保持せずに書き出す
+    // (以前は全イベントの TraceEvent と EventView を同時に保持していた)。
+    let path = trace_path_arg(&parsed)?;
+    let input = std::fs::File::open(&path)
+        .map_err(|e| ToolError::Runtime(format!("cannot read {path}: {e}")))?;
+    let input = std::io::BufReader::new(input);
+    let mut tally = EventTally::default();
+    let mut index = 0usize;
+    let mut failed: Option<String> = None;
     if format == "parquet" {
         let output = parsed.opt("output").expect("validated output path");
         let mut file = prepare_output(&path, output)?;
-        parquet_export::write(
-            file.as_file_mut(),
-            &view,
-            inspect_json(&path, &view).render(),
-        )
-        .map_err(|e| ToolError::Runtime(format!("Parquet export failed: {e}")))?;
+        let mut out = parquet_export::EventParquet::new(file.as_file_mut())
+            .map_err(|e| ToolError::Runtime(format!("Parquet export failed: {e}")))?;
+        let streamed = shirusu_analysis::stream_trace(input, |r, b, e| {
+            tally.note(r, b, e);
+            if failed.is_none() {
+                if let Err(err) = out.push(shirusu_analysis::EventView::of(r, b, e, index)) {
+                    failed = Some(err.to_string());
+                }
+            }
+            index += 1;
+        })
+        .map_err(|e| ToolError::Runtime(format!("{path} is not a readable trace: {e}")))?;
+        if let Some(err) = failed {
+            return Err(ToolError::Runtime(format!("Parquet export failed: {err}")));
+        }
+        let summary = inspect_json(&path, &inspect_data(&streamed, &tally)).render();
+        out.finish(summary)
+            .map_err(|e| ToolError::Runtime(format!("Parquet export failed: {e}")))?;
         file.persist(output).map_err(|e| {
             ToolError::Runtime(format!("cannot publish Parquet output {output}: {e}"))
         })?;
@@ -263,13 +282,23 @@ pub(crate) fn cmd_export(args: &[String]) -> Result<(), ToolError> {
         .map(|output| prepare_output(&path, output))
         .transpose()?;
     {
+        // P3-12: stdout もバッファを通す (1 イベントごとの書き込みをやめる)。
         let mut sink: Box<dyn std::io::Write + '_> = match file.as_mut() {
             Some(file) => Box::new(std::io::BufWriter::new(file.as_file_mut())),
-            None => Box::new(std::io::stdout()),
+            None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
         };
-        for ev in &view.events {
-            writeln!(sink, "{}", ev.to_json().render())
-                .map_err(|e| ToolError::Runtime(format!("write failed: {e}")))?;
+        shirusu_analysis::stream_trace(input, |r, b, e| {
+            if failed.is_none() {
+                let ev = shirusu_analysis::EventView::of(r, b, e, index);
+                if let Err(err) = writeln!(sink, "{}", ev.to_json().render()) {
+                    failed = Some(err.to_string());
+                }
+            }
+            index += 1;
+        })
+        .map_err(|e| ToolError::Runtime(format!("{path} is not a readable trace: {e}")))?;
+        if let Some(err) = failed {
+            return Err(ToolError::Runtime(format!("write failed: {err}")));
         }
         sink.flush()
             .map_err(|e| ToolError::Runtime(format!("flush failed: {e}")))?;

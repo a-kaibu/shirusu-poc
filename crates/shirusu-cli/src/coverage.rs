@@ -1,6 +1,6 @@
 //! Evidence ledger: installation, imports and observations are independent facts.
 use super::*;
-use shirusu_analysis::{capture_name, value_capture_name, KIND_ENTER, KIND_LEAVE};
+use shirusu_analysis::{capture_name, value_capture_name, EventView, KIND_ENTER, KIND_LEAVE};
 use shirusu_trace::proto::HookEvidence;
 use std::collections::BTreeMap;
 
@@ -31,9 +31,49 @@ fn observed_key(name: &str) -> String {
         None => name.to_string(),
     }
 }
-fn rows(view: &TraceView<'_>) -> BTreeMap<String, Row> {
+/// 観測イベントを 1 件ずつ行へ足す (P1-4: 全イベントを保持しない)。
+#[derive(Default)]
+struct Observed {
+    rows: BTreeMap<String, Row>,
+    /// api_id ごとに最初に観測した API 名 (profile 集計の名前解決用)。
+    names: HashMap<u32, Option<String>>,
+}
+
+impl Observed {
+    fn note(&mut self, event: &EventView) {
+        self.names
+            .entry(event.api_id)
+            .or_insert_with(|| event.api_name.clone());
+        let name = event
+            .api_name
+            .as_deref()
+            .map(observed_key)
+            .unwrap_or_else(|| format!("unknown-api-id:{}", event.api_id));
+        let row = self.rows.entry(name).or_default();
+        match event.kind {
+            KIND_ENTER => row.enter += 1,
+            KIND_LEAVE => row.leave += 1,
+            _ => row.other += 1,
+        }
+        for field in &event.fields {
+            *row.value_captures
+                .entry(value_capture_name(field.capture).to_string())
+                .or_default() += 1;
+        }
+        row.decode_errors += u64::from(event.args_error.is_some());
+        *row.captures
+            .entry(capture_name(event.capture).to_string())
+            .or_default() += 1;
+    }
+}
+
+fn rows(trace: &ReadTrace, observed: Observed) -> BTreeMap<String, Row> {
+    let Observed {
+        rows: mut observed_rows,
+        names,
+    } = observed;
     let mut rows = BTreeMap::<String, Row>::new();
-    if let Some(env) = &view.trace.environment {
+    if let Some(env) = &trace.environment {
         for dep in &env.static_dependencies {
             for import in &dep.imports {
                 let function = import.name.clone().unwrap_or_else(|| {
@@ -56,42 +96,31 @@ fn rows(view: &TraceView<'_>) -> BTreeMap<String, Row> {
                 .push(evidence.clone());
         }
     }
-    for event in &view.events {
-        let name = event
-            .api_name
-            .as_deref()
-            .map(observed_key)
-            .unwrap_or_else(|| format!("unknown-api-id:{}", event.api_id));
+    for (name, seen) in std::mem::take(&mut observed_rows) {
         let row = rows.entry(name).or_default();
-        match event.kind {
-            KIND_ENTER => row.enter += 1,
-            KIND_LEAVE => row.leave += 1,
-            _ => row.other += 1,
+        row.enter += seen.enter;
+        row.leave += seen.leave;
+        row.other += seen.other;
+        row.decode_errors += seen.decode_errors;
+        for (k, v) in seen.captures {
+            *row.captures.entry(k).or_default() += v;
         }
-        for field in &event.fields {
-            *row.value_captures
-                .entry(value_capture_name(field.capture).to_string())
-                .or_default() += 1;
+        for (k, v) in seen.value_captures {
+            *row.value_captures.entry(k).or_default() += v;
         }
-        row.decode_errors += u64::from(event.args_error.is_some());
-        *row.captures
-            .entry(capture_name(event.capture).to_string())
-            .or_default() += 1;
     }
-    if let Some(profile) = &view.trace.profile_summary {
+    if let Some(profile) = &trace.profile_summary {
         for api in &profile.apis {
             // IDs are session evidence, never interpreted using today's API table.
-            let name = view
-                .trace
+            let name = trace
                 .environment
                 .as_ref()
                 .and_then(|e| e.hook_evidence.iter().find(|h| h.api_id == api.api_id))
                 .map(|h| key(&h.module, &h.function))
                 .or_else(|| {
-                    view.events
-                        .iter()
-                        .find(|e| e.api_id == api.api_id)
-                        .and_then(|e| e.api_name.as_deref())
+                    names
+                        .get(&api.api_id)
+                        .and_then(|n| n.as_deref())
                         .map(observed_key)
                 })
                 .unwrap_or_else(|| format!("unknown-api-id:{}", api.api_id));
@@ -106,9 +135,19 @@ const LIMITS: &str = "Imports cover only the captured main executable's normal i
 pub(super) fn run(args: &[String]) -> Result<(), ToolError> {
     let parsed = parse_args(args, &["json"])?;
     parsed.validate_options(&["json"])?;
-    let (path, trace) = load_trace(&parsed)?;
-    let view = TraceView::build(&trace);
-    let rows = rows(&view);
+    let path = trace_path_arg(&parsed)?;
+    let file = std::fs::File::open(&path)
+        .map_err(|e| ToolError::Runtime(format!("cannot read {path}: {e}")))?;
+    let mut observed = Observed::default();
+    let mut index = 0usize;
+    let streamed = shirusu_analysis::stream_trace(std::io::BufReader::new(file), |r, b, e| {
+        observed.note(&EventView::of(r, b, e, index));
+        index += 1;
+    })
+    .map_err(|e| ToolError::Runtime(format!("{path} is not a readable trace: {e}")))?;
+    let trace = &streamed.meta;
+    let integrity = &streamed.integrity;
+    let rows = rows(trace, observed);
     if parsed.has("json") {
         let report = JsonValue::obj(vec![
             ("trace", JsonValue::Str(path.clone())),
@@ -122,29 +161,29 @@ pub(super) fn run(args: &[String]) -> Result<(), ToolError> {
             ),
             (
                 "has_finalization",
-                JsonValue::Bool(view.integrity.has_finalization),
+                JsonValue::Bool(integrity.has_finalization),
             ),
             (
                 "finalized_cleanly",
-                JsonValue::Bool(view.integrity.finalized_cleanly),
+                JsonValue::Bool(integrity.finalized_cleanly),
             ),
             (
                 "capture_coverage",
-                view.integrity
+                integrity
                     .capture_coverage
                     .map(|n| JsonValue::Str(integrity_level_name(n).into()))
                     .unwrap_or(JsonValue::Null),
             ),
             (
                 "event_integrity",
-                view.integrity
+                integrity
                     .event_integrity
                     .map(|n| JsonValue::Str(integrity_level_name(n).into()))
                     .unwrap_or(JsonValue::Null),
             ),
             (
                 "semantic_completeness",
-                view.integrity
+                integrity
                     .semantic_completeness
                     .map(|n| JsonValue::Str(integrity_level_name(n).into()))
                     .unwrap_or(JsonValue::Null),
@@ -152,7 +191,7 @@ pub(super) fn run(args: &[String]) -> Result<(), ToolError> {
             ("limitations", JsonValue::Str(LIMITS.into())),
             (
                 "event_integrity_lost",
-                JsonValue::Bool(view.integrity.has_event_loss()),
+                JsonValue::Bool(integrity.has_event_loss()),
             ),
             (
                 "apis",
@@ -172,8 +211,8 @@ pub(super) fn run(args: &[String]) -> Result<(), ToolError> {
         );
         println!(
             "finalized_cleanly={} event_integrity={}",
-            view.integrity.finalized_cleanly,
-            view.integrity
+            integrity.finalized_cleanly,
+            integrity
                 .event_integrity
                 .map(integrity_level_name)
                 .unwrap_or("unknown")
@@ -217,7 +256,7 @@ pub(super) fn run(args: &[String]) -> Result<(), ToolError> {
             println!("  observed value capture states: {:?}", row.value_captures);
         }
     }
-    if view.integrity.has_event_loss() {
+    if integrity.has_event_loss() {
         return Err(ToolError::Incomplete(format!(
             "{path} has event loss; coverage counts are observed counts only"
         )));

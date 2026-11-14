@@ -32,7 +32,7 @@ mod parquet_export;
 mod repair;
 
 use shirusu_analysis::{
-    api_name_of_schema, integrity_level_name, loss_kind_name, EventFilter, JsonValue, TraceView,
+    api_name_of_schema, integrity_level_name, loss_kind_name, EventFilter, JsonValue,
 };
 use shirusu_host::trace_convert::{resolve_api_names, RecordMode};
 use shirusu_trace::blob::BlobId;
@@ -305,7 +305,8 @@ impl Parsed {
     }
 }
 
-fn load_trace(parsed: &Parsed) -> Result<(String, ReadTrace), ToolError> {
+/// 位置引数の Trace パス (1 つだけ)。
+fn trace_path_arg(parsed: &Parsed) -> Result<String, ToolError> {
     let path = parsed
         .positional
         .first()
@@ -314,6 +315,11 @@ fn load_trace(parsed: &Parsed) -> Result<(String, ReadTrace), ToolError> {
     if parsed.positional.len() > 1 {
         return Err(ToolError::Usage("too many positional arguments".into()));
     }
+    Ok(path)
+}
+
+fn load_trace(parsed: &Parsed) -> Result<(String, ReadTrace), ToolError> {
+    let path = trace_path_arg(parsed)?;
     let data =
         std::fs::read(&path).map_err(|e| ToolError::Runtime(format!("cannot read {path}: {e}")))?;
     let trace = shirusu_trace::read_trace(&data)

@@ -551,34 +551,57 @@ pub struct IntegritySummary {
     pub has_stored_index: bool,
 }
 
+/// イベントごとに数える完全性の材料（全体読み込みとストリーミングで共用）。
+#[derive(Debug, Default, Clone)]
+pub struct IntegrityCounts {
+    pub dropped_payload_events: u64,
+    pub dropped_payload_bytes: u64,
+    pub degraded_events: u64,
+    pub missing_blob_refs: u64,
+}
+
+impl IntegrityCounts {
+    /// 1 件を数える。`blob_present` は参照先 Blob がファイル内にあるか。
+    pub fn note(&mut self, e: &TraceEvent, blob_present: impl FnOnce(&BlobId) -> bool) {
+        if let PayloadRef::Dropped { original_len, .. } = &e.payload {
+            self.dropped_payload_events += 1;
+            self.dropped_payload_bytes = self.dropped_payload_bytes.saturating_add(*original_len);
+        }
+        if e.capture != EventCapture::Captured {
+            self.degraded_events += 1;
+        }
+        if let PayloadRef::Blob(id) = &e.payload {
+            if !blob_present(id) {
+                self.missing_blob_refs += 1;
+            }
+        }
+    }
+}
+
 impl IntegritySummary {
     pub fn of(trace: &ReadTrace) -> Self {
+        let mut counts = IntegrityCounts::default();
+        for batch in &trace.batches {
+            for e in &batch.events {
+                counts.note(e, |id| trace.blobs.contains_key(id));
+            }
+        }
+        Self::assemble(trace, &counts)
+    }
+
+    /// `trace` のメタデータ (イベント本体は使わない) とイベントごとの
+    /// 集計から作る。ストリーミング読み (`stream_trace`) が使う。
+    pub fn assemble(trace: &ReadTrace, counts: &IntegrityCounts) -> Self {
         let mut by_kind: BTreeMap<u32, u64> = BTreeMap::new();
         let mut total_loss_count = 0u64;
         for rec in &trace.loss_records {
             *by_kind.entry(rec.kind).or_default() += 1;
             total_loss_count = total_loss_count.saturating_add(rec.count);
         }
-        let mut dropped_events = 0u64;
-        let mut dropped_bytes = 0u64;
-        let mut degraded = 0u64;
-        let mut missing_blobs = 0u64;
-        for batch in &trace.batches {
-            for e in &batch.events {
-                if let PayloadRef::Dropped { original_len, .. } = &e.payload {
-                    dropped_events += 1;
-                    dropped_bytes = dropped_bytes.saturating_add(*original_len);
-                }
-                if e.capture != EventCapture::Captured {
-                    degraded += 1;
-                }
-                if let PayloadRef::Blob(id) = &e.payload {
-                    if !trace.blobs.contains_key(id) {
-                        missing_blobs += 1;
-                    }
-                }
-            }
-        }
+        let dropped_events = counts.dropped_payload_events;
+        let dropped_bytes = counts.dropped_payload_bytes;
+        let degraded = counts.degraded_events;
+        let missing_blobs = counts.missing_blob_refs;
         let issues = trace
             .issues
             .iter()

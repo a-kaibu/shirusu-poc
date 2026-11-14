@@ -10,11 +10,14 @@
 //! は「記録されたものを、記録されたとおりに」返すことに徹する。
 
 pub mod json;
+pub mod stream;
 pub mod view;
 
 pub use json::JsonValue;
+pub use stream::{stream_trace, StreamedTrace};
 pub use view::{
     api_name_of_schema, capture_name, format_field, integrity_level_name, loss_kind_name,
-    reason_name, value_capture_name, EventFilter, EventView, FieldView, IntegritySummary,
-    PayloadView, Phase, TraceView, KIND_ABORTED, KIND_COMPLETED, KIND_ENTER, KIND_LEAVE,
+    reason_name, value_capture_name, EventFilter, EventView, FieldView, IntegrityCounts,
+    IntegritySummary, PayloadView, Phase, TraceView, KIND_ABORTED, KIND_COMPLETED, KIND_ENTER,
+    KIND_LEAVE,
 };

@@ -1081,3 +1081,32 @@ fn iid_identification_requires_captured_com_context_and_is_exported() {
     event.api_name = Some("application!not-com".into());
     assert!(event.com_interface_names().is_none());
 }
+
+/// P1-4: ストリーミング集計は全体読み込みと同じ完全性の要約と件数を出す。
+#[test]
+fn streamed_summary_matches_full_read() {
+    let (blob_bytes, _) = blob_trace_bytes();
+    let corrupt = corrupt_blob_body(&blob_bytes);
+    let mut cut = sample_trace_bytes();
+    cut.truncate(cut.len() - 7);
+    for bytes in [sample_trace_bytes(), blob_bytes.clone(), corrupt, cut] {
+        let full = shirusu_trace::read_trace(&bytes).unwrap();
+        let view = TraceView::build(&full);
+        let mut seen = 0u64;
+        let streamed =
+            shirusu_analysis::stream_trace(std::io::Cursor::new(&bytes), |_, _, _| seen += 1)
+                .unwrap();
+        assert_eq!(streamed.integrity, view.integrity);
+        assert_eq!(streamed.total_events, full.total_events());
+        assert_eq!(seen, full.total_events());
+        assert_eq!(streamed.batch_count, full.batches.len() as u64);
+        assert_eq!(streamed.blob_count, full.blobs.len() as u64);
+        assert_eq!(
+            streamed.blob_bytes,
+            full.blobs.values().map(|b| b.len() as u64).sum::<u64>()
+        );
+        assert_eq!(streamed.meta.schemas.len(), full.schemas.len());
+        assert_eq!(streamed.meta.finalization, full.finalization);
+        assert!(streamed.meta.batches.is_empty());
+    }
+}
