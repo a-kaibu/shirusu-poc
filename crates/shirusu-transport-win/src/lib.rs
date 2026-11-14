@@ -65,6 +65,11 @@ fn wait_timeout_millis(timeout: Duration) -> u32 {
         .min(u128::from(u32::MAX - 1)) as u32
 }
 
+/// これより短い待機は高分解能タイマーで待つ (P2-14)。既定のタイマー
+/// 周期は約 15.6ms。
+#[cfg(windows)]
+const PRECISE_WAIT_BELOW_MS: u32 = 16;
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -431,9 +436,59 @@ mod imp {
             Ok(())
         }
         /// タイムアウト付き待機。true = signaled。
+        ///
+        /// 既定のタイマー周期 (約 15.6ms) より短い待機は、高分解能の
+        /// waitable timer と一緒に待つ (2026-11-14 レビュー P2-14: 1ms の
+        /// つもりの待機が既定周期まで伸び得た)。プロセス全体のタイマー
+        /// 分解能 (timeBeginPeriod) は変えない: 対象アプリの時間の振る舞いを
+        /// 記録のために変えないため。作れなければ従来の待機に戻る。
         pub fn wait_timeout(&self, timeout: Duration) -> bool {
             let ms = super::wait_timeout_millis(timeout);
+            if ms > 0 && ms < super::PRECISE_WAIT_BELOW_MS {
+                if let Some(signaled) = self.wait_precise(timeout) {
+                    return signaled;
+                }
+            }
             unsafe { WaitForSingleObject(self.handle, ms) == 0 }
+        }
+
+        /// `timeout` まで高分解能タイマーと一緒に待つ。タイマーを作れ
+        /// なければ None。
+        fn wait_precise(&self, timeout: Duration) -> Option<bool> {
+            use windows_sys::Win32::System::Threading::{
+                CreateWaitableTimerExW, SetWaitableTimer, WaitForMultipleObjects,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+            };
+            // SAFETY: an unnamed timer with default security, closed below.
+            let timer = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            if timer.is_null() {
+                return None;
+            }
+            // Relative due time in 100ns units (negative = relative).
+            let due = -((timeout.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
+            // SAFETY: valid timer handle, no completion routine.
+            let armed = unsafe { SetWaitableTimer(timer, &due, 0, None, std::ptr::null(), 0) } != 0;
+            let result = if armed {
+                let handles = [self.handle, timer];
+                // The timer bounds the wait; INFINITE is never reached unless
+                // the timer itself fails, guarded by a generous fallback.
+                let fallback = super::wait_timeout_millis(timeout) + 16;
+                // SAFETY: two valid handles.
+                let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, fallback) };
+                Some(r == 0)
+            } else {
+                None
+            };
+            // SAFETY: created above.
+            unsafe { CloseHandle(timer) };
+            result
         }
     }
     impl Drop for EventObject {
@@ -2139,6 +2194,28 @@ pub fn loader_lock_held_by_current_thread() -> bool {
     #[cfg(not(all(windows, any(target_arch = "x86_64", target_arch = "x86"))))]
     {
         true
+    }
+}
+
+#[cfg(all(test, windows))]
+mod precise_wait_tests {
+    use std::time::{Duration, Instant};
+
+    /// P2-14: a 1ms wait does not stretch to the default timer period.
+    /// The bound is loose (CI machines are noisy); the point is that 20 waits
+    /// take well under 20 default periods (~312ms).
+    #[test]
+    fn short_waits_use_a_high_resolution_timer() {
+        let event = super::EventObject::new(false, false).unwrap();
+        let started = Instant::now();
+        for _ in 0..20 {
+            assert!(!event.wait_timeout(Duration::from_millis(1)));
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        event.set().unwrap();
+        assert!(event.wait_timeout(Duration::from_millis(1)));
     }
 }
 
