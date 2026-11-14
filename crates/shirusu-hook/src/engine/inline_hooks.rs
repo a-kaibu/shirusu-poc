@@ -134,11 +134,31 @@ pub(super) fn thread_instruction_pointer(handle: *mut c_void) -> Result<usize, u
     Ok(ip)
 }
 
+/// [`SuspendedThreads::suspend_all`] が取り直す回数の上限。
+pub(super) const SUSPEND_ATTEMPTS: u32 = 4;
+
+/// OpenThread が存在しないスレッド ID に返すエラー。
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
 impl SuspendedThreads {
     /// 全スレッドを停止する。1 つでも停止できなければ、既に停止した
     /// スレッドを再開して Err を返す（パッチ中の実行と競合させない）。
+    ///
+    /// 一覧の取得から停止までの間にスレッドが生まれたり終わったりすると
+    /// 失敗し得るため、[`SUSPEND_ATTEMPTS`] 回まで取り直す（レビュー
+    /// 2026-11-14 P2-8: 1 回の失敗でその回の設置や復元が丸ごと抜けていた）。
     pub(super) fn suspend_all() -> Result<Self, &'static str> {
-        Self::suspend_all_after_snapshot(|| {})
+        let mut attempt = 1;
+        loop {
+            match Self::suspend_all_after_snapshot(|| {}) {
+                Ok(suspended) => return Ok(suspended),
+                Err(_) if attempt < SUSPEND_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(reason) => return Err(reason),
+            }
+        }
     }
 
     pub(super) fn suspend_all_after_snapshot(
@@ -172,15 +192,25 @@ impl SuspendedThreads {
                     )
                 };
                 if handle.is_null() {
+                    // The thread exited after the snapshot (its ID no longer
+                    // names a thread). Skipping it is safe: a thread that is
+                    // in fact still running appears in the second snapshot
+                    // below, which then refuses the set. Any other failure
+                    // (access denied) stops the attempt.
+                    if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+                        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+                        continue;
+                    }
                     failed = true;
                     break;
                 }
                 // A terminated thread ID may have been reused since Toolhelp.
-                // Never suspend a handle belonging to a different process.
+                // Never suspend a handle belonging to a different process;
+                // our thread with that ID has exited, so skip it.
                 if unsafe { GetProcessIdOfThread(handle) } != current_pid {
                     unsafe { CloseHandle(handle) };
-                    failed = true;
-                    break;
+                    more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+                    continue;
                 }
                 handles.push(handle);
                 thread_ids.push(entry.th32ThreadID);
