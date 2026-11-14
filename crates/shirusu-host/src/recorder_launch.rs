@@ -39,6 +39,10 @@ use shirusu_hook::bootstrap::{
 use shirusu_hook::pe;
 use shirusu_transport::EXPANDED_SLOT_GENERATION;
 use shirusu_transport_win as win;
+/// P1-5: 利用者による記録停止 (Ctrl-C) の受け口。
+pub use shirusu_transport_win::{
+    install_console_stop_handler, notify_stop_finished, request_stop, stop_requested,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -220,6 +224,12 @@ impl LaunchedCapture {
         win::set_current_thread_priority(win::ThreadPriority::Highest);
         loop {
             if self.target_exited()? {
+                break;
+            }
+            // P1-5: 利用者の停止要求 (Ctrl-C) でも抜け、Agent の終了手順と
+            // Index・Finalization の書き出しまで済ませる。
+            if win::stop_requested() {
+                self.session().note_stopped_by_request();
                 break;
             }
             let stats = self.session().poll_once()?;
@@ -593,6 +603,14 @@ impl TreeCapture {
             // A failed final discovery sweep is not evidence that no live
             // descendants remain. Retry under the existing bounded failure policy.
             if root_exited && self.children.is_empty() && self.scan_failures == 0 {
+                break;
+            }
+            // P1-5: 利用者の停止要求。残っている全プロセスの Trace を閉じる。
+            if win::stop_requested() {
+                self.root.session().note_stopped_by_request();
+                for child in &mut self.children {
+                    child.session().note_stopped_by_request();
+                }
                 break;
             }
             // Visit every captured process once before the next sweep. As in

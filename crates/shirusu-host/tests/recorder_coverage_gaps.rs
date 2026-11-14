@@ -462,3 +462,22 @@ fn validator_rejection_stops_the_collector_on_a_later_poll() {
     assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Lost);
     let _ = std::fs::remove_file(&path);
 }
+
+/// P1-5: 利用者の要求で止めた記録は、対象の残りの実行を含まないため
+/// Capture Coverage を Degraded にし、注記を残す (Index と Finalization は書く)。
+#[test]
+fn stop_by_request_degrades_capture_coverage() {
+    let path = temp_trace("stop-request");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    session.start().unwrap();
+    session.note_stopped_by_request();
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Degraded);
+    assert!(summary
+        .integrity
+        .notes
+        .iter()
+        .any(|n| n.contains("stopped by request")));
+    let trace = shirusu_trace::read_trace(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(trace.finalized_cleanly);
+}

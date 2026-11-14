@@ -431,10 +431,11 @@ pub struct CaptureSession {
     rings: Vec<RingEndpoint>,
     state: SessionState,
     trace_path: PathBuf,
-    /// 同一プロセス記録の場合に呼び出し側が知らせる Slot 不足数。
-    /// プロセス間では Agent 内カウンタに留まり Host からは見えない
-    /// （Phase 3 の制約として summary の注記にも残す）。
+    /// Slot 不足で記録されなかった呼び出し数。同一プロセスでは呼び出し
+    /// 側が知らせ、プロセス間では Agent が Control に掲示した値を読む (P1-1)。
     coverage_missing_calls: u64,
+    /// P1-5: 対象の終了前に利用者の要求で記録を止めたか。
+    stopped_by_request: bool,
     /// Agent DLL が Bootstrap 経由で報告したフック設置結果
     /// (設置数, 欠落数)。プロセス間記録でのみ設定される。
     hook_coverage: Option<(usize, usize)>,
@@ -514,6 +515,7 @@ impl CaptureSession {
             state: SessionState::Created,
             trace_path: path.as_ref().to_path_buf(),
             coverage_missing_calls: 0,
+            stopped_by_request: false,
             hook_coverage: None,
             com_factory_count: None,
             winrt_activation_count: None,
@@ -621,6 +623,11 @@ impl CaptureSession {
             let seen = layout::process_missing_calls(ring.mapping.base());
             self.coverage_missing_calls = self.coverage_missing_calls.max(seen);
         }
+    }
+    /// P1-5: 対象の終了前に利用者の要求で記録を止めたことを記録する。
+    /// Capture Coverage は対象の残りの実行を含まないため Degraded にする。
+    pub fn note_stopped_by_request(&mut self) {
+        self.stopped_by_request = true;
     }
     /// 同一プロセス記録で判明している Slot 不足数を知らせる
     /// （Capture Coverage の劣化として Finalization に写す）。
@@ -943,6 +950,12 @@ impl CaptureSession {
                 "slot/coverage missing calls: {}",
                 self.coverage_missing_calls
             ));
+        }
+        if self.stopped_by_request {
+            report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
+            report
+                .notes
+                .push("recording stopped by request before the target exited".into());
         }
         if let Some(outcome) = &self.shutdown_outcome {
             if let Some((level, note)) = shutdown_integrity_impact(outcome) {

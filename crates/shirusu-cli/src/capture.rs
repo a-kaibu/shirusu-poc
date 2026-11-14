@@ -481,6 +481,10 @@ pub(crate) fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
     };
     let mut launch_cfg = LaunchConfig::new(session_cfg, dll);
     launch_cfg.init_timeout = req.timeout;
+    // P1-5: Ctrl-C は記録を止めて Trace を確定する (2 回目は強制終了)。
+    if shirusu_host::recorder_launch::install_console_stop_handler() {
+        eprintln!("shirusu: press Ctrl-C to stop recording and finalize the trace");
+    }
     if let Some(n) = req.rings {
         launch_cfg.ring_count = n;
     }
@@ -501,7 +505,9 @@ pub(crate) fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
             .map_err(|e| ToolError::Runtime(format!("failed to start capture: {e}")))?;
         let summary = tree
             .run_tree_to_completion(Duration::from_millis(2))
-            .map_err(|e| ToolError::Runtime(format!("capture failed: {e}")))?;
+            .map_err(|e| ToolError::Runtime(format!("capture failed: {e}")));
+        shirusu_host::recorder_launch::notify_stop_finished();
+        let summary = summary?;
         print_summary(&req.output, &summary.root);
         for (pid, child) in &summary.children {
             println!("child {pid}:");
@@ -521,8 +527,9 @@ pub(crate) fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
     .map_err(|e| ToolError::Runtime(format!("failed to start capture: {e}")))?;
     let summary = capture
         .run_to_completion(Duration::from_millis(2))
-        .map_err(|e| ToolError::Runtime(format!("capture failed: {e}")))?;
-    print_summary(&req.output, &summary);
+        .map_err(|e| ToolError::Runtime(format!("capture failed: {e}")));
+    shirusu_host::recorder_launch::notify_stop_finished();
+    print_summary(&req.output, &summary?);
     Ok(())
 }
 

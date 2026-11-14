@@ -95,10 +95,12 @@ fn usage() -> &'static str {
      \x20 \x20 recover readable events into a new trace (default: <trace>.repaired)\n\
      \x20 capture [options] -- <exe> [args...]\n\
      \x20 \x20 launch <exe> and record from the start (Windows only;\n\
-     \x20 \x20 waits until the target exits; default output: <exe>.trace)\n\
+     \x20 \x20 waits until the target exits or Ctrl-C, which stops recording and finalizes the trace;\n\
+     \x20 \x20 default output: <exe>.trace)\n\
      \x20 attach <PID> [options]\n\
      \x20 \x20 attach to a running process and record from now on (Windows only;\n\
-     \x20 \x20 waits until the target exits; default output: shirusu-attach-<PID>.trace)\n\
+     \x20 \x20 waits until the target exits or Ctrl-C, which unhooks the target and finalizes the trace;\n\
+     \x20 \x20 default output: shirusu-attach-<PID>.trace)\n\
      \n\
      capture / attach options:\n\
      \x20 --output <path>  --dll <path>  --timeout <secs> (init timeout, default 30)\n\

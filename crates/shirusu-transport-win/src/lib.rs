@@ -1195,6 +1195,69 @@ pub use imp::{
     wait_process, write_process_memory, EventObject, SharedMapping,
 };
 
+// --- 利用者による記録停止 (2026-11-14 レビュー P1-5) ---
+
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STOP_FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 記録の停止を求める (Ctrl-C / Ctrl-Break / コンソールを閉じる操作)。
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// 停止が求められたか。回収ループは対象の終了と同じく、これを見て
+/// 抜け、Index と Finalization を書いて閉じる。
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// 停止後の確定が終わったことを知らせる (コンソールを閉じる操作では、
+/// ハンドラが戻るとプロセスが終了するため、それまで待つ)。
+pub fn notify_stop_finished() {
+    STOP_FINISHED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// コンソールの Ctrl-C / Ctrl-Break / 閉じる操作を「記録の停止」として
+/// 受けるハンドラを登録する。1 回目は停止を求めるだけでプロセスを
+/// 終わらせない。2 回目は既定の処理 (強制終了) に任せる。
+#[cfg(windows)]
+pub fn install_console_stop_handler() -> bool {
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+    };
+    unsafe extern "system" fn handler(ctrl: u32) -> BOOL {
+        match ctrl {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
+                if stop_requested() {
+                    return 0; // 2 回目: 既定の処理で終わらせる
+                }
+                request_stop();
+                if ctrl == CTRL_CLOSE_EVENT {
+                    // 戻ると終了させられる。確定を最大 4.5 秒待つ。
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(4500);
+                    while !STOP_FINISHED.load(std::sync::atomic::Ordering::Acquire)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
+    // SAFETY: handler は 'static な関数で、登録の解除はしない。
+    unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
+}
+
+/// Windows 以外では登録しない。
+#[cfg(not(windows))]
+pub fn install_console_stop_handler() -> bool {
+    false
+}
+
 /// `C:\...` or `\\server\share\...` (either separator). Relative and
 /// drive-relative paths are resolved by the target's own search rules.
 pub fn is_absolute_windows_path(path: &str) -> bool {
@@ -2086,5 +2149,17 @@ mod loader_lock_tests {
         assert!(!super::loader_lock_held_by_current_thread());
         let other = std::thread::spawn(super::loader_lock_held_by_current_thread);
         assert!(!other.join().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod stop_request_tests {
+    /// P1-5: 停止要求はプロセス全体の印として残る。
+    #[test]
+    fn stop_request_is_sticky() {
+        super::request_stop();
+        assert!(super::stop_requested());
+        super::notify_stop_finished();
+        assert!(super::stop_requested());
     }
 }
