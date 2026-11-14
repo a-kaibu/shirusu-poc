@@ -45,7 +45,7 @@ use crate::proto::{
 };
 use crate::schema::SchemaRegistry;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 
 /// Writer が書き出し先へ永続化を求める強さ（F21）。
@@ -205,10 +205,11 @@ pub struct TraceWriter<W: DurableWrite> {
     registry: SchemaRegistry,
     /// 登録済みだがまだ Schema Block に書いていない Schema。
     unwritten_schemas: Vec<SchemaDef>,
-    seen_blobs: HashSet<BlobId>,
-    /// 既知の Blob ID から内容長への写像（F18: 更新の範囲検証用。
-    /// 派生版も含む。長さは更新で変わらない）。
-    blob_lens: HashMap<BlobId, usize>,
+    /// 既知の Blob ID から内容長への写像。重複排除、イベントの参照検査、
+    /// 更新の範囲検証（F18。派生版も含む。長さは更新で変わらない）を
+    /// 1 つの表で賄う（2026-11-14 レビュー P3-10: ID の集合と長さの表を
+    /// 二重に持っていた）。長さは Block の上限内なので u32 に収まる。
+    blobs: HashMap<BlobId, u32>,
     pending_blobs: Vec<(BlobId, Vec<u8>)>,
     pending_blob_raw: usize,
     index: Vec<IndexEntry>,
@@ -260,8 +261,7 @@ impl<W: DurableWrite> TraceWriter<W> {
             offset: 0,
             registry: SchemaRegistry::new(),
             unwritten_schemas: Vec::new(),
-            seen_blobs: HashSet::new(),
-            blob_lens: HashMap::new(),
+            blobs: HashMap::new(),
             pending_blobs: Vec::new(),
             pending_blob_raw: 0,
             index: Vec::new(),
@@ -389,11 +389,10 @@ impl<W: DurableWrite> TraceWriter<W> {
             )));
         }
         let id = BlobId::of_content(data);
-        if self.seen_blobs.contains(&id) {
+        if self.blobs.contains_key(&id) {
             return Ok(id);
         }
-        self.seen_blobs.insert(id);
-        self.blob_lens.insert(id, data.len());
+        self.blobs.insert(id, data.len() as u32);
         self.pending_blob_raw += 36 + data.len();
         self.pending_blobs.push((id, data.to_vec()));
         if self.pending_blob_raw >= self.chunk_raw_target {
@@ -422,7 +421,7 @@ impl<W: DurableWrite> TraceWriter<W> {
         offset: u64,
         data: &[u8],
     ) -> Result<()> {
-        let Some(&base_len) = self.blob_lens.get(&resource_id) else {
+        let Some(base_len) = self.blobs.get(&resource_id).map(|&len| len as usize) else {
             return Err(TraceError::WriterInvariant(format!(
                 "blob update references unknown resource {resource_id} (add_payload first)"
             )));
@@ -451,8 +450,7 @@ impl<W: DurableWrite> TraceWriter<W> {
         self.write_block(BlockType::BlobUpdate, &payload, true)?;
         // 新版は「更新で生まれた Blob」として既知にする。長さは更新で
         // 変わらないため、基底長を引き継ぐ。
-        self.seen_blobs.insert(new_version_id);
-        self.blob_lens.insert(new_version_id, base_len);
+        self.blobs.insert(new_version_id, base_len as u32);
         Ok(())
     }
 
@@ -546,7 +544,7 @@ impl<W: DurableWrite> TraceWriter<W> {
         }
         let fin = Finalization {
             total_events: self.total_events,
-            total_blobs: self.seen_blobs.len() as u64,
+            total_blobs: self.blobs.len() as u64,
             total_loss_records: self.total_loss_records,
             capture_coverage: info.capture_coverage,
             event_integrity: info.event_integrity,
@@ -595,7 +593,7 @@ impl<W: DurableWrite> TraceWriter<W> {
             }
             prev = Some(e.sequence);
             if let PayloadRef::Blob(id) = &e.payload {
-                if !self.seen_blobs.contains(id) {
+                if !self.blobs.contains_key(id) {
                     return Err(TraceError::WriterInvariant(format!(
                         "event references blob {id} not added via add_payload"
                     )));
