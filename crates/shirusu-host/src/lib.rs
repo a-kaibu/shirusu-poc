@@ -636,7 +636,10 @@ impl DrainWorker {
             base,
             cfg,
             reader: ValidatingReader::new(known, expected_generation),
-            image: vec![0u8; cfg.required_len()],
+            // Allocated on the first shared-memory drain: chunk workers
+            // never use it (review 2026-11-14 P3-1: 1.25MB, 5.25MB in burst,
+            // per Ring incarnation).
+            image: Vec::new(),
             total_bytes_copied: 0,
             prev_loss: LossCounters::default(),
             open_calls: HashMap::new(),
@@ -651,6 +654,11 @@ impl DrainWorker {
             total_events: 0,
             integrity_lost: false,
             degraded_seen: 0,
+        }
+    }
+    fn ensure_image(&mut self) {
+        if self.image.is_empty() {
+            self.image = vec![0u8; self.cfg.required_len()];
         }
     }
     /// Validation-only worker for [`CommittedRangeCollector`] chunks. It never
@@ -718,6 +726,7 @@ impl DrainWorker {
             layout::OFF_PAYLOAD_READ_POSITION,
             Ordering::Acquire,
         );
+        self.ensure_image();
         // SAFETY: base はコンストラクタの契約で有効。image は同じ長さ。
         let copied = unsafe {
             snapshot_committed_range(
@@ -790,6 +799,7 @@ impl DrainWorker {
         //    以後はこの像だけを見る。未公開の Descriptor / Payload は
         //    像へ取り込まない (公開境界は Acquire で読んだ write_cursor /
         //    payload_write_position で固定する)。
+        self.ensure_image();
         // SAFETY: base はコンストラクタの契約で有効。image は同じ長さで確保した。
         let copied = unsafe {
             snapshot_committed_range(
@@ -1640,7 +1650,7 @@ mod tests {
             d.sequence = call_id + 1;
             ReceivedEvent {
                 descriptor: d,
-                payload: Vec::new(),
+                payload: (Vec::new()).into(),
             }
         };
         for call in 0..(MAX_OPEN_CALLS as u64 + 1) {
@@ -1949,7 +1959,7 @@ mod tests {
         }
         ReceivedEvent {
             descriptor: d,
-            payload: payload.to_vec(),
+            payload: (payload.to_vec()).into(),
         }
     }
     #[test]

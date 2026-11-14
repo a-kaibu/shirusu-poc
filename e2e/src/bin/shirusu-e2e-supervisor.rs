@@ -158,7 +158,7 @@ fn cross_arch() -> ScenarioReport {
         let b = rd.drain(4096);
         for e in b.events {
             if !e.descriptor.payload_dropped() {
-                got.push(u64::from_le_bytes(e.payload.try_into().unwrap()));
+                got.push(u64::from_le_bytes(e.payload[..].try_into().unwrap()));
             }
         }
         if std::time::Instant::now() > deadline {
@@ -309,7 +309,7 @@ fn production_path() -> ScenarioReport {
                 let batch = worker.drain_all();
                 for e in batch.events {
                     if !e.descriptor.payload_dropped() {
-                        got.push(u64::from_le_bytes(e.payload.try_into().unwrap()));
+                        got.push(u64::from_le_bytes(e.payload[..].try_into().unwrap()));
                     }
                 }
                 got.len() as u64 >= count
@@ -495,7 +495,7 @@ fn memory_order_stress() -> ScenarioReport {
             sequence_gaps += batch.sequence_gaps;
             for e in batch.events {
                 if !e.descriptor.payload_dropped() {
-                    got.push(u64::from_le_bytes(e.payload.try_into().unwrap()));
+                    got.push(u64::from_le_bytes(e.payload[..].try_into().unwrap()));
                 }
             }
             got.len() as u64 >= COUNT

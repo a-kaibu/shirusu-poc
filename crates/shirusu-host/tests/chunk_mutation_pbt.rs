@@ -258,7 +258,7 @@ proptest! {
                 prop_assert!(e.descriptor.sequence > last_seq, "sequence not increasing");
                 last_seq = e.descriptor.sequence;
                 prop_assert_eq!(e.payload.len(), stored_len(&e.descriptor));
-                accepted.push((e.descriptor.call_id, e.payload.clone()));
+                accepted.push((e.descriptor.call_id, e.payload.to_vec()));
             }
             stopped |= worker.is_stopped();
         }

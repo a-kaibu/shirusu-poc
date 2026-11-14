@@ -819,7 +819,93 @@ impl RingWriter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedEvent {
     pub descriptor: EventDescriptor,
-    pub payload: Vec<u8>,
+    pub payload: EventPayload,
+}
+
+/// An event's stored payload: a range of the chunk it was collected in,
+/// shared with the other events of that chunk (review 2026-11-14 P3-2: the
+/// validator copied every payload out of the chunk it had just copied).
+#[derive(Clone, Default)]
+pub struct EventPayload {
+    buf: std::sync::Arc<[u8]>,
+    start: usize,
+    end: usize,
+}
+impl EventPayload {
+    /// `range` of a shared chunk buffer.
+    pub fn shared(buf: std::sync::Arc<[u8]>, range: std::ops::Range<usize>) -> Self {
+        assert!(range.start <= range.end && range.end <= buf.len());
+        Self {
+            buf,
+            start: range.start,
+            end: range.end,
+        }
+    }
+    pub fn to_vec(&self) -> Vec<u8> {
+        self[..].to_vec()
+    }
+}
+impl std::ops::Deref for EventPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+}
+impl AsRef<[u8]> for EventPayload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+impl From<Vec<u8>> for EventPayload {
+    fn from(v: Vec<u8>) -> Self {
+        let end = v.len();
+        Self {
+            buf: v.into(),
+            start: 0,
+            end,
+        }
+    }
+}
+impl From<&[u8]> for EventPayload {
+    fn from(v: &[u8]) -> Self {
+        v.to_vec().into()
+    }
+}
+impl std::fmt::Debug for EventPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self[..].fmt(f)
+    }
+}
+impl PartialEq for EventPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+impl Eq for EventPayload {}
+impl PartialEq<[u8]> for EventPayload {
+    fn eq(&self, other: &[u8]) -> bool {
+        &self[..] == other
+    }
+}
+impl PartialEq<Vec<u8>> for EventPayload {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self[..] == other[..]
+    }
+}
+impl<const N: usize> PartialEq<[u8; N]> for EventPayload {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self[..] == other[..]
+    }
+}
+impl<const N: usize> PartialEq<&[u8; N]> for EventPayload {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self[..] == other[..]
+    }
+}
+impl PartialEq<&[u8]> for EventPayload {
+    fn eq(&self, other: &&[u8]) -> bool {
+        &self[..] == *other
+    }
 }
 impl ReceivedEvent {
     pub fn capture_state(&self) -> CaptureState {
@@ -961,7 +1047,7 @@ impl RingReader {
             }
             batch.events.push(ReceivedEvent {
                 descriptor: desc,
-                payload,
+                payload: payload.into(),
             });
             processed += 1;
         }

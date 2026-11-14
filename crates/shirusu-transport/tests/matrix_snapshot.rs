@@ -239,7 +239,7 @@ fn ev(kind: EventKind, call: u64, payload: &[u8], dropped: bool) -> ReceivedEven
     }
     ReceivedEvent {
         descriptor: d,
-        payload: payload.to_vec(),
+        payload: payload.into(),
     }
 }
 #[test]

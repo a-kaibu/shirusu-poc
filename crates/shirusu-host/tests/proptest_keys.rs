@@ -107,7 +107,7 @@ impl Rig {
             };
             prop_assert_eq!(*key, expected);
             prop_assert!(
-                model.insert(*key, e.payload.clone()).is_none(),
+                model.insert(*key, e.payload.to_vec()).is_none(),
                 "duplicate temporary key: {:?}",
                 key
             );

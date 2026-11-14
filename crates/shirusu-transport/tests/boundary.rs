@@ -1462,7 +1462,7 @@ fn reassemble_mixed_calls_dropped_fragment_and_missing_complete() {
             d.flags = flags_v;
             d
         },
-        payload: payload.to_vec(),
+        payload: payload.into(),
     };
     let events = vec![
         mk(EventKind::SnapshotFragment, 9, 0, b"aa"),

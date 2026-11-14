@@ -448,10 +448,7 @@ impl<W: DurableWrite> TraceRecorder<W> {
                 {
                     Some(complete) => {
                         stats.args_incomplete += usize::from(!complete);
-                        args = Some(match event {
-                            Cow::Borrowed(event) => event.payload.clone(),
-                            Cow::Owned(event) => event.payload,
-                        });
+                        args = Some(event.payload.to_vec());
                         stats.args_attached += 1;
                         PayloadRef::None
                     }
@@ -543,7 +540,7 @@ mod tests {
         d.timestamp_qpc = timestamp_qpc;
         ReceivedEvent {
             descriptor: d,
-            payload: Vec::new(),
+            payload: (Vec::new()).into(),
         }
     }
 

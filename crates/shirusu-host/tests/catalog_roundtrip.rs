@@ -57,7 +57,7 @@ fn event(
     d.timestamp_qpc = seq;
     ReceivedEvent {
         descriptor: d,
-        payload,
+        payload: payload.into(),
     }
 }
 

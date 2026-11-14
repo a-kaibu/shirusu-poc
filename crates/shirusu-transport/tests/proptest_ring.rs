@@ -87,14 +87,14 @@ proptest! {
                     let batch = rd.drain(*n as usize);
                     for e in batch.events {
                         let expected = model.pop_front();
-                        prop_assert_eq!(Some(e.payload), expected);
+                        prop_assert_eq!(Some(e.payload.to_vec()), expected);
                     }
                 }
             }
         }
         let batch = rd.drain_all();
         for e in batch.events {
-            prop_assert_eq!(Some(e.payload), model.pop_front());
+            prop_assert_eq!(Some(e.payload.to_vec()), model.pop_front());
         }
         prop_assert!(model.is_empty());
     }

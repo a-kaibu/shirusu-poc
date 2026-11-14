@@ -502,6 +502,9 @@ impl ValidatingReader {
             return Err(IntegrityError::PayloadRangeInvalid);
         }
         let mut events = Vec::with_capacity(count as usize);
+        // One shared copy of the chunk's payload; each event refers to its
+        // range (review 2026-11-14 P3-2: one Vec per event before).
+        let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(&chunk.payload[..]);
         for bytes in chunk.descriptors.chunks_exact(64) {
             let expectation = DescriptorExpectation {
                 sequence_at_least: self.expected_sequence,
@@ -530,10 +533,10 @@ impl ValidatingReader {
             }
             let stored_end = desc.payload_position + stored;
             let payload = if stored == 0 {
-                Vec::new()
+                crate::ring::EventPayload::default()
             } else {
                 let start = (desc.payload_position - chunk.payload_position) as usize;
-                chunk.payload[start..start + stored as usize].to_vec()
+                crate::ring::EventPayload::shared(shared.clone(), start..start + stored as usize)
             };
             self.expected_payload_position = Some(stored_end);
             self.payload_read_position = stored_end;
@@ -681,7 +684,7 @@ impl ValidatingReader {
             let payload = decode_payload(&desc, payload_region, &self.known)?;
             events.push(crate::ring::ReceivedEvent {
                 descriptor: desc,
-                payload,
+                payload: payload.into(),
             });
             cursor += 1;
         }

@@ -745,7 +745,7 @@ mod tests {
                 descriptor.payload_len = payload.len() as u32;
                 ReceivedEvent {
                     descriptor,
-                    payload,
+                    payload: payload.into(),
                 }
             })
             .collect()
@@ -1191,7 +1191,7 @@ mod tests {
             };
             if oversized_payload {
                 // Valid transport payload may be opaque to the schema converter.
-                first[0].payload = vec![0; 1024 * 1024];
+                first[0].payload = vec![0; 1024 * 1024].into();
                 first[0].descriptor.payload_len = first[0].payload.len() as u32;
             }
             let first_len = first.len();

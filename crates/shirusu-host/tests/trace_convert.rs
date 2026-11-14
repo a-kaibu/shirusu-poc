@@ -58,7 +58,7 @@ fn received(
     d.api_id = 77;
     ReceivedEvent {
         descriptor: d,
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -369,7 +369,7 @@ fn received_call(
     d.api_id = api_id;
     ReceivedEvent {
         descriptor: d,
-        payload: Vec::new(),
+        payload: (Vec::new()).into(),
     }
 }
 

@@ -57,7 +57,7 @@ fn event(sequence: u64, kind: EventKind, schema_id: u32, payload: Vec<u8>) -> Re
     d.timestamp_qpc = 9000 + sequence;
     ReceivedEvent {
         descriptor: d,
-        payload,
+        payload: payload.into(),
     }
 }
 
