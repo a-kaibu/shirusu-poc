@@ -889,10 +889,11 @@ impl CaptureSession {
                 let mut worker = lock_worker(&retired.worker);
                 self.retired_events += worker.total_events;
                 let _ = worker.finalize_thread();
-                self.retired_reports.push(worker.integrity_report(
-                    self.coverage_missing_calls,
-                    retired.stopped || worker.is_stopped(),
-                ));
+                // The session-wide missing-call count is reported once in
+                // stop(), not once per worker (a churning target retires
+                // thousands of workers).
+                self.retired_reports
+                    .push(worker.integrity_report(0, retired.stopped || worker.is_stopped()));
                 self.retired_loss_records += worker.loss_event_count();
                 worker.take_loss_events()
             };
@@ -945,10 +946,7 @@ impl CaptureSession {
             let _unterminated = worker.finalize_thread();
             // integrity_report は loss_events / unknown_terminations を
             // 見るため、取り出す前に呼ぶこと。
-            reports.push(worker.integrity_report(
-                self.coverage_missing_calls,
-                ring.stopped || worker.is_stopped(),
-            ));
+            reports.push(worker.integrity_report(0, ring.stopped || worker.is_stopped()));
             total_loss_records += worker.loss_event_count();
             let losses = worker.take_loss_events();
             if !losses.is_empty() {
@@ -971,7 +969,6 @@ impl CaptureSession {
             other => other?,
         }
         reports.append(&mut self.retired_reports);
-        let reports_were_empty = reports.is_empty();
         let mut report = combine_reports(&reports);
         if pipeline_report.storage_full {
             // P2-10: the Writer kept room for Finalization; what came after
@@ -999,8 +996,8 @@ impl CaptureSession {
                 args_stats.args_fallback_blob
             ));
         }
-        if self.coverage_missing_calls > 0 && reports_were_empty {
-            // どの Ring も記録を始めなかった場合も欠落を落とさない (P1-1)。
+        if self.coverage_missing_calls > 0 {
+            // Once per session, including when no Ring started (P1-1).
             report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
             report.notes.push(format!(
                 "slot/coverage missing calls: {}",

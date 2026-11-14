@@ -68,7 +68,7 @@ $apps = @(
     @{ name = "powershell"; kind = "console"; exe = $ps
        # Windows PowerShell 5.1: CLR start-up, JIT, many threads, a COM object.
        args = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-                "`$fso = New-Object -ComObject Scripting.FileSystemObject; `$fso.FileExists('$inputFile'); [IO.File]::WriteAllText('ps.txt', ((Get-Content '$inputFile' | Select-String 'input 3' | Measure-Object).Count).ToString()); Get-Content ps.txt; (Get-FileHash '$inputFile').Hash")
+                "`$fso = New-Object -ComObject Scripting.FileSystemObject; `$fso.FileExists('$inputFile'); [IO.File]::WriteAllText((Join-Path (Get-Location) 'ps.txt'), ((Get-Content '$inputFile' | Select-String 'input 3' | Measure-Object).Count).ToString()); Get-Content ps.txt; [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('$inputFile'))); exit 0")
        check = @("ps.txt") },
     @{ name = "notepad"; kind = "gui"; exe = (Join-Path $sys "notepad.exe"); args = @($inputFile); check = @() },
     @{ name = "charmap"; kind = "gui"; exe = (Join-Path $sys "charmap.exe"); args = @(); check = @() }
@@ -211,9 +211,14 @@ try {
                 }
                 if (($run.files -join "|") -ne ($base.files -join "|")) { $problems += "written files differ: $($run.files -join ', ') vs $($base.files -join ', ')" }
                 $inspected = Invoke-NativeCaptured -FilePath $cli -ArgumentList @("inspect", "--json", $run.trace) -TimeoutSeconds 600 -DumpDirectory $diagnostics
-                if ($inspected.ExitCode -ne 0) { $problems += "inspect could not read the trace ($($inspected.ExitCode))" }
+                # inspect exits 1 for a readable trace that lost events; the
+                # loss is a measurement here, an unreadable trace is not.
+                $inspect = $null
+                if ($inspected.ExitCode -in @(0, 1)) { try { $inspect = $inspected.Output | ConvertFrom-Json } catch { } }
+                if (-not $inspect -or ($inspected.ExitCode -eq 1 -and $inspect.integrity.status -ne "incomplete")) {
+                    $problems += "inspect could not read the trace ($($inspected.ExitCode))"
+                }
                 else {
-                    $inspect = $inspected.Output | ConvertFrom-Json
                     if ($inspect.events -le 0) { $problems += "trace holds no events" }
                     if (-not $inspect.integrity.finalized_cleanly) { $problems += "trace did not finalize cleanly" }
                     if ($inspect.integrity.recovery_issues.Count -gt 0) { $problems += "recovery issues: $($inspect.integrity.recovery_issues -join '; ')" }
@@ -221,6 +226,8 @@ try {
                     $run | Add-Member -NotePropertyName inspect -NotePropertyValue $inspect
                 }
                 if ($problems.Count -gt 0) {
+                    Set-Content (Join-Path $diagnostics "real-$arch-$($app.name)-baseline-output.txt") $base.summary
+                    Set-Content (Join-Path $diagnostics "real-$arch-$($app.name)-$i-output.txt") ($run.summary + "`n--- stderr`n" + (Get-Content (Join-Path $run.dir "stderr.txt") -Raw))
                     Copy-Item $run.trace -Destination (Join-Path $diagnostics "real-$arch-$($app.name)-$i.trace") -ErrorAction SilentlyContinue
                     throw ("$($app.name) ($arch) run ${i}: " + ($problems -join "; ") + "`n$($run.summary)")
                 }

@@ -36,10 +36,12 @@ try {
     $start.FileName = $cli
     $start.WorkingDirectory = $work
     $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
     foreach ($argument in @("attach", "$($targetProcess.Id)", "--dll", $dll, "--output", $trace)) {
         $start.ArgumentList.Add($argument)
     }
     $recorderProcess = [System.Diagnostics.Process]::Start($start)
+    $recorderOutput = $recorderProcess.StandardOutput.ReadToEndAsync()
     Wait-Marker "churn.trace"
     # Keep creating threads after initialization as well as during patching.
     # V8: from here the target counts the threads it starts; a second of
@@ -49,6 +51,9 @@ try {
     Start-Sleep -Milliseconds 1000
     New-Item -ItemType File (Join-Path $work "stop") | Out-Null
     if (-not $recorderProcess.WaitForExit(30000)) { throw "churn recorder did not finish" }
+    $recorderProcess.WaitForExit()
+    $recorderText = $recorderOutput.GetAwaiter().GetResult()
+    Write-Host $recorderText
     if ($recorderProcess.ExitCode -notin @(0,2)) { throw "churn capture failed: $($recorderProcess.ExitCode)" }
     if (-not $targetProcess.WaitForExit(10000) -or $targetProcess.ExitCode -ne 0) {
         throw "thread churn application failed under capture"
@@ -64,10 +69,28 @@ try {
     $counted = [double](Get-Content (Join-Path $work "counted.txt") -Raw)
     $expected = 32 * $counted
     if ($counted -lt 16) { throw "thread churn counted only $counted threads while recording" }
-    if ($api[0].enter -lt $expected -or $api[0].leave -lt $expected) {
-        throw "thread churn recorded $($api[0].enter) GetCurrentProcessId calls, $expected expected from $counted threads (loss records: $($summary.integrity.total_loss_count))"
+    # A thread that starts while every Slot still awaits reclamation is not
+    # recorded and is counted as Capture Coverage loss (`--rings`), so not
+    # every counted thread has to be in the Trace. What must hold:
+    #  - Slots are reclaimed: far more threads are recorded than there are
+    #    Slots (32), which a never-reclaimed Slot would prevent;
+    #  - nothing is lost silently: a shortfall comes with loss records or a
+    #    slot/coverage missing-call count.
+    $missingCalls = 0
+    if ($recorderText -match 'slot/coverage missing calls: (\d+)') { $missingCalls = [double]$Matches[1] }
+    $lossRecords = [double]$summary.integrity.total_loss_count
+    $recorded = [Math]::Min([double]$api[0].enter, [double]$api[0].leave)
+    $recordedThreads = [Math]::Floor($recorded / 32)
+    if ($recordedThreads -lt 128) {
+        throw "thread churn recorded only $recorded GetCurrentProcessId calls (~$recordedThreads threads of $counted): Slots are not reclaimed"
     }
-    Write-Host "Thread churn: $counted threads while recording, $($api[0].enter) calls recorded ($expected expected)"
+    if ($recorded -lt $expected -and $missingCalls -eq 0 -and $lossRecords -eq 0) {
+        throw "thread churn recorded $recorded of $expected GetCurrentProcessId calls with no loss record and no missing-call count (silent loss)"
+    }
+    if (($recorded + $missingCalls) -lt $expected -and $lossRecords -eq 0) {
+        throw "thread churn: $recorded recorded + $missingCalls counted missing < $expected expected, with no loss record"
+    }
+    Write-Host ("Thread churn: {0} threads while recording, {1} calls recorded of {2} ({3:P1}), slot/coverage missing calls {4}, loss records {5}" -f $counted, $recorded, $expected, ($recorded / $expected), $missingCalls, $lossRecords)
     Write-Host "Thread creation during attach passed ($arch)"
 } finally {
     foreach ($process in @($recorderProcess, $targetProcess)) {

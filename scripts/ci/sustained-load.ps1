@@ -148,8 +148,10 @@ try {
                 # V2: read the Trace back with the product's own Reader before
                 # deleting it (unpaced traces reach gigabytes).
                 $inspected = Invoke-NativeCaptured -FilePath $cli -ArgumentList @("inspect", "--json", $trace) -TimeoutSeconds ([Math]::Max(900, 3 * $run.seconds)) -DumpDirectory $diagnostics
-                if ($inspected.ExitCode -ne 0) { throw "inspect could not read the sustained trace ($($inspected.ExitCode))" }
+                # inspect exits 1 for a readable trace that lost events.
+                if ($inspected.ExitCode -notin @(0, 1)) { throw "inspect could not read the sustained trace ($($inspected.ExitCode))" }
                 $inspect = $inspected.Output | ConvertFrom-Json
+                if ($inspected.ExitCode -eq 1 -and $inspect.integrity.status -ne "incomplete") { throw "inspect failed on a complete sustained trace (1)" }
                 Remove-Item $trace
                 if ($inspect.events -ne $events) { throw "trace holds $($inspect.events) events, the capture reported $events" }
                 if (-not $inspect.integrity.finalized_cleanly) { throw "sustained trace did not finalize cleanly" }
