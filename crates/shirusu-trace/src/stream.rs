@@ -429,36 +429,75 @@ impl<R: Read + Seek> TraceStream<R> {
     }
 
     fn load_blob_inner(&mut self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        let all = self.updates.len();
+        self.load_version_before(id, all)
+    }
+
+    /// `id` の内容を、格納済みの Blob と `updates[..limit]` の更新だけから
+    /// 全体読み込み（`fold_blob_updates`）と同じ規則で復元する。
+    ///
+    /// 更新の `resource_id` が、それ以前の更新で具体化された派生版を指す
+    /// 場合（更新の連鎖）は、その派生版も同じ規則で再帰的に復元する。
+    /// 全体読み込みはリソースの作業中内容を「基底を引けた最初の更新」で
+    /// 基底のコピーから始め、以後そのリソースへの更新を順に重ねるため、
+    /// ここでも基底は各更新の位置より前の更新だけで探す（`limit` は再帰の
+    /// たびに厳密に小さくなるので停止する）。
+    fn load_version_before(&mut self, id: &BlobId, limit: usize) -> Result<Option<Vec<u8>>> {
         if let Some(&offset) = self.blob_offsets.get(id) {
             return self.read_blob_at(offset, id);
         }
-        let Some(target) = self.updates.iter().position(|u| u.new_version_id == *id) else {
-            return Ok(None);
-        };
-        let resource = self.updates[target].resource_id;
-        let Some(&base_offset) = self.blob_offsets.get(&resource) else {
-            return Ok(None);
-        };
-        let Some(mut working) = self.read_blob_at(base_offset, &resource)? else {
-            return Ok(None);
-        };
-        let chain: Vec<u64> = self.updates[..=target]
+        // `id` を宣言する更新は複数あり得る（同じ版へ戻す更新、別リソース
+        // からの同じ内容）。ファイル順で最初の宣言が失敗しても（範囲外・
+        // ハッシュ不一致・破損）、後の宣言が成功すれば全体読み込みは具体化
+        // するので、宣言のあるリソースを順に試す。
+        let mut resources: Vec<BlobId> = Vec::new();
+        for u in &self.updates[..limit] {
+            if u.new_version_id == *id && !resources.contains(&u.resource_id) {
+                resources.push(u.resource_id);
+            }
+        }
+        for resource in resources {
+            if let Some(content) = self.fold_resource_until(&resource, id, limit)? {
+                return Ok(Some(content));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `resource` への `updates[..limit]` の更新を全体読み込みと同じ規則で
+    /// 順に重ね、`id` を宣言する更新が成功した時点の内容を返す。
+    fn fold_resource_until(
+        &mut self,
+        resource: &BlobId,
+        id: &BlobId,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let chain: Vec<(usize, u64)> = self.updates[..limit]
             .iter()
-            .filter(|u| u.resource_id == resource)
-            .map(|u| u.offset)
+            .enumerate()
+            .filter(|(_, u)| u.resource_id == *resource)
+            .map(|(i, u)| (i, u.offset))
             .collect();
-        for offset in chain {
+        let mut working: Option<Vec<u8>> = None;
+        for (index, offset) in chain {
+            if working.is_none() {
+                working = self.load_version_before(resource, index)?;
+                if working.is_none() {
+                    continue;
+                }
+            }
             let Some(update) = self
                 .read_block_payload(offset)?
                 .and_then(|raw| BlobUpdate::decode(&raw))
             else {
                 continue;
             };
-            if let Some(folded) = apply_update_to(&working, update.offset, &update.data) {
+            let current = working.as_mut().expect("seeded above");
+            if let Some(folded) = apply_update_to(current, update.offset, &update.data) {
                 if BlobId::of_content(&folded) == update.new_version_id {
-                    working = folded;
+                    *current = folded;
                     if update.new_version_id == *id {
-                        return Ok(Some(working));
+                        return Ok(working);
                     }
                 }
             }

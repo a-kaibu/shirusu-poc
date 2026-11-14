@@ -42,3 +42,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.lints.clippy]
 all = "warn"
+
+# cargo-mutants 用（`cargo mutants --profile mutants`）。debug assertion と
+# overflow 検査は残し、総当たり系の重いテストが数十秒かからないよう最適化する。
+[profile.mutants]
+inherits = "dev"
+opt-level = 1
+debug = false

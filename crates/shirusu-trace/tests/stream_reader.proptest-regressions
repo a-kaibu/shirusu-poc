@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd710d2fd8a991c92da6b5fd672d8ea1662230d069ce3ea0ac8a496a93aa7a40 # shrinks to ops = [Payload([0]), Update { target: 0, offset: 0, data: [1] }, Update { target: 2898486520592276977, offset: 0, data: [2] }]
+cc f8b895e0124f701be17b753e40e84e8b843ff85b73f5d2a2eab73b877d6a4f38 # shrinks to ops = [Payload([0]), Payload([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Uncompressed { thread: 1, refs: [0] }, Update { target: 0, offset: 0, data: [1] }, Update { target: 2126673672762040544, offset: 0, data: [2] }, Loss(1), Update { target: 1040808271878391450, offset: 0, data: [0] }], finish = false, d = None, limits = ReaderLimits { max_blocks: 1000000, max_events: 100000000, max_blobs: 10000000, max_decoded_bytes: 1073741824, max_blob_bytes: 536870912 }
+cc 746ef09390dd8f8cd510d4edec45b42898c3bada0e14a583cc755e4819efd4ce # shrinks to ops = [Payload([0]), Update { target: 0, offset: 0, data: [1] }, Payload([]), Batch { thread: 1, refs: [0], inline: None }, Batch { thread: 1, refs: [], inline: Some([]) }, Payload([2]), Batch { thread: 1, refs: [0], inline: None }, Batch { thread: 1, refs: [], inline: Some([]) }, Payload([3]), Loss(1), Batch { thread: 1, refs: [0], inline: None }, Payload([4]), Payload([5]), Loss(1), Loss(1), Loss(1), Loss(1), Loss(1), Batch { thread: 1, refs: [], inline: Some([]) }, Update { target: 1472722874058782, offset: 0, data: [6] }, Update { target: 5559279049207780035, offset: 0, data: [] }], finish = false, d = SwapBlocks(8297894174441852646), limits = ReaderLimits { max_blocks: 1000000, max_events: 100000000, max_blobs: 10000000, max_decoded_bytes: 1073741824, max_blob_bytes: 536870912 }
