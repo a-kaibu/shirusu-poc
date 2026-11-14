@@ -379,6 +379,9 @@ mod win {
                 return 1;
             }
         };
+        for (pid, reason) in &summary.uninjectable {
+            println!("  uninjectable child pid={pid}: {reason}");
+        }
         let mut c = Checker { failures: vec![] };
         c.check_target_exit(&summary.root, "root");
         c.check(
