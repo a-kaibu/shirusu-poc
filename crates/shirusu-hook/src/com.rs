@@ -21,7 +21,7 @@
 /// イベント識別子と Schema は API Catalog の共有定義を使う。
 pub use shirusu_api_catalog::com::*;
 use shirusu_trace::compact::encode_values;
-use shirusu_trace::schema::{schema_types, CapturedValue, TypedValue};
+use shirusu_trace::schema::{CapturedValue, TypedValue};
 use shirusu_trace::CompactError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -431,10 +431,18 @@ pub fn com_factory_enter_values(args: &ComFactoryArgs) -> Vec<CapturedValue> {
     ]
 }
 pub fn encode_com_factory_enter(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    encode_values(&schema_types(&com_factory_enter_schema()).unwrap(), values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(
+        crate::callback::cached_schema_types(&TYPES, com_factory_enter_schema),
+        values,
+    )
 }
 pub fn encode_com_factory_leave(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    encode_values(&schema_types(&com_factory_leave_schema()).unwrap(), values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(
+        crate::callback::cached_schema_types(&TYPES, com_factory_leave_schema),
+        values,
+    )
 }
 
 /// enter 値列を作る。`args` は `this` を除く引数の生スロット値列。
@@ -504,13 +512,19 @@ fn method_result_values(
 }
 
 pub fn encode_com_enter(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types = schema_types(&com_method_enter_schema()).expect("com enter schema is well-formed");
-    encode_values(&types, values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(
+        crate::callback::cached_schema_types(&TYPES, com_method_enter_schema),
+        values,
+    )
 }
 
 pub fn encode_com_leave(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types = schema_types(&com_method_leave_schema()).expect("com leave schema is well-formed");
-    encode_values(&types, values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(
+        crate::callback::cached_schema_types(&TYPES, com_method_leave_schema),
+        values,
+    )
 }
 
 /// 引数の生スロット値列を作る（native 幅の usize を LE で並べる）。
@@ -980,6 +994,7 @@ impl ComCloneRegistry {
 mod tests {
     use super::*;
     use shirusu_trace::compact::decode_values;
+    use shirusu_trace::schema::schema_types;
     use shirusu_trace::schema::{LastErrorMeaning, SchemaRegistry};
 
     #[test]

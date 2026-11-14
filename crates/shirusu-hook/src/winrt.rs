@@ -42,7 +42,7 @@ use crate::com::{ComInterfaceDef, ComMethodDef, Guid};
 /// イベント識別子と Schema は API Catalog の共有定義を使う。
 pub use shirusu_api_catalog::winrt::*;
 use shirusu_trace::compact::encode_values;
-use shirusu_trace::schema::{schema_types, CapturedValue, TypedValue};
+use shirusu_trace::schema::{CapturedValue, TypedValue};
 use shirusu_trace::CompactError;
 
 // ---- 既知の WinRT インターフェイス ----
@@ -612,15 +612,19 @@ pub fn winrt_activation_leave_values(hresult: i32, returned_object: u64) -> Vec<
 }
 
 pub fn encode_winrt_activation_enter(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types =
-        schema_types(&winrt_activation_enter_schema()).expect("winrt enter schema is well-formed");
-    encode_values(&types, values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(
+        crate::callback::cached_schema_types(&TYPES, winrt_activation_enter_schema),
+        values,
+    )
 }
 
 pub fn encode_winrt_activation_leave(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types =
-        schema_types(&winrt_activation_leave_schema()).expect("winrt leave schema is well-formed");
-    encode_values(&types, values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(
+        crate::callback::cached_schema_types(&TYPES, winrt_activation_leave_schema),
+        values,
+    )
 }
 
 // ---- HSTRING の読み取り ----
@@ -685,6 +689,7 @@ mod tests {
     use super::*;
     use crate::com::interface_by_iid;
     use shirusu_trace::compact::decode_values;
+    use shirusu_trace::schema::schema_types;
     use shirusu_trace::schema::SchemaRegistry;
 
     #[test]

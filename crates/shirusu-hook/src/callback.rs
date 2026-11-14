@@ -118,16 +118,24 @@ pub fn callback_leave_values(result: i64) -> Vec<CapturedValue> {
     vec![CapturedValue::captured(TypedValue::I64(result))]
 }
 
+/// Schema の型の並びを一度だけ作って使い回す (2026-11-14 レビュー P1-7:
+/// 以前はイベントごとに Schema を組み立て、内容ハッシュ (BLAKE3) まで
+/// 計算してから型の並びだけを使っていた)。
+pub fn cached_schema_types(
+    cell: &'static std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>>,
+    schema: fn() -> shirusu_trace::proto::SchemaDef,
+) -> &'static [shirusu_trace::schema::Ty] {
+    cell.get_or_init(|| schema_types(&schema()).expect("built-in schema is well-formed"))
+}
+
 pub fn encode_callback_enter(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types =
-        schema_types(&callback_enter_schema()).expect("callback enter schema is well-formed");
-    encode_values(&types, values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(cached_schema_types(&TYPES, callback_enter_schema), values)
 }
 
 pub fn encode_callback_leave(values: &[CapturedValue]) -> Result<Vec<u8>, CompactError> {
-    let types =
-        schema_types(&callback_leave_schema()).expect("callback leave schema is well-formed");
-    encode_values(&types, values)
+    static TYPES: std::sync::OnceLock<Vec<shirusu_trace::schema::Ty>> = std::sync::OnceLock::new();
+    encode_values(cached_schema_types(&TYPES, callback_leave_schema), values)
 }
 
 // ---- WndProc スロット表 ----
