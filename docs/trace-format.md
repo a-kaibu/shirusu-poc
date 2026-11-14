@@ -562,9 +562,13 @@ overview「チャンク、圧縮、Blob」節は「各 Event Chunk は、自分�
    `dump --api` 等で検索できる。args の生バイト列はイベントに残る。
 2. **型付き解釈は、ファイル内のいずれかの Schema / Checkpoint に
    定義が残っている限り可能**。Writer は Schema Block を書くたびに、
-   直後にその時点までの全定義の複製を Schema Checkpoint Block として
-   書く（`TraceWriter::flush_schemas`）。これにより、単一 Block の
-   破損では型付き解釈は失われない。手動の `write_schema_checkpoint()`
+   直後にその定義の複製を Schema Checkpoint Block として書く
+   （`TraceWriter::flush_schemas`）。これにより、単一 Block の破損では
+   型付き解釈は失われない。前回の全定義の複製以降に増えた定義数が
+   その複製の大きさに達したときは、代わりにその時点までの全定義を
+   複製する。遅延登録のたびに全定義を書くと定義数の二乗になるため、
+   全体複製は大きさが倍になるごとに留め、複製の総量を定義数の 3 倍
+   以内にする。手動の `write_schema_checkpoint()`
    は、長時間記録の途中で任意の時点に複製を追加で置くために残す。
 
 「リソース復元可能」との区別: 独立デコード可能とは、チャンク単独で型と

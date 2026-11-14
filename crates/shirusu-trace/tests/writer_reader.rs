@@ -512,6 +512,38 @@ fn schema_checkpoint_twins_schema_block() {
 }
 
 #[test]
+fn lazily_registered_schemas_keep_checkpoints_linear() {
+    // P3-11: one Schema at a time used to copy every definition each time.
+    let n = 200u32;
+    let mut w = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    for id in 1..=n {
+        w.register_schema(make_schema(
+            id,
+            &format!("api{id}"),
+            vec![("v".into(), Ty::U32, 0)],
+        ))
+        .unwrap();
+        let mut e = event(u64::from(id), PayloadRef::None);
+        e.schema_id = id;
+        w.write_batch(&batch(3, vec![e])).unwrap();
+    }
+    let bytes = w.finish(FinalizationInfo::default()).unwrap();
+    let mut copied = 0usize;
+    for (off, t, len) in block_layout(&bytes) {
+        if t == BlockType::SchemaCheckpoint {
+            let set =
+                shirusu_trace::proto::SchemaSet::decode(&bytes[off + 32..off + 32 + len]).unwrap();
+            copied += set.schemas.len();
+        }
+    }
+    assert!(copied >= n as usize, "every definition has a copy");
+    assert!(copied <= 3 * n as usize, "copies: {copied}");
+    let trace = read_trace_via(&bytes).unwrap();
+    assert_eq!(trace.registry.len(), n as usize);
+    assert!(trace.issues.is_empty(), "issues: {:?}", trace.issues);
+}
+
+#[test]
 fn corrupt_schema_block_is_covered_by_checkpoint() {
     // F22: Schema Block が 1 個壊れても、直後の Checkpoint の複製から
     // Schema が復旧し、型付き解釈ができる。

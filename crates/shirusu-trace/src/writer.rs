@@ -205,6 +205,10 @@ pub struct TraceWriter<W: DurableWrite> {
     registry: SchemaRegistry,
     /// 登録済みだがまだ Schema Block に書いていない Schema。
     unwritten_schemas: Vec<SchemaDef>,
+    /// Definitions written since the last full Schema Checkpoint, and how
+    /// many that checkpoint held (P3-11: amortized full copies).
+    schemas_since_full_checkpoint: usize,
+    last_full_checkpoint_len: usize,
     /// 既知の Blob ID から内容長への写像。重複排除、イベントの参照検査、
     /// 更新の範囲検証（F18。派生版も含む。長さは更新で変わらない）を
     /// 1 つの表で賄う（2026-11-14 レビュー P3-10: ID の集合と長さの表を
@@ -261,6 +265,8 @@ impl<W: DurableWrite> TraceWriter<W> {
             offset: 0,
             registry: SchemaRegistry::new(),
             unwritten_schemas: Vec::new(),
+            schemas_since_full_checkpoint: 0,
+            last_full_checkpoint_len: 0,
             blobs: HashMap::new(),
             pending_blobs: Vec::new(),
             pending_blob_raw: 0,
@@ -367,7 +373,10 @@ impl<W: DurableWrite> TraceWriter<W> {
             }
         }
         let payload = set.encode();
-        self.write_block(BlockType::SchemaCheckpoint, &payload, false)
+        self.write_block(BlockType::SchemaCheckpoint, &payload, false)?;
+        self.last_full_checkpoint_len = set.schemas.len();
+        self.schemas_since_full_checkpoint = 0;
+        Ok(())
     }
 
     /// Payload 本体を受け取り Blob ID を返す。既出の内容なら格納せず
@@ -684,13 +693,23 @@ impl<W: DurableWrite> TraceWriter<W> {
             self.unwritten_schemas = set.schemas;
             return Err(e);
         }
-        // F22: Schema Block の直後に、その時点までの全定義の複製を
-        // Schema Checkpoint Block として書く。Reader はファイル全体
-        // から 1 つのレジストリを構築するため、Schema Block と
-        // Checkpoint のどちらか一方のコピーが残っていれば型付き解釈
-        // ができる。単一 Block の破損に対する冗長性であり、Checkpoint
-        // 自体は write_schema_checkpoint() でも任意の時点で書ける。
-        self.write_schema_checkpoint()?;
+        // F22: Schema Block の直後に、その定義の複製を Schema Checkpoint
+        // Block として書く。Reader はファイル全体から 1 つのレジストリを
+        // 構築するため、Schema Block と Checkpoint のどちらか一方の
+        // コピーが残っていれば型付き解釈ができる（単一 Block の破損に
+        // 対する冗長性）。
+        //
+        // 全定義の複製は、前回の全体複製以降に増えた定義数がその大きさに
+        // 達したときだけ書き、それ以外は今回の定義だけを複製する。遅延
+        // 登録のたびに全定義を書くと定義数の二乗になる（2026-11-14
+        // レビュー P3-11）。全体複製の大きさは毎回 2 倍以上になるため、
+        // 複製の総量は定義数の 3 倍以内に収まる（全体複製で 2 倍、差分で 1 倍）。
+        self.schemas_since_full_checkpoint += set.schemas.len();
+        if self.schemas_since_full_checkpoint >= self.last_full_checkpoint_len {
+            self.write_schema_checkpoint()?;
+        } else {
+            self.write_block(BlockType::SchemaCheckpoint, &payload, false)?;
+        }
         Ok(())
     }
 
