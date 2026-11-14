@@ -168,7 +168,7 @@ impl ModuleClassification {
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
                 (1, WIRE_LEN) => m.module_name = r.value_string()?,
-                (2, WIRE_VARINT) => m.class = ModuleClass::from_code(r.value_u64()? as u32),
+                (2, WIRE_VARINT) => m.class = ModuleClass::from_code(r.value_u32()?),
                 (3, WIRE_LEN) => m.reason = r.value_string()?,
                 (4, WIRE_VARINT) => m.uncertain = r.value_bool()?,
                 (5, WIRE_LEN) => m.implementation_module = Some(r.value_string()?),

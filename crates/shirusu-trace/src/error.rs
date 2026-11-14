@@ -23,6 +23,9 @@ pub enum ProtoError {
     /// 1 つのメッセージの繰り返しフィールドが上限を超えた（2026-11-14
     /// レビュー P2-11: 数 KB の圧縮 Block から億単位の構造体を作らない）。
     TooManyEntries { limit: usize },
+    /// 整数フィールドが宣言された幅に収まらない（2026-11-14 レビュー
+    /// P3-13: 黙って切り捨てると別の ID として読まれる）。
+    ValueOutOfRange { value: u64 },
 }
 
 impl fmt::Display for ProtoError {
@@ -38,6 +41,9 @@ impl fmt::Display for ProtoError {
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
             Self::TooManyEntries { limit } => {
                 write!(f, "more than {limit} repeated entries in one message")
+            }
+            Self::ValueOutOfRange { value } => {
+                write!(f, "integer {value} does not fit the field width")
             }
         }
     }

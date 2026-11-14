@@ -84,7 +84,7 @@ impl StaticImport {
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
                 (1, WIRE_LEN) => m.name = Some(r.value_string()?),
-                (2, WIRE_VARINT) => m.ordinal = Some(r.value_u64()? as u16),
+                (2, WIRE_VARINT) => m.ordinal = Some(r.value_u16()?),
                 _ => r.skip(wire)?,
             }
         }

@@ -323,11 +323,13 @@ pub(crate) fn profile_api_name(trace: &ReadTrace, api_id: u32) -> String {
     if api_id == 0 {
         return "api#0".to_string();
     }
-    let enter_schema_id = (api_id - 1) * 2 + 1;
+    // api_id comes from the file: an id past u32::MAX / 2 has no Schema
+    // (2026-11-14 review P3-13: the multiplication overflowed).
+    let enter_schema_id = (api_id - 1).checked_mul(2).and_then(|n| n.checked_add(1));
     trace
         .schemas
         .iter()
-        .find(|s| s.schema_id == enter_schema_id)
+        .find(|s| Some(s.schema_id) == enter_schema_id)
         .map(|s| api_name_of_schema(&s.name).to_string())
         .unwrap_or_else(|| format!("api#{api_id}"))
 }
@@ -551,6 +553,29 @@ pub(crate) fn inspect_json(path: &str, d: &InspectData) -> JsonValue {
 mod tests {
     use super::*;
     use shirusu_trace::schema::{make_schema, EventCapture, Ty};
+
+    #[test]
+    fn profile_names_survive_api_ids_from_the_file() {
+        // P3-13: a crafted api_id overflowed the Schema ID computation.
+        let env = CaptureEnvironment {
+            session: SessionMetadata {
+                session_id: 3,
+                created_by: "inspect-test".into(),
+                qpc_frequency: 1000,
+            },
+            ..Default::default()
+        };
+        let mut w = TraceWriter::new(Vec::new(), env).unwrap();
+        w.register_schema(make_schema(1, "k32!T/enter", vec![]))
+            .unwrap();
+        let bytes = w.finish(Default::default()).unwrap();
+        let trace = shirusu_trace::read_trace(&bytes).unwrap();
+        assert_eq!(
+            profile_api_name(&trace, u32::MAX),
+            format!("api#{}", u32::MAX)
+        );
+        assert_eq!(profile_api_name(&trace, 0), "api#0");
+    }
 
     /// P1-4: ストリーミングで作った inspect の出力は、全体読み込みと同じ。
     #[test]

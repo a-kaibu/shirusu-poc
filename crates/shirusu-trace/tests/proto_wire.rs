@@ -409,3 +409,22 @@ fn present_empty_optionals_survive_roundtrip() {
     assert_eq!(StaticImport::named("A").encode(), vec![0x0A, 0x01, b'A']);
     assert_eq!(StaticImport::by_ordinal(7).encode(), vec![0x10, 0x07]);
 }
+
+#[test]
+fn out_of_range_u32_fields_are_rejected_not_truncated() {
+    // P3-13: schema_id = 2^32 + 1 used to read back as schema 1.
+    let mut w = ProtoWriter::new();
+    w.u64_field(1, (1u64 << 32) + 1);
+    assert_eq!(
+        SchemaDef::decode(&w.into_bytes()).unwrap_err(),
+        ProtoError::ValueOutOfRange {
+            value: (1u64 << 32) + 1
+        }
+    );
+    let mut w = ProtoWriter::new();
+    w.u64_field(1, u64::from(u32::MAX));
+    assert_eq!(
+        SchemaDef::decode(&w.into_bytes()).unwrap().schema_id,
+        u32::MAX
+    );
+}

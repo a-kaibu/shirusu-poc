@@ -185,6 +185,15 @@ impl<'a> ProtoReader<'a> {
     pub fn value_u64(&mut self) -> Result<u64, ProtoError> {
         self.read_varint()
     }
+    /// A `uint32` field. Out-of-range values are an error, not truncated.
+    pub fn value_u32(&mut self) -> Result<u32, ProtoError> {
+        let value = self.read_varint()?;
+        u32::try_from(value).map_err(|_| ProtoError::ValueOutOfRange { value })
+    }
+    pub fn value_u16(&mut self) -> Result<u16, ProtoError> {
+        let value = self.read_varint()?;
+        u16::try_from(value).map_err(|_| ProtoError::ValueOutOfRange { value })
+    }
     pub fn value_bool(&mut self) -> Result<bool, ProtoError> {
         Ok(self.read_varint()? != 0)
     }
@@ -396,8 +405,8 @@ impl HookEvidence {
                 (5, WIRE_LEN) => m.reason = r.value_string()?,
                 (6, WIRE_LEN) => m.scope = r.value_string()?,
                 (7, WIRE_LEN) => m.semantic_detail = r.value_string()?,
-                (8, WIRE_VARINT) => m.semantic_level = r.value_u64()? as u32,
-                (9, WIRE_VARINT) => m.api_id = r.value_u64()? as u32,
+                (8, WIRE_VARINT) => m.semantic_level = r.value_u32()?,
+                (9, WIRE_VARINT) => m.api_id = r.value_u32()?,
                 _ => r.skip(wire)?,
             }
         }
@@ -434,9 +443,9 @@ impl CaptureEnvironment {
             match (f, wire) {
                 (1, WIRE_LEN) => m.session = SessionMetadata::decode(r.value_bytes()?)?,
                 (2, WIRE_LEN) => m.os_version = r.value_string()?,
-                (3, WIRE_VARINT) => m.os_build = r.value_u64()? as u32,
+                (3, WIRE_VARINT) => m.os_build = r.value_u32()?,
                 (4, WIRE_LEN) => m.cpu_arch = r.value_string()?,
-                (5, WIRE_VARINT) => m.pointer_width = r.value_u64()? as u32,
+                (5, WIRE_VARINT) => m.pointer_width = r.value_u32()?,
                 (6, WIRE_LEN) => m.capture_config = r.value_string()?,
                 (7, WIRE_VARINT) => m.feature_flags = r.value_u64()?,
                 (8, WIRE_LEN) => m.target_description = r.value_string()?,
@@ -470,8 +479,8 @@ impl FieldDef {
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
                 (1, WIRE_LEN) => m.name = r.value_string()?,
-                (2, WIRE_VARINT) => m.ty = r.value_u64()? as u32,
-                (3, WIRE_VARINT) => m.flags = r.value_u64()? as u32,
+                (2, WIRE_VARINT) => m.ty = r.value_u32()?,
+                (3, WIRE_VARINT) => m.flags = r.value_u32()?,
                 _ => r.skip(wire)?,
             }
         }
@@ -496,7 +505,7 @@ impl SchemaDef {
         let mut r = ProtoReader::new(buf);
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
-                (1, WIRE_VARINT) => m.schema_id = r.value_u64()? as u32,
+                (1, WIRE_VARINT) => m.schema_id = r.value_u32()?,
                 (2, WIRE_LEN) => m.name = r.value_string()?,
                 (3, WIRE_VARINT) => m.content_hash = r.value_u64()?,
                 (4, WIRE_LEN) => push_bounded(
@@ -578,12 +587,12 @@ impl BatchHeader {
             match (f, wire) {
                 (1, WIRE_VARINT) => m.session_id = r.value_u64()?,
                 (2, WIRE_VARINT) => m.process_id = r.value_u64()?,
-                (3, WIRE_VARINT) => m.raw_pid = r.value_u64()? as u32,
+                (3, WIRE_VARINT) => m.raw_pid = r.value_u32()?,
                 (4, WIRE_VARINT) => m.thread_id = r.value_u64()?,
                 (5, WIRE_VARINT) => m.base_timestamp_qpc = r.value_u64()?,
                 (6, WIRE_VARINT) => m.qpc_frequency = r.value_u64()?,
                 (7, WIRE_VARINT) => m.first_sequence = r.value_u64()?,
-                (8, WIRE_VARINT) => m.event_count = r.value_u64()? as u32,
+                (8, WIRE_VARINT) => m.event_count = r.value_u32()?,
                 (9, WIRE_VARINT) => m.has_global_order = r.value_u64()? != 0,
                 _ => r.skip(wire)?,
             }
@@ -610,7 +619,7 @@ impl LossRecord {
         let mut r = ProtoReader::new(buf);
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
-                (1, WIRE_VARINT) => m.kind = r.value_u64()? as u32,
+                (1, WIRE_VARINT) => m.kind = r.value_u32()?,
                 (2, WIRE_VARINT) => m.count = r.value_u64()?,
                 (3, WIRE_VARINT) => m.dropped_payload_bytes = r.value_u64()?,
                 (4, WIRE_VARINT) => m.degraded_events = r.value_u64()?,
@@ -674,7 +683,7 @@ impl BlockIndex {
                     while let Some((ef, ewire)) = er.next_field()? {
                         match (ef, ewire) {
                             (1, WIRE_VARINT) => e.offset = er.value_u64()?,
-                            (2, WIRE_VARINT) => e.block_type = er.value_u64()? as u32,
+                            (2, WIRE_VARINT) => e.block_type = er.value_u32()?,
                             (3, WIRE_VARINT) => e.sequence = er.value_u64()?,
                             _ => er.skip(ewire)?,
                         }
@@ -715,9 +724,9 @@ impl Finalization {
                 (1, WIRE_VARINT) => m.total_events = r.value_u64()?,
                 (2, WIRE_VARINT) => m.total_blobs = r.value_u64()?,
                 (3, WIRE_VARINT) => m.total_loss_records = r.value_u64()?,
-                (4, WIRE_VARINT) => m.capture_coverage = r.value_u64()? as u32,
-                (5, WIRE_VARINT) => m.event_integrity = r.value_u64()? as u32,
-                (6, WIRE_VARINT) => m.semantic_completeness = r.value_u64()? as u32,
+                (4, WIRE_VARINT) => m.capture_coverage = r.value_u32()?,
+                (5, WIRE_VARINT) => m.event_integrity = r.value_u32()?,
+                (6, WIRE_VARINT) => m.semantic_completeness = r.value_u32()?,
                 (7, WIRE_VARINT) => cleanly = r.value_bool()?,
                 (8, WIRE_LEN) => m.notes.push(r.value_string()?),
                 _ => r.skip(wire)?,
@@ -763,7 +772,7 @@ impl ApiProfile {
         let mut r = ProtoReader::new(buf);
         while let Some((f, wire)) = r.next_field()? {
             match (f, wire) {
-                (1, WIRE_VARINT) => m.api_id = r.value_u64()? as u32,
+                (1, WIRE_VARINT) => m.api_id = r.value_u32()?,
                 (2, WIRE_VARINT) => m.calls = r.value_u64()?,
                 (3, WIRE_VARINT) => m.enters = r.value_u64()?,
                 (4, WIRE_VARINT) => m.leaves = r.value_u64()?,
