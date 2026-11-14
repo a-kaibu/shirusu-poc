@@ -3,7 +3,6 @@
 //! 境界値（Unknown は有効な水準、閉じた Enter への二重 Leave は違反）も見る。
 
 use shirusu_conformance::{check_trace, CheckStatus};
-use shirusu_trace::blob::BlobId;
 use shirusu_trace::model::{EventBatch, PayloadRef, TraceEvent};
 use shirusu_trace::proto::{integrity_level, CaptureEnvironment, SessionMetadata};
 use shirusu_trace::reader::ReadTrace;
