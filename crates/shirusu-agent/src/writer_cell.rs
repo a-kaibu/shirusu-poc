@@ -176,6 +176,11 @@ impl WriterCell {
         true
     }
 
+    /// Whether the calling OS thread owns the fast path (no lock, no call).
+    pub(crate) fn owned_by_current_thread(&self) -> bool {
+        self.owner.load(Ordering::Relaxed) == thread_token()
+    }
+
     /// Whether the fast-path owner has terminated (false while unclaimed or
     /// when its liveness is unknown). Final once true.
     pub(crate) fn owner_terminated(&self) -> bool {

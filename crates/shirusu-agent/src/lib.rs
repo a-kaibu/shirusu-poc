@@ -425,6 +425,25 @@ impl Agent {
             .ok()?;
         Some(state)
     }
+    /// Whether the calling OS thread already records for `thread_id` through
+    /// its own live Ring (its cached state, not retired, owned by it). Reads
+    /// only thread-local state and atomics: a recording thread asked to
+    /// confirm its registration takes no lock, so being terminated there
+    /// cannot leave one held.
+    pub fn current_thread_registered(&self, thread_id: u64) -> bool {
+        TLS_STATE
+            .try_with(|c| {
+                c.try_borrow().ok().is_some_and(|c| {
+                    c.as_ref().is_some_and(|c| {
+                        c.agent == self.id
+                            && c.thread_id == thread_id
+                            && !c.state.retired.load(Ordering::Acquire)
+                            && c.state.writer.owned_by_current_thread()
+                    })
+                })
+            })
+            .unwrap_or(false)
+    }
     fn state_for_slow(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
         let found = self.threads.read().unwrap().get(&thread_id).cloned();
         if let Some(s) = found {
@@ -1493,6 +1512,22 @@ mod tests {
     /// `owner_busy` set. Management paths must not wait for it forever, the
     /// Ring keeps only what was published, the cut-off event counts as lost,
     /// and the Slot is reused only after the published events are drained.
+    #[test]
+    fn registration_is_confirmed_from_thread_local_state() {
+        let a = agent(2);
+        assert!(!a.current_thread_registered(7), "nothing recorded yet");
+        assert!(matches!(
+            a.record_enter(7, 10, 20, 1, 0, b"x"),
+            RecordResult::Written(_)
+        ));
+        assert!(a.current_thread_registered(7));
+        assert!(!a.current_thread_registered(8), "another thread ID");
+        let other = std::thread::scope(|s| s.spawn(|| a.current_thread_registered(7)).join());
+        assert!(!other.unwrap(), "another OS thread does not own the Ring");
+        assert!(a.thread_exit(7));
+        assert!(!a.current_thread_registered(7), "retired Ring");
+    }
+
     #[test]
     fn reused_id_of_a_terminated_thread_gets_a_fresh_ring() {
         let a = Arc::new(agent(2));

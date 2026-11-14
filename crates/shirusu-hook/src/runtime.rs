@@ -1399,16 +1399,32 @@ impl HookRuntime {
         if !native_tls_available() {
             return;
         }
-        crate::fls::drain_pending_exits();
-        let epoch =
-            self.registration_epochs[registration_bucket(thread_id)].load(Ordering::Acquire);
-        let key = (self.runtime_id, thread_id, epoch);
+        let key = self.registration_key(thread_id);
         if REGISTERED_THREAD
             .try_with(|cache| cache.get() == Some(key))
             .unwrap_or(false)
         {
             return;
         }
+        // An exit of another thread in the same bucket (or of a terminated
+        // thread whose ID this thread reused) invalidated the cache. A thread
+        // that still records through its own live Ring confirms that without
+        // a lock; registration (seen set, thread table, notification wiring)
+        // takes global locks, which a thread terminated mid-recording must
+        // never hold.
+        if self.agent.current_thread_registered(thread_id) {
+            let _ = REGISTERED_THREAD.try_with(|cache| cache.set(Some(key)));
+            return;
+        }
+        // Exit notices queued by DLL_THREAD_DETACH are processed here, by a
+        // thread about to register, and not on every recording call: the
+        // processing (thread table, seen set, Heap frees) ran on whichever
+        // thread recorded next, so TerminateThread could cut a long-running
+        // recording thread off inside it with a global lock held (review P0,
+        // Windows E2E terminate-writer). Draining first still retires an
+        // exited thread's Ring before a new thread reuses its ID.
+        crate::fls::drain_pending_exits();
+        let key = self.registration_key(thread_id);
         let skip = REGISTER_FAILED
             .try_with(|c| match c.get() {
                 Some((k, n)) if k == key && n % REGISTER_RETRY_INTERVAL != 0 => {
@@ -1422,6 +1438,12 @@ impl HookRuntime {
             return;
         }
         self.register_thread(thread_id, key);
+    }
+
+    fn registration_key(&self, thread_id: u64) -> (u64, u64, u64) {
+        let epoch =
+            self.registration_epochs[registration_bucket(thread_id)].load(Ordering::Acquire);
+        (self.runtime_id, thread_id, epoch)
     }
 
     #[cold]
