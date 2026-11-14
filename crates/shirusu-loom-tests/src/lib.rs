@@ -3,6 +3,15 @@
 //! 最小モデルで検査する。通常メモリのデータ競合も loom::cell::UnsafeCell で追跡させる。
 //! 検査する性質: 未公開を読まない / 順序が保たれる / CAS による Slot 取得は排他 /
 //! 回収 (Release) の後にだけ上書きできる。
+//!
+//! 対象外 (レビュー 2026-11-14 V12): WriterCell と Hazard Slot は、片側だけが
+//! 重いフェンスを打つ Dekker 型の握手 (Store→Load) に依拠する。loom 0.7 は
+//! 2 地点にまたがる SeqCst 全順序を強制せず、全 SeqCst の SB リトマスでも
+//! 両側のすれ違いを生成する (`loom_wait_intent_bounded_wait_recovers_from_sb_window`
+//! の注記)。そのため loom に転写すると正しい実装でも偽の違反になる。この二つは
+//! `tla/AsymmetricHandshake.tla` (フェンスを外す・時間切れで奪う・終了を見ない
+//! 変種で反例を必須) と、Windows の最適化ビルドでのストレス
+//! (`record_shutdown_reattach_stress`、`writer_cell`) で検査する。
 
 use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU64, Ordering};
@@ -103,18 +112,33 @@ mod tests {
 
     #[test]
     fn loom_no_overwrite_before_release() {
+        // V12 (review 2026-11-14): the writer fills both cells and then
+        // tries a third value, which can only go into cell 0 once the reader
+        // has released it. An overwrite before release would either be a data
+        // race on cell 0 (reported by loom's UnsafeCell) or make the reader see
+        // 3 where 1 was published.
         loom::model(|| {
             let ring = Arc::new(MiniRing::new());
-            // cap 2 に 2 件まで: 回収前はそれ以上書かない契約を、
-            // 書き手が read_cursor (Acquire) を見て空きを判定する形で検査する
             let r2 = ring.clone();
             let reader = loom::thread::spawn(move || r2.drain());
-            let wc = ring.write_cursor.load(Ordering::Relaxed);
-            let rc = ring.read_cursor.load(Ordering::Acquire);
-            assert!(wc - rc <= CAP as u64);
-            ring.publish(5);
-            let got = reader.join().unwrap();
-            assert!(got.is_empty() || got == vec![5]);
+            ring.publish(1);
+            ring.publish(2);
+            let mut third = false;
+            for _ in 0..2 {
+                let wc = ring.write_cursor.load(Ordering::Relaxed);
+                let rc = ring.read_cursor.load(Ordering::Acquire);
+                assert!(wc - rc <= CAP as u64, "the window never exceeds the ring");
+                if wc - rc < CAP as u64 {
+                    ring.publish(3);
+                    third = true;
+                    break;
+                }
+                loom::thread::yield_now();
+            }
+            let mut all = reader.join().unwrap();
+            all.extend(ring.drain());
+            let expected: &[u64] = if third { &[1, 2, 3] } else { &[1, 2] };
+            assert_eq!(all, expected, "values and order survive cell reuse");
         });
     }
 
@@ -369,55 +393,90 @@ mod tests {
         });
     }
 
+    /// slot.rs の begin_detach の転写: handle の Generation を確かめてから
+    /// ACTIVE→DRAINING の CAS をする。確かめた後に Slot が再利用されると、
+    /// CAS は新しい所有者の ACTIVE に当たりうる (ABA)。
+    fn begin_detach(state: &AtomicU64, generation: &AtomicU64, handle_gen: u64) -> bool {
+        generation.load(Ordering::Acquire) == handle_gen
+            && state
+                .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    /// Host の再利用と新しい所有者の取得 (slot.rs の host_reclaim と claim の
+    /// 順序)。`wait_for_end` が真なら、古い所有者の終了を観測してからにする。
+    fn reclaim_and_reclaim_by_new_owner(
+        state: &AtomicU64,
+        generation: &AtomicU64,
+        ended: &AtomicBool,
+        wait_for_end: bool,
+    ) -> bool {
+        if wait_for_end && !ended.load(Ordering::Acquire) {
+            return false;
+        }
+        // RECLAIMABLE (スレッド終了と回収の確認済み) から始める。
+        state.store(4, Ordering::Release);
+        generation.fetch_add(1, Ordering::AcqRel);
+        state.store(0, Ordering::Release); // FREE
+        state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire) // 新しい所有者
+            .is_ok()
+    }
+
+    /// V12: 古い handle (gen 1) を持つスレッドの最後の操作は DETACH で、その
+    /// 後に終了する。Host は終了を観測してからだけ再利用する (仕様「Ring を
+    /// 再利用できるのは、スレッドの終了を確認し…た後だけ」)。この前提の下
+    /// では、古い handle の操作が新しい世代の Slot を DRAINING にすることは
+    /// ない。
     #[test]
-    fn loom_stale_generation_handle_never_wins_after_advance() {
+    fn loom_stale_handle_never_detaches_the_next_generation() {
         loom::model(|| {
-            let state = Arc::new(AtomicU64::new(2)); // ACTIVE
+            let state = Arc::new(AtomicU64::new(2)); // ACTIVE, gen 1
             let generation = Arc::new(AtomicU64::new(1));
-            let g2 = generation.clone();
-            let s2 = state.clone();
-            // 古い handle (gen=1) で DETACH を試みるスレッド。自分が読んだ世代が
-            // 既に進んでいたら、その操作は絶対に成功してはならない。
-            let stale = loom::thread::spawn(move || {
-                let cur = g2.load(Ordering::Acquire);
-                let ok = cur == 1
-                    && s2
-                        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-                (cur, ok)
+            let ended = Arc::new(AtomicBool::new(false));
+            let (s2, g2, e2) = (state.clone(), generation.clone(), ended.clone());
+            let old_owner = loom::thread::spawn(move || {
+                let detached = begin_detach(&s2, &g2, 1);
+                e2.store(true, Ordering::Release); // スレッド終了 (Handle の Signal)
+                detached
             });
-            // Host: 世代を進める (再利用の前提)
-            generation.store(2, Ordering::Release);
-            let (cur_seen, stale_ok) = stale.join().unwrap();
-            if cur_seen != 1 {
-                assert!(!stale_ok, "stale handle acted after generation advance");
+            let reused = reclaim_and_reclaim_by_new_owner(&state, &generation, &ended, true);
+            let detached = old_owner.join().unwrap();
+            if reused {
+                assert_eq!(generation.load(Ordering::Relaxed), 2);
+                assert_eq!(
+                    state.load(Ordering::Relaxed),
+                    2,
+                    "the new owner's slot stays ACTIVE whatever the old handle did"
+                );
+            } else {
+                assert_eq!(state.load(Ordering::Relaxed), if detached { 3 } else { 2 });
             }
-            assert_eq!(generation.load(Ordering::Relaxed), 2);
         });
     }
 
+    /// 上の前提 (終了を観測してから再利用) を外すと、Generation の確認だけ
+    /// では足りず、古い handle の DETACH が新しい所有者の Slot を DRAINING に
+    /// する実行がある。前提が必要なことの証跡として、loom がその実行を見つける
+    /// ことを固定する。
     #[test]
-    fn loom_generation_guard_blocks_stale_writer() {
+    #[should_panic(expected = "the new owner's slot stays ACTIVE")]
+    fn loom_generation_check_alone_admits_a_stale_detach() {
         loom::model(|| {
+            let state = Arc::new(AtomicU64::new(2));
             let generation = Arc::new(AtomicU64::new(1));
-            let stopped = Arc::new(AtomicBool::new(false));
-            let g2 = generation.clone();
-            let s2 = stopped.clone();
-            // 古い書き手: 世代が進んだら書かない
-            let stale = loom::thread::spawn(move || {
-                if g2.load(Ordering::Acquire) == 1 && !s2.load(Ordering::Acquire) {
-                    true // 書いた
-                } else {
-                    false
-                }
-            });
-            generation.store(2, Ordering::Release);
-            stopped.store(true, Ordering::Release);
-            let wrote = stale.join().unwrap();
-            // 世代交代後に書いたとしても、それは交代前の判定でのみあり得る。
-            // ここでは「交代を観測した書き手は書かない」ことだけを表明する弱い形で確認する。
-            let _ = wrote;
-            assert_eq!(generation.load(Ordering::Relaxed), 2);
+            let ended = Arc::new(AtomicBool::new(false));
+            let (s2, g2) = (state.clone(), generation.clone());
+            let old_owner = loom::thread::spawn(move || begin_detach(&s2, &g2, 1));
+            let reused = reclaim_and_reclaim_by_new_owner(&state, &generation, &ended, false);
+            old_owner.join().unwrap();
+            if reused {
+                assert_eq!(
+                    state.load(Ordering::Relaxed),
+                    2,
+                    "the new owner's slot stays ACTIVE whatever the old handle did"
+                );
+            }
         });
     }
 
