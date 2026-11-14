@@ -1464,14 +1464,27 @@ impl HookRuntime {
             .filter(|(k, _)| k.0 == self.runtime_id && k.1 == thread_id)
             .map(|(_, free_epoch)| free_epoch);
         if let Some(free_epoch) = failed_at {
-            if self.agent.pool().free_epoch() == free_epoch {
+            let now = self.agent.pool().free_epoch();
+            if now == free_epoch {
                 return;
             }
-        } else {
-            crate::fls::drain_pending_exits();
+            // Not a registration: the Agent hands this thread a Ring that a
+            // registering, exiting or reclaiming thread built for it (lock-free
+            // for this thread). The seen set, notification wiring and exit
+            // notice are skipped; an exit without notice is found by the
+            // thread's liveness like a terminated thread's.
+            let key = self.registration_key(thread_id);
+            if self.agent.thread_begin(thread_id).is_some() {
+                let _ = REGISTER_FAILED.try_with(|c| c.set(None));
+                let _ = REGISTERED_THREAD.try_with(|cache| cache.set(Some(key)));
+            } else {
+                let _ = REGISTER_FAILED.try_with(|c| c.set(Some((key, now))));
+            }
+            return;
         }
+        crate::fls::drain_pending_exits();
         let key = self.registration_key(thread_id);
-        self.register_thread(thread_id, key, failed_at.is_some());
+        self.register_thread(thread_id, key);
     }
 
     fn registration_key(&self, thread_id: u64) -> (u64, u64, u64) {
@@ -1482,7 +1495,7 @@ impl HookRuntime {
 
     #[cold]
     #[inline(never)]
-    fn register_thread(&self, thread_id: u64, key: (u64, u64, u64), retry: bool) {
+    fn register_thread(&self, thread_id: u64, key: (u64, u64, u64)) {
         // Read before claiming: a Slot freed after a failed claim is seen.
         let free_epoch = self.agent.pool().free_epoch();
         {
@@ -1496,9 +1509,6 @@ impl HookRuntime {
             }
         }
         let Some(handle) = self.agent.thread_begin(thread_id).or_else(|| {
-            if retry {
-                return None;
-            }
             // Slot 不足は、終了したスレッドの回収がまだなだけかも
             // しれない (P1-4)。強制終了したスレッドの Ring も隔離して
             // (レビュー P0)、1 回だけ回収を試してから再取得する。
