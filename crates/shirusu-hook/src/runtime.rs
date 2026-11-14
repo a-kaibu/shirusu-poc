@@ -1008,9 +1008,22 @@ thread_local! {
 /// are not ordered across threads (nothing orders them, `global_order` does).
 const CALL_ID_BLOCK_LEN: u64 = 256;
 
+/// Registration epochs, one per bucket of thread IDs. The end of a thread
+/// invalidates the cached registration only of threads in its bucket. A
+/// single epoch made every recording thread re-register (taking the
+/// registration locks) after any thread ended; a thread terminated by
+/// `TerminateThread` while holding one of them blocked every later thread
+/// (review P0, Windows E2E terminate-writer). Windows thread IDs are
+/// multiples of 4, so two IDs share a bucket only 16384 IDs apart.
+const REGISTRATION_EPOCH_BUCKETS: usize = 4096;
+
+fn registration_bucket(thread_id: u64) -> usize {
+    (thread_id >> 2) as usize % REGISTRATION_EPOCH_BUCKETS
+}
+
 pub struct HookRuntime {
     runtime_id: u64,
-    registration_epoch: AtomicU64,
+    registration_epochs: Box<[AtomicU64]>,
     agent: Arc<Agent>,
     /// Slot index 順の space_available 通知。スレッドが Slot を取得した
     /// 時点で、そのスレッド（Ring）へ結線する（R7 の Ring 単位結線）。
@@ -1070,7 +1083,9 @@ impl HookRuntime {
     ) -> Self {
         Self {
             runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
-            registration_epoch: AtomicU64::new(0),
+            registration_epochs: (0..REGISTRATION_EPOCH_BUCKETS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             agent,
             space_notifies,
             data_ready,
@@ -1378,7 +1393,8 @@ impl HookRuntime {
             return;
         }
         crate::fls::drain_pending_exits();
-        let epoch = self.registration_epoch.load(Ordering::Acquire);
+        let epoch =
+            self.registration_epochs[registration_bucket(thread_id)].load(Ordering::Acquire);
         let key = (self.runtime_id, thread_id, epoch);
         if REGISTERED_THREAD
             .try_with(|cache| cache.get() == Some(key))
@@ -1436,7 +1452,7 @@ impl HookRuntime {
         self.agent.poll_reclaims();
         // Native detach is processed on a different thread. Invalidate cached
         // registration only after removing the old slot, including TID reuse.
-        self.registration_epoch.fetch_add(1, Ordering::Release);
+        self.invalidate_registration(thread_id);
     }
 
     /// 強制終了 (`TerminateThread`) で終了通知が届かなかったスレッドの
@@ -1453,8 +1469,15 @@ impl HookRuntime {
             seen.remove(tid);
         }
         drop(seen);
-        self.registration_epoch.fetch_add(1, Ordering::Release);
+        for tid in &reaped {
+            self.invalidate_registration(*tid);
+        }
         reaped.len()
+    }
+
+    /// Make a thread with this ID register again on its next call.
+    fn invalidate_registration(&self, thread_id: u64) {
+        self.registration_epochs[registration_bucket(thread_id)].fetch_add(1, Ordering::Release);
     }
 
     fn signal_if_needed(&self, result: &RecordResult) {

@@ -392,9 +392,17 @@ impl Agent {
         Some(state)
     }
     fn state_for_slow(&self, thread_id: u64) -> Option<Arc<ThreadSlotState>> {
-        if let Some(s) = self.threads.read().unwrap().get(&thread_id).cloned() {
+        let found = self.threads.read().unwrap().get(&thread_id).cloned();
+        if let Some(s) = found {
             if !s.retired.load(Ordering::Acquire) {
-                return Some(s);
+                if !s.writer.owner_terminated() {
+                    return Some(s);
+                }
+                // The OS reused the ID of a thread that ended without an exit
+                // notice (TerminateThread). Retire its Ring now, while this
+                // thread starts, instead of writing through the dead owner's
+                // writer and swapping states later in the middle of recording.
+                self.reap_thread(thread_id, &s);
             }
         }
         self.begin_thread_state(thread_id)
@@ -968,21 +976,30 @@ impl Agent {
             .filter(|(_, s)| s.writer.owner_terminated())
             .map(|(tid, s)| (*tid, Arc::clone(s)))
             .collect();
-        let mut reaped = Vec::new();
-        for (tid, state) in terminated {
-            let removed = {
-                let mut map = self.threads.write().unwrap();
-                match map.get(&tid) {
-                    Some(s) if Arc::ptr_eq(s, &state) => map.remove(&tid),
-                    _ => None,
-                }
-            };
-            if let Some(state) = removed {
-                self.retire_to_reclaim(tid, state);
-                reaped.push(tid);
+        terminated
+            .into_iter()
+            .filter(|(tid, state)| self.reap_thread(*tid, state))
+            .map(|(tid, _)| tid)
+            .collect()
+    }
+
+    /// Remove `state` (still registered for `tid`) and retire its Ring.
+    /// False when another state replaced it meanwhile.
+    fn reap_thread(&self, tid: u64, state: &Arc<ThreadSlotState>) -> bool {
+        let removed = {
+            let mut map = self.threads.write().unwrap();
+            match map.get(&tid) {
+                Some(s) if Arc::ptr_eq(s, state) => map.remove(&tid),
+                _ => None,
             }
+        };
+        match removed {
+            Some(state) => {
+                self.retire_to_reclaim(tid, state);
+                true
+            }
+            None => false,
         }
-        reaped
     }
 
     /// 前回から [`REAP_INTERVAL`] 以上経っていれば true (呼び出し側が
@@ -1420,6 +1437,42 @@ mod tests {
     /// `owner_busy` set. Management paths must not wait for it forever, the
     /// Ring keeps only what was published, the cut-off event counts as lost,
     /// and the Slot is reused only after the published events are drained.
+    #[test]
+    fn reused_id_of_a_terminated_thread_gets_a_fresh_ring() {
+        let a = Arc::new(agent(2));
+        let old = {
+            let a = Arc::clone(&a);
+            std::thread::spawn(move || {
+                assert!(matches!(
+                    a.record_enter(7, 10, 20, 1, 0, b"old"),
+                    RecordResult::Written(_)
+                ));
+                let state = a.state_for(7).unwrap();
+                std::mem::forget(state.writer.try_owner().unwrap()); // cut off mid-write
+                let handle = state.handle;
+                std::mem::forget(state);
+                handle
+            })
+            .join()
+            .unwrap()
+        };
+        // A new thread with the same OS thread ID (no exit notice came).
+        let a2 = Arc::clone(&a);
+        let fresh = std::thread::spawn(move || {
+            assert!(matches!(
+                a2.record_enter(7, 10, 20, 2, 0, b"new"),
+                RecordResult::Written(_)
+            ));
+            let state = a2.state_for(7).unwrap();
+            // Its own Ring, written on the owner fast path from the start.
+            assert!(state.writer.try_owner().is_some());
+            state.handle
+        })
+        .join()
+        .unwrap();
+        assert_ne!(old.index, fresh.index, "the dead owner's Ring is retired");
+    }
+
     #[test]
     fn terminated_writer_is_isolated_and_reclaimed() {
         use shirusu_transport::ring::RingReader;
