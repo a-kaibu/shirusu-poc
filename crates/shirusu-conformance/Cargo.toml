@@ -10,6 +10,10 @@ description = "shirusu 適合性チェッカ: 外部生成 Trace が公開形式
 shirusu-analysis = { path = "../shirusu-analysis" }
 shirusu-trace = { path = "../shirusu-trace" }
 
+[dev-dependencies]
+proptest = "1"
+shirusu-emit = { path = "../shirusu-emit" }
+
 [[bin]]
 name = "shirusu-conformance"
 path = "src/bin/shirusu-conformance.rs"

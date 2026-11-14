@@ -752,7 +752,9 @@ dependencies = [
 name = "shirusu-conformance"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "shirusu-analysis",
+ "shirusu-emit",
  "shirusu-trace",
 ]
 

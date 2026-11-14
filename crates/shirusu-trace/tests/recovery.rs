@@ -1036,3 +1036,88 @@ fn raw_len_limit_is_inclusive() {
     let err = format!("{:?}", decode_payload(&over, &[]).unwrap_err());
     assert!(err.contains("exceeds limit"), "{err}");
 }
+
+/// 最後の Block の破損: 再同期の探索がファイル末尾まで進んでも panic せず、
+/// その Block だけを隔離する（既存の破損テストは後ろに正常な Block が残る
+/// 位置だけを扱っていた）。どの位置の Block を壊しても同じ。
+#[test]
+fn corruption_of_the_last_blocks_resyncs_to_the_end() {
+    let (bytes, _) = base_trace();
+    let layout = block_layout(&bytes);
+    for &(start, _, stored) in layout.iter().skip(1).rev().take(3) {
+        // payload の最後のバイト（payload が無ければ CRC 欄）を壊す。
+        let at = if stored > 0 { start + 32 + stored - 1 } else { start + 24 };
+        let mut data = bytes.clone();
+        data[at] ^= 0x5a;
+        let read = read_trace(&data).unwrap();
+        assert!(has_corrupt_at(&read, start as u64), "{start}: {:?}", read.issues);
+        // 末尾に 32 バイト以上の SBLK を含まないごみを足しても同じ。
+        let mut tail = data.clone();
+        tail.extend_from_slice(b"SBL\0garbage-without-a-block-header-at-all");
+        tail.extend_from_slice(b"SBLK");
+        let read = read_trace(&tail).unwrap();
+        assert!(has_corrupt_at(&read, start as u64));
+    }
+}
+
+/// 再同期の候補は、CRC が合っていても長さ上限を超える Block を受理しない
+/// （raw_len を上限超えにした正しい CRC の Block を、破損の直後に置く）。
+#[test]
+fn resync_skips_candidates_over_the_raw_length_limit() {
+    use shirusu_trace::container::MAX_RAW_LEN;
+    let (bytes, _) = base_trace();
+    let layout = block_layout(&bytes);
+    let (env_start, _, _) = layout[1];
+    let mut data = bytes[..env_start].to_vec();
+    // 壊れた Block（Magic だけ正しく、header_len が不正）。
+    data.extend_from_slice(b"SBLK\x00\x00\x00\x00");
+    data.extend_from_slice(&[0u8; 24]);
+    let candidate_at = data.len();
+    let header = BlockHeader {
+        block_type: BlockType::Unknown(200),
+        compression: Compression::None,
+        sequence: 77,
+        stored_len: 0,
+        raw_len: MAX_RAW_LEN + 1,
+    };
+    data.extend_from_slice(&serialize_header(&header, &[]));
+    data.extend_from_slice(&bytes[env_start..]);
+    let read = read_trace(&data).unwrap();
+    assert!(
+        read.blocks.iter().all(|b| b.offset != candidate_at as u64),
+        "over-limit candidate accepted: {:?}",
+        read.blocks
+    );
+    assert!(!read.blocks.iter().any(|b| b.sequence == 77));
+    // 正しい Block へは再同期できている。
+    assert_eq!(read.total_events(), 3);
+}
+
+/// 走査中の長さ上限の判定は上限ちょうどを許す（raw_len == MAX_RAW_LEN は
+/// 上限超過ではなく、非圧縮で stored と食い違う破損として扱う）。
+#[test]
+fn block_at_the_raw_length_limit_is_not_reported_as_over_limit() {
+    use shirusu_trace::container::MAX_RAW_LEN;
+    let (mut bytes, _) = base_trace();
+    let at = bytes.len();
+    let header = BlockHeader {
+        block_type: BlockType::Unknown(200),
+        compression: Compression::None,
+        sequence: 78,
+        stored_len: 0,
+        raw_len: MAX_RAW_LEN,
+    };
+    bytes.extend_from_slice(&serialize_header(&header, &[]));
+    let read = read_trace(&bytes).unwrap();
+    let reason = read
+        .issues
+        .iter()
+        .find_map(|i| match i {
+            RecoveryIssue::CorruptBlock { offset, reason } if *offset == at as u64 => {
+                Some(reason.clone())
+            }
+            _ => None,
+        })
+        .expect("the block is corrupt");
+    assert_ne!(reason, "block length exceeds limit");
+}

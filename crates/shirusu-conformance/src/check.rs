@@ -182,7 +182,7 @@ pub fn check_trace(trace: &ReadTrace) -> ConformanceReport {
             check_schemas(trace, &view),
             check_semantic_kinds(trace),
             check_sequence_monotonic(trace),
-            check_enter_leave_pairing(&view),
+            check_enter_leave_pairing(trace, &view),
             check_blob_refs(trace, &view),
             check_blob_hashes(trace),
             check_integrity_consistency(trace, &view),
@@ -470,7 +470,7 @@ fn check_sequence_monotonic(trace: &ReadTrace) -> CheckFinding {
     }
 }
 
-fn check_enter_leave_pairing(view: &TraceView) -> CheckFinding {
+fn check_enter_leave_pairing(trace: &ReadTrace, view: &TraceView) -> CheckFinding {
     let id = "enter-leave-pairing";
     // スレッドごとに、call_id の Enter が開いているかを数える。
     let mut open: HashMap<ThreadKey, HashMap<u64, usize>> = HashMap::new();
@@ -526,6 +526,19 @@ fn check_enter_leave_pairing(view: &TraceView) -> CheckFinding {
                 }
             }
             Phase::Other(_) => {}
+        }
+    }
+    // C6: 記録終了時点で終わっていない呼び出しは、Leave を捏造せず
+    // UNKNOWN_TERMINATION の Loss Record（call_id・process_id・thread_id）で
+    // 表すのが規約。その記録は開いた Enter を 1 件閉じる。Loss Record は
+    // セッションを持たないため、Header のセッションに属するとみなす。
+    for rec in &trace.loss_records {
+        if rec.kind != shirusu_trace::proto::loss_kind::UNKNOWN_TERMINATION {
+            continue;
+        }
+        let key = thread_key(trace.header.session_id, rec.process_id, rec.thread_id);
+        if let Some(n) = open.get_mut(&key).and_then(|calls| calls.get_mut(&rec.call_id)) {
+            *n = n.saturating_sub(1);
         }
     }
     let unclosed: Vec<String> = open
