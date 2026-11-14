@@ -90,6 +90,9 @@ fn cli_unknown_option_exits_two() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+    // 位置引数の数ではなく、未知のオプションとして拒否する。
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown option: --bogus"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
