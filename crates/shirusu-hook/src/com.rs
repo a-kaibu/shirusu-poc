@@ -723,6 +723,29 @@ impl ComTracker {
         self.objects.get(&ptr)
     }
 
+    /// Check that the object now at `ptr` still has the vptr this record
+    /// was installed with. Release through an unpatched path leaves the
+    /// record live; a different object at the same address would then be
+    /// recorded with the old IID. A mismatch ends the record's lifetime and
+    /// returns false (2026-11-14 review P3-8). A record with no known vptr
+    /// passes.
+    pub fn confirm_vptr(&mut self, ptr: u64, observed: Option<u64>) -> bool {
+        let Some(object) = self.objects.get(&ptr).filter(|o| !o.destroyed) else {
+            return true;
+        };
+        let expected = object.cloned_vtable.unwrap_or(object.original_vtable);
+        if expected == 0 || observed == Some(expected) {
+            return true;
+        }
+        if let Some(object) = self.objects.get_mut(&ptr) {
+            object.destroyed = true;
+            object.refcount = None;
+            object.interception_skip_reason = Some("address-reused");
+        }
+        self.note_retired();
+        false
+    }
+
     fn insert(&mut self, obj: ComObject) -> u64 {
         let identity = obj.identity;
         let (ptr, key) = (obj.ptr, group_key(&obj.identity_group));
@@ -1087,6 +1110,27 @@ mod tests {
         tracker.note_factory_result(123, iid, "CoCreateInstance");
         assert_eq!(tracker.lookup(123).unwrap().interface_name, "IStream");
         assert!(!tracker.lookup(123).unwrap().intercepted);
+    }
+
+    #[test]
+    fn a_different_vptr_at_a_tracked_address_ends_the_record() {
+        // P3-8: Release through an unpatched path, then another object at
+        // the same address, must not be recorded under the old IID.
+        let mut t = ComTracker::new();
+        t.note_factory_result(0x5000, IID_ISHELL_LINK_W, "CoCreateInstance");
+        assert!(t.confirm_vptr(0x5000, None), "no vptr known yet");
+        t.note_iunknown_intercepted(0x5000, 0x7000, 1);
+        assert!(t.confirm_vptr(0x5000, Some(0x7000)));
+        assert!(t.instance_token(0x5000).is_some());
+        assert!(!t.confirm_vptr(0x5000, Some(0x7100)));
+        assert!(t.instance_token(0x5000).is_none(), "the record ended");
+        assert_eq!(
+            t.lookup(0x5000).unwrap().interception_skip_reason,
+            Some("address-reused")
+        );
+        // The next discovery starts a fresh lifetime.
+        t.note_factory_result(0x5000, IID_ISHELL_LINK_W, "CoCreateInstance");
+        assert!(t.instance_token(0x5000).is_some());
     }
 
     #[test]

@@ -184,8 +184,18 @@ pub(crate) fn com_method_dispatch_with(
     let _flight = flight;
     // 追跡対象の確認：このセッションで追跡していないオブジェクトは
     // 元のメソッドを素通しで呼ぶ（記録しない）。
+    let vptr = {
+        let mut b = [0u8; 8];
+        let width = std::mem::size_of::<usize>();
+        ProcessMemory
+            .read_exact(this as u64, &mut b[..width])
+            .then(|| u64::from_le_bytes(b))
+    };
     let (iid, interface_name, method_name, instance) = match rt.with_com_tracker(|t| {
         retire_unloaded_com_address(t, this as u64);
+        if !t.confirm_vptr(this as u64, vptr) {
+            return None;
+        }
         let instance = t.instance_token(this as u64)?;
         t.lookup(this as u64).and_then(|o| {
             interface_by_iid(&o.iid).and_then(|d| {
