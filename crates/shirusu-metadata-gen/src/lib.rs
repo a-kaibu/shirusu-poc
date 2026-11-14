@@ -447,11 +447,13 @@ pub fn generate(index: &TypeIndex, config: &Config) -> Result<Generated, String>
         while config.reserved_api_ids.contains(&next_id) {
             next_id = next_id.checked_add(1).ok_or("API ID overflow")?;
         }
-        match map_api(index, api, next_id, config.max_params)? {
-            EntryOutcome::Emitted(mapped) => {
-                next_id += 1;
-                out.entries.push(EntryOutcome::Emitted(mapped));
-            }
+        // A configured API owns its ID even when this WinMD cannot map it,
+        // so the APIs after it keep their API and Schema IDs (2026-11-14
+        // review P3-15), as the broad tier already does.
+        let id = next_id;
+        next_id = next_id.checked_add(1).ok_or("API ID overflow")?;
+        match map_api(index, api, id, config.max_params)? {
+            EntryOutcome::Emitted(mapped) => out.entries.push(EntryOutcome::Emitted(mapped)),
             skipped @ EntryOutcome::Skipped { .. } => out.entries.push(skipped),
         }
     }

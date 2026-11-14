@@ -648,3 +648,35 @@ fn broad_refresh_appends_only_and_honors_skips() {
     );
     assert!(shirusu_metadata_gen::parse_broad_list("a\tb\n").is_err());
 }
+
+#[test]
+fn a_skipped_curated_api_keeps_its_id() {
+    // P3-15: an unmappable API used to shift every later API and Schema ID.
+    require_winmd!();
+    let index = read_index();
+    let generated = generate(
+        &index,
+        &config_with(
+            vec![
+                api(
+                    "Windows.Win32.UI.WindowsAndMessaging",
+                    "USER32.dll",
+                    "WindowFromPoint",
+                ),
+                api(
+                    "Windows.Win32.System.Registry",
+                    "advapi32.dll",
+                    "RegCloseKey",
+                ),
+            ],
+            12,
+        ),
+    )
+    .expect("生成できる");
+    assert_eq!(generated.skipped().len(), 1);
+    assert_eq!(
+        generated.emitted()[0].api_id,
+        8,
+        "first_api_id 7 is the skipped one"
+    );
+}
