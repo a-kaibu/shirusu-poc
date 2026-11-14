@@ -705,6 +705,13 @@ fn align(a: &[&str], b: &[&str]) -> Vec<AlignStep> {
 }
 
 fn align_greedy(a: &[&str], b: &[&str]) -> Vec<AlignStep> {
+    // "a[i] occurs in b[j..]" is "its last occurrence in b is at j or later"
+    // (review 2026-11-14 P2-13: a linear search per mismatch was O(n·m)).
+    let mut last_in_b: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(b.len());
+    for (index, item) in b.iter().enumerate() {
+        last_in_b.insert(item, index);
+    }
     let mut steps = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -712,7 +719,7 @@ fn align_greedy(a: &[&str], b: &[&str]) -> Vec<AlignStep> {
             steps.push(AlignStep::Pair(i, j));
             i += 1;
             j += 1;
-        } else if b[j..].contains(&a[i]) {
+        } else if last_in_b.get(a[i]).is_some_and(|&last| last >= j) {
             steps.push(AlignStep::OnlyRight(j));
             j += 1;
         } else {
@@ -746,6 +753,51 @@ mod tests {
                 AlignStep::Pair(2, 1)
             ]
         );
+    }
+
+    #[test]
+    fn greedy_alignment_matches_the_linear_search_it_replaced() {
+        fn naive(a: &[&str], b: &[&str]) -> Vec<AlignStep> {
+            let mut steps = Vec::new();
+            let (mut i, mut j) = (0, 0);
+            while i < a.len() && j < b.len() {
+                if a[i] == b[j] {
+                    steps.push(AlignStep::Pair(i, j));
+                    i += 1;
+                    j += 1;
+                } else if b[j..].contains(&a[i]) {
+                    steps.push(AlignStep::OnlyRight(j));
+                    j += 1;
+                } else {
+                    steps.push(AlignStep::OnlyLeft(i));
+                    i += 1;
+                }
+            }
+            steps.extend((i..a.len()).map(AlignStep::OnlyLeft));
+            steps.extend((j..b.len()).map(AlignStep::OnlyRight));
+            steps
+        }
+        let words = ["a", "b", "c", "d", "e"];
+        let mut x = 0x2545_f491u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            words[(x % 5) as usize]
+        };
+        for len in [0, 1, 7, 50, 300] {
+            let a: Vec<&str> = (0..len).map(|_| next()).collect();
+            let b: Vec<&str> = (0..len + 3).map(|_| next()).collect();
+            assert_eq!(align_greedy(&a, &b), naive(&a, &b));
+        }
+        // Large inputs stay linear.
+        let a: Vec<String> = (0..200_000).map(|i| format!("x{i}")).collect();
+        let b: Vec<String> = (0..200_000).map(|i| format!("y{i}")).collect();
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        let b: Vec<&str> = b.iter().map(String::as_str).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(align(&a, &b).len(), 400_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

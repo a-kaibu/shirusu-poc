@@ -93,7 +93,9 @@ pub enum NormValue {
     Utf16(Vec<u16>),
     Bytes(Vec<u8>),
     /// Blob の内容そのもの（BlobRef フィールドと Payload 共通）。
-    BlobContent(Vec<u8>),
+    /// Shared with every other reference to the same Blob (review
+    /// 2026-11-14 P2-13: each reference used to copy the content).
+    BlobContent(std::sync::Arc<[u8]>),
     /// 内容を解決できなかった Blob（ID の 16 進文字列）。
     BlobUnknown(String),
     /// 取得できなかった値。比較対象は取得状態の名前。
@@ -137,7 +139,7 @@ pub struct NormField {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormPayload {
     None,
-    Content(Vec<u8>),
+    Content(std::sync::Arc<[u8]>),
     Dropped { original_len: u64, reason_code: u8 },
     UnknownBlob(String),
 }
@@ -347,23 +349,31 @@ impl NormTrace {
         let mut calls: Vec<NormCall> = Vec::new();
         let mut pending: HashMap<(usize, u64), usize> = HashMap::new();
         let mut object_calls: HashMap<ObjectKey, Vec<usize>> = HashMap::new();
+        // Calls by raw call_id, in creation order (review 2026-11-14 P2-13:
+        // each completion scanned every call so far).
+        let mut calls_by_call_id: HashMap<u64, Vec<usize>> = HashMap::new();
 
+        let blob_cache: BlobCache = std::cell::RefCell::new(HashMap::new());
         let norm_event = |ev: &shirusu_analysis::EventView| -> NormEvent {
             let fields = ev
                 .fields
                 .iter()
                 .map(|f| NormField {
                     name: f.name.clone(),
-                    value: norm_value(trace, f, ev.index, &resolve),
+                    value: norm_value(trace, &blob_cache, f, ev.index, &resolve),
                 })
                 .collect();
             let payload = match &ev.payload {
                 shirusu_analysis::PayloadView::None => NormPayload::None,
-                shirusu_analysis::PayloadView::Inline(b) => NormPayload::Content(b.clone()),
-                shirusu_analysis::PayloadView::Blob(id) => match trace.blobs.get(id) {
-                    Some(content) => NormPayload::Content(content.clone()),
-                    None => NormPayload::UnknownBlob(id.to_hex()),
-                },
+                shirusu_analysis::PayloadView::Inline(b) => {
+                    NormPayload::Content(std::sync::Arc::from(b.as_slice()))
+                }
+                shirusu_analysis::PayloadView::Blob(id) => {
+                    match shared_blob(&blob_cache, trace, id) {
+                        Some(content) => NormPayload::Content(content),
+                        None => NormPayload::UnknownBlob(id.to_hex()),
+                    }
+                }
                 shirusu_analysis::PayloadView::Dropped {
                     original_len,
                     reason,
@@ -410,6 +420,7 @@ impl NormTrace {
                     first_sequence: ev.sequence,
                 });
                 threads[thread].push(idx);
+                calls_by_call_id.entry(ev.call_id).or_default().push(idx);
                 continue;
             }
             // 完了は同じ session/process/API/call_id の一意な呼び出しに
@@ -420,9 +431,11 @@ impl NormTrace {
                 // call_id can be reused by external emitters on different
                 // threads. Only correlate an unambiguous call in this process
                 // with the same API; never attach to an unrelated latest call.
-                let mut candidates = calls
+                let same_id: &[usize] =
+                    calls_by_call_id.get(&ev.call_id).map_or(&[], Vec::as_slice);
+                let mut candidates = same_id
                     .iter()
-                    .enumerate()
+                    .map(|&index| (index, &calls[index]))
                     .filter(|(_, c)| {
                         let origin = c.enter.as_ref().or(c.leave.as_ref());
                         origin.is_some_and(|origin| {
@@ -458,6 +471,7 @@ impl NormTrace {
                         first_sequence: ev.sequence,
                     });
                     threads[thread].push(idx);
+                    calls_by_call_id.entry(ev.call_id).or_default().push(idx);
                 }
                 continue;
             }
@@ -498,6 +512,7 @@ impl NormTrace {
                         first_sequence: ev.sequence,
                     });
                     threads[thread].push(idx);
+                    calls_by_call_id.entry(ev.call_id).or_default().push(idx);
                     pending.insert(pkey, idx);
                     idx
                 }
@@ -600,8 +615,26 @@ fn norm_u64(
     }
 }
 
+/// Blob contents shared between their references (P2-13).
+type BlobCache = std::cell::RefCell<HashMap<shirusu_trace::BlobId, std::sync::Arc<[u8]>>>;
+
+/// One shared copy per Blob, made on its first reference.
+fn shared_blob(
+    cache: &BlobCache,
+    trace: &ReadTrace,
+    id: &shirusu_trace::BlobId,
+) -> Option<std::sync::Arc<[u8]>> {
+    if let Some(shared) = cache.borrow().get(id) {
+        return Some(shared.clone());
+    }
+    let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(trace.blobs.get(id)?.as_slice());
+    cache.borrow_mut().insert(*id, shared.clone());
+    Some(shared)
+}
+
 fn norm_value(
     trace: &ReadTrace,
+    blob_cache: &BlobCache,
     f: &shirusu_analysis::FieldView,
     at_event: usize,
     resolve: &dyn Fn(u64, usize) -> Option<ObjectKey>,
@@ -651,8 +684,8 @@ fn norm_value(
             Err(_) => NormValue::Utf16(units.clone()),
         },
         TypedValue::Bytes(b) => NormValue::Bytes(b.clone()),
-        TypedValue::BlobRef(id) => match trace.blobs.get(id) {
-            Some(content) => NormValue::BlobContent(content.clone()),
+        TypedValue::BlobRef(id) => match shared_blob(blob_cache, trace, id) {
+            Some(content) => NormValue::BlobContent(content),
             None => NormValue::BlobUnknown(id.to_hex()),
         },
     }

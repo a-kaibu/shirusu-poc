@@ -234,7 +234,7 @@ fn norm_value_describe_covers_all_variants() {
     assert_eq!(NormValue::Text("hi".into()).describe(), "\"hi\"");
     assert_eq!(NormValue::Bytes(vec![1, 2, 3]).describe(), "bytes[3]");
     assert_eq!(
-        NormValue::BlobContent(vec![9; 5]).describe(),
+        NormValue::BlobContent(vec![9; 5].into()).describe(),
         "blob-content[5]"
     );
     assert_eq!(
@@ -247,7 +247,10 @@ fn norm_value_describe_covers_all_variants() {
 #[test]
 fn norm_payload_describe_covers_all_variants() {
     assert_eq!(NormPayload::None.describe(), "none");
-    assert_eq!(NormPayload::Content(vec![1, 2]).describe(), "content[2]");
+    assert_eq!(
+        NormPayload::Content(vec![1, 2].into()).describe(),
+        "content[2]"
+    );
     assert_eq!(
         NormPayload::Dropped {
             original_len: 100,
@@ -397,7 +400,7 @@ fn norm_value_covers_pointer_and_misc_types() {
     assert_eq!(v("text"), NormValue::Text("hello".into()));
     assert_eq!(
         v("blob_known"),
-        NormValue::BlobContent(b"known-blob".to_vec())
+        NormValue::BlobContent(b"known-blob".to_vec().into())
     );
     assert_eq!(v("blob_unknown"), NormValue::BlobUnknown(unknown.to_hex()));
     assert_eq!(v("ptr_u64"), NormValue::Pointer);
@@ -510,11 +513,11 @@ fn norm_event_covers_payload_variants() {
     assert_eq!(nt.calls.len(), 4);
     assert_eq!(
         nt.calls[0].enter.as_ref().unwrap().payload,
-        NormPayload::Content(vec![1, 2, 3])
+        NormPayload::Content(vec![1, 2, 3].into())
     );
     assert_eq!(
         nt.calls[1].leave.as_ref().unwrap().payload,
-        NormPayload::Content(b"payload-blob".to_vec())
+        NormPayload::Content(b"payload-blob".to_vec().into())
     );
     assert_eq!(
         nt.calls[2].leave.as_ref().unwrap().payload,
