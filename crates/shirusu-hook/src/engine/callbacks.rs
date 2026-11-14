@@ -189,6 +189,64 @@ pub(super) fn original_for_wrapper(wrapper: usize) -> Option<usize> {
     slot_for_wrapper(wrapper).and_then(|slot| callback_procs().original(slot))
 }
 
+type CallWindowProcFn =
+    unsafe extern "system-unwind" fn(usize, *mut c_void, u32, usize, isize) -> isize;
+
+/// user32 の CallWindowProcW / CallWindowProcA (P1-6)。WndProc の呼び出し
+/// 中なので user32 は読み込まれている。解決できなければ None。
+fn call_window_proc(ansi: bool) -> Option<CallWindowProcFn> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    static RESOLVED: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let cell = &RESOLVED[usize::from(ansi)];
+    let mut addr = cell.load(Ordering::Acquire);
+    if addr == 0 {
+        let user32: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+        // SAFETY: NUL 終端の名前。参照カウントは増やさない。
+        let module = unsafe { GetModuleHandleW(user32.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        let name: &[u8] = if ansi {
+            b"CallWindowProcA\0"
+        } else {
+            b"CallWindowProcW\0"
+        };
+        // SAFETY: 読み込み済みモジュールと NUL 終端の名前。
+        addr = unsafe { GetProcAddress(module, name.as_ptr()) }.map_or(0, |f| f as usize);
+        if addr == 0 {
+            return None;
+        }
+        cell.store(addr, Ordering::Release);
+    }
+    // SAFETY: CallWindowProc の正しい型。
+    Some(unsafe { std::mem::transmute::<usize, CallWindowProcFn>(addr) })
+}
+
+/// 保存した「元の WndProc」を呼ぶ (2026-11-14 レビュー P1-6)。
+/// ANSI と Unicode が食い違うウィンドウでは、GetWindowLongPtr /
+/// SetWindowLongPtr は関数アドレスではなく CallWindowProc 用のハンドルを
+/// 返す。関数として直接呼ぶとそこへジャンプして落ちるため、受け取った側と
+/// 同じ版の CallWindowProc を通す (関数アドレスならそのまま呼ばれる)。
+unsafe fn call_original_proc(
+    original: usize,
+    ansi: bool,
+    hwnd: *mut c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    match call_window_proc(ansi) {
+        // SAFETY: CallWindowProc は関数アドレスとハンドルの両方を受ける。
+        Some(cwp) => unsafe { cwp(original, hwnd, msg, wparam, lparam) },
+        None => {
+            // SAFETY: user32 が無ければハンドルは存在し得ず、関数アドレス。
+            let orig: WndProcFn = unsafe { std::mem::transmute(original) };
+            unsafe { orig(hwnd, msg, wparam, lparam) }
+        }
+    }
+}
+
 /// ラップされた WndProc の本体。コールバック enter を記録し、呼出スタックへ
 /// 積んでから元のプロシージャを呼ぶ。コールバック中の API 呼び出しは
 /// このイベントを親として入れ子に記録される（A43 / C18）。
@@ -206,8 +264,7 @@ pub(super) unsafe fn wnd_proc_dispatch(
         // 呼べない。0 を返す（呼ぶ先が無いため他に手段が無い）。
         return 0;
     };
-    // SAFETY: スロット表から引いた元のプロシージャ。
-    let orig: WndProcFn = unsafe { std::mem::transmute(original) };
+    let ansi = callback_procs().is_ansi(slot);
     let (rt, tid, _flight, mut guard, mut le) = match prepare_callback_dispatch(original) {
         CallbackPrepare::Proceed {
             rt,
@@ -219,8 +276,7 @@ pub(super) unsafe fn wnd_proc_dispatch(
         } => (rt, tid, flight, guard, last_error),
         CallbackPrepare::Passthrough { original } => {
             // SAFETY: スロット表から引いた元のプロシージャ。
-            let orig: WndProcFn = unsafe { std::mem::transmute(original) };
-            return unsafe { orig(hwnd, msg, wparam, lparam) };
+            return unsafe { call_original_proc(original, ansi, hwnd, msg, wparam, lparam) };
         }
         CallbackPrepare::Unavailable => return 0,
     };
@@ -247,7 +303,7 @@ pub(super) unsafe fn wnd_proc_dispatch(
     // SAFETY: スロット表から引いた元のプロシージャ。
     let (result, (mut call_guard, rt, _flight, mut guard)) = crate::seh::invoke(
         original,
-        |_| unsafe { orig(hwnd, msg, wparam, lparam) },
+        |_| unsafe { call_original_proc(original, ansi, hwnd, msg, wparam, lparam) },
         (call_guard, rt, _flight, guard),
     );
     let _ = le.capture_after_original();
@@ -385,7 +441,8 @@ pub(super) unsafe fn detour_set_window_long_ptr(
         // 既にラッパーになっている値（アプリが GetWindowLongPtrW で
         // 読み戻したもの）をそのまま渡した場合は二重ラップしない。
         if slot_for_wrapper(new_long).is_none() {
-            if let Some(slot) = callback_procs().wrap(new_long) {
+            let ansi = hook_index == CALLBACK_HOOK_SET_WINDOW_LONG_PTR_A;
+            if let Some(slot) = callback_procs().wrap_with(new_long, ansi) {
                 if let Some(wrapper) = wrapper_for_slot(slot) {
                     call_with = wrapper;
                 }

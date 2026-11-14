@@ -143,12 +143,19 @@ pub fn encode_callback_leave(values: &[CapturedValue]) -> Result<Vec<u8>, Compac
 #[derive(Debug)]
 pub struct CallbackProcTable<const N: usize> {
     slots: [AtomicUsize; N],
+    /// SetWindowLongPtrA 経由で登録したか (P1-6)。保存した値が
+    /// CallWindowProc 用のハンドルのとき、同じ文字コード側の
+    /// CallWindowProc で呼ぶために使う。
+    /// 0 = 未使用、1 = Unicode 版、2 = ANSI 版。スロットの確保もこの CAS
+    /// で行い、値と印の組を食い違わせない。
+    tag: [std::sync::atomic::AtomicU8; N],
 }
 
 impl<const N: usize> CallbackProcTable<N> {
     pub fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| AtomicUsize::new(0)),
+            tag: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -158,6 +165,12 @@ impl<const N: usize> CallbackProcTable<N> {
     /// 0 は登録しない。並行する同一プロシージャの登録は best-effort で
     /// 重複しうる（どちらも正しい対応であり、実害は無い）。
     pub fn wrap(&self, original: usize) -> Option<usize> {
+        self.wrap_with(original, false)
+    }
+
+    /// [`wrap`](Self::wrap) に、値を受け取った API が ANSI 版かを添える。
+    /// 新しく登録したスロットにだけ記録する (同じ値の 2 回目は既存の印)。
+    pub fn wrap_with(&self, original: usize, ansi: bool) -> Option<usize> {
         if original == 0 {
             return None;
         }
@@ -167,10 +180,14 @@ impl<const N: usize> CallbackProcTable<N> {
             }
         }
         for (i, slot) in self.slots.iter().enumerate() {
-            if slot
-                .compare_exchange(0, original, Ordering::AcqRel, Ordering::Acquire)
+            // 印の CAS でスロットを確保してから値を公開する。値を見た
+            // dispatch は必ずその値の印を読む。
+            let tag = if ansi { 2 } else { 1 };
+            if self.tag[i]
+                .compare_exchange(0, tag, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                slot.store(original, Ordering::Release);
                 return Some(i);
             }
         }
@@ -189,6 +206,13 @@ impl<const N: usize> CallbackProcTable<N> {
         })
     }
 
+    /// スロットの値を ANSI 版の API から受け取ったか。
+    pub fn is_ansi(&self, slot: usize) -> bool {
+        self.tag
+            .get(slot)
+            .is_some_and(|t| t.load(Ordering::Acquire) == 2)
+    }
+
     /// 登録済みの WndProc の数（テスト・診断用）。
     pub fn wrapped_count(&self) -> usize {
         self.slots
@@ -202,6 +226,9 @@ impl<const N: usize> CallbackProcTable<N> {
     pub fn clear_for_test(&self) {
         for s in &self.slots {
             s.store(0, Ordering::Release);
+        }
+        for t in &self.tag {
+            t.store(0, Ordering::Release);
         }
     }
 }
@@ -405,6 +432,20 @@ mod tests {
         assert_eq!(t.original(1), Some(0x2000));
         assert_eq!(t.original(2), None);
         assert_eq!(t.wrapped_count(), 2);
+    }
+
+    /// P1-6: SetWindowLongPtrA で受け取った値は ANSI 版の CallWindowProc で
+    /// 呼ぶため、スロットごとに版を覚える。同じ値の 2 回目は最初の印のまま。
+    #[test]
+    fn proc_table_remembers_ansi_origin() {
+        let t = CallbackProcTable::<3>::new();
+        assert_eq!(t.wrap_with(0xFFFF_0001, true), Some(0));
+        assert_eq!(t.wrap_with(0x2000, false), Some(1));
+        assert_eq!(t.wrap_with(0xFFFF_0001, false), Some(0));
+        assert!(t.is_ansi(0));
+        assert!(!t.is_ansi(1));
+        assert!(!t.is_ansi(2), "free slot");
+        assert!(!t.is_ansi(9), "out of range");
     }
 
     #[test]
