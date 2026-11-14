@@ -645,38 +645,46 @@ impl<const FIELDS: usize> GenericPayload<FIELDS> {
     }
 
     /// Encode a raw generated-table scalar exactly as `scalar(raw_to_value(..))`
-    /// would, without building the intermediate `CapturedValue`.
+    /// would, without building the intermediate `CapturedValue`. A field takes
+    /// at most 11 bytes (state + 10-byte ULEB), so it is written into one
+    /// fixed window: one bounds check per field instead of one per byte.
     #[inline(always)]
     fn raw_scalar(&mut self, capture: ValueCapture, function: &str, name: &str, ty: Ty, raw: u64) {
-        self.byte(capture.code());
-        match ty {
-            Ty::U32 => self.uleb(raw as u32 as u64),
-            Ty::U64 => self.uleb(raw),
+        let start = self.len;
+        let window: &mut [u8; 11] = (&mut self.bytes.as_flattened_mut()[start..start + 11])
+            .try_into()
+            .expect("field window");
+        window[0] = capture.code();
+        let n = match ty {
+            Ty::U32 => write_uleb(window, raw as u32 as u64),
+            Ty::U64 => write_uleb(window, raw),
             Ty::I32 => {
                 let v = raw as i32 as i64;
-                self.uleb(((v << 1) ^ (v >> 63)) as u64);
+                write_uleb(window, ((v << 1) ^ (v >> 63)) as u64)
             }
             Ty::I64 => {
                 let v = raw as i64;
-                self.uleb(((v << 1) ^ (v >> 63)) as u64);
+                write_uleb(window, ((v << 1) ^ (v >> 63)) as u64)
             }
-            Ty::Bool => self.byte((raw != 0) as u8),
+            Ty::Bool => {
+                window[1] = (raw != 0) as u8;
+                1
+            }
             Ty::F32 => {
-                for byte in (raw as u32).to_le_bytes() {
-                    self.byte(byte);
-                }
+                window[1..5].copy_from_slice(&(raw as u32).to_le_bytes());
+                4
             }
             Ty::F64 => {
-                for byte in raw.to_le_bytes() {
-                    self.byte(byte);
-                }
+                window[1..9].copy_from_slice(&raw.to_le_bytes());
+                8
             }
             other => {
                 panic!(
                     "{function}: field {name} uses unsupported Ty {other:?} for generic L1 capture"
                 )
             }
-        }
+        };
+        self.len = start + 1 + n;
     }
 
     #[cfg(test)]
@@ -704,6 +712,23 @@ impl<const FIELDS: usize> GenericPayload<FIELDS> {
             _ => unreachable!("generated L1 capture only produces scalar values"),
         }
     }
+}
+
+/// ULEB128 of `value` into `window[1..]`; returns its length (1..=10).
+#[inline(always)]
+fn write_uleb(window: &mut [u8; 11], mut value: u64) -> usize {
+    if value < 0x80 {
+        window[1] = value as u8;
+        return 1;
+    }
+    let mut i = 1;
+    while value >= 0x80 && i < 10 {
+        window[i] = (value as u8) | 0x80;
+        value >>= 7;
+        i += 1;
+    }
+    window[i] = value as u8;
+    i
 }
 
 /// Encode generated arguments directly into bounded stack storage.
