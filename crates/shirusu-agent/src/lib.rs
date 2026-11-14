@@ -534,7 +534,11 @@ impl Agent {
     /// 通常経路は全体ロックを取らない (R1): 書き手の取得は TLS キャッシュ
     /// または登録表の短い読みロックで済み、書き込み中はその Ring の書き手
     /// Mutex だけを保持する。満杯 Ring の待機が他スレッドを止めることはない。
-    #[inline]
+    ///
+    /// Not `#[inline]`: compiled in this crate, its thread-local accesses
+    /// (the writer cache and the writer cell's owner token) are inline. A
+    /// copy instantiated in a caller's crate reaches each through a call on
+    /// Windows without LTO.
     pub fn record(&self, thread_id: u64, origin: CallOrigin, input: EventInput) -> RecordResult {
         if origin == CallOrigin::AgentInternal {
             return RecordResult::SkippedAgentInternal;
