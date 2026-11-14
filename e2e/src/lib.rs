@@ -387,20 +387,50 @@ pub fn scenario_host_killed() -> ScenarioReport {
         max_wait: Duration::ZERO,
         ..Default::default()
     });
-    let mut passthrough = false;
+    let mut passthrough_at = None;
     for i in 0..100u64 {
         if agent.record_enter(1, 1, 1, i, 0, b"0123456789") == RecordResult::PassthroughHostStopped
         {
-            passthrough = true;
+            passthrough_at = Some(i);
             break;
         }
     }
-    // アプリ相当の処理は継続できる (記録だけが無効化される)
-    let app_continues = true;
+    // V13 (review 2026-11-14): the application keeps running once the Host is
+    // gone. Every later call, from this thread and from a new one, is passed
+    // through without recording or waiting, and the application's own work
+    // between the calls completes with the right result.
+    const CALLS: u64 = 10_000;
+    let started = std::time::Instant::now();
+    let app_work = |agent: &Agent, thread: u64| {
+        let mut checksum = 0u64;
+        let mut passthrough_calls = 0u64;
+        for i in 0..CALLS {
+            if agent.record_enter(thread, 1, 1, 1_000 + i, 0, b"0123456789")
+                == RecordResult::PassthroughHostStopped
+            {
+                passthrough_calls += 1;
+            }
+            checksum = checksum.wrapping_add(i * i);
+        }
+        (passthrough_calls, checksum)
+    };
+    let (same_thread, same_sum) = app_work(&agent, 1);
+    let (other_thread, other_sum) =
+        std::thread::scope(|scope| scope.spawn(|| app_work(&agent, 2)).join().unwrap());
+    let elapsed = started.elapsed();
+    let expected_sum = (0..CALLS).fold(0u64, |sum, i| sum.wrapping_add(i * i));
+    let app_continues = same_thread == CALLS
+        && other_thread == CALLS
+        && same_sum == expected_sum
+        && other_sum == expected_sum
+        && elapsed < Duration::from_secs(5);
     report(
         "host_killed_passthrough",
-        passthrough && app_continues,
-        format!("passthrough={passthrough}"),
+        passthrough_at.is_some() && app_continues,
+        format!(
+            "passthrough_at={passthrough_at:?} later_passthrough={same_thread}+{other_thread}/{} elapsed={elapsed:?}",
+            CALLS * 2
+        ),
     )
 }
 
