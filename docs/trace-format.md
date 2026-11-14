@@ -25,7 +25,7 @@ Blob は参照する Event Chunk より先に書く（前方参照を許さな�
 の決定）。Writer は参照の直前に Blob をフラッシュしてこの順序を守る
 （F09）。Reader は走査後に Blob を一括解決するため順序を問わず内容は
 解決できるが、順序の違反は黙って通さず、前方参照を `ForwardBlobReference
-{ id }` として issue に記録する（F23。内容は保持し、拒否はしない）。Index と Finalization は末尾に置き、両方とも省略可能である。
+{ id }` として issue に記録する（F23。内容は保持し、拒否はしない）。Index と Finalization は末尾に置き、両方とも省略可能である。Writer は Index に載せる Block を 1,048,576 件（`MAX_INDEX_ENTRIES`）までとし、超えた Trace では Index を省いて Finalization の notes に `index omitted` と書く（2026-11-14 レビュー P1-2）。
 Finalization が無いファイルは「途中で終わった可能性がある」ものとして
 扱い、完全性を確定できない（Event Integrity = Unknown 相当）。
 

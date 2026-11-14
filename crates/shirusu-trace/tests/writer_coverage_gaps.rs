@@ -157,6 +157,7 @@ fn options(durability: Durability, chunk_raw_target: usize) -> WriterOptions {
     WriterOptions {
         durability,
         chunk_raw_target,
+        ..Default::default()
     }
 }
 
@@ -300,9 +301,10 @@ fn write_batch_checkpoint_error_propagates() {
     let (w, state) = ProbeWriter::new();
     let mut w = TraceWriter::new(w, env(42)).unwrap();
     w.register_schema(schema_one()).unwrap();
-    // 構築時に 4 回の書き込みが済んでいるため、Schema Block は
-    // write 5〜6 回目、Checkpoint Block は 7 回目で失敗。
-    state.fail_at_write.set(Some(7));
+    // 小さい Block は 1 回の write で書く (P1-2)。構築時に 2 回の
+    // 書き込みが済んでいるため、Schema Block は 3 回目、Checkpoint
+    // Block は 4 回目で失敗。
+    state.fail_at_write.set(Some(4));
     let err = w
         .write_batch(&batch(vec![event(1, PayloadRef::None)]))
         .expect_err("checkpoint write must fail");
@@ -379,16 +381,16 @@ fn finish_schema_and_blob_flush_errors_propagate() {
 
 #[test]
 fn finish_index_and_finalization_write_errors_propagate() {
-    // 構築時に 4 回の書き込みが済んでいるため、Index Block は
-    // write 5〜6 回目、Finalization Block は 7〜8 回目。
+    // 構築時に 2 回の書き込みが済んでいるため、Index Block は
+    // write 3 回目、Finalization Block は 4 回目。
     let (w, state) = ProbeWriter::new();
     let w = TraceWriter::new(w, env(42)).unwrap();
-    state.fail_at_write.set(Some(5));
+    state.fail_at_write.set(Some(3));
     assert!(w.finish(FinalizationInfo::default()).is_err());
 
     let (w, state) = ProbeWriter::new();
     let w = TraceWriter::new(w, env(42)).unwrap();
-    state.fail_at_write.set(Some(7));
+    state.fail_at_write.set(Some(4));
     assert!(w.finish(FinalizationInfo::default()).is_err());
 }
 
@@ -414,14 +416,10 @@ fn construction_write_errors_propagate() {
     state.fail_at_write.set(Some(1));
     assert!(TraceWriter::new(w, env(42)).is_err());
 
-    // Header Block の格納部（2 回目）で失敗。
+    // Environment Block（2 回目。小さい Block はヘッダーと本体を 1 回で
+    // 書く）で失敗。
     let (w, state) = ProbeWriter::new();
     state.fail_at_write.set(Some(2));
-    assert!(TraceWriter::new(w, env(42)).is_err());
-
-    // Environment Block のヘッダ部（3 回目）で失敗。
-    let (w, state) = ProbeWriter::new();
-    state.fail_at_write.set(Some(3));
     assert!(TraceWriter::new(w, env(42)).is_err());
 }
 

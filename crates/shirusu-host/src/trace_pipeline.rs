@@ -9,13 +9,101 @@ use shirusu_trace::{proto::CaptureEnvironment, DurableWrite, TraceError};
 use shirusu_transport::ring::ReceivedEvent;
 use shirusu_transport::validate::CommittedChunk;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Commands a processing group may look ahead to coalesce compatible Events.
-pub(crate) const COALESCE_LOOKAHEAD: usize = 16;
+/// Events one output chunk collects before it is written.
+const STAGE_MAX_EVENTS: usize = 4096;
+/// Payload bytes one output chunk collects before it is written.
+const STAGE_MAX_PAYLOAD: usize = 1024 * 1024;
+/// Longest a sparse stream's events wait to fill a chunk. Barriers (Ring
+/// retirement, stop) flush at once, so this only delays the bytes on disk.
+const STAGE_MAX_AGE: Duration = Duration::from_millis(100);
+
+/// One context's events waiting to be written as one Event Chunk.
+struct Staged {
+    context: TraceBatchContext,
+    events: Vec<ReceivedEvent>,
+    payload: usize,
+    /// Queue accounting of each merged command, released once written.
+    bytes: Vec<usize>,
+    since: Instant,
+}
+
+impl Staged {
+    fn new(context: TraceBatchContext) -> Self {
+        Self {
+            context,
+            events: Vec::new(),
+            payload: 0,
+            bytes: Vec::new(),
+            since: Instant::now(),
+        }
+    }
+}
+
+/// Whether `events` more events with `payload` bytes still fit `staged`.
+fn fits(staged: &Staged, events: usize, payload: usize) -> bool {
+    staged.events.len().saturating_add(events) <= STAGE_MAX_EVENTS
+        && staged.payload.saturating_add(payload) <= STAGE_MAX_PAYLOAD
+}
+
+/// Write one staged group. Compression is skipped while conversion is behind:
+/// judged by the bytes waiting in the queue, not by whether another command
+/// is ready (review 2026-11-14 P2-1: several Rings collected in one poll
+/// always looked like a backlog and disabled compression for every
+/// multithreaded target).
+fn write_staged<W: DurableWrite>(
+    recorder: &mut TraceRecorder<W>,
+    totals: &mut PipelineReport,
+    state: &WorkerState,
+    staged: Staged,
+) -> Result<(), TraceError> {
+    if !staged.events.is_empty() {
+        let backlogged =
+            state.queued_bytes.load(Ordering::Acquire) > state.byte_budget / BACKLOG_FRACTION;
+        let stats = if backlogged {
+            totals.metrics.compression_bypass_requests =
+                totals.metrics.compression_bypass_requests.saturating_add(1);
+            recorder.record_owned_batch_uncompressed(&staged.context, staged.events)?
+        } else {
+            recorder.record_owned_batch_with_args(&staged.context, staged.events)?
+        };
+        totals.args.args_attached += stats.args_attached;
+        totals.args.args_incomplete += stats.args_incomplete;
+        totals.args.args_fallback_blob += stats.args_fallback_blob;
+    }
+    for bytes in staged.bytes {
+        state.release(bytes);
+    }
+    Ok(())
+}
+
+/// Write staged groups: all of them, or with `aged_only` those past
+/// [`STAGE_MAX_AGE`]. Groups are written in the order they were started.
+fn flush_staged<W: DurableWrite>(
+    recorder: &mut TraceRecorder<W>,
+    totals: &mut PipelineReport,
+    state: &WorkerState,
+    staged: &mut Vec<Staged>,
+    aged_only: bool,
+) -> Result<(), TraceError> {
+    let mut i = 0;
+    while i < staged.len() {
+        if aged_only && staged[i].since.elapsed() < STAGE_MAX_AGE {
+            i += 1;
+            continue;
+        }
+        let group = staged.remove(i);
+        write_staged(recorder, totals, state, group)?;
+    }
+    Ok(())
+}
+
+/// Conversion counts as behind once this fraction of the queue budget waits.
+const BACKLOG_FRACTION: usize = 8;
 
 /// Owned bytes the queue may hold before the collector waits. The Ring is
 /// released as soon as a chunk is copied, so this budget, not the Ring, absorbs
@@ -210,100 +298,111 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     shirusu_transport_win::ThreadPriority::BelowNormal,
                 );
                 let mut totals = PipelineReport::default();
-                let mut pending: Option<(Command, usize)> = None;
-                while let Some((command, bytes)) = pending.take().or_else(|| {
-                    state
-                        .receiver
-                        .recv()
-                        .ok()
-                        .map(|q| (materialize(q.command), q.bytes))
-                }) {
-                    let started = Instant::now();
-                    // Accounting released once this group's work is done.
-                    let mut group_bytes = vec![bytes];
-                    let mut barrier_reached: Option<Sender<()>> = None;
-                    match command {
-                        Command::Events(context, mut events) => {
-                            let mut coalesced = false;
-                            let mut payload_bytes = events
-                                .iter()
-                                .fold(0usize, |n, e| n.saturating_add(e.payload.len()));
-                            for _ in 0..COALESCE_LOOKAHEAD {
-                                // Preserve context, loss and environment boundaries. Do not
-                                // delay a sparse stream to fill a larger output chunk.
-                                let Ok(next) = state.receiver.try_recv() else {
-                                    break;
-                                };
-                                let next_bytes = next.bytes;
-                                match materialize(next.command) {
-                                    Command::Events(next_context, next_events)
-                                        if next_context == context
-                                            && events.len().saturating_add(next_events.len())
-                                                <= 4096
-                                            && payload_bytes.saturating_add(
-                                                next_events.iter().fold(0usize, |n, e| {
-                                                    n.saturating_add(e.payload.len())
-                                                }),
-                                            ) <= 1024 * 1024 =>
-                                    {
-                                        payload_bytes += next_events
-                                            .iter()
-                                            .map(|e| e.payload.len())
-                                            .sum::<usize>();
-                                        events.extend(next_events);
-                                        group_bytes.push(next_bytes);
-                                        coalesced = true;
-                                        totals.metrics.commands_processed =
-                                            totals.metrics.commands_processed.saturating_add(1);
-                                        totals.metrics.merged_event_commands =
-                                            totals.metrics.merged_event_commands.saturating_add(1);
-                                    }
-                                    other => {
-                                        pending = Some((other, next_bytes));
-                                        break;
-                                    }
-                                }
+                // Events staged per context until a full output chunk, an
+                // age limit, or an ordering barrier (review 2026-11-14 P1-2:
+                // one Block per collection made millions of tiny Blocks and
+                // an Index that eventually could not be written).
+                let mut staged: Vec<Staged> = Vec::new();
+                loop {
+                    let received = if staged.is_empty() {
+                        state.receiver.recv().ok()
+                    } else {
+                        let oldest = staged
+                            .iter()
+                            .map(|s| s.since)
+                            .min()
+                            .unwrap_or_else(Instant::now);
+                        match state
+                            .receiver
+                            .recv_timeout(STAGE_MAX_AGE.saturating_sub(oldest.elapsed()))
+                        {
+                            Ok(q) => Some(q),
+                            Err(RecvTimeoutError::Timeout) => {
+                                flush_staged(
+                                    &mut recorder,
+                                    &mut totals,
+                                    &state,
+                                    &mut staged,
+                                    true,
+                                )?;
+                                continue;
                             }
+                            Err(RecvTimeoutError::Disconnected) => None,
+                        }
+                    };
+                    let Some(queued) = received else { break };
+                    let started = Instant::now();
+                    let bytes = queued.bytes;
+                    totals.metrics.commands_processed =
+                        totals.metrics.commands_processed.saturating_add(1);
+                    let mut barrier_reached: Option<Sender<()>> = None;
+                    match materialize(queued.command) {
+                        Command::Events(context, events) => {
                             totals.metrics.events_received = totals
                                 .metrics
                                 .events_received
                                 .saturating_add(events.len() as u64);
-                            // Ready Events are evidence of backlog, not a reason to wait.
-                            // Keep every field but spend less CPU on compression until
-                            // this writer catches up. Loss/environment commands remain
-                            // ordering barriers and do not by themselves select raw output.
-                            let backlogged = coalesced
-                                || matches!(&pending, Some((Command::Events(..), _)))
-                                || state.queued_commands.load(Ordering::Acquire)
-                                    > group_bytes.len() + usize::from(pending.is_some());
-                            if !events.is_empty() {
-                                let stats = if backlogged {
-                                    totals.metrics.compression_bypass_requests = totals
-                                        .metrics
-                                        .compression_bypass_requests
-                                        .saturating_add(1);
-                                    recorder.record_owned_batch_uncompressed(&context, events)?
-                                } else {
-                                    recorder.record_owned_batch_with_args(&context, events)?
-                                };
-                                totals.args.args_attached += stats.args_attached;
-                                totals.args.args_incomplete += stats.args_incomplete;
-                                totals.args.args_fallback_blob += stats.args_fallback_blob;
+                            let payload = events
+                                .iter()
+                                .fold(0usize, |n, e| n.saturating_add(e.payload.len()));
+                            let slot = match staged.iter().position(|s| s.context == context) {
+                                Some(i) if fits(&staged[i], events.len(), payload) => {
+                                    totals.metrics.merged_event_commands =
+                                        totals.metrics.merged_event_commands.saturating_add(1);
+                                    i
+                                }
+                                Some(i) => {
+                                    // Full: write what is staged, start anew.
+                                    let full = staged.remove(i);
+                                    write_staged(&mut recorder, &mut totals, &state, full)?;
+                                    staged.push(Staged::new(context));
+                                    staged.len() - 1
+                                }
+                                None => {
+                                    staged.push(Staged::new(context));
+                                    staged.len() - 1
+                                }
+                            };
+                            let entry = &mut staged[slot];
+                            entry.events.extend(events);
+                            entry.payload = entry.payload.saturating_add(payload);
+                            entry.bytes.push(bytes);
+                            if entry.events.len() >= STAGE_MAX_EVENTS
+                                || entry.payload >= STAGE_MAX_PAYLOAD
+                            {
+                                let full = staged.remove(slot);
+                                write_staged(&mut recorder, &mut totals, &state, full)?;
                             }
+                            // Staged events still count against the queue
+                            // budget: never let them keep collection waiting.
+                            let pressed = state.boosted.load(Ordering::Acquire)
+                                || state.queued_bytes.load(Ordering::Acquire)
+                                    > state.byte_budget / 2;
+                            flush_staged(
+                                &mut recorder,
+                                &mut totals,
+                                &state,
+                                &mut staged,
+                                !pressed,
+                            )?;
                         }
                         Command::Chunk(..) => unreachable!("chunks are materialized on receipt"),
-                        Command::Losses(losses, process, thread) => {
-                            recorder.record_losses(&losses, process, thread)?;
+                        other => {
+                            // Loss, environment and barrier commands keep their
+                            // place relative to every event received before them.
+                            flush_staged(&mut recorder, &mut totals, &state, &mut staged, false)?;
+                            match other {
+                                Command::Losses(losses, process, thread) => {
+                                    recorder.record_losses(&losses, process, thread)?;
+                                }
+                                Command::Environment(environment) => {
+                                    recorder.update_environment(&environment)?;
+                                }
+                                Command::Barrier(reached) => barrier_reached = Some(reached),
+                                Command::Events(..) | Command::Chunk(..) => unreachable!(),
+                            }
+                            state.release(bytes);
                         }
-                        Command::Environment(environment) => {
-                            recorder.update_environment(&environment)?;
-                        }
-                        Command::Barrier(reached) => {
-                            barrier_reached = Some(reached);
-                        }
-                    }
-                    for bytes in group_bytes {
-                        state.release(bytes);
                     }
                     // Acknowledge only after the barrier's own accounting is
                     // released: a caller reading the queue after the barrier
@@ -312,13 +411,12 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     if let Some(reached) = barrier_reached.take() {
                         let _ = reached.send(());
                     }
-                    totals.metrics.commands_processed =
-                        totals.metrics.commands_processed.saturating_add(1);
                     totals.metrics.conversion_wall_ns = totals
                         .metrics
                         .conversion_wall_ns
                         .saturating_add(elapsed_ns(started));
                 }
+                flush_staged(&mut recorder, &mut totals, &state, &mut staged, false)?;
                 Ok((recorder, totals))
             })?;
         Ok(Self {
@@ -840,9 +938,10 @@ mod tests {
         }
         resume.send(()).unwrap();
         let (recorder, stats) = pipeline.finish().unwrap();
-        assert_eq!(stats.metrics.merged_event_commands, 1);
-        // The final isolated group resumes normal compression.
-        assert_eq!(stats.metrics.compression_bypass_requests, 2);
+        // Each context collects its own events (P1-2); 2 and 4 join 1.
+        assert_eq!(stats.metrics.merged_event_commands, 2);
+        // A tiny queue is not a backlog (P2-1): every group is compressed.
+        assert_eq!(stats.metrics.compression_bypass_requests, 0);
         assert_eq!(stats.metrics.commands_processed, 5);
         let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
         let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
@@ -852,7 +951,7 @@ mod tests {
                 .iter()
                 .map(|b| b.events.len())
                 .collect::<Vec<_>>(),
-            [4, 2, 2]
+            [6, 2]
         );
         assert_eq!(
             trace
@@ -860,7 +959,7 @@ mod tests {
                 .iter()
                 .map(|b| b.thread_id)
                 .collect::<Vec<_>>(),
-            [1, 2, 1]
+            [1, 2]
         );
         assert_eq!(
             trace
@@ -868,8 +967,37 @@ mod tests {
                 .iter()
                 .flat_map(|b| b.events.iter().map(|e| e.call_id))
                 .collect::<Vec<_>>(),
-            [1, 1, 2, 2, 3, 3, 4, 4]
+            [1, 1, 2, 2, 4, 4, 3, 3]
         );
+    }
+
+    /// P1-2: a sparse stream is not written one Block per collection; the
+    /// age limit writes it without waiting for a barrier.
+    #[test]
+    fn sparse_events_share_a_block_and_age_out() {
+        let (writer, _blocked, _resume) = controlled();
+        let bytes = writer.bytes.clone();
+        let mut pipeline = TracePipeline::new(recorder(writer, RecordMode::Full)).unwrap();
+        for call in 1..=20 {
+            pipeline
+                .record_owned_batch_with_args(&context(), events(call))
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let len_before = bytes.lock().unwrap().len();
+        while bytes.lock().unwrap().len() == len_before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            bytes.lock().unwrap().len() > len_before,
+            "aged group written"
+        );
+        let (recorder, stats) = pipeline.finish().unwrap();
+        assert_eq!(stats.metrics.merged_event_commands, 19);
+        let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
+        let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(trace.batches.len(), 1);
+        assert_eq!(trace.batches[0].events.len(), 40);
     }
 
     #[test]

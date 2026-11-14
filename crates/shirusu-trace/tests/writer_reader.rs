@@ -858,3 +858,40 @@ fn split_chunks_restart_sequence_clock_and_global_order_bases() {
         assert_eq!(actual.events, vec![expected]);
     }
 }
+
+/// P1-2: Block 数が Index の上限を超えても finish は成功し、Index を
+/// 省いて Finalization を書く。以前は Index が無制限に増え、約 1,700 万
+/// Block で Index Block が 256MiB を超えて finish が失敗した。
+#[test]
+fn index_over_limit_is_omitted_and_trace_still_finalizes() {
+    let options = WriterOptions {
+        max_index_entries: 8,
+        ..Default::default()
+    };
+    let mut writer = TraceWriter::with_options(Vec::new(), env(42), options).unwrap();
+    for seq in 1..=20 {
+        writer
+            .write_batch(&batch(1, vec![event(seq, PayloadRef::None)]))
+            .unwrap();
+    }
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace_via(&bytes).unwrap();
+    assert!(trace.stored_index.is_none(), "index omitted");
+    let fin = trace.finalization.as_ref().expect("finalized");
+    assert_eq!(fin.total_events, 20);
+    assert!(fin.notes.iter().any(|n| n.contains("index omitted")));
+    assert_eq!(
+        trace.batches.iter().map(|b| b.events.len()).sum::<usize>(),
+        20
+    );
+
+    // 上限内なら従来どおり Index を書き、走査結果と一致する。
+    let mut writer = TraceWriter::new(Vec::new(), env(42)).unwrap();
+    writer
+        .write_batch(&batch(1, vec![event(1, PayloadRef::None)]))
+        .unwrap();
+    let bytes = writer.finish(FinalizationInfo::default()).unwrap();
+    let trace = read_trace_via(&bytes).unwrap();
+    assert!(trace.stored_index.is_some());
+    assert!(trace.index_matches_scan);
+}

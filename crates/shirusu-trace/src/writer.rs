@@ -108,6 +108,16 @@ impl<W: DurableWrite> DurableWrite for std::io::BufWriter<W> {
     }
 }
 
+/// Writer が Index に載せる Block 数の上限 (2026-11-14 レビュー P1-2)。
+/// 以前は無制限で、約 1,700 万 Block で Index Block が 256MiB を超え、
+/// 何時間分の記録が Finalization なしで終わった。1 件は符号化で約 15
+/// バイト、メモリ上で 24 バイトなので、上限で約 15MiB / 24MiB に収まる。
+/// 超えたら Index を書かない (Index は省略可能な最適化)。
+pub const MAX_INDEX_ENTRIES: usize = 1 << 20;
+
+/// これ以下の Block は、ヘッダーと本体を 1 回の write で出す。
+const SMALL_BLOCK_COALESCE: usize = 64 * 1024;
+
 /// [`TraceWriter`] の作成時オプション。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WriterOptions {
@@ -121,6 +131,8 @@ pub struct WriterOptions {
     /// ヘッダーと Zstd フレームの数が増え、大きくすると圧縮率は上がるが
     /// 1 Block の破損で失われる量が増える。
     pub chunk_raw_target: usize,
+    /// Index に載せる Block 数の上限。`0` は [`MAX_INDEX_ENTRIES`]。
+    pub max_index_entries: usize,
 }
 
 /// `finish` に渡す完全性情報。Host の IntegrityReport からの写像は
@@ -149,6 +161,10 @@ pub struct TraceWriter<W: DurableWrite> {
     pending_blobs: Vec<(BlobId, Vec<u8>)>,
     pending_blob_raw: usize,
     index: Vec<IndexEntry>,
+    /// Index の上限を超えて記録をやめたか (P1-2)。Index は省略可能な
+    /// 最適化なので、超えたら破棄して Finalization だけを書く。
+    index_overflowed: bool,
+    max_index_entries: usize,
     last_sequence_by_thread: HashMap<(u64, u64), u64>,
     total_events: u64,
     total_loss_records: u64,
@@ -191,6 +207,12 @@ impl<W: DurableWrite> TraceWriter<W> {
             pending_blobs: Vec::new(),
             pending_blob_raw: 0,
             index: Vec::new(),
+            index_overflowed: false,
+            max_index_entries: if options.max_index_entries == 0 {
+                MAX_INDEX_ENTRIES
+            } else {
+                options.max_index_entries
+            },
             last_sequence_by_thread: HashMap::new(),
             total_events: 0,
             total_loss_records: 0,
@@ -431,11 +453,21 @@ impl<W: DurableWrite> TraceWriter<W> {
     pub fn finish(mut self, info: FinalizationInfo) -> Result<W> {
         self.flush_schemas()?;
         self.flush_blobs()?;
-        let index = BlockIndex {
-            entries: self.index.clone(),
-        };
-        let payload = index.encode();
-        self.write_block(BlockType::Index, &payload, false)?;
+        let mut notes = info.notes;
+        if self.index_overflowed {
+            // Index は省略可能 (trace-format)。Reader は走査結果を使う。
+            notes.push(format!(
+                "index omitted: more than {} blocks; readers scan the file instead",
+                self.max_index_entries
+            ));
+        } else {
+            let index = BlockIndex {
+                entries: std::mem::take(&mut self.index),
+            };
+            let payload = index.encode();
+            drop(index);
+            self.write_block(BlockType::Index, &payload, false)?;
+        }
         let fin = Finalization {
             total_events: self.total_events,
             total_blobs: self.seen_blobs.len() as u64,
@@ -443,7 +475,7 @@ impl<W: DurableWrite> TraceWriter<W> {
             capture_coverage: info.capture_coverage,
             event_integrity: info.event_integrity,
             semantic_completeness: info.semantic_completeness,
-            notes: info.notes,
+            notes,
         };
         let payload = fin.encode();
         self.write_block(BlockType::Finalization, &payload, false)?;
@@ -642,13 +674,31 @@ impl<W: DurableWrite> TraceWriter<W> {
         };
         let header_bytes = crate::container::serialize_header(&header, &stored);
         debug_assert_eq!(header_bytes.len(), HEADER_LEN);
-        self.index.push(IndexEntry {
-            offset: self.offset,
-            block_type: block_type.code() as u32,
-            sequence: self.next_sequence,
-        });
-        self.inner.write_all(&header_bytes)?;
-        self.inner.write_all(&stored)?;
+        if stored.len() <= SMALL_BLOCK_COALESCE {
+            // 小さい Block はヘッダーと合わせて 1 回で書く (P1-2: 直接
+            // File へ書くため、Block ごとに syscall が 2 回だった)。
+            let mut one = Vec::with_capacity(HEADER_LEN + stored.len());
+            one.extend_from_slice(&header_bytes);
+            one.extend_from_slice(&stored);
+            self.inner.write_all(&one)?;
+        } else {
+            self.inner.write_all(&header_bytes)?;
+            self.inner.write_all(&stored)?;
+        }
+        // 書けた Block だけを Index に載せる (P2-10: 書き込みに失敗した
+        // Block が Index に残ると、再試行後の位置がずれる)。
+        if !self.index_overflowed && block_type != BlockType::Index {
+            if self.index.len() >= self.max_index_entries {
+                self.index_overflowed = true;
+                self.index = Vec::new();
+            } else {
+                self.index.push(IndexEntry {
+                    offset: self.offset,
+                    block_type: block_type.code() as u32,
+                    sequence: self.next_sequence,
+                });
+            }
+        }
         self.offset += (HEADER_LEN + stored.len()) as u64;
         self.next_sequence += 1;
         if self.durability == Durability::SyncPerBlock {
