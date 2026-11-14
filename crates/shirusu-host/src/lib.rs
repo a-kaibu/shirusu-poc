@@ -377,6 +377,12 @@ unsafe impl Send for CommittedRangeCollector {}
 
 /// Writer-maintained loss counters. A change is collected even when no new
 /// descriptor was committed (see [`CommittedRangeCollector::collect`]).
+/// 1 本の Ring で追跡する未終了呼び出しの上限（レビュー 2026-11-14 P2-3）。
+/// Leave を失った呼び出しは閉じられずに残るため、過負荷が続くと
+/// `open_calls` が時間に比例して増える。上限を越えたら古い半分を
+/// 「終了不明」として確定させる。実際の入れ子はこれよりずっと浅い。
+pub const MAX_OPEN_CALLS: usize = 1 << 16;
+
 const LOSS_COUNTER_OFFSETS: [usize; 3] = [
     layout::OFF_DROPPED_EVENTS,
     layout::OFF_DROPPED_PAYLOAD_BYTES,
@@ -572,6 +578,8 @@ pub struct DrainWorker {
     /// 場合にだけ生成する。欠落 Payload には生成されない。
     pub payload_keys: Vec<TemporaryPayloadKey>,
     pub loss_events: Vec<LossEvent>,
+    /// `take_loss_events` で途中に書き出した欠落記録の数（P2-3）。
+    flushed_loss_events: u64,
     pub unknown_terminations: Vec<u64>,
     /// 中断した呼び出し（CallAborted）の回収数（L08）。Host 側の
     /// 「終了不明」とは別で、異常終了したことが分かっているもの。
@@ -608,6 +616,7 @@ impl DrainWorker {
             identity: None,
             payload_keys: Vec::new(),
             loss_events: Vec::new(),
+            flushed_loss_events: 0,
             unknown_terminations: Vec::new(),
             aborted_calls: 0,
             completed_calls: 0,
@@ -848,6 +857,9 @@ impl DrainWorker {
             Some(EventKind::CallEnter) => {
                 self.open_calls
                     .insert(e.descriptor.call_id, e.descriptor.sequence);
+                if self.open_calls.len() > MAX_OPEN_CALLS {
+                    self.evict_oldest_open_calls();
+                }
             }
             Some(EventKind::CallLeave)
                 if self.open_calls.remove(&e.descriptor.call_id).is_some() =>
@@ -900,6 +912,33 @@ impl DrainWorker {
         self.open_calls.clear();
         unterminated
     }
+    /// 古い (Enter の Sequence が小さい) 半分を「終了不明」として確定する。
+    fn evict_oldest_open_calls(&mut self) {
+        let mut open: Vec<(u64, u64)> = self
+            .open_calls
+            .iter()
+            .map(|(&call, &seq)| (seq, call))
+            .collect();
+        open.sort_unstable();
+        for &(_, call_id) in &open[..open.len() / 2] {
+            self.open_calls.remove(&call_id);
+            self.loss_events
+                .push(LossEvent::UnknownTermination { call_id });
+            self.unknown_terminations.push(call_id);
+        }
+    }
+    /// 溜まった欠落記録を取り出す。取り出した数は `loss_event_count` と
+    /// `integrity_report` に残る（P2-3: 終了を待たずに書き出すため）。
+    pub fn take_loss_events(&mut self) -> Vec<LossEvent> {
+        let taken = std::mem::take(&mut self.loss_events);
+        self.flushed_loss_events = self.flushed_loss_events.saturating_add(taken.len() as u64);
+        taken
+    }
+    /// これまでに生じた欠落記録の総数（途中で書き出した分を含む）。
+    pub fn loss_event_count(&self) -> u64 {
+        self.flushed_loss_events
+            .saturating_add(self.loss_events.len() as u64)
+    }
     pub fn open_call_count(&self) -> usize {
         self.open_calls.len()
     }
@@ -926,10 +965,10 @@ impl DrainWorker {
             r.event_integrity = IntegrityLevel::Lost;
             r.notes
                 .push("shared memory integrity lost; ring stopped".into());
-        } else if !self.loss_events.is_empty() || !self.unknown_terminations.is_empty() {
+        } else if self.loss_event_count() > 0 || !self.unknown_terminations.is_empty() {
             r.event_integrity = IntegrityLevel::Degraded;
             r.notes
-                .push(format!("loss events: {}", self.loss_events.len()));
+                .push(format!("loss events: {}", self.loss_event_count()));
         }
         if self.degraded_seen > 0 {
             r.semantic_completeness = IntegrityLevel::Degraded;
@@ -1561,6 +1600,43 @@ mod tests {
         assert_eq!(host.total_bytes_copied(), 256 + 64 + 2);
     }
 
+    #[test]
+    fn open_calls_are_bounded_and_flushed_losses_still_count() {
+        // P2-3: Leave を失った呼び出しが時間に比例して溜まらない。
+        let cfg = RingConfig::new(16, 512);
+        let mut host = DrainWorker::for_chunks(cfg, 1);
+        let enter = |call_id: u64| {
+            let mut d =
+                shirusu_transport::descriptor::EventDescriptor::new(EventKind::CallEnter, call_id);
+            d.call_id = call_id;
+            d.sequence = call_id + 1;
+            ReceivedEvent {
+                descriptor: d,
+                payload: Vec::new(),
+            }
+        };
+        for call in 0..(MAX_OPEN_CALLS as u64 + 1) {
+            host.track_call(&enter(call));
+        }
+        assert_eq!(host.open_call_count(), MAX_OPEN_CALLS / 2 + 1);
+        let evicted = host.loss_events.len();
+        assert_eq!(evicted, MAX_OPEN_CALLS / 2);
+        // 古い方から確定する
+        assert!(matches!(
+            host.loss_events[0],
+            LossEvent::UnknownTermination { call_id: 0 }
+        ));
+        let taken = host.take_loss_events();
+        assert_eq!(taken.len(), evicted);
+        assert!(host.loss_events.is_empty());
+        assert_eq!(host.loss_event_count(), evicted as u64);
+        let report = host.integrity_report(0, false);
+        assert_eq!(report.event_integrity, IntegrityLevel::Degraded);
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n == &format!("loss events: {evicted}")));
+    }
     #[test]
     fn loss_counters_become_loss_events() {
         let (_rg, mut w, mut host) = setup();

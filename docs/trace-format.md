@@ -1139,6 +1139,11 @@ overview「完全性と復旧」節の「Host や OS がクラッシュしたら
 - Loss 情報（Sequence 欠番、カウンタ差分、終了不明、完全性喪失）は
   Loss Block の LossRecord として残し、Finalization には Host の
   IntegrityReport に対応する3指標を写す。
+- Loss Block は停止時にまとめて書くのではなく、1 本の Ring で 256 件
+  溜まるたびに、その時点までのイベントの後へ書く（2026-11-14 レビュー
+  P2-3）。Host が途中で異常終了しても、残った Trace から欠落が分かる。
+  Leave を失った呼び出しの追跡は Ring あたり 65,536 件までとし、越えたら
+  古い半分を終了不明として確定する。
 
 ## 依存クレートの判断
 

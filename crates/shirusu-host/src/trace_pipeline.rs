@@ -244,28 +244,39 @@ impl WorkerState {
 
 /// Validate a collected chunk into owned events. A rejected chunk stops its
 /// Ring inside the DrainWorker (recorded at finalization) and yields nothing.
-fn materialize(command: Command) -> Command {
+///
+/// Loss records accumulated by the validator are handed back once there are
+/// [`LOSS_FLUSH_RECORDS`] of them (review 2026-11-14 P2-3): an overloaded
+/// session would otherwise hold every record until stop, and a Host crash
+/// would leave a Trace with no sign that anything was lost.
+fn materialize(command: Command) -> (Command, Option<Command>) {
     match command {
         Command::Chunk(context, worker, chunk) => {
-            let events = match worker.worker.lock() {
+            let (events, losses) = match worker.worker.lock() {
                 Ok(mut validator) => {
                     let events = validator.ingest_chunk(&chunk).events;
                     if validator.is_stopped() {
                         worker.stopped.store(true, Ordering::Release);
                     }
-                    events
+                    let losses = (validator.loss_events.len() >= LOSS_FLUSH_RECORDS)
+                        .then(|| validator.take_loss_events());
+                    (events, losses)
                 }
                 // A poisoned validator cannot vouch for anything.
                 Err(_) => {
                     worker.stopped.store(true, Ordering::Release);
-                    Vec::new()
+                    (Vec::new(), None)
                 }
             };
-            Command::Events(context, events)
+            let losses = losses.map(|l| Command::Losses(l, context.process_id, context.thread_id));
+            (Command::Events(context, events), losses)
         }
-        other => other,
+        other => (other, None),
     }
 }
+
+/// Validator loss records written as soon as this many have accumulated.
+const LOSS_FLUSH_RECORDS: usize = 256;
 
 impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
     pub(crate) fn new(recorder: TraceRecorder<W>) -> Result<Self, TraceError> {
@@ -336,7 +347,8 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     totals.metrics.commands_processed =
                         totals.metrics.commands_processed.saturating_add(1);
                     let mut barrier_reached: Option<Sender<()>> = None;
-                    match materialize(queued.command) {
+                    let (command, early_losses) = materialize(queued.command);
+                    match command {
                         Command::Events(context, events) => {
                             totals.metrics.events_received = totals
                                 .metrics
@@ -403,6 +415,11 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                             }
                             state.release(bytes);
                         }
+                    }
+                    if let Some(Command::Losses(losses, process, thread)) = early_losses {
+                        // After the events they describe, like a Loss command.
+                        flush_staged(&mut recorder, &mut totals, &state, &mut staged, false)?;
+                        recorder.record_losses(&losses, process, thread)?;
                     }
                     // Acknowledge only after the barrier's own accounting is
                     // released: a caller reading the queue after the barrier
@@ -752,6 +769,61 @@ mod tests {
             ready,
             resume,
         )
+    }
+
+    #[test]
+    fn validator_losses_are_written_before_stop() {
+        // P2-3: 溜まった欠落記録は停止を待たずに Trace へ書く。
+        use shirusu_transport::clock::{Clock, ManualClock};
+        use shirusu_transport::ring::{EventInput, SharedRegion, WriterPolicy};
+        use shirusu_transport::RingConfig;
+        let cfg = RingConfig::new(16, 512);
+        let region = SharedRegion::new(cfg, 1, 1);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut ring = unsafe {
+            region.writer(
+                WriterPolicy {
+                    max_wait: Duration::ZERO,
+                    ..Default::default()
+                },
+                clock,
+            )
+        };
+        let mut collector = unsafe { crate::CommittedRangeCollector::new(region.base(), cfg) };
+        let mut validator = DrainWorker::for_chunks(cfg, 1);
+        validator.loss_events.extend(
+            (0..LOSS_FLUSH_RECORDS as u64).map(|count| LossEvent::SequenceGap { count: count + 1 }),
+        );
+        let shared = RingValidation::new(validator);
+        ring.write(EventInput {
+            kind: EventKind::CallEnter,
+            api_id: API_CLOSE_HANDLE,
+            schema_id: 1,
+            call_id: 1,
+            parent_call_id: 0,
+            payload: b"",
+            capture_state: CaptureState::Captured,
+            global_order: 0,
+        });
+        let chunk = collector.collect(|| {}).expect("one event committed");
+        let (writer, _, _) = controlled();
+        let bytes = writer.bytes.clone();
+        let mut pipeline = TracePipeline::new(recorder(writer, RecordMode::Full)).unwrap();
+        pipeline.record_chunk(&context(), &shared, chunk).unwrap();
+        pipeline.barrier().unwrap();
+        {
+            let validator = shared.lock();
+            assert!(validator.loss_events.is_empty());
+            assert_eq!(validator.loss_event_count(), LOSS_FLUSH_RECORDS as u64);
+        }
+        let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
+        assert!(trace.finalization.is_none(), "still recording");
+        assert_eq!(trace.loss_records.len(), LOSS_FLUSH_RECORDS);
+        assert_eq!(
+            trace.batches.iter().map(|b| b.events.len()).sum::<usize>(),
+            1
+        );
+        drop(pipeline);
     }
 
     #[test]

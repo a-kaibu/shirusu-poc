@@ -407,9 +407,9 @@ fn retire_ring_worker(
     let _ = worker.finalize_thread();
     retired_reports
         .push(worker.integrity_report(coverage_missing_calls, ring.stopped || worker.is_stopped()));
-    let losses = std::mem::take(&mut worker.loss_events);
+    *retired_loss_records += worker.loss_event_count();
+    let losses = worker.take_loss_events();
     if !losses.is_empty() {
-        *retired_loss_records += losses.len() as u64;
         recorder.record_losses(losses, ring.spec.process_id, ring.trace_thread_id)?;
     }
     ring.stopped = false;
@@ -908,8 +908,8 @@ impl CaptureSession {
                 self.coverage_missing_calls,
                 ring.stopped || worker.is_stopped(),
             ));
-            let losses = std::mem::take(&mut worker.loss_events);
-            total_loss_records += losses.len() as u64;
+            total_loss_records += worker.loss_event_count();
+            let losses = worker.take_loss_events();
             if !losses.is_empty() {
                 self.recorder
                     .record_losses(losses, ring.spec.process_id, ring.trace_thread_id)?;
