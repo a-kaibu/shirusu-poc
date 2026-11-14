@@ -109,6 +109,10 @@ struct UpdateRecord {
 /// Block を 1 つずつ読むストリーミング Reader。
 pub struct TraceStream<R: Read + Seek> {
     inner: R,
+    /// Where `inner` is positioned, when known. Blocks are mostly read one
+    /// after another, and seeking a `BufReader` to where it already is
+    /// still throws its buffer away (2026-11-14 review P3-12).
+    cursor: Option<u64>,
     len: u64,
     pos: u64,
     options: StreamOptions,
@@ -179,6 +183,7 @@ impl<R: Read + Seek> TraceStream<R> {
         }
         Ok(Self {
             inner,
+            cursor: Some(first.len() as u64),
             len,
             pos: first.len() as u64,
             options,
@@ -435,7 +440,7 @@ impl<R: Read + Seek> TraceStream<R> {
     pub fn load_blob(&mut self, id: &BlobId) -> Result<Option<Vec<u8>>> {
         let resume = self.pos;
         let result = self.load_blob_inner(id);
-        self.inner.seek(SeekFrom::Start(resume))?;
+        self.seek_to(resume)?;
         result
     }
 
@@ -548,6 +553,27 @@ impl<R: Read + Seek> TraceStream<R> {
         Ok(decode_payload(compression, raw.raw_len, &payload).ok())
     }
 
+    /// The underlying reader, positioned wherever the scan left it.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    fn seek_to(&mut self, pos: u64) -> Result<()> {
+        if self.cursor != Some(pos) {
+            self.cursor = None;
+            self.inner.seek(SeekFrom::Start(pos))?;
+            self.cursor = Some(pos);
+        }
+        Ok(())
+    }
+
+    fn read_tracked(&mut self, buf: &mut [u8]) -> Result<()> {
+        let at = self.cursor.take();
+        self.inner.read_exact(buf)?;
+        self.cursor = at.map(|a| a + buf.len() as u64);
+        Ok(())
+    }
+
     /// `offset` の Block ヘッダーを読み、長さ上限と配置だけを検査する
     /// （CRC は未検査）。成立しなければ None。読み位置は payload の先頭に残る。
     fn read_candidate_header(
@@ -558,8 +584,8 @@ impl<R: Read + Seek> TraceStream<R> {
             return Ok(None);
         }
         let mut head = [0u8; HEADER_LEN];
-        self.inner.seek(SeekFrom::Start(offset))?;
-        self.inner.read_exact(&mut head)?;
+        self.seek_to(offset)?;
+        self.read_tracked(&mut head)?;
         let Some(raw) = container::parse_raw_header(&head) else {
             return Ok(None);
         };
@@ -596,7 +622,7 @@ impl<R: Read + Seek> TraceStream<R> {
         let mut buf = vec![0u8; left.min(CHUNK)];
         while left > 0 {
             let n = left.min(CHUNK);
-            self.inner.read_exact(&mut buf[..n])?;
+            self.read_tracked(&mut buf[..n])?;
             crc = shirusu_crc32c::crc32c_update(crc, &buf[..n]);
             left -= n;
         }
@@ -612,7 +638,7 @@ impl<R: Read + Seek> TraceStream<R> {
             return Ok(None);
         };
         let mut payload = vec![0u8; raw.stored_len as usize];
-        self.inner.read_exact(&mut payload)?;
+        self.read_tracked(&mut payload)?;
         if !container::raw_header_crc_matches(&raw, &head, &payload) {
             return Ok(None);
         }
@@ -639,8 +665,8 @@ impl<R: Read + Seek> TraceStream<R> {
                 return Ok(None);
             }
             let mut head = [0u8; HEADER_LEN];
-            self.inner.seek(SeekFrom::Start(pos))?;
-            self.inner.read_exact(&mut head)?;
+            self.seek_to(pos)?;
+            self.read_tracked(&mut head)?;
             let reason = match container::parse_raw_header(&head) {
                 None => Some("block magic not found".to_string()),
                 Some(raw) if raw.header_len as usize != HEADER_LEN || raw.reserved != 0 => {
@@ -659,7 +685,7 @@ impl<R: Read + Seek> TraceStream<R> {
                         return Ok(None);
                     }
                     let mut payload = vec![0u8; raw.stored_len as usize];
-                    self.inner.read_exact(&mut payload)?;
+                    self.read_tracked(&mut payload)?;
                     if container::raw_header_crc_matches(&raw, &head, &payload) {
                         let block_type = BlockType::from_code(raw.block_type_code);
                         self.blocks.push(ScannedBlock {
@@ -704,8 +730,8 @@ impl<R: Read + Seek> TraceStream<R> {
         let mut window = vec![0u8; WINDOW];
         while q + HEADER_LEN as u64 <= self.len {
             let n = (self.len - q).min(WINDOW as u64) as usize;
-            self.inner.seek(SeekFrom::Start(q))?;
-            self.inner.read_exact(&mut window[..n])?;
+            self.seek_to(q)?;
+            self.read_tracked(&mut window[..n])?;
             let mut i = 0;
             while i + 4 <= n {
                 if window[i..i + 4] == container::BLOCK_MAGIC {

@@ -952,3 +952,42 @@ fn blob_entry_with_wrong_content_is_not_loaded() {
         Some(&after[..])
     );
 }
+
+/// Counts seeks that land somewhere else than the current position.
+struct CountingSeeks {
+    inner: Cursor<Vec<u8>>,
+    seeks: usize,
+}
+
+impl std::io::Read for CountingSeeks {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for CountingSeeks {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        if matches!(pos, std::io::SeekFrom::Start(_)) {
+            self.seeks += 1;
+        }
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn sequential_blocks_are_read_without_seeking() {
+    // P3-12: seeking a BufReader to where it already is drops its buffer.
+    let (data, _, _) = rich_trace();
+    let mut stream = TraceStream::open(CountingSeeks {
+        inner: Cursor::new(data),
+        seeks: 0,
+    })
+    .unwrap();
+    let mut items = 0;
+    while stream.next_item().unwrap().is_some() {
+        items += 1;
+    }
+    assert!(items > 3);
+    let seeks = stream.into_inner().seeks;
+    assert!(seeks <= 2, "seeks: {seeks}");
+}
