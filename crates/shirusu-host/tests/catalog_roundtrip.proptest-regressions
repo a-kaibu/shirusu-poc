@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6a04fd9d3a7e47ae13bf4db63a82ac6e26a0eb538c8bec59960b047a09257173 # shrinks to calls = [(ApiDef { api_id: 4903, module: "kernel32.dll", function: "CreateTimerQueue", level: 1, level_note: "L1 broad（Metadata 生成、メインモジュール IAT のみ）：型付き引数・戻り値のみ。動的解決・他モジュール経由は未捕捉", enter_fields: [], leave_fields: [("return", U64, Handle, After), ("last_error", U32, Scalar, After)], last_error_meaning: WhenReturnIsNull }, [], 11084968779533064257, 4131270790)]

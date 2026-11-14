@@ -285,3 +285,59 @@ fn blob_store_apply_update_folds_and_dedups() {
     assert!(store.apply_update(&base_id, 15, b"XY").is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 再オープン時の走査は `<2 文字のディレクトリ>/<64 hex>` だけを既出とする。
+/// 長い名前のディレクトリの中身や、root 直下のファイルは数えない。
+#[test]
+fn blob_store_open_ignores_foreign_layout() {
+    let root = temp_root("foreign");
+    std::fs::create_dir_all(&root).unwrap();
+    let a = BlobId::of_content(b"in a long-named dir");
+    let b = BlobId::of_content(b"two-char file at root");
+    let c = BlobId::of_content(b"not hex");
+    std::fs::create_dir_all(root.join("abc")).unwrap();
+    std::fs::write(root.join("abc").join(a.to_hex()), b"x").unwrap();
+    // root 直下の 2 文字のファイル（ディレクトリではない）。
+    std::fs::write(root.join("zz"), b"x").unwrap();
+    std::fs::write(root.join(b.to_hex()), b"x").unwrap();
+    let hex = c.to_hex();
+    std::fs::create_dir_all(root.join(&hex[..2])).unwrap();
+    std::fs::write(root.join(&hex[..2]).join("not-a-blob-id"), b"x").unwrap();
+    let store = BlobStore::open(&root).unwrap();
+    assert_eq!(store.stored_count(), 0);
+    for id in [a, b, c] {
+        assert!(!store.contains(&id));
+        assert_eq!(store.get(&id).unwrap(), None);
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 既出のファイルが外部で消えたら `get` は None、読めない（ディレクトリに
+/// なっている）なら Err を返す。NotFound だけを「無い」と扱う。
+#[test]
+fn blob_store_get_distinguishes_missing_from_unreadable() {
+    let root = temp_root("unreadable");
+    let mut store = BlobStore::open(&root).unwrap();
+    let (gone, _) = store.put(b"deleted behind the store").unwrap();
+    let (dir, _) = store.put(b"replaced by a directory").unwrap();
+    let path = |id: &BlobId| {
+        let hex = id.to_hex();
+        root.join(&hex[..2]).join(hex)
+    };
+    std::fs::remove_file(path(&gone)).unwrap();
+    std::fs::remove_file(path(&dir)).unwrap();
+    std::fs::create_dir(path(&dir)).unwrap();
+    assert!(store.contains(&gone));
+    assert_eq!(store.get(&gone).unwrap(), None);
+    assert_eq!(store.get_verified(&gone).unwrap(), None);
+    assert!(store.get(&dir).is_err());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn container_size_limits_match_the_format_spec() {
+    use shirusu_trace::container::{MAX_RAW_LEN, MAX_STORED_LEN};
+    // docs/trace-format.md: stored_len ≤ 512 MiB、raw_len ≤ 256 MiB。
+    assert_eq!(MAX_STORED_LEN, 512 << 20);
+    assert_eq!(MAX_RAW_LEN, 256 << 20);
+}

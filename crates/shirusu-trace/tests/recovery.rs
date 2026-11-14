@@ -925,3 +925,114 @@ fn blob_update_size_mismatch_is_corrupt_block() {
     assert!(has_corrupt_at(&trace, offset), "issues: {:?}", trace.issues);
     assert!(trace.blob_updates.is_empty());
 }
+
+/// 先頭 Block の各欄を 1 つだけ不正にし、CRC は付け直す。どの欄の検査も
+/// 単独で成り立つこと（他の検査や CRC に頼らない）を、全体読み込みと
+/// ストリーミング読み込みの両方で確かめる。
+#[test]
+fn each_file_header_field_is_checked_on_its_own() {
+    use shirusu_trace::stream::TraceStream;
+    let good_payload = FileHeader::new(42).encode();
+    // (header バイト列への改変, payload)
+    let build = |edit: &dyn Fn(&mut [u8; 32]), payload: &[u8]| {
+        let header = BlockHeader {
+            block_type: BlockType::Header,
+            compression: Compression::None,
+            sequence: 0,
+            stored_len: payload.len() as u32,
+            raw_len: payload.len() as u32,
+        };
+        let mut h = serialize_header(&header, payload);
+        edit(&mut h);
+        // CRC 欄を 0 にして付け直す（reserved を含むヘッダー全体と payload）。
+        h[24..28].copy_from_slice(&[0; 4]);
+        let crc = shirusu_crc32c::crc32c_update(shirusu_crc32c::crc32c(&h), payload);
+        h[24..28].copy_from_slice(&crc.to_le_bytes());
+        let mut file = h.to_vec();
+        file.extend_from_slice(payload);
+        file
+    };
+    let ok = build(&|_| {}, &good_payload);
+    assert!(read_trace(&ok).is_ok());
+    assert!(TraceStream::open(std::io::Cursor::new(&ok)).is_ok());
+    let mut long = good_payload.to_vec();
+    long.push(0);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("header_len", build(&|h| h[6..8].copy_from_slice(&40u16.to_le_bytes()), &good_payload)),
+        ("reserved", build(&|h| h[28] = 1, &good_payload)),
+        ("block_type", build(&|h| h[4] = BlockType::Environment.code(), &good_payload)),
+        ("compression", build(&|h| h[5] = Compression::Zstd.code(), &good_payload)),
+        ("stored_len", build(&|h| h[16..20].copy_from_slice(&25u32.to_le_bytes()), &long)),
+        ("raw_len", build(&|h| h[20..24].copy_from_slice(&25u32.to_le_bytes()), &good_payload)),
+        ("both lengths", build(&|_| {}, &long)),
+        ("container_version", {
+            let mut p = good_payload.clone();
+            p[10] ^= 0x02;
+            build(&|_| {}, &p)
+        }),
+        ("schema_version", {
+            let mut p = good_payload.clone();
+            p[12] ^= 0x02;
+            build(&|_| {}, &p)
+        }),
+    ];
+    for (what, file) in cases {
+        assert!(
+            matches!(read_trace(&file), Err(TraceError::NotATrace)),
+            "{what}: full reader must reject"
+        );
+        assert!(
+            matches!(
+                TraceStream::open(std::io::Cursor::new(&file)),
+                Err(TraceError::NotATrace)
+            ),
+            "{what}: stream reader must reject"
+        );
+    }
+}
+
+/// 末尾にちょうど 32 バイト（payload なしの Block 1 つ）が残る場合は
+/// 切れた末尾ではなく Block として読む。
+#[test]
+fn exact_header_sized_tail_block_is_read_not_truncated() {
+    let (mut bytes, _) = base_trace();
+    let header = BlockHeader {
+        block_type: BlockType::Unknown(200),
+        compression: Compression::None,
+        sequence: 999,
+        stored_len: 0,
+        raw_len: 0,
+    };
+    bytes.extend_from_slice(&serialize_header(&header, &[]));
+    let read = read_trace(&bytes).unwrap();
+    assert!(
+        !read
+            .issues
+            .iter()
+            .any(|i| matches!(i, RecoveryIssue::TruncatedTail { .. })),
+        "{:?}",
+        read.issues
+    );
+    assert_eq!(read.blocks.last().unwrap().sequence, 999);
+}
+
+/// raw_len の上限はちょうど MAX_RAW_LEN までを許す（上限を超えたら拒否）。
+#[test]
+fn raw_len_limit_is_inclusive() {
+    use shirusu_trace::container::{decode_payload, MAX_RAW_LEN};
+    let at_limit = BlockHeader {
+        block_type: BlockType::Unknown(200),
+        compression: Compression::None,
+        sequence: 1,
+        stored_len: 0,
+        raw_len: MAX_RAW_LEN,
+    };
+    let err = format!("{:?}", decode_payload(&at_limit, &[]).unwrap_err());
+    assert!(!err.contains("exceeds limit"), "{err}");
+    let over = BlockHeader {
+        raw_len: MAX_RAW_LEN + 1,
+        ..at_limit
+    };
+    let err = format!("{:?}", decode_payload(&over, &[]).unwrap_err());
+    assert!(err.contains("exceeds limit"), "{err}");
+}

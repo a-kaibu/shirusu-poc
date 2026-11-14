@@ -377,3 +377,305 @@ pub(crate) fn cmd_repair(args: &[String]) -> Result<(), ToolError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod pbt {
+    //! repair の性質検査（PBT）。任意の操作列で書いた Trace に任意の破損を
+    //! 加え、回復読みできた入力を修復する。
+    //!
+    //! - 修復結果は issue なしで読め、きれいに終わっている。
+    //! - 会計: 回収数 + 損失数 = 走査数、損失の内訳の合計 = 損失数。
+    //! - 修復結果のイベントは入力の（空でない）Batch を順に絞り込んだもの。
+    //! - 冪等: 修復結果をもう一度修復しても何も失わず、イベントは変わらない。
+    //! - イベントを失ったら Complete を宣言しない。
+    use super::*;
+    use proptest::prelude::*;
+    use shirusu_trace::container::HEADER_LEN;
+    use shirusu_trace::reader::read_trace;
+    use shirusu_trace::schema::{make_schema, EventCapture, Ty};
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Payload(Vec<u8>),
+        Batch {
+            thread: u64,
+            refs: Vec<usize>,
+        },
+        Loss(u64),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            2 => proptest::collection::vec(any::<u8>(), 0..32).prop_map(Op::Payload),
+            4 => (1u64..4, proptest::collection::vec(any::<usize>(), 0..5))
+                .prop_map(|(thread, refs)| Op::Batch { thread, refs }),
+            1 => (1u64..9).prop_map(Op::Loss),
+        ]
+    }
+
+    fn env() -> CaptureEnvironment {
+        CaptureEnvironment {
+            session: SessionMetadata {
+                session_id: 9,
+                created_by: "repair-pbt".into(),
+                qpc_frequency: 1000,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn write(ops: &[Op], finish: bool, integrity: u32) -> Vec<u8> {
+        let mut w = TraceWriter::new(Vec::new(), env()).unwrap();
+        w.register_schema(make_schema(1, "k32!T/enter", vec![("x".into(), Ty::U32, 0)]))
+            .unwrap();
+        let mut blobs: Vec<BlobId> = Vec::new();
+        let mut seq: HashMap<u64, u64> = HashMap::new();
+        for op in ops {
+            match op {
+                Op::Payload(d) => blobs.push(w.add_payload(d).unwrap()),
+                Op::Batch { thread, refs } => {
+                    let events: Vec<TraceEvent> = refs
+                        .iter()
+                        .map(|r| {
+                            let s = seq.entry(*thread).or_insert(0);
+                            *s += 1;
+                            TraceEvent {
+                                kind: 1,
+                                sequence: *s,
+                                timestamp_qpc: *s,
+                                call_id: *s,
+                                parent_call_id: 0,
+                                api_id: 1,
+                                schema_id: 1,
+                                capture: EventCapture::Captured,
+                                payload: if blobs.is_empty() || r % 3 == 0 {
+                                    PayloadRef::Inline(vec![*r as u8])
+                                } else {
+                                    PayloadRef::Blob(blobs[r % blobs.len()])
+                                },
+                                args: None,
+                                global_order: None,
+                            }
+                        })
+                        .collect();
+                    if events.is_empty() {
+                        continue;
+                    }
+                    w.write_batch(&EventBatch {
+                        session_id: 9,
+                        process_id: 1,
+                        raw_pid: 1,
+                        thread_id: *thread,
+                        qpc_frequency: 1000,
+                        events,
+                    })
+                    .unwrap();
+                }
+                Op::Loss(n) => w
+                    .write_loss_records(&[shirusu_trace::proto::LossRecord {
+                        kind: 1,
+                        count: *n,
+                        ..Default::default()
+                    }])
+                    .unwrap(),
+            }
+        }
+        let bytes = w
+            .finish(FinalizationInfo {
+                capture_coverage: 0,
+                event_integrity: integrity,
+                semantic_completeness: 0,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        if finish {
+            bytes
+        } else {
+            // Index と Finalization の 2 Block を落とす（途中で終わった Trace）。
+            let mut at = 0;
+            let mut offs = Vec::new();
+            while at + HEADER_LEN <= bytes.len() {
+                offs.push(at);
+                let stored =
+                    u32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap()) as usize;
+                at += HEADER_LEN + stored;
+            }
+            let cut = offs[offs.len().saturating_sub(2).max(1)];
+            bytes[..cut].to_vec()
+        }
+    }
+
+    /// 同じスレッドの Sequence を巻き戻した Batch を Block 単位で複製して
+    /// 足す破損（sequence_regression の経路）も含める。
+    #[derive(Debug, Clone)]
+    enum Damage {
+        None,
+        Flip(usize, u8),
+        Truncate(usize),
+        DuplicateTail(usize),
+    }
+
+    fn damage() -> impl Strategy<Value = Damage> {
+        prop_oneof![
+            1 => Just(Damage::None),
+            3 => (any::<usize>(), 1u8..=255).prop_map(|(a, m)| Damage::Flip(a, m)),
+            1 => any::<usize>().prop_map(Damage::Truncate),
+            2 => any::<usize>().prop_map(Damage::DuplicateTail),
+        ]
+    }
+
+    fn apply(mut b: Vec<u8>, d: &Damage) -> Vec<u8> {
+        match *d {
+            Damage::None => b,
+            Damage::Flip(at, m) => {
+                let i = at % b.len();
+                b[i] ^= m;
+                b
+            }
+            Damage::Truncate(at) => {
+                b.truncate(at % (b.len() + 1));
+                b
+            }
+            Damage::DuplicateTail(at) => {
+                // Header の後ろの任意の位置から末尾までを複製して足す。
+                // Block 境界に当たれば同じ Batch の再提示になる。
+                let from = HEADER_LEN + 24 + at % (b.len() - HEADER_LEN - 24 + 1);
+                let tail = b[from..].to_vec();
+                b.extend_from_slice(&tail);
+                b
+            }
+        }
+    }
+
+    fn events(t: &ReadTrace) -> Vec<(u64, TraceEvent)> {
+        t.batches
+            .iter()
+            .flat_map(|b| b.events.iter().map(move |e| (b.thread_id, e.clone())))
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            std::env::var("SHIRUSU_PBT_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+        ))]
+
+        #[test]
+        fn repair_is_accounted_clean_and_idempotent(
+            ops in proptest::collection::vec(op(), 0..20),
+            finish in any::<bool>(),
+            integrity in 0u32..4,
+            d in damage(),
+        ) {
+            let data = apply(write(&ops, finish, integrity), &d);
+            let Ok(input) = read_trace(&data) else { return Ok(()) };
+            let (bytes, report) = repair_trace("in", &input).unwrap();
+            prop_assert_eq!(report.recovered + report.lost, report.scanned);
+            prop_assert_eq!(
+                report.lost_by_cause.iter().map(|(_, n)| n).sum::<u64>(),
+                report.lost
+            );
+            let out = read_trace(&bytes).unwrap();
+            prop_assert!(out.issues.is_empty(), "{:?}", out.issues);
+            prop_assert!(out.finalized_cleanly);
+            prop_assert_eq!(out.total_events(), report.recovered);
+            prop_assert_eq!(&out.loss_records, &input.loss_records);
+            // 出力イベントは入力イベントの部分列（順序を保つ）。
+            let src = events(&input);
+            let mut it = src.iter();
+            for e in events(&out) {
+                prop_assert!(it.any(|s| *s == e), "event not from the input in order: {e:?}");
+            }
+            // 参照する Blob はすべて運ばれている。
+            for (_, e) in events(&out) {
+                if let PayloadRef::Blob(id) = e.payload {
+                    prop_assert!(out.blobs.contains_key(&id));
+                }
+            }
+            let f = out.finalization.as_ref().unwrap();
+            if report.lost > 0 {
+                prop_assert_ne!(f.event_integrity, 0, "lost events but still Complete");
+            }
+            // 冪等性。
+            let (again, report2) = repair_trace("out", &out).unwrap();
+            prop_assert_eq!(report2.lost, 0);
+            let out2 = read_trace(&again).unwrap();
+            prop_assert_eq!(events(&out2), events(&out));
+            prop_assert_eq!(out2.finalization.unwrap().event_integrity, f.event_integrity);
+        }
+    }
+
+    /// すべての RecoveryIssue に表記があり、報告の行と JSON に載る。
+    #[test]
+    fn every_issue_variant_is_formatted_and_reported() {
+        let id = BlobId::of_content(b"x");
+        let issues = vec![
+            RecoveryIssue::TruncatedTail { offset: 1 },
+            RecoveryIssue::CorruptBlock {
+                offset: 2,
+                reason: "r".into(),
+            },
+            RecoveryIssue::Resync { from: 3, to: 4 },
+            RecoveryIssue::DuplicateBlob { id },
+            RecoveryIssue::BlobHashMismatch { id, computed: id },
+            RecoveryIssue::MissingBlob { id },
+            RecoveryIssue::ForwardBlobReference { id },
+            RecoveryIssue::IndexMismatch,
+            RecoveryIssue::LimitExceeded { what: "blobs" },
+            RecoveryIssue::SessionMismatch {
+                what: "batch",
+                expected: 1,
+                found: 2,
+            },
+            RecoveryIssue::BlobUpdateMissingBase { resource_id: id },
+            RecoveryIssue::BlobUpdateOutOfRange {
+                resource_id: id,
+                offset: 5,
+                size: 6,
+                base_len: 7,
+            },
+            RecoveryIssue::BlobUpdateHashMismatch {
+                resource_id: id,
+                expected: id,
+                computed: id,
+            },
+        ];
+        let texts: Vec<String> = issues.iter().map(format_issue).collect();
+        let mut prefixes: Vec<&str> = texts
+            .iter()
+            .map(|t| t.split('(').next().unwrap())
+            .collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        assert_eq!(prefixes.len(), issues.len(), "{texts:?}");
+        assert_eq!(texts[2], "resync(3..4)");
+        assert_eq!(
+            texts[11],
+            format!("blob_update_out_of_range(resource={id}, offset=5, size=6, base_len=7)")
+        );
+        let mut report = RepairReport {
+            input: "a".into(),
+            output: "b".into(),
+            issues: texts.clone(),
+            ..Default::default()
+        };
+        add_lost(&mut report, "missing_blob", 2);
+        add_lost(&mut report, "write_failed", 1);
+        add_lost(&mut report, "missing_blob", 3);
+        assert_eq!(report.lost, 6);
+        assert_eq!(
+            report.lost_by_cause,
+            vec![("missing_blob".to_string(), 5), ("write_failed".to_string(), 1)]
+        );
+        report.schemas_skipped = 1;
+        let lines = repair_lines(&report);
+        assert!(lines.contains(&"schemas: 0 registered, 1 skipped".to_string()));
+        assert!(lines.contains(&"  - missing_blob: 5".to_string()));
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("  - ")).count(),
+            texts.len() + 2
+        );
+        let json = repair_json(&report).render_pretty();
+        assert!(json.contains("\"write_failed\""), "{json}");
+        assert!(json.contains("resync(3..4)"));
+    }
+}

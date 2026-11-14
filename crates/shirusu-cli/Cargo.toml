@@ -16,6 +16,9 @@ shirusu-host = { path = "../shirusu-host" }
 shirusu-trace = { path = "../shirusu-trace" }
 shirusu-transport = { path = "../shirusu-transport" }
 
+[dev-dependencies]
+proptest = "1"
+
 [[bin]]
 name = "shirusu"
 path = "src/main.rs"

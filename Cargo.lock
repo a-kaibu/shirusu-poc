@@ -730,6 +730,7 @@ name = "shirusu-cli"
 version = "0.1.0"
 dependencies = [
  "parquet",
+ "proptest",
  "shirusu-analysis",
  "shirusu-api-catalog",
  "shirusu-host",

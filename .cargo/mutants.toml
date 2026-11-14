@@ -1,0 +1,4 @@
+# cargo-mutants の設定。Kani の証明ハーネス（#[cfg(kani)] の proofs）は
+# cargo test では動かないため対象から外す。
+exclude_re = ["proofs::", "kani"]
+profile = "mutants"
