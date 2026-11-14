@@ -751,3 +751,58 @@ fn later_successful_declaration_of_a_version_is_loaded() {
     );
     assert_equivalent(&bytes, ReaderLimits::default());
 }
+
+/// CRC は正しいが中身の壊れた Blob Chunk（正常なエントリの後ろに
+/// 36 バイトに満たない端切れ、または本体の足りないエントリ）。その Block を
+/// 破損として隔離し、先頭の正常なエントリは取り込む。両 Reader で同じ。
+/// 走査途中の `registry()` / `issues()` も全体読み込みと同じものを返す。
+#[test]
+fn malformed_blob_chunk_entries_are_isolated_like_the_full_reader() {
+    use shirusu_trace::container::{serialize_header, BlockHeader, BlockType, Compression};
+    let (bytes, ..) = rich_trace();
+    let good = b"kept blob";
+    let good_id = BlobId::of_content(good);
+    let entry = |id: BlobId, len: u32, body: &[u8]| {
+        let mut e = id.as_bytes().to_vec();
+        e.extend_from_slice(&len.to_le_bytes());
+        e.extend_from_slice(body);
+        e
+    };
+    for (tail, reason) in [
+        (vec![0u8; 10], "blob entry header truncated"),
+        (
+            entry(BlobId::of_content(b"long"), 100, b"short"),
+            "blob entry body truncated",
+        ),
+    ] {
+        let mut payload = entry(good_id, good.len() as u32, good);
+        payload.extend_from_slice(&tail);
+        let header = BlockHeader {
+            block_type: BlockType::BlobChunk,
+            compression: Compression::None,
+            sequence: 500,
+            stored_len: payload.len() as u32,
+            raw_len: payload.len() as u32,
+        };
+        let mut data = bytes.clone();
+        let at = data.len() as u64;
+        data.extend_from_slice(&serialize_header(&header, &payload));
+        data.extend_from_slice(&payload);
+        let full = read_trace(&data).unwrap();
+        assert!(
+            full.issues.iter().any(|i| matches!(
+                i,
+                RecoveryIssue::CorruptBlock { offset, reason: r } if *offset == at && r == reason
+            )),
+            "{reason}: {:?}",
+            full.issues
+        );
+        assert_eq!(full.blobs.get(&good_id).map(Vec::as_slice), Some(&good[..]));
+        assert_equivalent(&data, ReaderLimits::default());
+        let mut stream = TraceStream::open(Cursor::new(&data)).unwrap();
+        while stream.next_item().unwrap().is_some() {}
+        assert!(!full.registry.ids().is_empty());
+        assert_eq!(stream.registry().ids(), full.registry.ids());
+        assert!(stream.issues().iter().any(|i| matches!(i, RecoveryIssue::CorruptBlock { .. })));
+    }
+}

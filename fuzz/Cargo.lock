@@ -160,6 +160,7 @@ dependencies = [
  "iced-x86",
  "libfuzzer-sys",
  "shirusu-hook",
+ "shirusu-host",
  "shirusu-trace",
  "shirusu-transport",
 ]
@@ -176,6 +177,17 @@ dependencies = [
  "shirusu-transport",
  "shirusu-transport-win",
  "windows-sys",
+]
+
+[[package]]
+name = "shirusu-host"
+version = "0.1.0"
+dependencies = [
+ "shirusu-api-catalog",
+ "shirusu-hook",
+ "shirusu-trace",
+ "shirusu-transport",
+ "shirusu-transport-win",
 ]
 
 [[package]]
