@@ -377,7 +377,7 @@ pub(super) unsafe extern "system-unwind" fn detour_read_file(
     // CallAborted を記録する（例外は捕捉しない）。
     let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
-    let pending_submission = rt.begin_pending_overlapped(
+    let pending_submission = rt.begin_signed_overlapped(
         overlapped as u64,
         capture::PendingOverlapped {
             api_id: API_READ_FILE,
@@ -388,6 +388,7 @@ pub(super) unsafe extern "system-unwind" fn detour_read_file(
             direction: capture::OverlappedDirection::Read,
             bytes_addr: bytes_read as u64,
         },
+        capture::read_overlapped_signature(&ProcessMemory, overlapped as u64),
     );
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
@@ -493,7 +494,7 @@ pub(super) unsafe extern "system-unwind" fn detour_write_file(
     // CallAborted を記録する（例外は捕捉しない）。
     let call_guard = crate::runtime::CallGuard::new(&rt, tid, api, call_id);
     // G15: 元の API 呼び出しの間だけ再入ガードを外す (A43)。
-    let pending_submission = rt.begin_pending_overlapped(
+    let pending_submission = rt.begin_signed_overlapped(
         overlapped as u64,
         capture::PendingOverlapped {
             api_id: API_WRITE_FILE,
@@ -504,6 +505,7 @@ pub(super) unsafe extern "system-unwind" fn detour_write_file(
             direction: capture::OverlappedDirection::Write,
             bytes_addr: bytes_written as u64,
         },
+        capture::read_overlapped_signature(&ProcessMemory, overlapped as u64),
     );
     le.restore_before_original(); // P1-5: 元の API が入口時点の値を観測する
     guard.suspend();
@@ -669,14 +671,18 @@ pub(super) unsafe extern "system-unwind" fn detour_get_overlapped_result(
     if let Ok(bytes) = capture::encode_leave(api, &values) {
         rt.emit_leave(tid, api, call_id, &bytes);
     }
+    // P2-7: only the operation still registered for this handle and
+    // OVERLAPPED contents; a stale registration is dropped.
+    let signature = capture::read_overlapped_signature(&ProcessMemory, overlapped as u64);
+    let take = || rt.take_matching_overlapped(overlapped as u64, Some(file as u64), signature);
     if ret != 0 {
-        if let Some(pending) = rt.take_pending_overlapped(overlapped as u64) {
+        if let Some(pending) = take() {
             if let Some(n) = transferred {
                 record_overlapped_completion(&rt, tid, pending, n, true, last_error);
             }
         }
     } else if last_error != capture::ERROR_IO_INCOMPLETE {
-        if let Some(pending) = rt.take_pending_overlapped(overlapped as u64) {
+        if let Some(pending) = take() {
             record_overlapped_completion(&rt, tid, pending, 0, false, last_error);
         }
     }
@@ -774,7 +780,8 @@ pub(super) unsafe extern "system-unwind" fn detour_get_queued_completion_status(
         rt.emit_leave(tid, api, call_id, &bytes);
     }
     if dequeued != 0 {
-        if let Some(pending) = rt.take_pending_overlapped(dequeued) {
+        let signature = capture::read_overlapped_signature(&ProcessMemory, dequeued);
+        if let Some(pending) = rt.take_matching_overlapped(dequeued, None, signature) {
             if let Some(n) = transferred {
                 record_overlapped_completion(&rt, tid, pending, n, ret != 0, last_error);
             }

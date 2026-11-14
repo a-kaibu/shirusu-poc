@@ -395,9 +395,66 @@ pub struct PendingOverlapped {
 /// のアドレス。同じ構造体で完了前に再登録された場合は古い方を上書き
 /// する（Win32 は完了前の構造体再利用を禁じているため、古い操作の
 /// 完了は以後対応付けできない）。
+///
+/// 照合はアドレスに加え、提出時の Offset／hEvent と（分かれば）ハンドル
+/// でも行う（レビュー 2026-11-14 P2-7）。Detour の無い経路
+/// （GetQueuedCompletionStatusEx、スレッドプール I/O、イベント待ち）で
+/// 完了した登録は残り、同じアドレスが別の操作に再利用されると古い
+/// call_id の完了として誤記録していた。登録は
+/// [`MAX_PENDING_OVERLAPPED`] 件までとし、越えたら古い半分を捨てる。
 #[derive(Debug, Default, Clone)]
 pub struct OverlappedRegistry {
-    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, PendingOverlapped>>>,
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, PendingEntry>>>,
+}
+
+/// 保持する完了待ちの登録の上限。
+pub const MAX_PENDING_OVERLAPPED: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingEntry {
+    op: PendingOverlapped,
+    signature: Option<OverlappedSignature>,
+}
+
+/// 提出時の OVERLAPPED の内容のうち、I/O の間カーネルが書き換えない
+/// もの（Offset／OffsetHigh と hEvent）。構造体が別の操作に再利用された
+/// ことを見分けるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlappedSignature {
+    pub offset: u64,
+    pub event: u64,
+}
+
+/// [`OverlappedSignature`] を読む。読めなければ None。
+pub fn read_overlapped_signature(
+    mem: &dyn MemoryReader,
+    overlapped_addr: u64,
+) -> Option<OverlappedSignature> {
+    read_overlapped_signature_with_width(mem, overlapped_addr, size_of::<usize>())
+}
+
+/// ポインタ幅を指定する版。Offset は Internal と InternalHigh の後
+/// (2 × 幅)、hEvent はその 8 バイト後に置かれる。
+pub fn read_overlapped_signature_with_width(
+    mem: &dyn MemoryReader,
+    overlapped_addr: u64,
+    pointer_width: usize,
+) -> Option<OverlappedSignature> {
+    if overlapped_addr == 0 || !matches!(pointer_width, 4 | 8) {
+        return None;
+    }
+    let at = overlapped_addr + 2 * pointer_width as u64;
+    let mut b = [0u8; 16];
+    let len = 8 + pointer_width;
+    if !mem.read_exact(at, &mut b[..len]) {
+        return None;
+    }
+    let mut event = [0u8; 8];
+    event[..pointer_width].copy_from_slice(&b[8..len]);
+    Some(OverlappedSignature {
+        offset: u64::from_le_bytes(b[..8].try_into().unwrap()),
+        event: u64::from_le_bytes(event),
+    })
 }
 
 /// A provisional registration is cancelled on unwind as well as synchronous
@@ -429,7 +486,16 @@ impl OverlappedRegistry {
         Self::default()
     }
     pub fn submit(&self, address: u64, pending: PendingOverlapped) -> PendingSubmission {
-        self.register(address, pending);
+        self.submit_signed(address, pending, None)
+    }
+    /// [`Self::submit`] with the OVERLAPPED contents seen at submission.
+    pub fn submit_signed(
+        &self,
+        address: u64,
+        pending: PendingOverlapped,
+        signature: Option<OverlappedSignature>,
+    ) -> PendingSubmission {
+        self.register_signed(address, pending, signature);
         PendingSubmission {
             registry: (address != 0).then(|| self.clone()),
             address,
@@ -438,13 +504,26 @@ impl OverlappedRegistry {
         }
     }
     pub fn register(&self, overlapped_addr: u64, pending: PendingOverlapped) {
+        self.register_signed(overlapped_addr, pending, None);
+    }
+    fn register_signed(
+        &self,
+        overlapped_addr: u64,
+        op: PendingOverlapped,
+        signature: Option<OverlappedSignature>,
+    ) {
         if overlapped_addr == 0 {
             return;
         }
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(overlapped_addr, pending);
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING_OVERLAPPED && !pending.contains_key(&overlapped_addr) {
+            // Completed through a path without a Detour: drop the oldest.
+            let mut ids: Vec<u64> = pending.values().map(|e| e.op.call_id).collect();
+            ids.sort_unstable();
+            let cutoff = ids[ids.len() / 2];
+            pending.retain(|_, e| e.op.call_id >= cutoff);
+        }
+        pending.insert(overlapped_addr, PendingEntry { op, signature });
     }
     /// Remove only this operation, never a newer reuse of the same address.
     pub fn cancel(&self, address: u64, call_id: u64) {
@@ -452,12 +531,40 @@ impl OverlappedRegistry {
             return;
         }
         let mut pending = self.pending.lock().unwrap();
-        if pending.get(&address).is_some_and(|p| p.call_id == call_id) {
+        if pending
+            .get(&address)
+            .is_some_and(|p| p.op.call_id == call_id)
+        {
             pending.remove(&address);
         }
     }
     pub fn take(&self, overlapped_addr: u64) -> Option<PendingOverlapped> {
-        self.pending.lock().unwrap().remove(&overlapped_addr)
+        self.pending
+            .lock()
+            .unwrap()
+            .remove(&overlapped_addr)
+            .map(|e| e.op)
+    }
+    /// Take the registration at `overlapped_addr` and return it only if it
+    /// is still the same operation: the handle (when the completion API
+    /// names one) and the OVERLAPPED contents recorded at submission must
+    /// match. A mismatching registration is stale and is dropped.
+    pub fn take_matching(
+        &self,
+        overlapped_addr: u64,
+        handle: Option<u64>,
+        signature: Option<OverlappedSignature>,
+    ) -> Option<PendingOverlapped> {
+        let entry = self.pending.lock().unwrap().remove(&overlapped_addr)?;
+        if handle.is_some_and(|h| h != entry.op.handle) {
+            return None;
+        }
+        if let (Some(then), Some(now)) = (entry.signature, signature) {
+            if then != now {
+                return None;
+            }
+        }
+        Some(entry.op)
     }
     pub fn len(&self) -> usize {
         self.pending.lock().unwrap().len()
@@ -948,6 +1055,106 @@ mod tests {
         let v = read_utf16_string(&mem, at);
         assert_eq!(v.capture, ValueCapture::Truncated);
         assert_eq!(v.value, TypedValue::Str16(cut));
+    }
+
+    fn op(call_id: u64, handle: u64) -> PendingOverlapped {
+        PendingOverlapped {
+            api_id: 1,
+            call_id,
+            handle,
+            buffer: 0,
+            requested_len: 0,
+            direction: OverlappedDirection::Read,
+            bytes_addr: 0,
+        }
+    }
+
+    #[test]
+    fn a_reused_overlapped_is_not_completed_as_the_old_call() {
+        // P2-7: the old registration must not describe a new operation.
+        let registry = OverlappedRegistry::new();
+        let then = OverlappedSignature {
+            offset: 4096,
+            event: 0x44,
+        };
+        let reused = OverlappedSignature {
+            offset: 0,
+            event: 0x44,
+        };
+        registry
+            .submit_signed(0x40, op(1, 7), Some(then))
+            .finish(true);
+        assert!(registry
+            .take_matching(0x40, Some(7), Some(reused))
+            .is_none());
+        assert!(registry.is_empty(), "the stale registration is dropped");
+        registry
+            .submit_signed(0x40, op(2, 7), Some(then))
+            .finish(true);
+        assert!(registry.take_matching(0x40, Some(8), Some(then)).is_none());
+        registry
+            .submit_signed(0x40, op(3, 7), Some(then))
+            .finish(true);
+        assert_eq!(
+            registry
+                .take_matching(0x40, Some(7), Some(then))
+                .map(|p| p.call_id),
+            Some(3)
+        );
+        // Completion ports name no handle; the contents still have to match.
+        registry
+            .submit_signed(0x40, op(4, 7), Some(then))
+            .finish(true);
+        assert_eq!(
+            registry
+                .take_matching(0x40, None, Some(then))
+                .map(|p| p.call_id),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn pending_overlapped_registrations_are_bounded() {
+        let registry = OverlappedRegistry::new();
+        for i in 0..(MAX_PENDING_OVERLAPPED as u64 + 1) {
+            registry.submit(0x1000 + i * 64, op(i + 1, 1)).finish(true);
+        }
+        assert!(registry.len() <= MAX_PENDING_OVERLAPPED / 2 + 1);
+        // The newest survive.
+        let newest = 0x1000 + MAX_PENDING_OVERLAPPED as u64 * 64;
+        assert!(registry.take(newest).is_some());
+        assert!(registry.take(0x1000).is_none());
+    }
+
+    #[test]
+    fn overlapped_signature_follows_pointer_width() {
+        let mut mem = MapMemory::new();
+        // x64: Offset at +16, OffsetHigh at +20, hEvent at +24.
+        mem.write(0x100, &[0u8; 32]);
+        mem.write_u32(0x110, 0x10);
+        mem.write_u32(0x114, 0x2);
+        mem.write(0x118, &0x1234_5678_9abcu64.to_le_bytes());
+        assert_eq!(
+            read_overlapped_signature_with_width(&mem, 0x100, 8),
+            Some(OverlappedSignature {
+                offset: 0x2_0000_0010,
+                event: 0x1234_5678_9abc,
+            })
+        );
+        // x86: Offset at +8, hEvent at +16 (4 bytes).
+        let mut mem = MapMemory::new();
+        mem.write(0x200, &[0u8; 20]);
+        mem.write_u32(0x208, 0x30);
+        mem.write_u32(0x210, 0x77);
+        assert_eq!(
+            read_overlapped_signature_with_width(&mem, 0x200, 4),
+            Some(OverlappedSignature {
+                offset: 0x30,
+                event: 0x77,
+            })
+        );
+        assert_eq!(read_overlapped_signature_with_width(&mem, 0, 4), None);
+        assert_eq!(read_overlapped_signature_with_width(&mem, 0x200, 2), None);
     }
 
     #[test]

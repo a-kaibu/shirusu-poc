@@ -1863,6 +1863,30 @@ impl HookRuntime {
         self.pending_overlapped.submit(address, pending)
     }
 
+    /// [`Self::begin_pending_overlapped`] with the OVERLAPPED contents seen
+    /// at submission, checked again at completion (P2-7).
+    pub fn begin_signed_overlapped(
+        &self,
+        address: u64,
+        pending: PendingOverlapped,
+        signature: Option<crate::capture::OverlappedSignature>,
+    ) -> crate::capture::PendingSubmission {
+        self.pending_overlapped
+            .submit_signed(address, pending, signature)
+    }
+
+    /// Take a completed operation only if it is still the one registered
+    /// (see [`crate::capture::OverlappedRegistry::take_matching`]).
+    pub fn take_matching_overlapped(
+        &self,
+        overlapped_addr: u64,
+        handle: Option<u64>,
+        signature: Option<crate::capture::OverlappedSignature>,
+    ) -> Option<PendingOverlapped> {
+        self.pending_overlapped
+            .take_matching(overlapped_addr, handle, signature)
+    }
+
     pub fn cancel_pending_overlapped(&self, address: u64, call_id: u64) {
         self.pending_overlapped.cancel(address, call_id);
     }
