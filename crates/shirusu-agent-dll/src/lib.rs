@@ -665,6 +665,11 @@ mod win {
         let rt = engine::runtime();
         let drained = rt.as_ref().is_some_and(|rt| {
             rt.shutdown_recording();
+            // Threads ended by TerminateThread got no exit notification:
+            // isolate their Rings and count an event cut off mid-record as
+            // lost before the Host finalizes (review P0). Their hazards are
+            // withdrawn by the flight scan itself.
+            rt.reap_terminated_threads();
             rt.wait_in_flight_drained(timeout)
         });
         // Restore even after a flight timeout, but do not retire the session

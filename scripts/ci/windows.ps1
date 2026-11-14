@@ -39,6 +39,11 @@ try {
     Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "canary-exit-code.ps1") } "exit-code canary"
     Invoke-Native { cargo test --workspace --no-fail-fast --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
     Invoke-Native { cargo test -p shirusu-hook --release --target x86_64-pc-windows-msvc native_tls_vector_absence_bypasses_rust_tls_access } "native TLS availability (optimized, x64)"
+    # Review P1: asymmetric handshakes under the real Windows fences, optimized.
+    $env:SHIRUSU_STRESS_CYCLES = "400"
+    Invoke-Native { cargo test -p shirusu-hook --release --target x86_64-pc-windows-msvc --lib record_shutdown_reattach_stress } "record/shutdown/reattach stress (optimized, x64)"
+    Remove-Item Env:SHIRUSU_STRESS_CYCLES
+    Invoke-Native { cargo test -p shirusu-agent --release --target x86_64-pc-windows-msvc --lib writer_cell } "writer cell handshake (optimized, x64)"
     Invoke-Native { cargo build --workspace --target x86_64-pc-windows-msvc } "cargo build (workspace, x64)"
     # Build per-package e2e binaries outside timed scenarios. `-p shirusu-e2e`
     # resolves features apart from the workspace build and would otherwise
@@ -123,8 +128,12 @@ try {
 
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "attach-rollback.ps1")) } "native attach rollback and reattach"
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "thread-churn.ps1")) } "native thread creation during attach"
+    # Review P0: writers terminated by TerminateThread mid-record (watchdog).
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "terminate-writer.ps1")) } "native terminated writers"
 
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1")) } "native injected performance"
+    # Review P1: 10-30 s continuous capture (loss rate, Host queue, backlog).
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 900 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "sustained-load.ps1")) } "native sustained load"
 
     if ($captureFailures.Count -gt 0) {
         throw ("Windows scenarios failed:`n" + ($captureFailures -join "`n"))

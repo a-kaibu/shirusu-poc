@@ -18,6 +18,11 @@ Invoke-Native { cargo test -p shirusu-transport -p shirusu-transport-win -p shir
 # Phase 3: フックの単体テストと Agent DLL の x86 ビルド（同一ビットネス注入の前提）
 Invoke-Native { cargo test -p shirusu-hook --target i686-pc-windows-msvc } "cargo test (hook, i686)"
 Invoke-Native { cargo test -p shirusu-hook --release --target i686-pc-windows-msvc native_tls_vector_absence_bypasses_rust_tls_access } "native TLS availability (optimized, i686)"
+# Review P1: asymmetric handshakes under the real Windows fences, optimized.
+$env:SHIRUSU_STRESS_CYCLES = "400"
+Invoke-Native { cargo test -p shirusu-hook --release --target i686-pc-windows-msvc --lib record_shutdown_reattach_stress } "record/shutdown/reattach stress (optimized, i686)"
+Remove-Item Env:SHIRUSU_STRESS_CYCLES
+Invoke-Native { cargo test -p shirusu-agent --release --target i686-pc-windows-msvc --lib writer_cell } "writer cell handshake (optimized, i686)"
 Invoke-Native { cargo build -p shirusu-agent-dll --target i686-pc-windows-msvc } "agent dll build (i686)"
 if ($env:GITHUB_ACTIONS -eq "true") {
     Copy-Item "target\i686-pc-windows-msvc\debug\shirusu_agent_dll.dll", "target\i686-pc-windows-msvc\debug\shirusu_agent_dll.pdb" -Destination $env:SHIRUSU_DIAGNOSTIC_DIR
@@ -58,7 +63,9 @@ Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (
 
 Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "attach-rollback.ps1"), "-Target", "i686-pc-windows-msvc")
 Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "thread-churn.ps1"), "-Target", "i686-pc-windows-msvc")
+Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "terminate-writer.ps1"), "-Target", "i686-pc-windows-msvc")
 
 Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1"), "-Target", "i686-pc-windows-msvc")
+Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 900 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "sustained-load.ps1"), "-Target", "i686-pc-windows-msvc")
 
 Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "corpus-record.ps1"), "-Target", "i686-pc-windows-msvc")

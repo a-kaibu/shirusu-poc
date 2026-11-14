@@ -13,7 +13,7 @@
 
 pub mod expansion;
 mod writer_cell;
-use writer_cell::WriterCell;
+use writer_cell::{Access, WriterCell};
 
 pub use expansion::{ExpansionManager, ExpansionManagerHandle, ExpansionStats};
 
@@ -94,6 +94,8 @@ pub struct Agent {
     /// 全スレッド共通の観測順序カウンタ (L11)。`record` で書き込みが
     /// 確定する直前に 1 つ採番する。1 始まり（0 は未割当）。
     next_global_order: AtomicU64,
+    /// [`Agent::reap_due`] の前回時刻 (ms)。
+    last_reap_ms: AtomicU64,
 }
 
 /// 追加 Slot (A70) へ紐付けた Mapping。Slot の index ごとに Agent が保持する。
@@ -252,6 +254,7 @@ impl Agent {
             expanded_regions: Arc::new(Mutex::new(HashMap::new())),
             order_global: false,
             next_global_order: AtomicU64::new(1),
+            last_reap_ms: AtomicU64::new(0),
         }
     }
     /// `--order=global` (L11) を有効にする。フックの観測点ごとに
@@ -313,7 +316,7 @@ impl Agent {
         let state = self.threads.read().unwrap().get(&thread_id).cloned();
         if let Some(state) = state {
             if !state.retired.load(Ordering::Acquire) {
-                state
+                let _ = state
                     .writer
                     .exclusive(|w| w.set_clock(Arc::clone(&clock) as Arc<dyn Clock>));
             }
@@ -744,7 +747,9 @@ impl Agent {
             Some(mut writer) => self.write_locked(&mut writer, depth, input),
             None => state
                 .writer
-                .exclusive(|writer| self.write_locked(writer, depth, input)),
+                .exclusive(|writer| self.write_locked(writer, depth, input))
+                .done()
+                .flatten(),
         };
         let Some(outcome) = outcome else {
             self.pool.note_call_after_detach(&state.handle);
@@ -875,7 +880,7 @@ impl Agent {
     pub fn thread_detach(&self, thread_id: u64) -> bool {
         let state = self.threads.read().unwrap().get(&thread_id).map(Arc::clone);
         if let Some(s) = state {
-            s.writer.exclusive(|w| w.mark_detached());
+            let _ = s.writer.exclusive(|w| w.mark_detached());
             return self.pool.begin_detach(&s.handle);
         }
         false
@@ -889,8 +894,9 @@ impl Agent {
         let removed = self.threads.write().unwrap().remove(&thread_id);
         if let Some(state) = removed {
             state.retired.store(true, Ordering::Release);
-            // Exclusive access waits for an in-flight record to finish.
-            state.writer.exclusive(|_| ());
+            // Exclusive access waits for an in-flight record to finish (or
+            // reports that its thread was terminated inside it).
+            let _ = state.writer.exclusive(|_| ());
         }
     }
 
@@ -916,17 +922,80 @@ impl Agent {
         let Some(state) = removed else {
             return false;
         };
+        self.retire_to_reclaim(thread_id, state);
+        true
+    }
+
+    /// 登録表から外した状態を DETACH 済みにして回収待ちへ送る。
+    fn retire_to_reclaim(&self, thread_id: u64, state: Arc<ThreadSlotState>) {
         state.retired.store(true, Ordering::Release);
-        {
-            // 排他取得自体が、進行中の記録の完了待ちになる。
-            state.writer.exclusive(|writer| writer.mark_detached());
+        // 排他取得自体が、進行中の記録の完了待ちになる。記録の途中で
+        // 強制終了した書き手は待たずに隔離する (レビュー P0)。
+        if state.writer.exclusive(|writer| writer.mark_detached()) == Access::OwnerTerminated {
+            abandon_ring(state.region.base());
         }
         // この Ring への space_available 結線はこの incarnation の
         // ものであるため外す (再利用時は ensure 経路が結び直す)。
         self.space_clocks.write().unwrap().remove(&thread_id);
         self.pool.begin_detach(&state.handle);
         self.pending_reclaim.lock().unwrap().push(state);
-        true
+    }
+
+    /// 強制終了したスレッドの Ring を隔離して回収待ちへ送る (レビュー P0)。
+    /// 回収したスレッド ID を返す。
+    ///
+    /// `TerminateThread` で終了したスレッドには FLS デストラクタも
+    /// DLL_THREAD_DETACH も届かず、[`Agent::thread_exit`] は呼ばれない。
+    /// ここでは高速経路の所有者が終了したことをカーネルの終了状態
+    /// (`ThreadLiveness`) で確かめた Ring だけを扱う。生きているスレッド
+    /// (一時停止中を含む) の Ring には触れず、待ちもしない。
+    ///
+    /// - 記録の外で終了していれば、通常の終了と同じく DETACH して回収を待つ。
+    /// - 記録の途中で終了していれば書き手は使えない (イベントの途中かも
+    ///   しれない)。書き手には触れず、公開済みのイベントだけを Host に
+    ///   残し、書きかけの 1 件を欠落として Control に数える。Trace は
+    ///   完全とは確定しない。
+    ///
+    /// Slot の再利用は終了の確認後に限る: 終了したスレッドは二度と
+    /// 書き込まない。管理パスと新しいスレッドの初回記録、Shutdown から
+    /// 呼ばれる。
+    pub fn reap_terminated_threads(&self) -> Vec<u64> {
+        let terminated: Vec<(u64, Arc<ThreadSlotState>)> = self
+            .threads
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.writer.owner_terminated())
+            .map(|(tid, s)| (*tid, Arc::clone(s)))
+            .collect();
+        let mut reaped = Vec::new();
+        for (tid, state) in terminated {
+            let removed = {
+                let mut map = self.threads.write().unwrap();
+                match map.get(&tid) {
+                    Some(s) if Arc::ptr_eq(s, &state) => map.remove(&tid),
+                    _ => None,
+                }
+            };
+            if let Some(state) = removed {
+                self.retire_to_reclaim(tid, state);
+                reaped.push(tid);
+            }
+        }
+        reaped
+    }
+
+    /// 前回から [`REAP_INTERVAL`] 以上経っていれば true (呼び出し側が
+    /// [`Agent::reap_terminated_threads`] を呼ぶ)。スレッド終了のたびに
+    /// 全スレッドの終了状態を問い合わせないための間引き。
+    pub fn reap_due(&self) -> bool {
+        let now = reap_clock_ms();
+        let last = self.last_reap_ms.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= REAP_INTERVAL.as_millis() as u64
+            && self
+                .last_reap_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     /// 回収待ち Slot のうち、Host が読み終えたものを再利用可能へ
@@ -946,7 +1015,7 @@ impl Agent {
         let mut i = 0;
         while i < pending.len() {
             let state = &pending[i];
-            if !ring_is_drained(state.region.base()) {
+            if !ring_is_drained(state.region.base(), state.writer.is_abandoned()) {
                 i += 1;
                 continue;
             }
@@ -975,15 +1044,40 @@ impl Agent {
     }
 }
 
+/// 強制終了したスレッドの探索を間引く間隔 ([`Agent::reap_due`])。
+pub const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn reap_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // +REAP_INTERVAL: the first call is always due.
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + REAP_INTERVAL.as_millis() as u64
+}
+
 /// Ring が drain 済みか (回収判定。レビュー #6 P1-4)。
 /// 書き手は終了済みであることが前提で、読み位置が書き込み位置へ
 /// 到達していれば公開済みイベントは全て読み手が取り出した。
-fn ring_is_drained(base: *const u8) -> bool {
+///
+/// 隔離した Ring (書き手が記録の途中で強制終了) では、Payload の書き込み
+/// 位置だけが Descriptor の公開より先に進んでいることがある。その分は
+/// 公開されないため、公開済み Descriptor を読み終えたことだけで判定する。
+fn ring_is_drained(base: *const u8, abandoned: bool) -> bool {
     let write_cursor = layout::load(base, layout::OFF_WRITE_CURSOR, Ordering::Acquire);
     let read_cursor = layout::load(base, layout::OFF_READ_CURSOR, Ordering::Acquire);
     let write_pos = layout::load(base, layout::OFF_PAYLOAD_WRITE_POSITION, Ordering::Acquire);
     let read_pos = layout::load(base, layout::OFF_PAYLOAD_READ_POSITION, Ordering::Acquire);
-    read_cursor >= write_cursor && read_pos >= write_pos
+    read_cursor >= write_cursor && (abandoned || read_pos >= write_pos)
+}
+
+/// 記録の途中で強制終了した書き手の Ring を隔離する (レビュー P0)。
+/// 書きかけのイベントは公開されないため、欠落として 1 件数える。
+/// 書き手は終了済み (二度と実行されない) なので、書き手行の更新が
+/// 競合することはない。
+fn abandon_ring(base: *mut u8) {
+    layout::fetch_add(base, layout::OFF_DROPPED_EVENTS, 1);
 }
 
 #[cfg(test)]
@@ -1321,6 +1415,72 @@ mod tests {
         assert_ne!(h1.index, h2.index);
         assert_eq!(a.pool().free_count(), 0);
     }
+    /// Review P0: a thread terminated inside a record (TerminateThread runs
+    /// no Drop; modeled by leaking the owner guard and exiting) leaves
+    /// `owner_busy` set. Management paths must not wait for it forever, the
+    /// Ring keeps only what was published, the cut-off event counts as lost,
+    /// and the Slot is reused only after the published events are drained.
+    #[test]
+    fn terminated_writer_is_isolated_and_reclaimed() {
+        use shirusu_transport::ring::RingReader;
+        let a = Arc::new(agent(2));
+        let cfg = RingConfig::new(16, 512);
+        let victim = {
+            let a = Arc::clone(&a);
+            std::thread::spawn(move || {
+                assert!(matches!(
+                    a.record_enter(7, 10, 20, 1, 0, b"published"),
+                    RecordResult::Written(_)
+                ));
+                let state = a.state_for(7).unwrap();
+                let guard = state.writer.try_owner().expect("owner fast path");
+                // Half way through the next event: payload reserved, its
+                // descriptor never published.
+                let base = state.region.base();
+                let pos = layout::load(base, layout::OFF_PAYLOAD_WRITE_POSITION, Ordering::Relaxed);
+                layout::store(
+                    base,
+                    layout::OFF_PAYLOAD_WRITE_POSITION,
+                    pos + 8,
+                    Ordering::Relaxed,
+                );
+                std::mem::forget(guard);
+                // Leak the TLS cache's reference as well: a terminated thread
+                // drops nothing.
+                std::mem::forget(state);
+            })
+        };
+        victim.join().unwrap();
+        let base = unsafe { a.thread_region_base(7) }.unwrap();
+        // Another thread keeps capturing meanwhile.
+        assert!(matches!(
+            a.record_enter(8, 10, 20, 2, 0, b"other"),
+            RecordResult::Written(_)
+        ));
+        // Management paths of the victim's Ring return instead of hanging.
+        assert!(a.thread_detach(7));
+        assert_eq!(a.reap_terminated_threads(), vec![7]);
+        assert_eq!(
+            layout::load(base, layout::OFF_DROPPED_EVENTS, Ordering::Acquire),
+            1,
+            "the cut-off event is counted as lost"
+        );
+        assert!(a.reap_terminated_threads().is_empty(), "reaped once");
+        // Not reusable before the Host drained what was published.
+        assert_eq!(a.poll_reclaims(), 0);
+        let mut reader = unsafe { RingReader::new(base, cfg) };
+        let batch = reader.drain_all();
+        assert_eq!(batch.events.len(), 1, "only published events are read");
+        assert_eq!(batch.events[0].descriptor.call_id, 1);
+        assert_eq!(a.poll_reclaims(), 1);
+        // The live thread is unaffected and the Slot serves a new thread.
+        assert!(a.reap_terminated_threads().is_empty());
+        assert!(matches!(
+            a.record_enter(9, 10, 20, 3, 0, b"new"),
+            RecordResult::Written(_)
+        ));
+    }
+
     #[test]
     fn thread_exit_reclaim_survives_short_lived_thread_churn() {
         // レビュー #6 P1-4: 短命スレッドを大量に作って捨てても、Host
@@ -1436,7 +1596,7 @@ mod tests {
                     let _ = a.record_enter(tid, 1, 1, call, 0, b"x");
                 }
                 let state = a.state_for(tid).unwrap();
-                state.writer.exclusive(|writer| {
+                let _ = state.writer.exclusive(|writer| {
                     assert_eq!(writer.loader_lock_state(), loader_lock);
                     if loader_lock == LoaderLockState::Unknown {
                         assert_eq!(writer.wait_count, 0);

@@ -1474,6 +1474,123 @@ pub fn asymmetric_fence_heavy() {
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Proof that an OS thread has terminated (review P0, forced writer
+/// termination). Taken by the thread itself on a cold path, when it first
+/// claims a Ring writer or a hazard slot.
+///
+/// A thread ended by `TerminateThread` (or by `ExitThread` from a nested
+/// frame) runs no Rust `Drop`, so a flag it raised for the duration of a
+/// record stays raised. Waiting for the flag then never ends, and clearing it
+/// after a timeout is unsound: a thread that was only suspended or descheduled
+/// would resume inside its critical section. Termination is the only state in
+/// which the flag can be ignored, and the kernel reports it exactly:
+///
+/// - Windows: a duplicated `SYNCHRONIZE` handle to the thread. The thread
+///   object is signaled once the thread has terminated, and a terminated
+///   thread never runs again. Holding the handle also keeps the thread ID
+///   from being reused while the liveness is held, so the thread cannot be
+///   confused with a later thread of the same ID.
+/// - Elsewhere: a thread-local token cleared by its destructor. There is no
+///   `TerminateThread` there; tests model forced termination as a thread that
+///   leaks its guard (`mem::forget`) and exits.
+pub struct ThreadLiveness {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(not(windows))]
+    alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+// SAFETY: the handle is only waited on and closed; it is not tied to the
+// thread that opened it.
+unsafe impl Send for ThreadLiveness {}
+unsafe impl Sync for ThreadLiveness {}
+
+#[cfg(not(windows))]
+struct AliveToken(Arc<std::sync::atomic::AtomicBool>);
+#[cfg(not(windows))]
+impl Drop for AliveToken {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+#[cfg(not(windows))]
+thread_local! {
+    static ALIVE_TOKEN: AliveToken =
+        AliveToken(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+}
+
+impl ThreadLiveness {
+    /// Liveness of the calling thread. `None` when it cannot be taken (for
+    /// example during thread teardown); the caller must then treat the thread
+    /// as alive forever.
+    pub fn current() -> Option<Self> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{DuplicateHandle, HANDLE};
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentProcess, GetCurrentThread, THREAD_SYNCHRONIZE,
+            };
+            let mut handle: HANDLE = std::ptr::null_mut();
+            // SAFETY: duplicates the calling thread's pseudo handle into a
+            // real handle of this process with SYNCHRONIZE access only.
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    GetCurrentThread(),
+                    GetCurrentProcess(),
+                    &mut handle,
+                    THREAD_SYNCHRONIZE,
+                    0,
+                    0,
+                )
+            };
+            (ok != 0 && !handle.is_null()).then_some(Self { handle })
+        }
+        #[cfg(not(windows))]
+        {
+            ALIVE_TOKEN
+                .try_with(|t| Self {
+                    alive: Arc::clone(&t.0),
+                })
+                .ok()
+        }
+    }
+
+    /// Whether the thread has terminated. `true` is final: the thread will
+    /// never execute again, and all its memory writes are complete.
+    pub fn has_terminated(&self) -> bool {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            // SAFETY: the handle is owned by self and valid until drop.
+            unsafe { WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0 }
+        }
+        #[cfg(not(windows))]
+        {
+            !self.alive.load(Ordering::Acquire)
+        }
+    }
+}
+
+impl Drop for ThreadLiveness {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            // SAFETY: the handle is owned by self.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        }
+    }
+}
+
+impl std::fmt::Debug for ThreadLiveness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadLiveness")
+            .field("terminated", &self.has_terminated())
+            .finish()
+    }
+}
+
 #[cfg(windows)]
 fn qpc_frequency() -> u64 {
     use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;

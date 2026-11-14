@@ -1401,7 +1401,9 @@ impl HookRuntime {
         }
         let Some(handle) = self.agent.thread_begin(thread_id).or_else(|| {
             // Slot 不足は、終了したスレッドの回収がまだなだけかも
-            // しれない (P1-4)。1 回だけ回収を試してから再取得する。
+            // しれない (P1-4)。強制終了したスレッドの Ring も隔離して
+            // (レビュー P0)、1 回だけ回収を試してから再取得する。
+            self.reap_terminated_threads();
             self.agent.poll_reclaims();
             self.agent.thread_begin(thread_id)
         }) else {
@@ -1428,10 +1430,31 @@ impl HookRuntime {
     pub fn thread_exit(&self, thread_id: u64) {
         self.seen_threads.lock().unwrap().remove(&thread_id);
         self.agent.thread_exit(thread_id);
+        if self.agent.reap_due() {
+            self.reap_terminated_threads();
+        }
         self.agent.poll_reclaims();
         // Native detach is processed on a different thread. Invalidate cached
         // registration only after removing the old slot, including TID reuse.
         self.registration_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// 強制終了 (`TerminateThread`) で終了通知が届かなかったスレッドの
+    /// Ring を隔離して回収待ちへ送る (レビュー P0)。終了はカーネルの
+    /// 終了状態で確かめる ([`Agent::reap_terminated_threads`])。回収した
+    /// スレッドは通常の終了と同じく seen から外す。管理パス専用。
+    pub fn reap_terminated_threads(&self) -> usize {
+        let reaped = self.agent.reap_terminated_threads();
+        if reaped.is_empty() {
+            return 0;
+        }
+        let mut seen = self.seen_threads.lock().unwrap();
+        for tid in &reaped {
+            seen.remove(tid);
+        }
+        drop(seen);
+        self.registration_epoch.fetch_add(1, Ordering::Release);
+        reaped.len()
     }
 
     fn signal_if_needed(&self, result: &RecordResult) {
@@ -2467,6 +2490,156 @@ mod tests {
         drained.store(true, Ordering::SeqCst);
         let entered: u32 = workers.into_iter().map(|w| w.join().unwrap()).sum();
         assert!(entered > 0);
+    }
+
+    /// Review P1: record, shut down and re-attach over and over with the real
+    /// asymmetric fences (compiler fence + FlushProcessWriteBuffers on the
+    /// Windows x86 and x64 CI jobs). Persistent workers record through the
+    /// hazard and writer-owner fast paths across runtime swaps; per cycle a
+    /// management thread takes every writer's exclusive path and a reader
+    /// drains the Rings while the main thread shuts down, unregisters and
+    /// registers a fresh runtime. Checked: nothing is in flight on a drained
+    /// runtime, every Ring validates with increasing sequences, and every
+    /// replaced runtime is freed. `SHIRUSU_STRESS_CYCLES` scales it.
+    #[test]
+    fn record_shutdown_reattach_stress() {
+        use std::sync::atomic::AtomicUsize;
+        const WORKERS: u64 = 4;
+        let cycles: u32 = std::env::var("SHIRUSU_STRESS_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        let cfg = RingConfig::new(64, 4096);
+        let slot = Arc::new(RuntimeSlot::new());
+        let drained_rt = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::new(AtomicU64::new(0));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|w| {
+                let (slot, drained_rt, stop, recorded) = (
+                    slot.clone(),
+                    drained_rt.clone(),
+                    stop.clone(),
+                    recorded.clone(),
+                );
+                std::thread::spawn(move || {
+                    let _guard = ReentrancyGuard::try_enter().unwrap();
+                    let api = api_by_id(API_READ_FILE).unwrap();
+                    let tid = 7000 + w;
+                    let mut call = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let Some(rt) = slot.for_detour_ref() else {
+                            std::thread::yield_now();
+                            continue;
+                        };
+                        let Some(flight) = DetourFlight::begin_ref(rt) else {
+                            std::thread::yield_now();
+                            continue;
+                        };
+                        let rt = flight.runtime();
+                        let me = rt as *const HookRuntime as usize;
+                        assert_ne!(drained_rt.load(Ordering::SeqCst), me, "entered after drain");
+                        call += 1;
+                        let _ = rt.record_enter(tid, api, call, b"stress");
+                        let _ = rt.record_leave(tid, api, call, b"stress");
+                        assert_ne!(
+                            drained_rt.load(Ordering::SeqCst),
+                            me,
+                            "in flight after drain"
+                        );
+                        drop(flight);
+                        recorded.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        let mut replaced = Vec::new();
+        for _ in 0..cycles {
+            let agent = Arc::new(Agent::new(
+                Arc::new(SlotPool::new(WORKERS as usize + 1)),
+                cfg,
+                Arc::new(HostMonitor::always_alive()),
+            ));
+            let rt = Arc::new(HookRuntime::new(Arc::clone(&agent), Vec::new(), None));
+            assert!(slot.register(rt.clone()).is_ok());
+            let cycle_done = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                // Remote users of every writer (exclusive path, heavy fence).
+                scope.spawn(|| {
+                    let notify = Arc::new(RingNotify::new().unwrap());
+                    while !cycle_done.load(Ordering::Relaxed) {
+                        for w in 0..WORKERS {
+                            let _ = agent.attach_space_available_notify(7000 + w, notify.clone());
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+                // Single reader per Ring, validating as it drains.
+                scope.spawn(|| {
+                    let mut readers: std::collections::HashMap<u64, (RingReader, u64)> =
+                        std::collections::HashMap::new();
+                    let drain =
+                        |readers: &mut std::collections::HashMap<u64, (RingReader, u64)>| {
+                            for w in 0..WORKERS {
+                                let tid = 7000 + w;
+                                let (reader, last) = match readers.entry(tid) {
+                                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                    std::collections::hash_map::Entry::Vacant(e) => {
+                                        // SAFETY: the Agent outlives this scope
+                                        // and keeps a registered thread's region.
+                                        let Some(base) = (unsafe { agent.thread_region_base(tid) })
+                                        else {
+                                            continue;
+                                        };
+                                        e.insert((unsafe { RingReader::new(base, cfg) }, 0))
+                                    }
+                                };
+                                let batch = reader.drain_all();
+                                assert!(
+                                    batch.integrity_error.is_none(),
+                                    "{:?}",
+                                    batch.integrity_error
+                                );
+                                for e in &batch.events {
+                                    assert!(e.descriptor.sequence > *last || *last == 0);
+                                    *last = e.descriptor.sequence;
+                                }
+                            }
+                        };
+                    while !cycle_done.load(Ordering::Relaxed) {
+                        drain(&mut readers);
+                        std::thread::yield_now();
+                    }
+                    drain(&mut readers);
+                });
+                std::thread::sleep(Duration::from_millis(3));
+                rt.shutdown_recording();
+                assert!(rt.wait_in_flight_drained(Duration::from_secs(10)));
+                drained_rt.store(Arc::as_ptr(&rt) as usize, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1));
+                cycle_done.store(true, Ordering::Relaxed);
+            });
+            assert!(slot.unregister(&rt));
+            replaced.push(Arc::downgrade(&rt));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(recorded.load(Ordering::Relaxed) > 0);
+        // One more swap reclaims the graveyard now that no hazard remains.
+        let (_, last) = runtime();
+        let last = Arc::new(last);
+        assert!(slot.register(last.clone()).is_ok());
+        assert!(slot.unregister(&last));
+        drop(last);
+        let (_, sweep) = runtime();
+        let sweep = Arc::new(sweep);
+        assert!(slot.register(sweep.clone()).is_ok());
+        assert!(slot.unregister(&sweep));
+        for weak in &replaced {
+            assert!(weak.upgrade().is_none(), "a replaced runtime leaked");
+        }
     }
 
     #[test]

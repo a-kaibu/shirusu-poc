@@ -17,8 +17,21 @@
 //! slot defers freeing it) and counts as in flight (shutdown waits for it).
 //! Threads without a slot (the table is full, or their thread-local cache is
 //! gone) keep the `Arc` and counter path.
+//!
+//! The handshake is model-checked with store→load reordering in
+//! `tla/AsymmetricHandshake.tla` (`HazardSafe`).
+//!
+//! Forced termination (review P0): a thread ended by `TerminateThread` inside
+//! a Detour never clears its hazard. Each slot keeps its owner's
+//! [`ThreadLiveness`]; a scan that finds a hazard whose owner has terminated
+//! withdraws it and frees the slot. That is safe because a terminated thread
+//! never runs again, so it can no longer dereference the runtime. A hazard of
+//! a live thread (even one suspended for ever) is always counted.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::Mutex;
+
+use shirusu_transport_win::ThreadLiveness;
 
 use crate::runtime::HookRuntime;
 
@@ -31,6 +44,9 @@ pub(crate) const HAZARD_SLOTS: usize = 1024;
 pub(crate) struct HazardSlot {
     runtime: AtomicPtr<HookRuntime>,
     claimed: AtomicBool,
+    /// The claiming thread's liveness (cold paths only). `None`: unknown,
+    /// the owner is treated as alive.
+    owner: Mutex<Option<ThreadLiveness>>,
 }
 
 impl HazardSlot {
@@ -38,6 +54,7 @@ impl HazardSlot {
         Self {
             runtime: AtomicPtr::new(std::ptr::null_mut()),
             claimed: AtomicBool::new(false),
+            owner: Mutex::new(None),
         }
     }
 }
@@ -46,22 +63,47 @@ static SLOTS: [HazardSlot; HAZARD_SLOTS] = [const { HazardSlot::new() }; HAZARD_
 
 /// Claim a free slot for the calling thread (management path).
 pub(crate) fn claim() -> Option<u32> {
-    SLOTS
-        .iter()
-        .position(|s| {
-            !s.claimed.load(Ordering::Relaxed)
-                && s.claimed
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-        })
-        .map(|i| i as u32)
+    let index = SLOTS.iter().position(|s| {
+        !s.claimed.load(Ordering::Relaxed)
+            && s.claimed
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+    })?;
+    // Before the first publication: a scan that sees this thread's hazard
+    // finds its liveness (the slot lock orders the two).
+    *lock_owner(&SLOTS[index]) = ThreadLiveness::current();
+    Some(index as u32)
+}
+
+fn lock_owner(slot: &HazardSlot) -> std::sync::MutexGuard<'_, Option<ThreadLiveness>> {
+    slot.owner.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Give a slot back. Its owner must not be publishing through it.
 pub(crate) fn release(index: u32) {
     let slot = &SLOTS[index as usize];
+    let liveness = lock_owner(slot).take();
+    drop(liveness);
     slot.runtime.store(std::ptr::null_mut(), Ordering::Release);
     slot.claimed.store(false, Ordering::Release);
+}
+
+/// Withdraw `slot`'s hazard and free the slot if its owner has terminated.
+/// Returns whether it did.
+#[cold]
+fn reap_if_terminated(slot: &HazardSlot) -> bool {
+    let mut owner = lock_owner(slot);
+    if !owner.as_ref().is_some_and(ThreadLiveness::has_terminated) {
+        return false;
+    }
+    let liveness = owner.take();
+    // The owner never runs again: nobody else stores to this slot until it
+    // is claimed anew, which needs `claimed` false.
+    slot.runtime.store(std::ptr::null_mut(), Ordering::Release);
+    slot.claimed.store(false, Ordering::Release);
+    drop(owner);
+    drop(liveness);
+    true
 }
 
 /// The runtime this thread's slot currently publishes (owner only).
@@ -102,10 +144,13 @@ pub(crate) fn count(rt: *const HookRuntime) -> usize {
 /// remain; their Release clears become visible to these Acquire loads. A
 /// polling waiter therefore pays the process-wide fence once, not per poll
 /// (review N2).
+///
+/// A hazard whose owner has terminated is withdrawn instead of counted (see
+/// the module notes); a terminated thread can never dereference `rt` again.
 pub(crate) fn count_published(rt: *const HookRuntime) -> usize {
     SLOTS
         .iter()
-        .filter(|s| std::ptr::eq(s.runtime.load(Ordering::Acquire), rt))
+        .filter(|s| std::ptr::eq(s.runtime.load(Ordering::Acquire), rt) && !reap_if_terminated(s))
         .count()
 }
 
@@ -120,5 +165,28 @@ mod tests {
         assert_ne!(a, b);
         release(a);
         release(b);
+    }
+
+    /// Review P0: a thread terminated with a published hazard (it skipped
+    /// every destructor) no longer holds the runtime or its slot.
+    #[test]
+    fn terminated_owner_hazard_is_withdrawn() {
+        const RT: usize = 0x1000; // compared, never dereferenced
+        let rt = RT as *const HookRuntime;
+        let index = std::thread::spawn(move || {
+            let index = claim().unwrap();
+            publish(index, RT as *const HookRuntime);
+            index // exits without clear/release, as after TerminateThread
+        })
+        .join()
+        .unwrap();
+        assert_eq!(count(rt), 0, "a terminated thread's hazard was counted");
+        assert!(!SLOTS[index as usize].claimed.load(Ordering::Acquire));
+        // A live publisher is still counted.
+        let live = claim().unwrap();
+        publish(live, rt);
+        assert_eq!(count(rt), 1);
+        clear(live);
+        release(live);
     }
 }

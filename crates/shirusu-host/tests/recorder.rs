@@ -282,6 +282,63 @@ fn corrupted_ring_stops_and_marks_integrity_lost() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Review P1 (transport spec v0.5, copy-release-validate): a descriptor is
+/// corrupted after commit but before the Host copied it. The collection
+/// thread copies and releases it, and the Agent keeps writing into the
+/// released space while validation runs later. The session must stop the
+/// Ring, keep only what was validated before the corruption, and never
+/// finalize the Trace as complete.
+#[test]
+fn corruption_found_after_release_stops_ring_and_loses_integrity() {
+    let path = temp_trace("deferred-corrupt");
+    let (agent, generation, base) = agent_and_region(12);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(
+                base,
+                RingConfig::new(64, 4096).required_len(),
+                spec(generation),
+            )
+            .unwrap();
+    }
+    session.start().unwrap();
+    record_file_io(&agent, 12);
+    assert_eq!(session.poll_once().unwrap().events, 6);
+    // Six more committed events; corrupt the first one in shared memory.
+    record_file_io(&agent, 12);
+    let read = layout::load(base, layout::OFF_READ_CURSOR, Ordering::Acquire);
+    assert_eq!(read, 6, "first batch released");
+    let cfg = RingConfig::new(64, 4096);
+    unsafe {
+        let desc = base.add(cfg.descriptors_offset() + (read as usize % 64) * 64);
+        desc.cast::<u16>().write_unaligned(0xffff); // invalid kind
+    }
+    // The collector copies and releases without validating.
+    let _ = session.poll_once().unwrap();
+    // The Agent keeps writing into the released space meanwhile.
+    for _ in 0..3 {
+        record_file_io(&agent, 12);
+        let _ = session.poll_once().unwrap();
+    }
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.rings_stopped, 1);
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Lost);
+    assert_eq!(
+        summary.total_events, 6,
+        "nothing after the corruption is kept"
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let n: usize = trace.batches.iter().map(|b| b.events.len()).sum();
+    assert_eq!(n, 6);
+    assert!(trace
+        .loss_records
+        .iter()
+        .any(|l| l.kind == loss_kind::INTEGRITY_LOST));
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn unterminated_call_becomes_loss_record() {
     let path = temp_trace("unterminated");

@@ -365,9 +365,19 @@ pub struct CommittedRangeCollector {
     read_cursor: u64,
     payload_read_position: u64,
     stopped: bool,
+    /// Loss counters of the last Control copy handed to the validator.
+    reported_loss: [u64; 3],
 }
 // SAFETY: same contract as DrainWorker (single reader per Ring, base valid).
 unsafe impl Send for CommittedRangeCollector {}
+
+/// Writer-maintained loss counters. A change is collected even when no new
+/// descriptor was committed (see [`CommittedRangeCollector::collect`]).
+const LOSS_COUNTER_OFFSETS: [usize; 3] = [
+    layout::OFF_DROPPED_EVENTS,
+    layout::OFF_DROPPED_PAYLOAD_BYTES,
+    layout::OFF_DEGRADED_EVENTS,
+];
 
 impl CommittedRangeCollector {
     /// # Safety
@@ -380,6 +390,7 @@ impl CommittedRangeCollector {
             read_cursor: 0,
             payload_read_position: 0,
             stopped: false,
+            reported_loss: [0; 3],
         }
     }
 
@@ -394,15 +405,22 @@ impl CommittedRangeCollector {
     }
 
     /// Copy everything committed since the previous call and release it to
-    /// the writer. Returns None when nothing new was committed. Calls
-    /// `notify_space` when space was released and the writer is waiting.
+    /// the writer. Returns None when nothing new was committed and the loss
+    /// counters did not change. Calls `notify_space` when space was released
+    /// and the writer is waiting.
+    ///
+    /// Losses counted after the last committed descriptor (events dropped on
+    /// a full Ring, or one cut off by a terminated writer) produce a
+    /// Control-only chunk: without it, a Ring that never publishes again would
+    /// hide them and the Trace could be finalized as complete.
     pub fn collect(&mut self, notify_space: impl Fn()) -> Option<CommittedChunk> {
         if self.stopped {
             return None;
         }
         // 1. Commit boundary (pairs with the writer's publication order).
         let write_cursor = layout::load(self.base, layout::OFF_WRITE_CURSOR, Ordering::Acquire);
-        if write_cursor == self.read_cursor {
+        let loss = LOSS_COUNTER_OFFSETS.map(|off| layout::load(self.base, off, Ordering::Acquire));
+        if write_cursor == self.read_cursor && loss == self.reported_loss {
             return None;
         }
         let payload_write = layout::load(
@@ -419,6 +437,10 @@ impl CommittedRangeCollector {
             .copy_from_slice(&write_cursor.to_le_bytes());
         control[layout::OFF_PAYLOAD_WRITE_POSITION..layout::OFF_PAYLOAD_WRITE_POSITION + 8]
             .copy_from_slice(&payload_write.to_le_bytes());
+        for (off, value) in LOSS_COUNTER_OFFSETS.iter().zip(loss) {
+            control[*off..*off + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        self.reported_loss = loss;
         let mut chunk = CommittedChunk {
             control,
             first_cursor: self.read_cursor,
@@ -428,6 +450,8 @@ impl CommittedRangeCollector {
         };
         let capacity = self.cfg.descriptor_capacity as u64;
         let count = match write_cursor.checked_sub(self.read_cursor) {
+            // Only the loss counters changed: nothing to copy or release.
+            Some(0) => return Some(chunk),
             Some(count) if count <= capacity => count,
             // Contradictory cursors: hand the evidence to the validator.
             _ => {

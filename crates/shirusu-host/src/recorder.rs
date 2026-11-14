@@ -900,9 +900,9 @@ impl CaptureSession {
         let args_stats = pipeline_report.args;
         let host_pipeline = pipeline_report.metrics;
         self.config.environment.capture_config.push_str(&format!(
-            "; host_commands={}; host_events_received={}; host_conversion_wall_ns={}; host_queue_full={}; host_drain_wait_ns={}; host_merged_event_commands={}; host_compression_bypass_requests={}",
+            "; host_commands={}; host_events_received={}; host_conversion_wall_ns={}; host_queue_full={}; host_drain_wait_ns={}; host_merged_event_commands={}; host_compression_bypass_requests={}; host_queue_peak_bytes={}",
             host_pipeline.commands_processed, host_pipeline.events_received,
-            host_pipeline.conversion_wall_ns, host_pipeline.queue_full_count, host_pipeline.drain_wait_ns, host_pipeline.merged_event_commands, host_pipeline.compression_bypass_requests,
+            host_pipeline.conversion_wall_ns, host_pipeline.queue_full_count, host_pipeline.drain_wait_ns, host_pipeline.merged_event_commands, host_pipeline.compression_bypass_requests, host_pipeline.peak_queued_bytes,
         ));
         recorder.update_environment(&self.config.environment)?;
         reports.append(&mut self.retired_reports);

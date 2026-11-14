@@ -98,6 +98,9 @@ pub struct HostPipelineStats {
     pub conversion_wall_ns: u64,
     pub queue_full_count: u64,
     pub drain_wait_ns: u64,
+    /// Largest number of bytes queued for conversion at once (sustained-load
+    /// measurement: a Host that keeps up keeps it bounded).
+    pub peak_queued_bytes: u64,
 }
 
 #[derive(Default)]
@@ -116,6 +119,7 @@ pub(crate) struct TracePipeline<W: DurableWrite + Send + 'static> {
     byte_budget: usize,
     queue_full_count: u64,
     drain_wait_ns: u64,
+    peak_queued_bytes: usize,
     /// Set while the worker runs at Normal priority because collection
     /// waited on it (see `boost_worker`).
     boosted: Arc<AtomicBool>,
@@ -324,6 +328,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             queued_commands,
             byte_budget,
             queue_full_count: 0,
+            peak_queued_bytes: 0,
             drain_wait_ns: 0,
             boosted,
         })
@@ -353,6 +358,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             .map_err(|_| failure("trace worker panicked"))??;
         report.metrics.queue_full_count = self.queue_full_count;
         report.metrics.drain_wait_ns = self.drain_wait_ns;
+        report.metrics.peak_queued_bytes = self.peak_queued_bytes as u64;
         Ok((recorder, report))
     }
 
@@ -393,7 +399,8 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             .sender
             .as_ref()
             .ok_or_else(|| failure("trace worker closed"))?;
-        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let queued = self.queued_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.peak_queued_bytes = self.peak_queued_bytes.max(queued);
         self.queued_commands.fetch_add(1, Ordering::AcqRel);
         if sender.send(Queued { command, bytes }).is_err() {
             return Err(self.failed_worker());

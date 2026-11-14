@@ -84,7 +84,16 @@ foreach ($workload in @("gui", "high-load")) {
                     $raw | Set-Content "trace-summary.json"
                     $summary = ($raw -join "`n") | ConvertFrom-Json
                     if ($null -eq $summary.integrity -or ($inspectExit -eq 1 -and $summary.integrity.status -ne "incomplete")) { throw "invalid performance inspection result" }
-                    $unpaired = @($summary.api_stats | Where-Object { $_.enter -ne $_.leave } | ForEach-Object { "$($_.api):$($_.enter)/$($_.leave)" }) -join ","
+                    # Callback entry and return are recorded under two event names
+                    # (callback!enter / callback!leave), one side each. Pair them as one
+                    # logical API; comparing per name reported every pair as unpaired.
+                    $unpaired = @($summary.api_stats |
+                        Group-Object { if ($_.api -match '^callback!(enter|leave)$') { "callback" } else { $_.api } } |
+                        ForEach-Object {
+                            $enter = ($_.Group | Measure-Object -Property enter -Sum).Sum
+                            $leave = ($_.Group | Measure-Object -Property leave -Sum).Sum
+                            if ($enter -ne $leave) { "$($_.Name):$enter/$leave" }
+                        }) -join ","
                     $lossKinds = @($summary.integrity.loss_records | ForEach-Object { "$($_.kind):$($_.records)" }) -join ","
                     Write-Host ("Native sample {0}/{1}: {2:N3}ms events={3} losses={4} kinds=[{5}] unpaired=[{6}]" -f $workload, $round, (1000.0 * $measurement.ticks / $measurement.qpc_frequency), $summary.events, $summary.integrity.total_loss_count, $lossKinds, $unpaired)
                     $requiredApi = if ($workload -eq "gui") { "user32!BeginPaint" } else { "kernel32!HeapAlloc" }

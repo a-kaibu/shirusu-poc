@@ -111,6 +111,7 @@ jobs:
           path: |
             target/ci-diagnostics/native-performance-*.json
             target/ci-diagnostics/native-performance-phases-*.txt
+            target/ci-diagnostics/sustained-load-*.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Preserve Windows reference corpus

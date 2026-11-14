@@ -1,4 +1,4 @@
-# Agent–Host転送仕様 v0.4
+# Agent–Host転送仕様 v0.5
 
 各スレッドは専用のSPSC Ringへイベントを書き、HostがWindowsのFile Mappingを介して直接取り出す。通常の記録ではプロセス共通のロックもフェンスも使わず、満杯時は既定1msまで待ってから欠落として記録する。
 
@@ -10,6 +10,9 @@ v0.1からの主な変更は次のとおり。
 - Slotが足りないときは予備Queueを使わず、Capture Coverageの欠落として記録する。予備Queueは安全性を検証できるまで保留する（v0.4）。Ringの再利用は、スレッドの終了をHostが確認してからに限る（v0.4）。
 - Hostと共有する値は、書き手が一人でもすべてアトミックにする（v0.3）。
 - Hostは共有メモリを信頼せず、自分が知っている範囲だけを読む（v0.2、順序はv0.3で修正）。
+- Hostは確定済みの範囲を自分のメモリへコピーした時点で領域を書き手へ返し、検証は後から別スレッドで行う（v0.5、「コピー後解放・後検証」）。保証の内容が変わったので、読み手の手順と保証を書き直した。
+- `TerminateThread`で終わったスレッドの検出はAgentがスレッドのHandleで行い、記録の途中で止まった書き手のRingを隔離する（v0.5）。書き手の所有権とHazard Slotの非対称同期の契約を明記し、TLA+で検査する（v0.5）。
+- 新しいイベントが無くても欠落カウンタが進んだらHostへ渡す（v0.5）。
 
 リングの容量、Slot数、待機上限、復帰の閾値は測定で調整する値であり、変えても安全性やイベントの意味は変わらない。
 
@@ -72,13 +75,36 @@ Descriptorの公開が、そのDescriptorが参照するPayloadの公開も兼�
   3. Descriptorを書く
   4. write_cursorをReleaseで更新する
 
-読み手（Host）
-  1. write_cursorをAcquireで読む
-  2. 確定済みのDescriptorとPayloadをHost側へコピーし、検証する
-  3. read_cursorとpayload_read_positionをReleaseで更新する
+読み手（Host、回収スレッド: CommittedRangeCollector）
+  1. write_cursorをAcquireで読む（欠落カウンタも読む）
+  2. 確定済みのDescriptorと、それらが参照するPayloadの終端までをHost側へコピーする
+     （範囲はHostが知っている容量でだけ制限し、共有メモリの値は信用しない）
+  3. payload_read_positionとread_cursorをReleaseで更新する（領域を書き手へ返す）
+  4. コピーをTrace Workerへ渡す
+
+読み手（Host、Trace Worker: DrainWorker::ingest_chunk）
+  5. コピーしたDescriptorとPayloadを検証し、イベントとして受け入れる
+  6. 矛盾があればRingを止め、Event Integrityを失ったとして記録する
 ```
 
 PayloadはDescriptorと同じ順に確保されるので、Hostは最後に読んだDescriptorのPayload終端までをまとめて解放できる。格納位置は`payload_position % payload_capacity`で求める。
+
+### コピー後解放・後検証の保証（v0.5）
+
+v0.4までは「Hostが検証を終えるまで、書き手はその領域を再利用できない」だった。v0.5では「Hostがコピーを終えれば書き手はその領域を再利用でき、検証は後から行う」になる。高負荷時に検証と変換が回収を遅らせ、Ringが溢れてイベントを失っていたためである（`docs/performance.md`）。
+
+この方式で保証すること:
+
+- Hostが受け入れるイベントは、書き手が公開したイベントの先頭からの並びに一致する。検証はHost自身のコピーだけを読むので、解放後に書き手や対象プロセスが共有メモリを書き換えても、受け入れた内容は変わらない。
+- 解放するのはコピーした範囲だけである。Payloadは最後にコピーしたDescriptorが参照する終端までしか解放しない。その先のPayloadは未確定のDescriptorのものかもしれないからである。
+- 検証で矛盾を見つけたら、そのChunkはDescriptor 1件も受け入れない。Ringを止め、以後のChunkは受け入れない。回収スレッドは次の回収の前にRingの停止を確かめ、それ以上領域を解放しない。
+- 検証が遅れている間に書き手が書いたイベントは、矛盾より後のものとして捨てる。Event IntegrityはLostになり、Traceを完全として確定しない。
+
+保証しないこと: 矛盾を見つけるまでに解放した領域へ、書き手が次のイベントを書くことは止められない。Hostはそれらを受け入れないので、Traceの正しさには影響しない。
+
+欠落カウンタ（`dropped_events`など）だけが進み、新しいDescriptorが無い場合も、回収スレッドはControlだけのChunkを渡す。Ringが溢れた後に何も公開しないまま終わったスレッドや、記録の途中で強制終了した書き手の欠落を、Traceへ確実に残すためである。
+
+この手順は`crates/shirusu-host/tests/deferred_validation_dst.rs`（コピー・解放・遅れた検証・未コピーDescriptorの破壊を混ぜた操作列のDST）と、`crates/shirusu-host/tests/recorder.rs`の`corruption_found_after_release_stops_ring_and_loses_integrity`（解放後に破損が見つかる間も書き手が書き続けるE2E）で検査する。
 
 終端をまたぐコピーを無くしたければ、同じ領域を仮想アドレス上で二重に並べて割り当てる方法がある（`VirtualAlloc2`と`MapViewOfFile3`、Windows 10 1803以降）。Windows 7対応と両立しないので、初版は分割コピーとし、後から最適化として検討する。
 
@@ -163,10 +189,44 @@ v0.3の予備Queueは、確定しないセルをHostが10msで放棄して再利
 スレッドが終わってもRingはすぐには再利用せず、`ACTIVE`→`DRAINING`→`RECLAIMABLE`→`FREE`と進める。Hostが未処理のイベントとPayloadをすべて回収してから`FREE`に戻す。
 
 - RingにはGeneration番号を持たせ、同じThread IDを再利用した新しいスレッドと古いRingを混同しない。
-- Agentは`DLL_THREAD_DETACH`でRingの状態だけを変える（Loader Lock中なので待たない）。`TerminateThread`などで通知なしに終わったスレッドは、HostがThread Handleの終了で検出する。Hostが公開済みデータを回収し終えるまで、SlotのGenerationを変えて再利用しない。
+- Agentは`DLL_THREAD_DETACH`でRingの状態だけを変える（Loader Lock中なので待たない）。`TerminateThread`などで通知なしに終わったスレッドは、Agentがスレッドの複製Handle（`SYNCHRONIZE`）の終了で検出する（v0.5、下記「強制終了した書き手」）。Hostが公開済みデータを回収し終えるまで、SlotのGenerationを変えて再利用しない。
 - 対象プロセスがクラッシュしても、Hostが共有メモリのHandleを持っていれば公開済みのイベントを回収できる。
 
-Ringを再利用できるのは、HostがThread HandleのSignalでそのスレッドの終了を確認し、公開済みデータを回収し終えた後だけである。`DLL_THREAD_DETACH`はDRAININGへの移行の合図にすぎない。DETACHの後も、他のDLLの終了処理がそのスレッドでHook対象のAPIを呼ぶことがあるためである。DETACH後の呼び出しは記録せず欠落として数える。
+Ringを再利用できるのは、スレッドの終了をThread HandleのSignal（または終了通知）で確認し、Hostが公開済みデータを回収し終えた後だけである。`DLL_THREAD_DETACH`はDRAININGへの移行の合図にすぎない。DETACHの後も、他のDLLの終了処理がそのスレッドでHook対象のAPIを呼ぶことがあるためである。DETACH後の呼び出しは記録せず欠落として数える。
+
+### 強制終了した書き手（v0.5）
+
+記録の通常経路は書き手の所有権をMutexではなく非対称の同期で取る（下記「非対称同期の契約」）。所有者のスレッドは`owner_busy`を立てて書き、終わったら下ろす。`TerminateThread`はRustの`Drop`もFLSデストラクタも走らせないので、書き手の途中で終了すると`owner_busy`は立ったまま残る。v0.4の実装では、そのRingの排他取得（スレッド終了の処理や、終了したスレッドのIDを再利用した新しいスレッドの記録）が永久に待った。
+
+時間切れで`owner_busy`を下ろすのは安全ではない。一時停止していただけの所有者が再開すると、所有権が重複する。v0.5では次のようにする。
+
+- 所有者は最初に高速経路を取るとき（冷えた経路で1回）、自分のスレッドの複製Handle（`SYNCHRONIZE`のみ）を取る。Handleを持つ間はスレッドIDが再利用されないので、別のスレッドと取り違えない。
+- 排他取得は、所有者が生きている間は待つ。待つ間に所有者のHandleがSignal状態（終了済み）になったら待つのをやめる。終了したスレッドは二度と実行されず、その書き込みはすべて完了している。
+- 記録の途中で終了していた書き手は「放棄」とし、以後だれも使わない（書きかけのイベントの途中かもしれない）。`remote`を立てたままにして高速経路も閉じる。公開済みのイベントはそのままHostが回収し、書きかけの1件は`dropped_events`に数える。未公開のPayloadは公開しない。回収判定は公開済みDescriptorを読み終えたことだけで行う（Payloadの書き込み位置だけが先に進んでいることがあるため）。
+- 終了の検出は、新しいスレッドの初回記録でSlotが足りないとき、他のスレッドの終了通知のとき（50msに1回まで）、Shutdownのときに行う。生きているスレッド（一時停止中を含む）のRingには触れず、待ちもしない。
+- Hazard Slotも同様に所有者の複製Handleを持つ。終了したスレッドのHazardは走査時に取り下げてSlotを空ける。終了したスレッドはRuntimeを二度と参照しないので、Runtimeを解放してよい。
+
+限界: Hazard Slotを持たないスレッド（Slot表が満杯、TLSの破棄中）は参照カウントと進行中カウンタを使うので、記録の途中で強制終了すると進行中のまま残り、Shutdownは期限切れでINCOMPLETEを返す（Runtimeは解放しないので安全側）。Heapや登録表のロックを持ったまま強制終了したスレッドは、どのWindowsプログラムでも回復できない（`TerminateThread`の既知の制約）。
+
+検査: `crates/shirusu-agent/src/writer_cell.rs`と`crates/shirusu-hook/src/hazard.rs`の単体テスト、`terminated_writer_is_isolated_and_reclaimed`、Windows E2E `scripts/ci/terminate-writer.ps1`（x86/x64、記録中のスレッドを`TerminateThread`で止め、新しいスレッドを作り続ける。ウォッチドッグ付き）。
+
+### 非対称同期の契約（v0.5）
+
+書き手の所有権（`WriterCell`）とHazard Slotは、通常経路の不可分な読み書き更新命令を無くすため、Dekker型の非対称な手順を使う。
+
+| | 軽い側（通常経路） | 重い側（管理経路） |
+| --- | --- | --- |
+| WriterCell | `owner_busy=true` → コンパイラフェンス → `remote`を読む | `remote=true` → `FlushProcessWriteBuffers`＋全順序フェンス → `owner_busy`が下りるまで待つ |
+| Hazard Slot | Runtimeのポインタを置く → コンパイラフェンス → Revisionとゲートを読み直す | Revisionかゲートを変える → 同上 → 全Slotを走査する |
+
+前提:
+
+1. 軽い側のコンパイラフェンスは命令を出さない。軽い側の書き込みは、後続の読み出しの時点でまだStore Bufferにあり得る（Store→Loadの並べ替え）。x86/x64のTSOが許すのはこの並べ替えだけで、手順はこれに耐える必要がある。
+2. `FlushProcessWriteBuffers`が戻った時点で、このプロセスのスレッドを実行しているすべてのプロセッサが全順序のバリアを実行している。したがって、それ以前に軽い側が発行した書き込みはすべて重い側から見える。重い側の書き込みは全順序フェンスの後に読み出す。
+3. ARM64でも、IPIが軽い側のプログラム順のある点にバリアを入れるという同じ論法が成り立つ。モデルが扱うのはStore→Loadの並べ替えだけであり、ARM64の実機検証は未実施である。
+4. Windows以外では軽い側も全順序フェンスを使う。したがってLinuxのテストやloomはWindowsの手順そのものを検査しない。
+
+性質（`tla/AsymmetricHandshake.tla`、TLCで検査）: 所有者と重い側が同時に書き手を使わない（MutualExclusion）、途中で止まった書き手を使わない（NoPoisonedUse）、放棄した書き手の高速経路は閉じたまま（AbandonedStaysClosed）、参照中のRuntimeを解放しない（HazardSafe）、所有者やHazardの持ち主が強制終了しても待ちは終わる（RemoteProgress、ReclaimProgress）。重い側のフラッシュを外した変種、時間切れで奪う変種、終了状態を見ない変種（v0.4の実装）では、それぞれ反例が出ることも`scripts/ci/tla.sh`で確かめる。Windows x86/x64の実機では、記録・Shutdown・再Attachを繰り返すストレステスト（`record_shutdown_reattach_stress`、最適化ビルド）を実行する。
 
 ### 再入
 
@@ -229,6 +289,9 @@ APIのHookより先に、複数プロセス間で動くRingと、Agent・Hostの
 | x86 Agent＋x64 Host | レイアウトとアトミック操作の動作が一致する |
 | Hookの入れ子 | アプリ由来の呼び出しを正しく記録できる |
 | 共有メモリの破壊、異常なCursor | 範囲外コピーをせず、Hostが崩れない |
+| 解放後の検証で破損が見つかる間も書き手が書き続ける（v0.5） | 破損より後のイベントを受け入れず、Ringを止め、Traceを完全として確定しない |
+| 記録中のスレッドを`TerminateThread`で止める（v0.5） | 管理処理が永久に待たず、他のスレッドの記録が続き、放棄した書き手を再利用しない |
+| 欠落カウンタだけが進む（v0.5） | 新しいイベントが無くても欠落がTraceに残る |
 
 メモリ順序は、実際のWindowsのプロセス間共有メモリでのストレステストで確かめる。単一プロセス内のユニットテストでは、Handleの寿命やプロセス終了時の挙動は確かめられない。単一プロセス内の並行性は`loom`で網羅的に検査できる。
 
