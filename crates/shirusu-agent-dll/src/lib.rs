@@ -214,6 +214,31 @@ mod win {
         }
     }
 
+    /// Close every handle the Host duplicated into this process for a
+    /// Bootstrap that is rejected before any of them is used. Call only
+    /// after `validate` succeeded (the Ring count is trusted).
+    fn close_bootstrap_handles(b: &AgentBootstrap) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        let rings = b.ring_count as usize;
+        let handles = b
+            .mapping_handles
+            .iter()
+            .take(rings)
+            .chain(b.space_handles.iter().take(rings));
+        let singles = [
+            b.data_ready_handle,
+            b.init_done_handle,
+            b.host_process_handle,
+        ];
+        for &h in handles.chain(singles.iter()) {
+            if h != 0 {
+                // SAFETY: the Host duplicated this value into this process
+                // for this Bootstrap; nothing else holds it.
+                unsafe { CloseHandle(h as usize as HANDLE) };
+            }
+        }
+    }
+
     pub fn init(bootstrap: *const AgentBootstrap) -> u32 {
         if bootstrap.is_null() {
             return STATUS_BAD_BOOTSTRAP;
@@ -243,6 +268,7 @@ mod win {
             (*(bootstrap as *mut AgentBootstrap)).result_api_catalog_fingerprint = own_catalog;
         }
         if b.api_catalog_fingerprint != own_catalog {
+            close_bootstrap_handles(&b);
             return STATUS_CATALOG_MISMATCH;
         }
         // v15: Capture Policy。選択モードでは Host が対象プロセス内に置いた
@@ -263,7 +289,10 @@ mod win {
             };
             match capture_selection(ids) {
                 Some(set) => Some(set),
-                None => return STATUS_BAD_CAPTURE_POLICY,
+                None => {
+                    close_bootstrap_handles(&b);
+                    return STATUS_BAD_CAPTURE_POLICY;
+                }
             }
         } else {
             None
@@ -284,6 +313,9 @@ mod win {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         {
+            // This attempt's handles are fresh duplicates the running
+            // session never uses.
+            close_bootstrap_handles(&b);
             return STATUS_ALREADY_INITIALIZED;
         }
         // Host 生存確認： Bootstrap で渡された Host プロセスへのハンドルが
@@ -636,11 +668,12 @@ mod win {
         // application call or block replay of an otherwise complete trace.
         shirusu_hook::runtime::ReentrancyGuard::mark_thread_exiting();
         if b.init_done_handle != 0 {
-            // SAFETY: Host が複製して渡したイベント。立てた後は所有を
-            // 持たないよう forget する（Host 側の実体を閉じない）。
-            let ev = unsafe { EventObject::from_handle_value(b.init_done_handle as usize, false) };
+            // SAFETY: Host がこのプロセスへ複製して渡したイベント。この値は
+            // Host 側のハンドルとは別物なので、立てた後に閉じる（閉じずに
+            // いると attach のたびに 1 つ漏れる。2026-11-14 レビュー P3-9）。
+            let ev = unsafe { EventObject::from_handle_value(b.init_done_handle as usize, true) };
             let _ = ev.set();
-            std::mem::forget(ev);
+            drop(ev);
         }
         STATUS_OK
     }

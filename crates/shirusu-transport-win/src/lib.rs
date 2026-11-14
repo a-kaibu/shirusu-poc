@@ -720,6 +720,37 @@ mod imp {
         Ok(hv(dup))
     }
 
+    /// Close a handle that this process duplicated into `target_pid`
+    /// (`DUPLICATE_CLOSE_SOURCE`). Only for handles the target has not been
+    /// told about: the target could otherwise already have closed and reused
+    /// the value.
+    pub fn close_remote_handle(target_pid: u32, value: HandleValue) -> Result<()> {
+        use windows_sys::Win32::Foundation::DUPLICATE_CLOSE_SOURCE;
+        if value == 0 {
+            return Ok(());
+        }
+        let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, target_pid) };
+        if target.is_null() {
+            return Err(last_err("OpenProcess"));
+        }
+        let ok = unsafe {
+            DuplicateHandle(
+                target,
+                value as HANDLE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                DUPLICATE_CLOSE_SOURCE,
+            )
+        };
+        unsafe { CloseHandle(target) };
+        if ok == 0 {
+            return Err(last_err("DuplicateHandle(close remote)"));
+        }
+        Ok(())
+    }
+
     pub fn write_process_memory(
         process: HandleValue,
         dest: usize,
@@ -1198,6 +1229,9 @@ mod imp {
     pub fn duplicate_self_synchronize_to_process(_target_pid: u32) -> Result<HandleValue> {
         Err(WinError::Unsupported)
     }
+    pub fn close_remote_handle(_target_pid: u32, _value: HandleValue) -> Result<()> {
+        Err(WinError::Unsupported)
+    }
     pub fn write_process_memory(
         _process: HandleValue,
         _dest: usize,
@@ -1243,11 +1277,12 @@ mod imp {
 }
 
 pub use imp::{
-    close_handle_value, duplicate_handle_to_process, duplicate_self_synchronize_to_process,
-    enumerate_processes, module_base, open_process_for_injection, process_creation_time,
-    process_exit_code, process_exited, read_process_memory, remote_alloc, remote_call, remote_free,
-    remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process,
-    wait_process, write_process_memory, EventObject, SharedMapping,
+    close_handle_value, close_remote_handle, duplicate_handle_to_process,
+    duplicate_self_synchronize_to_process, enumerate_processes, module_base,
+    open_process_for_injection, process_creation_time, process_exit_code, process_exited,
+    read_process_memory, remote_alloc, remote_call, remote_free, remote_load_library,
+    resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process, wait_process,
+    write_process_memory, EventObject, SharedMapping,
 };
 
 // --- 利用者による記録停止 (2026-11-14 レビュー P1-5) ---

@@ -830,6 +830,39 @@ struct InjectedTarget {
 /// Mapping とイベントを用意し、DLL を注入して初期化を確認する。
 /// 起動（suspended）とアタッチで共通の手順。Trace ファイルはまだ作ら
 /// ない。Ring を準備した後、再開前に `finalize_session` で作成する。
+/// Handles duplicated into the target that nothing there knows about yet.
+/// Closed in the target when dropped, unless released to the Agent.
+struct RemoteHandles {
+    pid: u32,
+    values: Vec<win::HandleValue>,
+}
+
+impl RemoteHandles {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            values: Vec::new(),
+        }
+    }
+
+    fn keep(&mut self, value: win::HandleValue) -> win::HandleValue {
+        self.values.push(value);
+        value
+    }
+
+    fn release(&mut self) {
+        self.values.clear();
+    }
+}
+
+impl Drop for RemoteHandles {
+    fn drop(&mut self) {
+        for &value in &self.values {
+            let _ = win::close_remote_handle(self.pid, value);
+        }
+    }
+}
+
 fn inject_and_init(
     cfg: &LaunchConfig,
     process: win::HandleValue,
@@ -893,15 +926,18 @@ fn inject_and_init(
     // Host プロセスへのハンドルを対象へ渡す（Agent の生存確認用）
     // The target only waits on this handle. Never hand it VM write, thread
     // creation or handle duplication rights over the Host.
-    let host_dup = win::duplicate_self_synchronize_to_process(pid)?;
+    // Until the Agent has seen the Bootstrap, every handle duplicated into
+    // the target is ours to close on failure (2026-11-14 review P3-9).
+    let mut remote_handles = RemoteHandles::new(pid);
+    let host_dup = remote_handles.keep(win::duplicate_self_synchronize_to_process(pid)?);
 
     let mut rings = Vec::with_capacity(cfg.ring_count);
     let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(cfg.ring_count);
     for i in 0..cfg.ring_count {
         let mapping = win::SharedMapping::create(ring_len)?;
         let ring_notify = std::sync::Arc::new(win::RingNotify::new()?);
-        let mapping_dup = mapping.duplicate_to_process(pid)?;
-        let space_dup = ring_notify.space_available.duplicate_to_process(pid)?;
+        let mapping_dup = remote_handles.keep(mapping.duplicate_to_process(pid)?);
+        let space_dup = remote_handles.keep(ring_notify.space_available.duplicate_to_process(pid)?);
         let spec = RingSpec {
             process_id: TARGET_PROCESS_ID,
             raw_pid: pid,
@@ -911,8 +947,8 @@ fn inject_and_init(
         rings.push((mapping, ring_notify, spec));
         pairs.push((mapping_dup as u64, space_dup as u64));
     }
-    let data_dup = notify.data_ready.duplicate_to_process(pid)?;
-    let init_dup = init_done.duplicate_to_process(pid)?;
+    let data_dup = remote_handles.keep(notify.data_ready.duplicate_to_process(pid)?);
+    let init_dup = remote_handles.keep(init_done.duplicate_to_process(pid)?);
 
     let mut bootstrap =
         AgentBootstrap::new(cfg.session.session_id, cfg.session.ring_config, &pairs);
@@ -1007,6 +1043,9 @@ fn inject_and_init(
         win::remote_free(process, remote);
         return Err(e);
     }
+    // From here the Agent owns the handles: it closes them when it rejects
+    // the Bootstrap, and keeps them when it starts recording.
+    remote_handles.release();
     let status = win::remote_call(process, base + rva as usize, remote);
     // 初期化結果の読み戻しは、Bootstrap 領域の解放より前に行う
     // （レビュー #4 の #8）。失敗時も読み戻す: 設置失敗の詳細
