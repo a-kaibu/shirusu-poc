@@ -166,12 +166,20 @@ impl<'a> Parser<'a> {
                     return Err(format!("unescaped control character at byte {}", self.pos))
                 }
                 _ => {
-                    // UTF-8 の継続バイトも含め、文字単位で取り込む。
-                    let s = std::str::from_utf8(&self.bytes[self.pos..])
-                        .map_err(|_| format!("invalid UTF-8 at byte {}", self.pos))?;
-                    let ch = s.chars().next().unwrap();
-                    out.push(ch);
-                    self.pos += ch.len_utf8();
+                    // 次の `"`・`\`・制御文字までをまとめて検証して取り込む
+                    // （2026-11-14 レビュー P2-12: 1 文字ごとに文書の末尾まで
+                    // UTF-8 を検証し直し、1MiB の文字列で 17 秒かかっていた）。
+                    let start = self.pos;
+                    let run = self.bytes[start..]
+                        .iter()
+                        .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
+                        .unwrap_or(self.bytes.len() - start);
+                    let text =
+                        std::str::from_utf8(&self.bytes[start..start + run]).map_err(|e| {
+                            format!("invalid UTF-8 at byte {}", start + e.valid_up_to())
+                        })?;
+                    out.push_str(text);
+                    self.pos = start + run;
                 }
             }
         }
@@ -280,6 +288,26 @@ pub fn as_u64(value: &JsonValue) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_strings_parse_in_linear_time() {
+        // P2-12: 8MiB with multi-byte characters and escapes in between.
+        let chunk = "aé日本\\\"\\u00e9x";
+        let mut body = String::new();
+        while body.len() < 8 * 1024 * 1024 {
+            body.push_str(chunk);
+        }
+        let started = std::time::Instant::now();
+        let value = parse_json(&format!("\"{body}\"")).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let text = as_str(&value).unwrap();
+        assert!(text.starts_with("aé日本\"éxaé"));
+        assert_eq!(text.matches('日').count(), body.matches('日').count());
+        assert!(
+            parse_json("\"a\u{1}b\"").is_err(),
+            "control characters still rejected"
+        );
+    }
 
     #[test]
     fn rejects_ambiguous_or_excessively_nested_json() {
