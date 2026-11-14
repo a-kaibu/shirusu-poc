@@ -1008,13 +1008,29 @@ fn inject_and_init(
         }
         return Err(source);
     }
-    if !init_done.wait_timeout(cfg.init_timeout) {
-        return Err(SessionError::PostInitialization {
-            source: Box::new(SessionError::Injection(
-                "agent did not signal init_done before timeout".into(),
-            )),
-            rollback: rollback_initialized_agent(process, shutdown_addr),
-        });
+    // A target that exits during attach also ends the remote init thread,
+    // whose exit code then reads as the process's (often 0). Watch for that
+    // instead of waiting out the whole timeout.
+    let deadline = Instant::now() + cfg.init_timeout;
+    loop {
+        let slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50));
+        if init_done.wait_timeout(slice) {
+            break;
+        }
+        let exited = win::process_exited(process).unwrap_or(false);
+        if exited || Instant::now() >= deadline {
+            let reason = if exited {
+                "target exited before the agent signaled init_done"
+            } else {
+                "agent did not signal init_done before timeout"
+            };
+            return Err(SessionError::PostInitialization {
+                source: Box::new(SessionError::Injection(reason.into())),
+                rollback: rollback_initialized_agent(process, shutdown_addr),
+            });
+        }
     }
     // v15: 成功を返した Agent の Fingerprint と記録範囲も確かめる。食い違う
     // 場合は、誤った Schema で解釈する Trace を作らない。

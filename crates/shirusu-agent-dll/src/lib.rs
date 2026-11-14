@@ -125,6 +125,21 @@ pub extern "system" fn shirusu_agent_shutdown() -> u32 {
     }
 }
 
+/// 1 when this process's Agent has finished initialization (hooks
+/// installed and the session state published), else 0. A target can poll it
+/// to wait for an attach that started after it was created.
+#[no_mangle]
+pub extern "system" fn shirusu_agent_ready() -> u32 {
+    #[cfg(windows)]
+    {
+        u32::from(win::ready())
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 /// DllMain では初期化を行わない。静的 TLS を使用するため、
 /// DisableThreadLibraryCalls は呼ばず、native thread-detach callback を保つ。
 #[cfg(windows)]
@@ -618,6 +633,13 @@ mod win {
             std::mem::forget(ev);
         }
         STATUS_OK
+    }
+
+    pub fn ready() -> bool {
+        STATE
+            .try_lock()
+            .map(|state| state.is_some())
+            .unwrap_or(false)
     }
 
     pub fn shutdown() -> u32 {

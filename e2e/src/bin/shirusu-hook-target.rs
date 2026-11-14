@@ -110,7 +110,7 @@ mod win {
     }
 
     /// 自分自身を `--child` 付きで子プロセスとして起動し、終了を待つ
-    /// （L05 の E2E 用。子は 500ms 待ってからファイル操作をするため、
+    /// （L05 の E2E 用。子は Agent の初期化完了を待ってからファイル操作をするため、
     /// ドライバが発見・注入する時間がある）。
     pub fn spawn_child_and_wait() -> i32 {
         let exe = std::env::current_exe().expect("current exe");
@@ -156,8 +156,29 @@ mod win {
     }
 
     /// 子プロセスとして起動された場合の待ち（ドライバの発見・注入用）。
+    /// Wait until the capture driver has attached and initialized the Agent
+    /// in this process (it discovers children by polling, after they start),
+    /// so the file operations below are recorded. Gives up after 30s and
+    /// runs anyway: the driver then reports this child as uncaptured.
     pub fn wait_as_child() {
-        unsafe { Sleep(500) };
+        let module: Vec<u16> = "shirusu_agent_dll.dll".encode_utf16().chain([0]).collect();
+        for _ in 0..3000 {
+            // SAFETY: NUL-terminated name; a null handle means not loaded yet.
+            let handle = unsafe { GetModuleHandleW(module.as_ptr()) };
+            if !handle.is_null() {
+                // SAFETY: the export takes no arguments and returns u32.
+                let proc =
+                    unsafe { GetProcAddress(handle, c"shirusu_agent_ready".as_ptr().cast()) };
+                if !proc.is_null() {
+                    let ready: extern "system" fn() -> u32 = unsafe { std::mem::transmute(proc) };
+                    if ready() != 0 {
+                        return;
+                    }
+                }
+            }
+            unsafe { Sleep(10) };
+        }
+        println!("TARGET_CHILD_WAIT timed out waiting for the Agent");
     }
 
     pub const CONTENT: &[u8] = b"shirusu-hook-e2e-content";
