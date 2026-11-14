@@ -23,6 +23,10 @@ if ($phasesExit -ne 0) { throw "component benchmark failed: $phasesExit" }
 $detourPhasesExit = $LASTEXITCODE
 if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }
 if ($detourPhasesExit -ne 0) { throw "typed detour benchmark failed: $detourPhasesExit" }
+& cargo test -p shirusu-agent --release --target $Target --lib tests::measure_agent_record_parts -- --ignored --exact --nocapture | Tee-Object -FilePath $phasesPath -Append
+$agentPhasesExit = $LASTEXITCODE
+if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }
+if ($agentPhasesExit -ne 0) { throw "agent record benchmark failed: $agentPhasesExit" }
 & cargo test -p shirusu-host --release --target $Target --lib trace_pipeline::tests::measure_queued_conversion -- --ignored --exact --nocapture | Tee-Object -FilePath $phasesPath -Append
 $hostPhasesExit = $LASTEXITCODE
 if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $phasesPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }

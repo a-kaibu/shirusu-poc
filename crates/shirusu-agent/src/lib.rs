@@ -768,6 +768,86 @@ fn ring_is_drained(base: *const u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explicit release-only measurement of the Agent record path in parts
+    /// (CI: scripts/ci/native-performance.ps1). Each part is timed alone on a
+    /// Ring that a collector-free reader empties between rounds.
+    #[test]
+    #[ignore = "run explicitly in release mode for native component measurements"]
+    #[allow(clippy::assertions_on_constants)] // Runtime refusal, not a compile-time assertion.
+    fn measure_agent_record_parts() {
+        use shirusu_transport::ring::RingReader;
+        use std::hint::black_box;
+        use std::time::Instant;
+        assert!(!cfg!(debug_assertions), "measurement requires --release");
+        const CALLS: usize = 1536;
+        const ROUNDS: usize = 7;
+        let cfg = RingConfig::new(4096, 1024 * 1024);
+        let a = Agent::new(
+            Arc::new(SlotPool::new(2)),
+            cfg,
+            Arc::new(HostMonitor::always_alive()),
+        )
+        .with_timestamp_source(Arc::new(shirusu_transport_win::QpcTimestampSource::new()));
+        let tid = 1;
+        a.thread_begin(tid).unwrap();
+        let base = unsafe { a.thread_region_base(tid) }.unwrap();
+        let mut reader = unsafe { RingReader::new(base, cfg) };
+        let state = a.state_for(tid).unwrap();
+        let payload = [7u8; 24];
+        let report = |name: &str, mut samples: Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "phase={name} median_ns_per_operation={:.2} min={:.2} max={:.2}",
+                samples[ROUNDS / 2],
+                samples[0],
+                samples[ROUNDS - 1]
+            );
+        };
+        let mut time = |name: &str, f: &mut dyn FnMut(u64)| {
+            let mut samples = Vec::new();
+            for round in 0..=ROUNDS {
+                let start = Instant::now();
+                for i in 0..2 * CALLS as u64 {
+                    f(i);
+                }
+                let ns = start.elapsed().as_nanos() as f64 / (2 * CALLS) as f64;
+                black_box(reader.drain_all());
+                if round > 0 {
+                    samples.push(ns);
+                }
+            }
+            report(name, samples);
+        };
+        time("agent_part_tls_state_lookup", &mut |_| {
+            black_box(TLS_STATE.try_with(|c| {
+                let c = c.try_borrow().ok()?;
+                match &*c {
+                    Some((agent, t, s)) if *agent == a.id && *t == tid => {
+                        Some(s.retired.load(Ordering::Acquire))
+                    }
+                    _ => None,
+                }
+            }))
+            .ok();
+        });
+        time("agent_part_writer_cell_with", &mut |_| {
+            black_box(state.writer.with(|w| w.is_detached()));
+        });
+        time("agent_part_publish_guard", &mut |_| {
+            black_box(should_record(CallOrigin::Application));
+            let _g = black_box(PublishGuard::enter());
+        });
+        time("agent_part_write_captured", &mut |i| {
+            black_box(state.writer.with(|w| {
+                w.write_captured(EventKind::CallEnter, 1, 1, i, 0, 0, black_box(&payload))
+            }));
+        });
+        time("agent_part_record_enter", &mut |i| {
+            black_box(a.record_enter(tid, 1, 1, i, 0, black_box(&payload)));
+        });
+    }
+
     fn agent(pool_size: usize) -> Agent {
         let pool = Arc::new(SlotPool::new(pool_size));
         Agent::new(
