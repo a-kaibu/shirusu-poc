@@ -8,6 +8,9 @@
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "native-step.ps1")
 Set-Location (Join-Path $PSScriptRoot "..\..")
+# V11: every step is timed and the suite stops itself before the job's
+# 60-minute timeout, so the finally below still preserves diagnostics.
+Start-CiDeadline -Seconds 3120
 # Run independent capture scenarios even after one fails, then fail the suite.
 # A failed child-tree scenario must not hide ABI, callback, or replay failures.
 $captureFailures = [System.Collections.Generic.List[string]]::new()
@@ -37,22 +40,22 @@ $ciComplete = $false
 try {
     # カナリア: 失敗するネイティブコマンドがジョブを落とすこと自体を検証する。
     Invoke-Native { pwsh -NoProfile -File (Join-Path $PSScriptRoot "canary-exit-code.ps1") } "exit-code canary"
-    Invoke-Native { cargo test --workspace --no-fail-fast --target x86_64-pc-windows-msvc } "cargo test (workspace, x64)"
-    Invoke-Native { cargo test -p shirusu-hook --release --target x86_64-pc-windows-msvc native_tls_vector_absence_bypasses_rust_tls_access } "native TLS availability (optimized, x64)"
+    Invoke-NativeWithTimeout -What "cargo test (workspace, x64)" -TimeoutSeconds 1800 -FilePath cargo -ArgumentList @("test", "--workspace", "--no-fail-fast", "--target", "x86_64-pc-windows-msvc")
+    Invoke-NativeWithTimeout -What "native TLS availability (optimized, x64)" -TimeoutSeconds 1800 -FilePath cargo -ArgumentList @("test", "-p", "shirusu-hook", "--release", "--target", "x86_64-pc-windows-msvc", "native_tls_vector_absence_bypasses_rust_tls_access")
     # Review P1: asymmetric handshakes under the real Windows fences, optimized.
     $env:SHIRUSU_STRESS_CYCLES = "400"
-    Invoke-Native { cargo test -p shirusu-hook --release --target x86_64-pc-windows-msvc --lib record_shutdown_reattach_stress } "record/shutdown/reattach stress (optimized, x64)"
+    Invoke-NativeWithTimeout -What "record/shutdown/reattach stress (optimized, x64)" -TimeoutSeconds 1800 -FilePath cargo -ArgumentList @("test", "-p", "shirusu-hook", "--release", "--target", "x86_64-pc-windows-msvc", "--lib", "record_shutdown_reattach_stress")
     Remove-Item Env:SHIRUSU_STRESS_CYCLES
-    Invoke-Native { cargo test -p shirusu-agent --release --target x86_64-pc-windows-msvc --lib writer_cell } "writer cell handshake (optimized, x64)"
-    Invoke-Native { cargo build --workspace --target x86_64-pc-windows-msvc } "cargo build (workspace, x64)"
+    Invoke-NativeWithTimeout -What "writer cell handshake (optimized, x64)" -TimeoutSeconds 1800 -FilePath cargo -ArgumentList @("test", "-p", "shirusu-agent", "--release", "--target", "x86_64-pc-windows-msvc", "--lib", "writer_cell")
+    Invoke-NativeWithTimeout -What "cargo build (workspace, x64)" -TimeoutSeconds 1200 -FilePath cargo -ArgumentList @("build", "--workspace", "--target", "x86_64-pc-windows-msvc")
     # Build per-package e2e binaries outside timed scenarios. `-p shirusu-e2e`
     # resolves features apart from the workspace build and would otherwise
     # recompile the generated Hook engine inside a scenario's 180 s budget.
-    Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --bins } "capture targets build (x64)"
+    Invoke-NativeWithTimeout -What "capture targets build (x64)" -TimeoutSeconds 1200 -FilePath cargo -ArgumentList @("build", "-p", "shirusu-e2e", "--target", "x86_64-pc-windows-msvc", "--bins")
     # L20: Probe exe 生成と JSON Runner の実動（サンプル仕様から x64 の
     # Probe exe を生成・実行し、Runner でも同じ仕様を実行する）。
-    Invoke-CaptureScenario { pwsh -NoProfile -File (Join-Path $PSScriptRoot "probe-l20.ps1") -Target x86_64-pc-windows-msvc } "probe-exe + runner (L20, x64)"
-    Invoke-Native { .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe --all } "e2e supervisor --all"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -What "probe-exe + runner (L20, x64)" -TimeoutSeconds 600 -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "probe-l20.ps1"), "-Target", "x86_64-pc-windows-msvc") } "probe-exe + runner (L20, x64)"
+    Invoke-NativeWithTimeout -What "e2e supervisor --all" -TimeoutSeconds 900 -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-e2e-supervisor.exe -ArgumentList @("--all")
     # Phase 3: Agent DLL 注入＋フック記録の実 E2E（対象プロセスを起動して Trace を検証）
     # D54: Application Verifier を対象プロセス (shirusu-hook-target) に併用する。
     # appverif.exe が無い環境 (手元再現時など) では注記して従来どおり実行する。
@@ -112,13 +115,13 @@ try {
     # 既定でも Windows API 呼び出しが記録されることを検証する。
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath .\target\x86_64-pc-windows-msvc\debug\shirusu-capture-e2e.exe -ArgumentList @("--modules") } "capture-e2e --modules"
     # A74: 64bit アトミック操作のコスト測定 (x64 側の対照値。判断は i686 側の実測で行う)
-    Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-atomic-bench } "atomic bench build (x64)"
-    Invoke-Native { .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe } "atomic bench (x64)"
+    Invoke-NativeWithTimeout -What "atomic bench build (x64)" -TimeoutSeconds 1200 -FilePath cargo -ArgumentList @("build", "-p", "shirusu-e2e", "--target", "x86_64-pc-windows-msvc", "--release", "--bin", "shirusu-atomic-bench")
+    Invoke-NativeWithTimeout -What "atomic bench (x64)" -TimeoutSeconds 600 -FilePath .\target\x86_64-pc-windows-msvc\release\shirusu-atomic-bench.exe
     # L10: モデル性能の測定 (実注入の測定は native-performance.ps1)。API 追加遅延・
     # スループット・バッファ使用率)。測定器でありゲートではないため終了コードは
     # 常に 0。判定の読み取りはログで行う。CI 時間を抑えるため --rounds 1。
-    Invoke-Native { cargo build -p shirusu-e2e --target x86_64-pc-windows-msvc --release --bin shirusu-perf-bench } "perf bench build (x64)"
-    Invoke-CaptureScenario { .\target\x86_64-pc-windows-msvc\release\shirusu-perf-bench.exe --rounds 1 } "perf bench (x64)"
+    Invoke-NativeWithTimeout -What "perf bench build (x64)" -TimeoutSeconds 1200 -FilePath cargo -ArgumentList @("build", "-p", "shirusu-e2e", "--target", "x86_64-pc-windows-msvc", "--release", "--bin", "shirusu-perf-bench")
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -What "perf bench (x64)" -TimeoutSeconds 600 -FilePath .\target\x86_64-pc-windows-msvc\release\shirusu-perf-bench.exe -ArgumentList @("--rounds", "1") } "perf bench (x64)"
 
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "exception-transparency.ps1")) } "native SEH transparency"
     # Actual captured file I/O must produce an executable replay, not only a rule.
