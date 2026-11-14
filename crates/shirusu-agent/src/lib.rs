@@ -499,6 +499,7 @@ impl Agent {
         self.write_to(&state, input)
     }
 
+    #[inline]
     fn write_to(&self, state: &ThreadSlotState, input: EventInput) -> RecordResult {
         let outcome = state.writer.with(|writer| {
             if writer.is_detached() {
@@ -512,7 +513,19 @@ impl Agent {
             if self.order_global {
                 input.global_order = self.next_global_order.fetch_add(1, Ordering::Relaxed);
             }
-            Some(writer.write(input))
+            Some(if input.capture_state == CaptureState::Captured {
+                writer.write_captured(
+                    input.kind,
+                    input.api_id,
+                    input.schema_id,
+                    input.call_id,
+                    input.parent_call_id,
+                    input.global_order,
+                    input.payload,
+                )
+            } else {
+                writer.write(input)
+            })
         });
         let Some(outcome) = outcome else {
             self.pool.note_call_after_detach(&state.handle);

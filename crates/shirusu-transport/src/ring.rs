@@ -184,6 +184,7 @@ impl Drop for SharedRegion {
 }
 
 // Descriptor / Payload の生コピー（公開前領域への書込、確定領域からの読出）。
+#[inline(always)]
 unsafe fn write_descriptor_at(base: *mut u8, cfg: RingConfig, cursor: u64, desc: &EventDescriptor) {
     let off = cfg.descriptors_offset()
         + (slot_index(cursor, cfg.descriptor_capacity as u64) as usize) * 64;
@@ -201,6 +202,7 @@ unsafe fn read_descriptor_at(base: *const u8, cfg: RingConfig, cursor: u64) -> E
     EventDescriptor::from_bytes(&buf).expect("64 bytes always decode")
 }
 /// 終端をまたぐ場合は末尾と先頭に分割してコピーする。
+#[inline(always)]
 unsafe fn copy_payload_write(base: *mut u8, cfg: RingConfig, position: u64, data: &[u8]) {
     if data.is_empty() {
         return;
@@ -452,8 +454,21 @@ impl RingWriter {
         // first publication after that consumes it, so one wait costs the
         // writer one notification; while the flag is down (always under
         // sustained load) this is a single plain load.
-        let host_waiting = load(self.base, OFF_HOST_WAITING, Ordering::Relaxed) != 0
-            && swap(self.base, OFF_HOST_WAITING, 0, Ordering::Relaxed) != 0;
+        let host_waiting = self.take_host_waiting();
+        self.notify_after_publish(wc, payload_before, payload_len, host_waiting)
+    }
+
+    /// Notify decision for the publication just made at descriptor cursor
+    /// `wc`. `payload_before` is the payload occupancy before it, against the
+    /// read positions loaded for this write.
+    #[inline]
+    fn notify_after_publish(
+        &mut self,
+        wc: u64,
+        payload_before: u64,
+        payload_len: u64,
+        host_waiting: bool,
+    ) -> NotifySignal {
         // Below the notify threshold no edge can be crossed: skip the tracker's
         // percentage arithmetic and only keep it disarmed. Near or above it,
         // evaluate the edge exactly as before.
@@ -473,6 +488,18 @@ impl RingWriter {
                 NotifySignal::None
             };
         }
+        self.notify_near_threshold(wc, payload_before, payload_len, host_waiting)
+    }
+
+    #[cold]
+    fn notify_near_threshold(
+        &mut self,
+        wc: u64,
+        payload_before: u64,
+        payload_len: u64,
+        host_waiting: bool,
+    ) -> NotifySignal {
+        let payload_relevant = payload_len > 0;
         let used_before = wc.saturating_sub(self.cached_read_cursor);
         let used_after = used_before + 1;
         let descriptor_signal = self.notify_tracker.after_publish(
@@ -483,13 +510,9 @@ impl RingWriter {
             host_waiting,
         );
         let payload_signal = payload_relevant.then(|| {
-            let after = self
-                .payload_write_position
-                .saturating_sub(self.cached_payload_read_position);
-            let before = after.saturating_sub(payload_len);
             self.payload_notify_tracker.after_publish(
-                before,
-                after,
+                payload_before,
+                payload_before + payload_len,
                 self.cfg.payload_capacity as u64,
                 self.policy.notify_threshold_percent,
                 false,
@@ -499,6 +522,88 @@ impl RingWriter {
             NotifySignal::ThresholdCrossing
         } else {
             descriptor_signal
+        }
+    }
+
+    /// Host waiting flag check after a publication (see `publish`).
+    #[inline]
+    fn take_host_waiting(&self) -> bool {
+        load(self.base, OFF_HOST_WAITING, Ordering::Relaxed) != 0
+            && swap(self.base, OFF_HOST_WAITING, 0, Ordering::Relaxed) != 0
+    }
+
+    /// Captured event on the common path: NORMAL state, no dropped Enter
+    /// pending, room in both capacities. Builds the descriptor in place and
+    /// publishes it with the same order as `publish`. Every other case goes
+    /// through [`RingWriter::write`], which handles waiting and degradation.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_captured(
+        &mut self,
+        kind: EventKind,
+        api_id: u32,
+        schema_id: u32,
+        call_id: u64,
+        parent_call_id: u64,
+        global_order: u64,
+        payload: &[u8],
+    ) -> WriteOutcome {
+        let len = payload.len() as u64;
+        let leave_like = matches!(kind, EventKind::CallLeave | EventKind::CallAborted);
+        let common = self.state == OverflowState::Normal
+            && !(leave_like && !self.dropped_enter_calls.is_empty())
+            && len <= u32::MAX as u64
+            && self.fits_cached(1, len);
+        if !common {
+            return self.write(EventInput {
+                kind,
+                api_id,
+                schema_id,
+                call_id,
+                parent_call_id,
+                payload,
+                capture_state: CaptureState::Captured,
+                global_order,
+            });
+        }
+        let seq = self.next_sequence;
+        self.next_sequence += 1;
+        let wc = self.write_cursor();
+        let position = self.payload_write_position;
+        let payload_before = position.saturating_sub(self.cached_payload_read_position);
+        if len > 0 {
+            // SAFETY: fits_cached reserved `len` bytes from `position`.
+            unsafe { copy_payload_write(self.base, self.cfg, position, payload) };
+            self.payload_write_position = position + len;
+            store(
+                self.base,
+                OFF_PAYLOAD_WRITE_POSITION,
+                self.payload_write_position,
+                Ordering::Relaxed,
+            );
+        }
+        let descriptor = EventDescriptor {
+            kind: kind as u16,
+            flags: 0, // CaptureState::Captured
+            payload_len: len as u32,
+            sequence: seq,
+            timestamp_qpc: self.timestamps.now(),
+            call_id,
+            parent_call_id,
+            payload_position: position,
+            api_id,
+            schema_id,
+            global_order,
+        };
+        // SAFETY: fits_cached reserved the descriptor slot at `wc`.
+        unsafe { write_descriptor_at(self.base, self.cfg, wc, &descriptor) };
+        // 単一公開点 (publish と同じ順序)。
+        store(self.base, OFF_WRITE_CURSOR, wc + 1, Ordering::Release);
+        let host_waiting = self.take_host_waiting();
+        let notify = self.notify_after_publish(wc, payload_before, len, host_waiting);
+        WriteOutcome::Published {
+            sequence: seq,
+            notify,
         }
     }
 

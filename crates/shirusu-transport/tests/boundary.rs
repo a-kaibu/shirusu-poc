@@ -1859,3 +1859,47 @@ fn init_control_writes_meta_and_zeroes_cursors() {
         assert_eq!(ctrl(base, off), 0, "offset {off} starts at zero");
     }
 }
+
+proptest::proptest! {
+    /// The captured fast path must behave exactly like `write` for captured
+    /// events: same outcomes (including notification), the same descriptors
+    /// apart from timestamps, and the same loss accounting, across full Rings,
+    /// wraps, degradation and dropped Enters.
+    #[test]
+    fn write_captured_matches_write(
+        ops in proptest::collection::vec((0u8..4, 0usize..40), 1..120),
+        desc in 4usize..10,
+        pay in 64usize..160,
+    ) {
+        let (_ra, mut wa, mut rda, _) = setup(desc, pay, no_wait());
+        let (_rb, mut wb, mut rdb, _) = setup(desc, pay, no_wait());
+        let bytes = [0xA5u8; 40];
+        for (i, (op, len)) in ops.into_iter().enumerate() {
+            let call = i as u64 / 2 + 1;
+            let kind = match op {
+                0 => EventKind::CallEnter,
+                1 => EventKind::CallLeave,
+                2 => EventKind::CallAborted,
+                _ => {
+                    let (a, b) = (rda.drain(len % 5), rdb.drain(len % 5));
+                    let strip = |e: Vec<ReceivedEvent>| {
+                        e.into_iter()
+                            .map(|mut e| {
+                                e.descriptor.timestamp_qpc = 0;
+                                e
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    proptest::prop_assert_eq!(strip(a.events), strip(b.events));
+                    continue;
+                }
+            };
+            let payload = &bytes[..len];
+            let a = wa.write(input(kind, call, payload));
+            let b = wb.write_captured(kind, 10, 20, call, 0, 0, payload);
+            proptest::prop_assert_eq!(a, b);
+            proptest::prop_assert_eq!(wa.state(), wb.state());
+        }
+        proptest::prop_assert_eq!(wa.loss_counters(), wb.loss_counters());
+    }
+}

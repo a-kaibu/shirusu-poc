@@ -86,7 +86,8 @@ fn main() {
     ));
     let agent = Arc::new(
         Agent::new(
-            Arc::new(SlotPool::new(2)),
+            // Threads 1-3: batch phases and the record layers.
+            Arc::new(SlotPool::new(4)),
             cfg,
             Arc::new(HostMonitor::always_alive()),
         )
@@ -231,6 +232,8 @@ fn main() {
         });
     }
 
+    record_layers(cfg, &timestamps, &agent, &rt, api);
+
     // Batch sizes stay below capacity. Production sizes are unchanged; no wait
     // for a consumer is measured here. Compare with native-performance losses.
     // SAFETY: Agent owns this registered ring until after worker is dropped;
@@ -335,4 +338,105 @@ fn main() {
             "event",
         );
     }
+}
+
+/// Peel the publication path into layers on one Ring each (3072 events per
+/// round, collected between rounds): the Ring writer alone, the Agent record
+/// call, and the Hook runtime record call (the batch phases' producer).
+/// Differences between adjacent layers locate the per-event cost.
+fn record_layers(
+    cfg: RingConfig,
+    timestamps: &Arc<dyn TimestampSource>,
+    agent: &Arc<Agent>,
+    rt: &Arc<HookRuntime>,
+    api: &'static shirusu_hook::api::ApiDef,
+) {
+    use shirusu_transport::descriptor::{CaptureState, EventKind};
+    use shirusu_transport::ring::{EventInput, RingWriter, SharedRegion, WriterPolicy};
+    const CALLS: usize = 1536;
+    let enter = capture::encode_generic_enter::<3>(api, &[0x1234, 0, 64]);
+    let leave = capture::encode_generic_leave(api, 0x5678, 0);
+    let input = |kind, schema_id, call_id, payload| EventInput {
+        kind,
+        api_id: api.api_id,
+        schema_id,
+        call_id,
+        parent_call_id: 0,
+        payload,
+        capture_state: CaptureState::Captured,
+        global_order: 0,
+    };
+    let rounds = |name: &str, base: *mut u8, mut produce: Box<dyn FnMut(u64) + '_>| {
+        // SAFETY: base is a Ring of `cfg` owned for this function; the
+        // producer and this collector run on this thread only.
+        let mut collector = unsafe { CommittedRangeCollector::new(base, cfg) };
+        let mut samples = Vec::new();
+        for round in 0..=ROUNDS {
+            let start = Instant::now();
+            for call in 0..CALLS as u64 {
+                produce(round as u64 * CALLS as u64 + call + 1);
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (2 * CALLS) as f64;
+            let chunk = collector.collect(|| {}).expect("committed events");
+            assert_eq!(chunk.descriptor_count(), 2 * CALLS);
+            if round > 0 {
+                samples.push(ns); // round 0 warms the Ring
+            }
+        }
+        report(name, &mut samples, "event");
+    };
+    let region = SharedRegion::new(cfg, 1, 7);
+    // SAFETY: the region outlives the writer; this thread is its only writer.
+    let mut writer = unsafe {
+        RingWriter::new_with_timestamps(
+            region.base(),
+            cfg,
+            WriterPolicy::default(),
+            shirusu_transport::clock::system_clock(),
+            timestamps.clone(),
+        )
+    };
+    let (enter_schema, leave_schema) = (api.enter_schema_id(), api.leave_schema_id());
+    rounds(
+        "layer_ring_writer_write",
+        region.base(),
+        Box::new(|id| {
+            let e = writer.write(input(
+                EventKind::CallEnter,
+                enter_schema,
+                id,
+                enter.as_bytes(),
+            ));
+            let l = writer.write(input(
+                EventKind::CallLeave,
+                leave_schema,
+                id,
+                leave.as_bytes(),
+            ));
+            black_box((e, l));
+        }),
+    );
+    agent.thread_begin(2).expect("slot");
+    // SAFETY: thread 2's Ring stays registered for this function.
+    let base = unsafe { agent.thread_region_base(2) }.unwrap();
+    rounds(
+        "layer_agent_record",
+        base,
+        Box::new(|id| {
+            published(agent.record_enter(2, api.api_id, enter_schema, id, 0, enter.as_bytes()));
+            published(agent.record_leave(2, api.api_id, leave_schema, id, 0, leave.as_bytes()));
+        }),
+    );
+    rt.ensure_thread(3);
+    agent.thread_begin(3).expect("slot");
+    // SAFETY: thread 3's Ring stays registered for this function.
+    let base = unsafe { agent.thread_region_base(3) }.unwrap();
+    rounds(
+        "layer_hook_runtime_record",
+        base,
+        Box::new(|id| {
+            published(rt.record_enter(3, api, id, enter.as_bytes()));
+            published(rt.record_leave(3, api, id, leave.as_bytes()));
+        }),
+    );
 }
