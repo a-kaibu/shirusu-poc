@@ -354,3 +354,40 @@ fn aborted_creator_call_reports_missing_object() {
         CandidateKind::ObjectStateDifference
     );
 }
+
+#[test]
+fn report_counts_each_side_and_severity() {
+    let left = standard(Env::default()).finish(FinalizationInfo::default(), &[]);
+    let mut b = standard(Env::default());
+    b.ping(5, 8, 8);
+    b.ping(6, 9, 1);
+    let right = b.finish(FinalizationInfo::default(), &[]);
+    let report = compare_traces(&left, &right);
+    assert_eq!((report.left_events, report.right_events), (8, 12));
+    assert_eq!((report.left_calls, report.right_calls), (4, 6));
+    assert_eq!((report.left_objects, report.right_objects), (1, 1));
+    let pings: Vec<_> = report
+        .api_counts
+        .iter()
+        .filter(|(_, &(l, r))| (l, r) == (1, 3))
+        .collect();
+    assert_eq!(pings.len(), 1, "{:?}", report.api_counts);
+    assert_eq!(
+        report.api_counts.values().map(|&(l, _)| l).sum::<usize>(),
+        4
+    );
+    let total: usize = [
+        Severity::Info,
+        Severity::Low,
+        Severity::Medium,
+        Severity::High,
+    ]
+    .into_iter()
+    .map(|s| report.count_by_severity(s))
+    .sum();
+    assert_eq!(total, report.candidates.len());
+    assert!(total >= 2);
+    for c in &report.candidates {
+        assert!(report.count_by_severity(c.severity) >= 1);
+    }
+}

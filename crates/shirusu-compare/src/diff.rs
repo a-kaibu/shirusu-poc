@@ -824,6 +824,69 @@ mod tests {
         assert!(steps.iter().all(|s| matches!(s, AlignStep::Pair(_, _))));
     }
 
+    /// LCS の長さ（素朴な再帰＋メモ）。`align` の対応数と比べる。
+    fn lcs_len(a: &[&str], b: &[&str]) -> usize {
+        fn go(
+            a: &[&str],
+            b: &[&str],
+            i: usize,
+            j: usize,
+            memo: &mut HashMap<(usize, usize), usize>,
+        ) -> usize {
+            if i == a.len() || j == b.len() {
+                return 0;
+            }
+            if let Some(&v) = memo.get(&(i, j)) {
+                return v;
+            }
+            let v = if a[i] == b[j] {
+                go(a, b, i + 1, j + 1, memo) + 1
+            } else {
+                go(a, b, i + 1, j, memo).max(go(a, b, i, j + 1, memo))
+            };
+            memo.insert((i, j), v);
+            v
+        }
+        go(a, b, 0, 0, &mut HashMap::new())
+    }
+
+    proptest::proptest! {
+        /// 小さな入力では LCS（最長の対応）を返し、各要素をちょうど 1 回、
+        /// 順に使う。貪欲経路は最長にならない入力があるため、これで区別できる。
+        #[test]
+        fn align_is_a_longest_common_subsequence(
+            a in proptest::collection::vec(0u8..4, 0..12),
+            b in proptest::collection::vec(0u8..4, 0..12),
+        ) {
+            let names = ["w", "x", "y", "z"];
+            let a: Vec<&str> = a.iter().map(|&v| names[v as usize]).collect();
+            let b: Vec<&str> = b.iter().map(|&v| names[v as usize]).collect();
+            let steps = align(&a, &b);
+            let (mut i, mut j, mut pairs) = (0, 0, 0);
+            for s in &steps {
+                match *s {
+                    AlignStep::Pair(x, y) => {
+                        proptest::prop_assert_eq!((x, y), (i, j));
+                        proptest::prop_assert_eq!(a[x], b[y]);
+                        i += 1;
+                        j += 1;
+                        pairs += 1;
+                    }
+                    AlignStep::OnlyLeft(x) => {
+                        proptest::prop_assert_eq!(x, i);
+                        i += 1;
+                    }
+                    AlignStep::OnlyRight(y) => {
+                        proptest::prop_assert_eq!(y, j);
+                        j += 1;
+                    }
+                }
+            }
+            proptest::prop_assert_eq!((i, j), (a.len(), b.len()));
+            proptest::prop_assert_eq!(pairs, lcs_len(&a, &b));
+        }
+    }
+
     #[test]
     fn align_greedy_skips_unmatched_right_items() {
         // カバレッジ gap: 貪欲経路で b 側の先行要素を飛ばす分岐

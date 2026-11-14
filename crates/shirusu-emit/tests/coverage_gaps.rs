@@ -543,3 +543,55 @@ fn finish_writer_error_is_trace_error() {
         Err(EmitError::Trace(_))
     ));
 }
+
+#[test]
+fn calls_on_one_thread_get_distinct_ids_and_nest_by_parent() {
+    let mut em = new_emitter();
+    let outer = em
+        .begin_call(
+            1,
+            "kernel32!CloseHandle",
+            &close_handle_args(1),
+            0,
+            EventMeta::default(),
+        )
+        .unwrap();
+    let inner = em
+        .begin_call(
+            1,
+            "kernel32!CloseHandle",
+            &close_handle_args(2),
+            1,
+            EventMeta::default(),
+        )
+        .unwrap();
+    em.end_call(inner, &close_handle_leave(), 2, EventMeta::default())
+        .unwrap();
+    em.end_call(outer, &close_handle_leave(), 3, EventMeta::default())
+        .unwrap();
+    let third = em
+        .begin_call(
+            1,
+            "kernel32!CloseHandle",
+            &close_handle_args(3),
+            4,
+            EventMeta::default(),
+        )
+        .unwrap();
+    em.end_call(third, &close_handle_leave(), 5, EventMeta::default())
+        .unwrap();
+    let bytes = em.finish(FinalizationInfo::default()).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let enters: Vec<_> = trace
+        .batches
+        .iter()
+        .flat_map(|b| b.events.iter())
+        .filter(|e| e.kind == 1)
+        .collect();
+    assert_eq!(enters.len(), 3);
+    let ids: std::collections::HashSet<_> = enters.iter().map(|e| e.call_id).collect();
+    assert_eq!(ids.len(), 3, "call ids repeat: {enters:?}");
+    assert_eq!(enters[0].parent_call_id, 0);
+    assert_eq!(enters[1].parent_call_id, enters[0].call_id);
+    assert_eq!(enters[2].parent_call_id, 0);
+}

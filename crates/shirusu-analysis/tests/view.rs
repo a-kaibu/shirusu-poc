@@ -1110,3 +1110,75 @@ fn streamed_summary_matches_full_read() {
         assert!(streamed.meta.batches.is_empty());
     }
 }
+
+#[test]
+fn seq_bounds_are_inclusive_and_index_mismatch_alone_is_not_loss() {
+    let bytes = sample_trace_bytes();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let view = TraceView::build(&trace);
+    let target = &view.events[2];
+    let exact = EventFilter {
+        seq_min: Some(target.sequence),
+        seq_max: Some(target.sequence),
+        ..Default::default()
+    };
+    let hits: Vec<usize> = view
+        .events
+        .iter()
+        .filter(|e| exact.matches(e))
+        .map(|e| e.index)
+        .collect();
+    assert_eq!(hits, vec![2]);
+
+    let mut s = view.integrity.clone();
+    s.recovery_issues = vec!["index_mismatch".into()];
+    assert!(!s.has_event_loss(), "a stale index loses no events");
+    s.recovery_issues.push("truncated_tail".into());
+    assert!(s.has_event_loss());
+}
+
+#[test]
+fn thread_count_counts_distinct_threads() {
+    let bytes = sample_trace_bytes();
+    let mut trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let mut other = trace.batches[0].clone();
+    other.thread_id += 1;
+    trace.batches.push(other.clone());
+    trace.batches.push(other);
+    let view = TraceView::build(&trace);
+    assert_eq!(view.thread_count(), 2);
+}
+
+#[test]
+fn hex_prefix_marks_only_real_truncation() {
+    use shirusu_analysis::view::hex_prefix;
+    assert_eq!(hex_prefix(&[1, 2, 3], 3), "010203");
+    assert_eq!(hex_prefix(&[1, 2, 3], 2), "0102..");
+    assert_eq!(hex_prefix(&[], 0), "");
+}
+
+#[test]
+fn json_compact_and_pretty_layouts_are_fixed() {
+    use shirusu_analysis::JsonValue as J;
+    let v = J::obj(vec![
+        ("a", J::Array(vec![J::U64(1), J::I64(-2), J::Null])),
+        ("b", J::Array(vec![])),
+        ("c", J::Object(vec![])),
+        (
+            "d",
+            J::obj(vec![("x", J::Bool(true)), ("y", J::Str("q\"".into()))]),
+        ),
+    ]);
+    assert_eq!(
+        v.render(),
+        r#"{"a":[1,-2,null],"b":[],"c":{},"d":{"x":true,"y":"q\""}}"#
+    );
+    assert_eq!(
+        v.render_pretty(),
+        "{\n  \"a\": [\n    1,\n    -2,\n    null\n  ],\n  \"b\": [],\n  \"c\": {},\n  \"d\": {\n    \"x\": true,\n    \"y\": \"q\\\"\"\n  }\n}"
+    );
+    assert_eq!(
+        J::Array(vec![J::Array(vec![J::U64(7)])]).render_pretty(),
+        "[\n  [\n    7\n  ]\n]"
+    );
+}
