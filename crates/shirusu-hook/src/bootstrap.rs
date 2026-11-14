@@ -295,6 +295,13 @@ pub enum BootstrapError {
     BadCapturePolicy,
 }
 
+/// Upper bound on all Rings mapped into the target together. A 32-bit
+/// target has at most a few GiB of address space.
+#[cfg(target_pointer_width = "64")]
+pub const MAX_TOTAL_RING_BYTES: u64 = 16 << 30;
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_TOTAL_RING_BYTES: u64 = 1 << 30;
+
 impl AgentBootstrap {
     /// Agent side: copy `records` into the Host-named record area and publish
     /// the count. A missing or too small area marks the report truncated, so
@@ -455,6 +462,14 @@ impl AgentBootstrap {
         if len > isize::MAX as usize {
             return Err(BootstrapError::BadRingConfig);
         }
+        // Every Ring is mapped into the target: bound the product, not just
+        // one Ring (2026-11-14 review P3-7).
+        let total = len
+            .checked_mul(self.ring_count as usize)
+            .ok_or(BootstrapError::BadRingConfig)?;
+        if total as u64 > MAX_TOTAL_RING_BYTES {
+            return Err(BootstrapError::BadRingConfig);
+        }
         Ok(RingConfig::new(d, p))
     }
 
@@ -575,6 +590,21 @@ mod tests {
         assert_eq!(b.validate(), Ok(cfg));
         assert_eq!(b.ring_mapping_handle(1), 333);
         assert_eq!(b.ring_space_handle(0), 222);
+    }
+
+    #[test]
+    fn validate_bounds_all_rings_together() {
+        // One Ring of about 1GiB is fine alone, but not times the Ring count.
+        let payload = (MAX_TOTAL_RING_BYTES / 2).min(1 << 31);
+        let one = RingConfig::new(1 << 10, payload as usize);
+        let over = (MAX_TOTAL_RING_BYTES / payload + 1) as usize;
+        assert!(over <= MAX_BOOTSTRAP_RINGS);
+        let rings: Vec<(u64, u64)> = (1..=over as u64).map(|i| (i, i)).collect();
+        assert!(AgentBootstrap::new(1, one, &rings[..1]).validate().is_ok());
+        assert_eq!(
+            AgentBootstrap::new(1, one, &rings).validate(),
+            Err(BootstrapError::BadRingConfig)
+        );
     }
 
     #[test]
