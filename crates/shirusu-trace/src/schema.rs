@@ -221,6 +221,11 @@ pub enum LastErrorMeaning {
     /// contract and mark inapplicable values Stale; a return-only query cannot
     /// prove staleness and conservatively preserves the value.
     DependsOnInputs,
+    /// NULL か INVALID_HANDLE_VALUE のどちらかが失敗（どちらで失敗するか
+    /// 宣言の無い HANDLE 返し。広域層の既定。2026-11-14 レビュー P3-16:
+    /// NULL だけを失敗とすると、INVALID_HANDLE_VALUE で失敗する API の
+    /// 本物のエラー値が Stale と記録された）。
+    WhenReturnIsNullOrInvalidHandle,
 }
 
 /// LastErrorMeaning を格納するフラグビット範囲 (bit8..=11)。
@@ -238,6 +243,7 @@ impl LastErrorMeaning {
             6 => Self::WhenReturnIsMinusOne,
             7 => Self::WhenReturnIsNotNull,
             8 => Self::DependsOnInputs,
+            9 => Self::WhenReturnIsNullOrInvalidHandle,
             _ => Self::Unspecified,
         }
     }
@@ -253,6 +259,7 @@ impl LastErrorMeaning {
             Self::WhenReturnIsMinusOne => 6,
             Self::WhenReturnIsNotNull => 7,
             Self::DependsOnInputs => 8,
+            Self::WhenReturnIsNullOrInvalidHandle => 9,
         };
         v << LAST_ERROR_MEANING_SHIFT
     }
@@ -276,6 +283,11 @@ impl LastErrorMeaning {
             Self::Never => false,
             Self::WhenReturnIsMinusOne => {
                 return_value == u64::MAX || return_value == 0x0000_0000_ffff_ffff
+            }
+            Self::WhenReturnIsNullOrInvalidHandle => {
+                return_value == 0
+                    || return_value == u64::MAX
+                    || return_value == 0x0000_0000_ffff_ffff
             }
         }
     }
@@ -632,6 +644,7 @@ mod tests {
             LastErrorMeaning::WhenReturnIsMinusOne,
             LastErrorMeaning::WhenReturnIsNotNull,
             LastErrorMeaning::DependsOnInputs,
+            LastErrorMeaning::WhenReturnIsNullOrInvalidHandle,
         ] {
             assert_eq!(LastErrorMeaning::from_flags(meaning.flags()), meaning);
             // 意味条件は bit0..=7 (inout/省略可能・ValueKind・
@@ -715,6 +728,11 @@ mod tests {
         assert!(WhenReturnIsMinusOne.is_meaningful(0x0000_0000_ffff_ffff));
         assert!(!WhenReturnIsMinusOne.is_meaningful(0));
         assert!(!WhenReturnIsMinusOne.is_meaningful(0x1234));
+        // P3-16: HANDLE returns without a declared failure value.
+        assert!(WhenReturnIsNullOrInvalidHandle.is_meaningful(0));
+        assert!(WhenReturnIsNullOrInvalidHandle.is_meaningful(u64::MAX));
+        assert!(WhenReturnIsNullOrInvalidHandle.is_meaningful(0x0000_0000_ffff_ffff));
+        assert!(!WhenReturnIsNullOrInvalidHandle.is_meaningful(0x1234));
     }
 
     #[test]

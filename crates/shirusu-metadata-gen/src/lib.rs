@@ -486,6 +486,14 @@ pub fn generate(index: &TypeIndex, config: &Config) -> Result<Generated, String>
         match map_api(index, api, id, config.max_params) {
             Ok(EntryOutcome::Emitted(mut mapped)) => {
                 mapped.iat_only = true;
+                // The broad tier has no per-API declaration: a HANDLE or
+                // pointer return may fail with NULL or INVALID_HANDLE_VALUE
+                // (P3-16).
+                if api.last_error.is_none()
+                    && mapped.last_error_meaning == LastErrorMeaning::WhenReturnIsNull
+                {
+                    mapped.last_error_meaning = LastErrorMeaning::WhenReturnIsNullOrInvalidHandle;
+                }
                 out.entries.push(EntryOutcome::Emitted(mapped));
             }
             Ok(skipped @ EntryOutcome::Skipped { .. }) => out.entries.push(skipped),
@@ -797,6 +805,7 @@ pub fn parse_last_error(s: &str) -> Result<LastErrorMeaning, String> {
         "depends-on-inputs" => LastErrorMeaning::DependsOnInputs,
         "minus-one" => LastErrorMeaning::WhenReturnIsMinusOne,
         "never" => LastErrorMeaning::Never,
+        "null-or-invalid-handle" => LastErrorMeaning::WhenReturnIsNullOrInvalidHandle,
         "always" => LastErrorMeaning::Always,
         "unspecified" => LastErrorMeaning::Unspecified,
         other => return Err(format!("不明な last_error 指定: {other}")),

@@ -362,6 +362,12 @@ GetLastError の生値と、API 仕様上意味のあるエラー値を区別す
   Capture が契約を評価して Captured / Stale を保存する。戻り値だけを受け取る
   `is_meaningful` はこの条件では保守的に true を返し、値を捨てない。
   bit11 を追加使用するが既存の条件値 0〜7 と他の意味ビットは変更しない。
+- `WhenReturnIsNullOrInvalidHandle`（9）: 戻り値が NULL (0) か
+  INVALID_HANDLE_VALUE の場合に意味を持つ。広域層（IAT のみ）の HANDLE /
+  ポインタ返しで、どちらで失敗するかの宣言が無い API の既定。NULL だけを
+  失敗とすると、INVALID_HANDLE_VALUE で失敗する API の本物のエラー値が
+  `Stale` と記録されていた（2026-11-14 レビュー P3-16）。値 9 を知らない
+  Reader は `Unspecified` として読む。
 
 互換性：未知の条件値は `Unspecified` として読む
 （前方互換）。値 4〜8 を知らない旧来の Reader は `Unspecified`
