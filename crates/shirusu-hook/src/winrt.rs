@@ -673,15 +673,49 @@ pub fn read_hstring_string(hstring: usize) -> Option<String> {
     }
     // SAFETY: f は WindowsGetStringRawBuffer の実アドレス。
     let func: WindowsGetStringRawBufferFn = unsafe { std::mem::transmute(f) };
-    let mut len: u32 = 0;
-    let ptr = unsafe { func(hstring, &mut len) };
-    if ptr.is_null() {
+    read_hstring_with(&crate::engine::ProcessMemory, hstring as u64, |h| {
+        let mut len: u32 = 0;
+        // SAFETY: h のヘッダは読めることを確認済み。関数はヘッダの長さと
+        // 文字列ポインタを返すだけで、文字列本体は読まない。
+        let ptr = unsafe { func(h as usize, &mut len) };
+        (!ptr.is_null()).then_some((ptr as u64, len))
+    })
+}
+
+/// HSTRING のヘッダ（flags・length・予約 2 つ・文字列ポインタ）の大きさ。
+pub const HSTRING_HEADER_LEN: usize = 16 + std::mem::size_of::<usize>();
+/// 読む UTF-16 単位の上限。クラス名は短く、超えた分は切り捨てる。
+pub const MAX_HSTRING_UNITS: usize = 1024;
+
+/// HSTRING を `mem` 経由で読む（2026-11-14 レビュー P3-5）。
+///
+/// ヘッダが読めることを確かめてから `raw_buffer`（`WindowsGetStringRawBuffer`）
+/// で文字列ポインタと長さを得て、本体は長さを [`MAX_HSTRING_UNITS`] に
+/// 抑えたうえで `mem` から複製する。不正な HSTRING でもアプリのメモリを
+/// 直接触らないので、Agent 内でフォールトしない。
+pub fn read_hstring_with(
+    mem: &dyn crate::capture::MemoryReader,
+    hstring: u64,
+    raw_buffer: impl FnOnce(u64) -> Option<(u64, u32)>,
+) -> Option<String> {
+    if hstring == 0 {
         return None;
     }
-    // SAFETY: ptr は長さ len の UTF-16 バッファ。HSTRING の中身は
-    // 呼び出し中は有効（所有者はアプリ側で保持している）。
-    let units = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-    Some(hstring_units_to_string(units))
+    let mut header = [0u8; HSTRING_HEADER_LEN];
+    if !mem.read_exact(hstring, &mut header) {
+        return None;
+    }
+    let (ptr, len) = raw_buffer(hstring)?;
+    let units = (len as usize).min(MAX_HSTRING_UNITS);
+    let mut bytes = vec![0u8; units * 2];
+    if !mem.read_exact(ptr, &mut bytes) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Some(hstring_units_to_string(&units))
 }
 
 #[cfg(test)]
@@ -691,6 +725,28 @@ mod tests {
     use shirusu_trace::compact::decode_values;
     use shirusu_trace::schema::schema_types;
     use shirusu_trace::schema::SchemaRegistry;
+
+    #[test]
+    fn hstrings_are_read_through_the_memory_reader_and_bounded() {
+        let mut mem = crate::capture::MapMemory::new();
+        mem.write(0x1000, &[0u8; HSTRING_HEADER_LEN]);
+        let text: Vec<u16> = "Windows.Foo".encode_utf16().collect();
+        mem.write_u16s(0x2000, &text);
+        let got = read_hstring_with(&mem, 0x1000, |_| Some((0x2000, text.len() as u32)));
+        assert_eq!(got.as_deref(), Some("Windows.Foo"));
+        // Unreadable header: the raw-buffer function is never called.
+        assert_eq!(read_hstring_with(&mem, 0x9000, |_| unreachable!()), None);
+        // A bogus length is capped, then the read fails instead of faulting.
+        assert_eq!(
+            read_hstring_with(&mem, 0x1000, |_| Some((0x2000, u32::MAX))),
+            None
+        );
+        let long: Vec<u16> = vec![u16::from(b'a'); MAX_HSTRING_UNITS + 10];
+        mem.write_u16s(0x8000, &long);
+        let got = read_hstring_with(&mem, 0x1000, |_| Some((0x8000, long.len() as u32))).unwrap();
+        assert_eq!(got.len(), MAX_HSTRING_UNITS);
+        assert_eq!(read_hstring_with(&mem, 0, |_| unreachable!()), None);
+    }
 
     #[test]
     fn winrt_iids_display_in_canonical_form() {
