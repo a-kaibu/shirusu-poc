@@ -163,10 +163,10 @@
 | D25 | TLA+: DETACH 後呼出をモデルに含める | 検証済み |
 | D26 | TLA+ 不変条件 NoUnpublishedRead | 検証済み |
 | D27 | TLA+ 不変条件 NoOverwriteBeforeRelease | 検証済み |
-| D28 | TLA+ 不変条件 ExclusiveCellOwnership | 検証済み |
+| D28 | TLA+ 不変条件 ExclusiveCellOwnership（2026-11-14 V10 の v0.5 モデルで AcceptedIsPublished / NoOverwriteBeforeRelease に統合） | 検証済み |
 | D29 | TLA+ 不変条件 NoStaleProducerWrite | 検証済み |
-| D30 | TLA+ 不変条件 SequenceConsistency | 検証済み |
-| D31 | TLA+ 不変条件 NoPermanentBlocking（進行性: 容量不足なら欠落として前に進む） | 検証済み |
+| D30 | TLA+ 不変条件 SequenceConsistency（2026-11-14 V10 の v0.5 モデルで AcceptedIsPublished に統合） | 検証済み |
+| D31 | TLA+ 不変条件 NoPermanentBlocking（進行性: 容量不足なら欠落として前に進む。恒真式だったため 2026-11-14 V10 で WriterNeverBlocks と進行性 2 件に置換） | 検証済み |
 | D32 | TLA+/TLC を実際に実行する（無理なら週次 CI 設定＋未実行の明記） | 検証済み |
 | D33 | Windows E2E: Test Supervisor が専用プログラムを起動する実コード | 検証済み |
 | D34 | Windows E2E: 同期ポイントはテスト用に有効化でき本番では無効 | 検証済み |

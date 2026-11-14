@@ -63,34 +63,43 @@ Miriは`unsafe`コードの未定義動作の検出に使うが、Windows FFIや
 
 各手法が「何を保証しないか」も明記する。
 
-- TLA+ は抽象的な状態遷移の検証であり、実装の原子操作の順序やメモリ順序は検査しない。`NoPermanentBlocking` は状態述語としては「容量不足なら待機ではなく欠落として前に進む遷移が存在する」ことしか表しておらず、実装の待機が有限時間で終わることの証明ではない。実装側の有限性は BOUNDED_WAIT の上限（既定 1ms）と、それを測るテストが担う。ただし Slot 再利用の公開順序については、実装の操作列に対応する段階分割をモデルに入れ、旧順序の変種で違反が検出できることまで確認した（後述「Slot 再利用の段階分割と旧順序の変種」）。メモリ順序そのものは依然として検査しない。
+- TLA+ は抽象的な状態遷移の検証であり、実装の原子操作の順序やメモリ順序は検査しない。旧モデルの `NoPermanentBlocking` は全状態で真になる恒真式だった（レビュー 2026-11-14 V10）。v0.5 のモデルでは、書き手が Host を待たずに前へ進めることを `ENABLED` を含む状態述語 `WriterNeverBlocks` で、Host 側の進行を公平性の下の時相性質で検査する。それでも実装の待機が有限時間で終わることの証明ではなく、実装側の有限性は BOUNDED_WAIT の上限（既定 1ms）と、それを測るテストが担う。Slot 再利用の公開順序とコピー後解放は、実装の操作列に対応する段階分割をモデルに入れ、旧順序などの変種で違反が検出できることまで確認した（後述）。メモリ順序そのものは依然として検査しない。
 - loom のモデルには二種類ある。MiniRing 系はプロトコルの最小再現であり、実 `Slot`/`RingWriter` の操作順序そのものではない。実装の順序が問題になる箇所（Slot 回収の公開順序など）は、実装の原子操作列を転写したモデルで別に検査する（R3 で追加）。ただし転写モデルも実装そのものではなく、写し間違いの可能性は残るため、実物の並行ストレスと併用する。
 - DST は本実装では PBT の操作列に故障を混ぜる方式であり、独立した決定性スケジューラではない。再現性は Seed と操作列の保存に依存し、実スレッドのタイミング依存の競合は loom とストレスが担う。
 
 ## TLA+で検証する性質
 
-最初のモデルは、Ring容量2、書き手1〜2、読み手1の小さな構成とする。バイト列ではなく、各セルの持ち主・状態・Generation・公開済みかどうかを扱う。スレッドの終了と`DLL_THREAD_DETACH`後の呼び出しもモデルに含める。
+`tla/ShirusuTransport.tla` は転送仕様 v0.5 のモデルである（レビュー 2026-11-14 V10 で v0.4 のモデルから作り直した）。v0.5 の Ring はスレッドごとに 1 本で、Ring どうしは状態を共有しないので、Slot 1 本を世代をまたいで扱う。Descriptor Ring（2 件）と Payload Ring（2 単位、1 イベント 0〜2 単位）を持ち、バイト列ではなく各セルに書いたイベントの Sequence を扱う。書き手は Payload と Descriptor を書いてから write_cursor で公開し、どの時点でも強制終了しうる（DETACH なし）。Host は公開済みの範囲をコピーしてから解放し、検証はコピーだけを読んで後から行う。
 
-| 不変条件 | 命題 |
-| --- | --- |
-| `NoUnpublishedRead` | Hostは未確定のイベントを受け取らない |
-| `NoOverwriteBeforeRelease` | 書き手は未回収の領域を書き換えない |
-| `ExclusiveCellOwnership` | 同じ領域に書ける書き手は同時に一人 |
-| `NoStaleProducerWrite` | 再利用した後に古い書き手が書き換えない |
-| `ClaimedGenerationIsCurrent` | 取得者が Claim の瞬間に観測した Generation は、その Slot の現在の Generation と一致し続ける |
-| `SequenceConsistency` | 公開済みイベントの順序と欠落情報が矛盾しない |
-| `NoPermanentBlocking` | Host停止や容量不足で待機が無期限に続かない |
+| 性質 | 種類 | 命題 |
+| --- | --- | --- |
+| `NoOverwriteBeforeRelease` | 不変条件 | 公開窓は Descriptor と Payload の両方で容量以内で、未回収の Descriptor と Payload は公開したときの内容のまま |
+| `AcceptedIsPublished` | 不変条件 | Host が受け入れたイベントは公開したイベントの先頭からの並びに一致し、中身は公開したときのもの。書きかけで終了したイベントは受け入れない |
+| `ClaimedGenerationIsCurrent` | 不変条件 | 取得者が Claim の瞬間に観測した Generation は、その Slot の現在の Generation と一致し続ける |
+| `NoStaleProducerWrite` | 不変条件 | 再利用中・空き・退役の Slot を持つスレッドは生きていない |
+| `WriterNeverBlocks` | 不変条件（`ENABLED`） | 生きている書き手は、Host が止まっていても、記録するか欠落として数えて前に進める |
+| `EverythingPublishedIsAccepted` | 進行性 | Host の公平性の下で、公開されたイベントはいずれすべて受け入れられる |
+| `DeadSlotIsReclaimed` | 進行性 | 終了したスレッドの Slot は、DETACH の有無や書きかけのイベントによらず、いずれ再利用に進む |
 
-### Slot 再利用の段階分割と旧順序の変種（レビュー第2回・項目6）
+v0.4 のモデルの `NoUnpublishedRead`、`ExclusiveCellOwnership`、`SequenceConsistency` は `AcceptedIsPublished` と `NoOverwriteBeforeRelease` に含まれる。`NoPermanentBlocking`（恒真式）は `WriterNeverBlocks` と 2 つの進行性に置き換えた。
 
-Slot の再利用は、実装の原子操作列に合わせて段階に分けてある。`ReclaimBegin` が RECLAIMING の間に Generation を進めて終了フラグを落とし、`PublishFree` が最後に FREE を公開する。Claim は FREE が公開されているときにだけ可能で、観測した Generation を `slotClaimGen` に記録する。これにより、中間状態（FREE 公開済み・Generation 未更新）がモデルに存在せず、`ClaimedGenerationIsCurrent` が「取得済み Slot の Generation が後から変わらない」ことを直接表す。
+### 変種（反例が必須）
 
-さらに、旧順序（FREE 公開 → Generation 更新）を表す変種モデル `ShirusuTransportBuggy.tla` を置き、TLC が違反を検出できることを確認した。モデルがこの競合を表現できることの証跡である。実行は `scripts/ci/tla.sh`（主モデルの成立と変種の違反検出の両方を主張する）。
+`scripts/ci/tla.sh` は主モデルの成立と、次の変種で期待した反例が出ることの両方を必須にする。どれもモデルがその競合を表現できる証跡である。
 
-2026-11-09 のローカル実行結果（tla2tools v1.8.0、MaxCursor=4、Generation<=2 の制約下）:
+| 設定 | 変えた手順 | 期待する反例 |
+| --- | --- | --- |
+| `ShirusuTransportBuggy.cfg`（`FreeBeforeGen`） | FREE の公開を Generation の更新より先にする（旧順序、レビュー第2回・項目6） | `ClaimedGenerationIsCurrent` |
+| `ShirusuTransportValidateShared.cfg`（`ValidateShared`） | 解放した後に共有メモリの Payload を読んで検証する（v0.4 以前の「検証してから解放」をコピーなしで逆にした形） | `AcceptedIsPublished` |
+| `ShirusuTransportReclaimByPayload.cfg`（`ReclaimByPayload`） | Payload の書き込み位置まで回収したことを再利用の条件にする | `DeadSlotIsReclaimed`（Payload を書いて未公開のまま終了した Slot が再利用されない） |
 
-- 主モデル: エラーなし。990,889 状態生成 / 310,249 相異状態 / 深さ 28 / 13s。全 7 不変条件が成立。
-- 変種モデル: `Invariant ClaimedGenerationIsCurrent is violated` を 924 状態生成時点で検出（期待どおりの違反）。
+Slot の再利用は実装の原子操作列に合わせて段階に分けてある。`ReclaimBegin` が RECLAIMING の間に Control を戻して Generation を進め、`PublishFree` が最後に FREE を公開する。
+
+2026-11-14 のローカル実行結果（tla2tools v1.8.0、MaxEvents=3、MaxGen=2）:
+
+- 主モデル: エラーなし。260,682 状態生成 / 93,258 相異状態 / 8s。MaxGen=3 では 4,298,656 相異状態 / 5 分 26 秒でエラーなし。
+- 変種: 3 件とも期待した反例を検出。
+- `DropWhenFull` に Descriptor の空きを条件として足した（書き手が満杯の Descriptor Ring で待つ）変異では `WriterNeverBlocks` が破れることも確認した（CI では実行しない）。
 
 進行性には公平性の前提が要る。有限のバッファでは「Hostが永久に止まっても全部保存する」は成り立たないので、「容量不足なら欠落として前に進む」ことを検証する。TLA+の状態機械とPBTの参照モデルは同じ不変条件を共有するが、実装は独立させ、実装のバグを参照モデルに写し込まないようにする。
 

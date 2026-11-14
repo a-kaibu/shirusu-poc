@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # TLA+ / TLC モデル検査 (CI ubuntu + Java)。tla2tools.jar を取得して実行する。
-# 主モデルは全不変条件が成立すること、旧順序の変種モデルは
-# ClaimedGenerationIsCurrent の違反を検出すること (モデルが Slot 再利用の
-# 競合を表現できる証跡) の両方を確認する。
+# 主モデルは全性質が成立すること、変種は期待した反例を検出すること (モデルが
+# その競合を表現できる証跡) の両方を確認する。
 set -euo pipefail
 cd "$(dirname "$0")/../../tla"
 TLA_TOOLS_SHA256="e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f"
@@ -20,20 +19,27 @@ if [ ! -f tla2tools.jar ]; then
   fi
   mv tla2tools.jar.tmp tla2tools.jar
 fi
-java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config ShirusuTransport.cfg ShirusuTransport
-
+# 転送 (仕様 v0.5、レビュー 2026-11-14 V10): Payload Ring、コピーして解放して
+# から検証、DETACH なしの終了。変種はどれも反例が必須。
 buggy_log="$(mktemp)"
-if java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config ShirusuTransportBuggy.cfg ShirusuTransportBuggy >"$buggy_log" 2>&1; then
-  echo "ERROR: 旧順序の変種モデルで違反が検出されなかった (モデルが競合を表現できていない)" >&2
-  cat "$buggy_log" >&2
-  exit 1
-fi
-if ! grep -q "Invariant ClaimedGenerationIsCurrent is violated" "$buggy_log"; then
-  echo "ERROR: 変種モデルで期待した ClaimedGenerationIsCurrent の違反が見つからない" >&2
-  cat "$buggy_log" >&2
-  exit 1
-fi
-echo "OK: 変種モデル (旧順序) で ClaimedGenerationIsCurrent の違反を検出した"
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -lncheck final -workers auto -config ShirusuTransport.cfg ShirusuTransport
+expect_transport_violation() {
+  local cfg="$1" pattern="$2"
+  if java -cp tla2tools.jar tlc2.TLC -lncheck final -config "$cfg" ShirusuTransport >"$buggy_log" 2>&1; then
+    echo "ERROR: $cfg で違反が検出されなかった (モデルが競合を表現できていない)" >&2
+    cat "$buggy_log" >&2
+    exit 1
+  fi
+  if ! grep -Eq "$pattern" "$buggy_log"; then
+    echo "ERROR: $cfg で期待した違反 ($pattern) が見つからない" >&2
+    cat "$buggy_log" >&2
+    exit 1
+  fi
+  echo "OK: $cfg で $pattern を検出した"
+}
+expect_transport_violation ShirusuTransportBuggy.cfg "Invariant ClaimedGenerationIsCurrent is violated"
+expect_transport_violation ShirusuTransportValidateShared.cfg "Invariant AcceptedIsPublished is violated"
+expect_transport_violation ShirusuTransportReclaimByPayload.cfg "Temporal property DeadSlotIsReclaimed was violated"
 
 # Registration precedes OS submission; late cancellation cannot erase reuse.
 java -cp tla2tools.jar tlc2.TLC -config OverlappedLifecycle.cfg OverlappedLifecycle
