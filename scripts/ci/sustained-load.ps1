@@ -9,6 +9,18 @@
 #     (Host wall time after the application's own measured interval)
 # A measurement, not a gate: failures to run or observe the workload and a
 # Trace with losses finalized as complete are fatal; loss itself is reported.
+#
+# Review 2026-11-14 gates:
+#   V1: fewer events than the workload produced, with no loss record, fails.
+#   V2: every Trace is read back with `shirusu inspect` before it is deleted;
+#       it must finalize cleanly, without recovery issues, with the captured
+#       event count.
+#   V3: Host and target peak memory are recorded; the Host's peak private
+#       memory must not grow with the recording length (10 s vs 30 s).
+#   V4: each capture has its own deadline, dumps the Host when it hangs, and
+#       the report is rewritten after every run so a later hang keeps it.
+#   V5: one run records four threads at once (several Rings).
+#   V7: the backlog is the Host's time after it saw the target exit.
 param(
     [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")][string]$Target = "x86_64-pc-windows-msvc"
 )
@@ -41,16 +53,34 @@ function Get-ConfigValue([string]$config, [string]$key) {
 # (seconds, rate): paced runs at two rates and two durations, one unpaced run
 # with an uncaptured baseline for the throughput ratio.
 $runs = @(
-    @{ seconds = 10; rate = "50000" },
-    @{ seconds = 30; rate = "50000" },
-    @{ seconds = 10; rate = "200000" },
-    @{ seconds = 10; rate = "max" }
+    @{ seconds = 10; rate = "50000"; threads = 1 },
+    @{ seconds = 30; rate = "50000"; threads = 1 },
+    @{ seconds = 10; rate = "200000"; threads = 1 },
+    @{ seconds = 10; rate = "200000"; threads = 4 },
+    @{ seconds = 10; rate = "max"; threads = 1 }
 )
 $results = @()
 $complete = $false
+$diagnostics = if ($env:SHIRUSU_DIAGNOSTIC_DIR) { $env:SHIRUSU_DIAGNOSTIC_DIR } else { Join-Path $work "diagnostics" }
+$reportPath = Join-Path $work "sustained-load-$arch.json"
+function Write-Report([bool]$done) {
+    $report = [ordered]@{
+        benchmark = "native-sustained-load"; target = $Target; measurement_complete = $done
+        os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+        commit = (git rev-parse HEAD); agent_configuration = "release, full, default ring sizes"
+        scope = "GetCurrentProcessId + HeapAlloc + HeapFree in a loop for a fixed duration, paced (sleeping when ahead) or unpaced, on one or more threads. Expected counts the loop and its Sleep calls; startup/shutdown add a few hundred events."
+        results = $script:results
+    }
+    $report | ConvertTo-Json -Depth 8 | Set-Content $reportPath
+    if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $reportPath $env:SHIRUSU_DIAGNOSTIC_DIR -Force }
+}
+function Get-SummaryNumber([string]$text, [string]$pattern) {
+    if ($text -match $pattern) { return [double]$Matches[1] }
+    return $null
+}
 try {
     foreach ($run in $runs) {
-        $name = "$($run.seconds)s-$($run.rate)"
+        $name = "$($run.seconds)s-$($run.rate)-t$($run.threads)"
         $modes = if ($run.rate -eq "max") { @("baseline", "capture") } else { @("capture") }
         $baselineRate = $null
         foreach ($mode in $modes) {
@@ -59,13 +89,15 @@ try {
             $trace = Join-Path $dir "capture.trace"
             Push-Location $dir
             try {
-                $arguments = @("$($run.seconds)", $run.rate)
+                $arguments = @("$($run.seconds)", $run.rate, "$($run.threads)")
                 $wall = [System.Diagnostics.Stopwatch]::StartNew()
                 if ($mode -eq "baseline") {
                     Invoke-NativeWithTimeout -FilePath $exe -ArgumentList $arguments -TimeoutSeconds 120
                 } else {
-                    $captureOutput = & $cli capture --dll $dll --mode full --output $trace -- $exe @arguments
-                    $captureExit = $LASTEXITCODE
+                    $captureArgs = @("capture", "--dll", $dll, "--mode", "full", "--output", $trace, "--", $exe) + $arguments
+                    $captured = Invoke-NativeCaptured -FilePath $cli -ArgumentList $captureArgs -TimeoutSeconds (6 * $run.seconds + 120) -DumpDirectory $diagnostics
+                    $captureOutput = $captured.Output -split "`r?`n"
+                    $captureExit = $captured.ExitCode
                     $captureOutput | Out-Host
                     if ($captureExit -notin @(0,2)) { throw "sustained capture failed: $captureExit" }
                 }
@@ -84,15 +116,32 @@ try {
                 $queueFull = [double]$Matches[1]; $drainWaitMs = [double]$Matches[2]; $conversionMs = [double]$Matches[3]; $queuePeak = [double]$Matches[4]
                 if ($text -notmatch 'event_integrity=(\w+)') { throw "capture summary missing integrity" }
                 $integrity = $Matches[1]
+                $hostPeakWs = Get-SummaryNumber $text 'host memory: peak working set (\d+) bytes'
+                $hostPeakPrivate = Get-SummaryNumber $text 'host memory: peak working set \d+ bytes, peak private (\d+) bytes'
+                $targetPeakWs = Get-SummaryNumber $text 'target memory: peak working set (\d+) bytes'
+                $targetPeakPrivate = Get-SummaryNumber $text 'target memory: peak working set \d+ bytes, peak private (\d+) bytes'
+                $afterExitMs = Get-SummaryNumber $text 'host after target exit: ([\d.]+)ms'
                 $traceBytes = (Get-Item $trace).Length
-                Remove-Item $trace  # unpaced traces reach gigabytes
+                # V2: read the Trace back with the product's own Reader before
+                # deleting it (unpaced traces reach gigabytes).
+                $inspected = Invoke-NativeCaptured -FilePath $cli -ArgumentList @("inspect", "--json", $trace) -TimeoutSeconds 900 -DumpDirectory $diagnostics
+                if ($inspected.ExitCode -ne 0) { throw "inspect could not read the sustained trace ($($inspected.ExitCode))" }
+                $inspect = $inspected.Output | ConvertFrom-Json
+                Remove-Item $trace
+                if ($inspect.events -ne $events) { throw "trace holds $($inspect.events) events, the capture reported $events" }
+                if (-not $inspect.integrity.finalized_cleanly) { throw "sustained trace did not finalize cleanly" }
+                if ($inspect.integrity.recovery_issues.Count -gt 0) { throw "sustained trace has recovery issues: $($inspect.integrity.recovery_issues -join '; ')" }
                 if ($lossRecords -gt 0 -and $integrity -eq "Complete") { throw "sustained trace with losses finalized as complete" }
-                # Two events per call, three calls per iteration; startup and
-                # shutdown add a few hundred more.
-                $expected = 6.0 * $m.iterations
+                # Two events per call, three calls per iteration, plus each
+                # pacing Sleep; startup and shutdown add a few hundred more.
+                $sleeps = if ($null -ne $m.sleeps) { [double]$m.sleeps } else { 0.0 }
+                $expected = 6.0 * $m.iterations + 2.0 * $sleeps
+                # V1: missing events with no loss record are a silent loss.
+                if ($lossRecords -eq 0 -and $events -lt $expected) { throw "silent loss: $events events, at least $expected expected, no loss record" }
                 $result = [ordered]@{
                     run = $name; seconds = $run.seconds; rate = $run.rate
-                    app_seconds = $appSeconds; iterations = $m.iterations
+                    threads = $run.threads
+                    app_seconds = $appSeconds; iterations = $m.iterations; pacing_sleeps = $sleeps
                     app_iterations_per_second = $itersPerSecond
                     app_iterations_per_second_by_second = $m.per_second
                     baseline_iterations_per_second = $baselineRate
@@ -107,26 +156,35 @@ try {
                     host_queue_full = $queueFull
                     host_drain_wait_ms = $drainWaitMs
                     host_conversion_wall_ms = $conversionMs
-                    backlog_after_exit_ms = $wall.Elapsed.TotalMilliseconds - 1000.0 * $appSeconds
+                    # V7: Host time after it saw the target exit. The old wall
+                    # time estimate included launch, injection and signature
+                    # checks, and is kept only for comparison.
+                    backlog_after_exit_ms = $afterExitMs
+                    wall_minus_app_ms = $wall.Elapsed.TotalMilliseconds - 1000.0 * $appSeconds
+                    host_peak_working_set_bytes = $hostPeakWs
+                    host_peak_private_bytes = $hostPeakPrivate
+                    target_peak_working_set_bytes = $targetPeakWs
+                    target_peak_private_bytes = $targetPeakPrivate
                 }
                 $results += $result
+                Write-Report $false
                 $perSecond = ($m.per_second | ForEach-Object { "{0:N0}" -f $_ }) -join " "
-                Write-Host ("Sustained {0} ({1}): app {2:N0} it/s, events={3:N0} expected~{4:N0} missing~{5:N0} loss records={6} integrity={7}, queue peak={8:N0}B full={9} drain wait={10:N1}ms, backlog after exit={11:N0}ms, ratio={12}" -f $name, $arch, $itersPerSecond, $events, $expected, $result.missing_events_estimate, $lossRecords, $integrity, $queuePeak, $queueFull, $drainWaitMs, $result.backlog_after_exit_ms, $(if ($result.throughput_ratio) { "{0:N2}x" -f $result.throughput_ratio } else { "n/a" }))
+                Write-Host ("Sustained {0} ({1}): app {2:N0} it/s, events={3:N0} expected~{4:N0} missing~{5:N0} loss records={6} integrity={7}, queue peak={8:N0}B full={9} drain wait={10:N1}ms, backlog after exit={11:N0}ms, host peak private={12:N0}B, ratio={13}" -f $name, $arch, $itersPerSecond, $events, $expected, $result.missing_events_estimate, $lossRecords, $integrity, $queuePeak, $queueFull, $drainWaitMs, $result.backlog_after_exit_ms, $hostPeakPrivate, $(if ($result.throughput_ratio) { "{0:N2}x" -f $result.throughput_ratio } else { "n/a" }))
                 Write-Host "  per-second iterations: $perSecond"
             } finally { Pop-Location }
         }
     }
+    # V3: the Host's memory must not grow with the recording length.
+    $short = $results | Where-Object { $_.run -eq "10s-50000-t1" }
+    $long = $results | Where-Object { $_.run -eq "30s-50000-t1" }
+    if ($short -and $long -and $short.host_peak_private_bytes -and $long.host_peak_private_bytes) {
+        $limit = 2.0 * $short.host_peak_private_bytes + 64MB
+        if ($long.host_peak_private_bytes -gt $limit) {
+            throw ("host peak private memory grows with recording length: 10s {0:N0}B, 30s {1:N0}B" -f $short.host_peak_private_bytes, $long.host_peak_private_bytes)
+        }
+    }
     $complete = $true
 } finally {
-    $report = [ordered]@{
-        benchmark = "native-sustained-load"; target = $Target; measurement_complete = $complete
-        os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
-        commit = (git rev-parse HEAD); agent_configuration = "release, full, default ring sizes"
-        scope = "GetCurrentProcessId + HeapAlloc + HeapFree in a loop for a fixed duration, paced or unpaced. Trace events include startup/shutdown; expected counts only the loop."
-        results = $results
-    }
-    $reportPath = Join-Path $work "sustained-load-$arch.json"
-    $report | ConvertTo-Json -Depth 8 | Set-Content $reportPath
-    if ($env:SHIRUSU_DIAGNOSTIC_DIR) { Copy-Item $reportPath $env:SHIRUSU_DIAGNOSTIC_DIR }
+    Write-Report $complete
     Write-Host "Sustained load report: $reportPath"
 }

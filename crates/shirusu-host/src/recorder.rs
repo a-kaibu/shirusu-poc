@@ -275,6 +275,12 @@ pub struct SessionSummary {
     /// 集計の `total_events_seen` が回収数と一致する）。
     pub profile_summary: Option<ProfileSummary>,
     pub integrity: IntegrityReport,
+    /// Peak memory of the target process, read before its handle is closed
+    /// (review 2026-11-14 V3). None where it could not be read.
+    pub target_peak_memory: Option<shirusu_transport_win::ProcessPeakMemory>,
+    /// Host wall time from seeing the target exit to the closed Trace: the
+    /// collection and conversion backlog, without startup (V7).
+    pub host_ms_after_target_exit: Option<f64>,
 }
 
 /// Agent 終了手順（`shirusu_agent_shutdown`）の結果
@@ -1078,6 +1084,8 @@ impl CaptureSession {
             uninjectable_children: std::mem::take(&mut self.uninjectable_children),
             profile_summary,
             integrity: report,
+            target_peak_memory: None,
+            host_ms_after_target_exit: None,
         })
     }
 }

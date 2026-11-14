@@ -49,3 +49,62 @@ function Invoke-NativeWithTimeout {
         }
     } finally { $process.Dispose() }
 }
+
+# Write a full minidump of a running process (best effort, review 2026-11-14
+# V4/V11): a hang then leaves something to read instead of only a timeout.
+function Save-ProcessDump {
+    param(
+        [Parameter(Mandatory = $true)] [int] $ProcessId,
+        [Parameter(Mandatory = $true)] [string] $Directory,
+        [string] $Label = "process"
+    )
+    try {
+        New-Item -ItemType Directory -Force $Directory | Out-Null
+        $file = Join-Path $Directory ("{0}-{1}.dmp" -f $Label, $ProcessId)
+        $comsvcs = Join-Path $env:SystemRoot "System32\comsvcs.dll"
+        & rundll32.exe $comsvcs, MiniDump $ProcessId $file full | Out-Null
+        Start-Sleep -Milliseconds 500
+        if (Test-Path $file) { Write-Host "dump written: $file" } else { Write-Host "dump not written for PID $ProcessId" }
+    } catch {
+        Write-Host "dump failed for PID ${ProcessId}: $_"
+    }
+}
+
+# Run a native command with a deadline and return its standard output and
+# exit code. On a timeout, dump the process and its children, kill the tree
+# and throw, so the caller's finally blocks still run (V4).
+function Invoke-NativeCaptured {
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [string[]] $ArgumentList = @(),
+        [int] $TimeoutSeconds = 300,
+        [string] $DumpDirectory = $null
+    )
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = (Get-Command $FilePath -ErrorAction Stop).Source
+    $start.WorkingDirectory = (Get-Location).Path
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    foreach ($argument in $ArgumentList) { $start.ArgumentList.Add($argument) }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw "Could not start $FilePath" }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            if (-not $DumpDirectory) { $DumpDirectory = $env:SHIRUSU_DIAGNOSTIC_DIR }
+            if ($DumpDirectory) {
+                Save-ProcessDump -ProcessId $process.Id -Directory $DumpDirectory -Label "host"
+                Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" -ErrorAction SilentlyContinue |
+                    ForEach-Object { Save-ProcessDump -ProcessId $_.ProcessId -Directory $DumpDirectory -Label "child" }
+            }
+            $process.Kill($true)
+            $null = $process.WaitForExit(10000)
+            throw "Native command timed out after ${TimeoutSeconds}s: $FilePath $ArgumentList"
+        }
+        $process.WaitForExit()
+        $output = $stdout.GetAwaiter().GetResult()
+        $global:LASTEXITCODE = $process.ExitCode
+        return [pscustomobject]@{ Output = $output; ExitCode = $process.ExitCode }
+    } finally { $process.Dispose() }
+}

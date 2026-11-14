@@ -46,6 +46,14 @@ pub type Result<T> = std::result::Result<T, WinError>;
 /// OS ハンドルの数値表現（プロセス間受け渡し用）。共有メモリに置く値ではない。
 pub type HandleValue = usize;
 
+/// Peak memory counters of a process (review 2026-11-14 V3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProcessPeakMemory {
+    pub peak_working_set: u64,
+    /// Peak private commit (`PeakPagefileUsage`).
+    pub peak_private: u64,
+}
+
 /// 起動したプロセスのハンドル一式（CREATE_SUSPENDED 起動用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnedProcess {
@@ -636,6 +644,29 @@ mod imp {
             return Err(last_err("GetExitCodeProcess"));
         }
         Ok(Some(code))
+    }
+
+    /// Peak working set and peak private commit (bytes) of a process, from
+    /// `GetProcessMemoryInfo`. `process` 0 means this process. The counters
+    /// stay readable after the process exits while a handle is open.
+    pub fn process_peak_memory(process: HandleValue) -> Result<ProcessPeakMemory> {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        let handle = if process == 0 {
+            unsafe { GetCurrentProcess() }
+        } else {
+            h(process)
+        };
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if unsafe { GetProcessMemoryInfo(handle, &mut counters, counters.cb) } == 0 {
+            return Err(last_err("GetProcessMemoryInfo"));
+        }
+        Ok(ProcessPeakMemory {
+            peak_working_set: counters.PeakWorkingSetSize as u64,
+            peak_private: counters.PeakPagefileUsage as u64,
+        })
     }
 
     pub fn process_creation_time(process: HandleValue) -> Result<u64> {
@@ -1274,15 +1305,18 @@ mod imp {
     pub fn process_creation_time(_process: HandleValue) -> Result<u64> {
         Err(WinError::Unsupported)
     }
+    pub fn process_peak_memory(_process: HandleValue) -> Result<ProcessPeakMemory> {
+        Err(WinError::Unsupported)
+    }
 }
 
 pub use imp::{
     close_handle_value, close_remote_handle, duplicate_handle_to_process,
     duplicate_self_synchronize_to_process, enumerate_processes, module_base,
     open_process_for_injection, process_creation_time, process_exit_code, process_exited,
-    read_process_memory, remote_alloc, remote_call, remote_free, remote_load_library,
-    resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process, wait_process,
-    write_process_memory, EventObject, SharedMapping,
+    process_peak_memory, read_process_memory, remote_alloc, remote_call, remote_free,
+    remote_load_library, resume_main_thread, spawn_inheriting, spawn_suspended, terminate_process,
+    wait_process, write_process_memory, EventObject, SharedMapping,
 };
 
 // --- 利用者による記録停止 (2026-11-14 レビュー P1-5) ---

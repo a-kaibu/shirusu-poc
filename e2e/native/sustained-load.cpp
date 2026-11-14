@@ -4,13 +4,22 @@
 // Host keep converting after the application exits; a sustained run shows
 // whether collection, conversion and the queue keep up over time.
 //
-// Usage: sustained-load <seconds> <iterations-per-second | max>
-// Writes measurement.json with the total and per-second iteration counts.
+// Usage: sustained-load <seconds> <iterations-per-second | max> [threads]
+// Writes measurement.json with the total and per-second iteration counts and
+// the number of Sleep calls made while pacing.
 //
 // The loop must not call any other Windows API: QueryPerformanceCounter is
 // captured too, and calling it per pacing check produced tens of millions of
 // extra events. Time inside the loop comes from the TSC, calibrated against
 // QPC before the loop starts.
+//
+// Review 2026-11-14:
+// - V5: `threads` > 1 runs the loop on that many threads (each at
+//   rate / threads), so several Rings are collected at once.
+// - V6: a paced loop that is ahead of schedule by more than a few
+//   milliseconds sleeps instead of spinning, like an application that rests
+//   between bursts. Each Sleep is one captured call (two events); the count
+//   is reported so the expected event count stays exact.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
@@ -19,15 +28,78 @@
 #include <string.h>
 
 static const unsigned kMaxSeconds = 120;
+static const unsigned kMaxThreads = 16;
 static const unsigned kBatch = 64;
 
+struct Shared {
+    unsigned seconds;
+    bool unpaced;
+    unsigned long long rate;  // per thread
+    unsigned long long tsc_rate;
+    unsigned long long tsc_start;
+    unsigned long long tsc_end;
+    HANDLE heap;
+    volatile long long per_second[kMaxSeconds];
+    volatile long long total;
+    volatile long long sleeps;
+    volatile long checksum;
+    volatile long failure;
+};
+
+static DWORD run_loop(Shared* s) {
+    unsigned long long total = 0, sleeps = 0;
+    unsigned checksum = 0;
+    // Sleep only when this far ahead: well above one timer tick of work.
+    const unsigned long long sleep_ahead = s->unpaced ? 0 : s->rate / 200 + kBatch;
+    for (;;) {
+        const unsigned long long tsc = __rdtsc();
+        if (tsc >= s->tsc_end) break;
+        const unsigned long long elapsed = tsc - s->tsc_start;
+        if (!s->unpaced) {
+            // Pace in batches: run only while behind the target schedule.
+            const unsigned long long due =
+                (unsigned long long)((double)elapsed * (double)s->rate / (double)s->tsc_rate);
+            if (total >= due) {
+                if (total - due >= sleep_ahead) {
+                    Sleep(1);
+                    ++sleeps;
+                } else {
+                    YieldProcessor();
+                }
+                continue;
+            }
+        }
+        for (unsigned i = 0; i < kBatch; ++i) {
+            if (GetCurrentProcessId() == 0) { s->failure = 5; return 5; }
+            auto* block = (volatile unsigned*)HeapAlloc(s->heap, 0, 64);
+            if (!block) { s->failure = 6; return 6; }
+            *block = (unsigned)total + i;
+            checksum ^= *block;
+            if (!HeapFree(s->heap, 0, (void*)block)) { s->failure = 7; return 7; }
+        }
+        total += kBatch;
+        const unsigned bucket = (unsigned)(elapsed / s->tsc_rate);
+        if (bucket < s->seconds) _InterlockedExchangeAdd64(&s->per_second[bucket], kBatch);
+    }
+    _InterlockedExchangeAdd64(&s->total, (long long)total);
+    _InterlockedExchangeAdd64(&s->sleeps, (long long)sleeps);
+    _InterlockedXor(&s->checksum, (long)checksum);
+    return 0;
+}
+
+static DWORD WINAPI thread_main(void* arg) { return run_loop((Shared*)arg); }
+
+static Shared g_shared;
+
 int main(int argc, char** argv) {
-    if (argc != 3) return 2;
+    if (argc != 3 && argc != 4) return 2;
     const unsigned seconds = (unsigned)strtoul(argv[1], nullptr, 10);
     if (seconds == 0 || seconds > kMaxSeconds) return 2;
     const bool unpaced = strcmp(argv[2], "max") == 0;
     const unsigned long long rate = unpaced ? 0 : strtoull(argv[2], nullptr, 10);
     if (!unpaced && rate == 0) return 2;
+    const unsigned threads = argc == 4 ? (unsigned)strtoul(argv[3], nullptr, 10) : 1;
+    if (threads == 0 || threads > kMaxThreads) return 2;
     LARGE_INTEGER frequency, calibrate_start, calibrate_end, start, now;
     if (!QueryPerformanceFrequency(&frequency)) return 3;
     const long long f = frequency.QuadPart;
@@ -40,46 +112,38 @@ int main(int argc, char** argv) {
         (unsigned long long)((double)(__rdtsc() - tsc_calibrate) * (double)f /
                              (double)(calibrate_end.QuadPart - calibrate_start.QuadPart));
     if (tsc_rate == 0) return 3;
-    HANDLE heap = GetProcessHeap();
-    unsigned long long per_second[kMaxSeconds] = {};
-    unsigned long long total = 0;
-    unsigned checksum = 0;
+    Shared* s = &g_shared;
+    s->seconds = seconds;
+    s->unpaced = unpaced;
+    s->rate = unpaced ? 0 : (rate + threads - 1) / threads;
+    s->tsc_rate = tsc_rate;
+    s->heap = GetProcessHeap();
+    HANDLE workers[kMaxThreads] = {};
     if (!QueryPerformanceCounter(&start)) return 3;
-    const unsigned long long tsc_start = __rdtsc();
-    const unsigned long long tsc_end = tsc_start + (unsigned long long)seconds * tsc_rate;
-    for (;;) {
-        const unsigned long long tsc = __rdtsc();
-        if (tsc >= tsc_end) break;
-        const unsigned long long elapsed = tsc - tsc_start;
-        if (!unpaced) {
-            // Pace in batches: run only while behind the target schedule.
-            const unsigned long long due =
-                (unsigned long long)((double)elapsed * (double)rate / (double)tsc_rate);
-            if (total >= due) {
-                YieldProcessor();
-                continue;
-            }
-        }
-        for (unsigned i = 0; i < kBatch; ++i) {
-            if (GetCurrentProcessId() == 0) return 5;
-            auto* block = (volatile unsigned*)HeapAlloc(heap, 0, 64);
-            if (!block) return 6;
-            *block = (unsigned)total + i;
-            checksum ^= *block;
-            if (!HeapFree(heap, 0, (void*)block)) return 7;
-        }
-        total += kBatch;
-        const unsigned bucket = (unsigned)(elapsed / tsc_rate);
-        if (bucket < seconds) per_second[bucket] += kBatch;
+    s->tsc_start = __rdtsc();
+    s->tsc_end = s->tsc_start + (unsigned long long)seconds * tsc_rate;
+    // Extra threads start before the main thread's loop; their creation
+    // calls are outside the expected count, like startup.
+    for (unsigned t = 1; t < threads; ++t) {
+        workers[t] = CreateThread(nullptr, 0, thread_main, s, 0, nullptr);
+        if (!workers[t]) return 10;
     }
+    run_loop(s);
+    for (unsigned t = 1; t < threads; ++t) {
+        if (WaitForSingleObject(workers[t], INFINITE) != WAIT_OBJECT_0) return 11;
+        CloseHandle(workers[t]);
+    }
+    if (s->failure) return (int)s->failure;
     if (!QueryPerformanceCounter(&now)) return 4;
     FILE* output = nullptr;
     if (fopen_s(&output, "measurement.json", "w") != 0) return 8;
-    fprintf(output, "{\"seconds\":%u,\"rate\":%llu,\"iterations\":%llu,\"ticks\":%lld,"
-                    "\"qpc_frequency\":%lld,\"checksum\":%u,\"per_second\":[",
-            seconds, rate, total, now.QuadPart - start.QuadPart, f, checksum);
-    for (unsigned s = 0; s < seconds; ++s) {
-        fprintf(output, s ? ",%llu" : "%llu", per_second[s]);
+    fprintf(output, "{\"seconds\":%u,\"rate\":%llu,\"threads\":%u,\"iterations\":%lld,"
+                    "\"sleeps\":%lld,\"ticks\":%lld,\"qpc_frequency\":%lld,\"checksum\":%lu,"
+                    "\"per_second\":[",
+            seconds, rate, threads, s->total, s->sleeps, now.QuadPart - start.QuadPart, f,
+            (unsigned long)s->checksum);
+    for (unsigned i = 0; i < seconds; ++i) {
+        fprintf(output, i ? ",%lld" : "%lld", s->per_second[i]);
     }
     fprintf(output, "]}\n");
     if (fclose(output) != 0) return 9;

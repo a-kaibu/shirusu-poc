@@ -101,6 +101,8 @@ pub struct LaunchedCapture {
     shutdown_outcome: Option<ShutdownOutcome>,
     module_scan: Option<ModuleScan>,
     data_ready: win::ProcessNotify,
+    /// When collection saw the target exit (V7: Host time after exit).
+    exit_observed: Option<Instant>,
 }
 
 /// The module watcher thread and its stop request.
@@ -172,6 +174,7 @@ impl LaunchedCapture {
             shutdown_outcome: None,
             module_scan,
             data_ready,
+            exit_observed: None,
         })
     }
 
@@ -196,6 +199,7 @@ impl LaunchedCapture {
                         shutdown_outcome: None,
                         module_scan: start_module_scan(pid, Vec::new()),
                         data_ready,
+                        exit_observed: None,
                     }),
                     Err(e) => {
                         let rollback = rollback_initialized_agent(process, shutdown_addr);
@@ -243,6 +247,7 @@ impl LaunchedCapture {
         win::set_current_thread_priority(win::ThreadPriority::Highest);
         loop {
             if self.target_exited()? {
+                self.exit_observed = Some(Instant::now());
                 break;
             }
             // P1-5: 利用者の停止要求 (Ctrl-C) でも抜け、Agent の終了手順と
@@ -352,10 +357,19 @@ impl LaunchedCapture {
         session.set_shutdown_outcome(outcome);
         let mut summary = session.stop()?;
         summary.target_exit_code = win::process_exit_code(self.process)?;
+        summary.target_peak_memory = win::process_peak_memory(self.process).ok();
+        summary.host_ms_after_target_exit = self
+            .exit_observed
+            .map(|at| at.elapsed().as_secs_f64() * 1000.0);
         win::close_handle_value(self.process);
         self.process = 0;
         Ok(summary)
     }
+}
+
+/// Peak memory of this (Host) process, where it can be read (V3).
+pub fn host_peak_memory() -> Option<shirusu_transport_win::ProcessPeakMemory> {
+    win::process_peak_memory(0).ok()
 }
 
 /// Only called after successful initialization. Never terminate an attached
@@ -1323,6 +1337,7 @@ mod tests {
                 shutdown_outcome: Some(outcome.clone()),
                 module_scan: None,
                 data_ready: win::ProcessNotify::new().unwrap(),
+                exit_observed: None,
             };
             assert_eq!(capture.shutdown_once(), outcome);
             let error =

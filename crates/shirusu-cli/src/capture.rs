@@ -647,6 +647,22 @@ pub(crate) fn print_summary(trace: &Path, summary: &shirusu_host::recorder::Sess
     if let Some((hooked, missing)) = summary.hook_coverage {
         println!("hook coverage: {hooked} hooked, {missing} missing");
     }
+    // V3 (review 2026-11-14): the peaks that CI compares between runs.
+    if let Some(host) = shirusu_host::recorder_launch::host_peak_memory() {
+        println!(
+            "host memory: peak working set {} bytes, peak private {} bytes",
+            host.peak_working_set, host.peak_private
+        );
+    }
+    if let Some(ms) = summary.host_ms_after_target_exit {
+        println!("host after target exit: {ms:.3}ms");
+    }
+    if let Some(target) = summary.target_peak_memory {
+        println!(
+            "target memory: peak working set {} bytes, peak private {} bytes",
+            target.peak_working_set, target.peak_private
+        );
+    }
     let i = &summary.integrity;
     println!(
         "integrity: capture_coverage={} event_integrity={} semantic_completeness={}",
