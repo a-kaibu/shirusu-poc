@@ -384,3 +384,52 @@ fn create_file_in_missing_directory_reports_io_error() {
     };
     assert!(matches!(error, SessionError::Io(_)), "{error}");
 }
+
+/// 検証側（Trace worker）が Chunk を拒否したら、次の `poll_once` で
+/// 回収側も止まり、以後その Ring の空きを解放しない。
+#[test]
+fn validator_rejection_stops_the_collector_on_a_later_poll() {
+    let path = temp_trace("validator-stop");
+    let (agent, generation, base) = agent_and_region(12);
+    let cfg = RingConfig::new(64, 4096);
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    unsafe {
+        session
+            .add_borrowed_ring(base, cfg.required_len(), spec(generation))
+            .unwrap();
+    }
+    session.start().unwrap();
+    let cf = api_by_id(API_CREATE_FILE_W).unwrap();
+    let payload = vec![0u8; 4];
+    agent.record_enter(12, cf.api_id, cf.enter_schema_id(), 1, 0, &payload);
+    // 確定済み Descriptor の種別を未定義値へ書き換える（対象の改竄）。
+    unsafe { *base.add(cfg.descriptors_offset()) = 0xee };
+    let first = session.poll_once().unwrap();
+    assert_eq!(first.events, 1, "the collector copies before validation");
+    let read_after_first = layout::load(base, layout::OFF_READ_CURSOR, Ordering::Acquire);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let stats = session.poll_once().unwrap();
+        if stats.stopped_rings == 1 {
+            assert_eq!(stats.active_rings, 0);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "collector never stopped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // 止まった後に書いた分は回収も解放もしない。
+    agent.record_enter(12, cf.api_id, cf.enter_schema_id(), 2, 0, &payload);
+    let stats = session.poll_once().unwrap();
+    assert_eq!((stats.events, stats.stopped_rings), (0, 1));
+    assert_eq!(
+        layout::load(base, layout::OFF_READ_CURSOR, Ordering::Acquire),
+        read_after_first
+    );
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.rings_stopped, 1);
+    assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Lost);
+    let _ = std::fs::remove_file(&path);
+}

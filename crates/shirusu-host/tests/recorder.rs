@@ -655,10 +655,26 @@ fn session_follows_ring_reincarnation_after_slot_reuse() {
     let stats = session.poll_once().unwrap();
     assert_eq!(stats.events, 6, "new incarnation must be drained");
     assert_eq!(stats.stopped_rings, 0);
+    // incarnation 3: さらに別の TID が世代 2 で使う
+    assert!(agent.thread_exit(222));
+    let _ = session.poll_once().unwrap();
+    assert_eq!(agent.poll_reclaims(), 1);
+    let h3 = agent.thread_begin(333).expect("recycled slot");
+    assert_eq!(h3.generation, 2);
+    record_file_io(&agent, 333);
+    assert_eq!(session.poll_once().unwrap().events, 6);
     let summary = session.stop().unwrap();
-    assert_eq!(summary.total_events, 12);
+    assert_eq!(summary.total_events, 18);
     assert_eq!(summary.rings_stopped, 0);
     assert_eq!(summary.integrity.event_integrity, IntegrityLevel::Complete);
+    // incarnation ごとに Sequence が 1 から再開するため、Trace 上は
+    // それぞれ別のスレッドとして記録される。
+    let trace = shirusu_trace::read_trace(&std::fs::read(&path).unwrap()).unwrap();
+    let mut threads: Vec<u64> = trace.batches.iter().map(|b| b.thread_id).collect();
+    threads.sort_unstable();
+    threads.dedup();
+    assert_eq!(threads.len(), 3, "threads: {threads:?}");
+    assert!(trace.issues.is_empty(), "{:?}", trace.issues);
     let _ = std::fs::remove_file(&path);
 }
 

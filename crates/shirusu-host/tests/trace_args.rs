@@ -245,3 +245,57 @@ fn broad_tier_schemas_are_registered_on_first_use() {
         broad.leave_schema_id()
     );
 }
+
+#[test]
+fn plain_record_batch_blobs_even_decodable_payloads() {
+    // record_batch（引数モードでない経路）は、登録済み Schema で復号できる
+    // Payload でも args にせず Blob として残す。
+    let schema = api_by_id(API_CREATE_FILE_W).unwrap().enter_schema_id();
+    let payload = create_file_enter_payload();
+    let mut rec = recorder();
+    rec.record_batch(
+        &ctx(),
+        &[event(1, EventKind::CallEnter, schema, payload.clone())],
+    )
+    .unwrap();
+    let bytes = rec.finish(&IntegrityReport::default()).unwrap();
+    let trace = shirusu_trace::read_trace(&bytes).unwrap();
+    let e = &trace.batches[0].events[0];
+    assert!(e.args.is_none());
+    match e.payload {
+        PayloadRef::Blob(id) => assert_eq!(trace.blobs[&id], payload),
+        ref other => panic!("expected a blob, got {other:?}"),
+    }
+}
+
+#[test]
+fn profile_summary_is_readable_before_finish_only_in_profile_mode() {
+    use shirusu_host::trace_convert::RecordMode;
+    let mut full = recorder();
+    assert!(full.profile_summary().is_none());
+    full.record_batch(&ctx(), &[event(1, EventKind::CallEnter, 0, vec![])])
+        .unwrap();
+    assert!(full.profile_summary().is_none());
+
+    let mut rec = recorder();
+    rec.set_record_mode(RecordMode::Profile);
+    let empty = rec.profile_summary().unwrap();
+    assert_eq!(empty.total_events_seen, 0);
+    assert!(empty.apis.is_empty());
+    let mut leave = event(2, EventKind::CallLeave, 0, vec![]);
+    leave.descriptor.timestamp_qpc = 9001 + 40;
+    rec.record_batch(&ctx(), &[event(1, EventKind::CallEnter, 0, vec![]), leave])
+        .unwrap();
+    let summary = rec.profile_summary().unwrap();
+    assert_eq!(summary.qpc_frequency, 10_000_000);
+    assert_eq!(summary.total_events_seen, 2);
+    assert_eq!(summary.apis.len(), 1);
+    let row = &summary.apis[0];
+    assert_eq!(row.api_id, API_CREATE_FILE_W);
+    assert_eq!((row.calls, row.enters, row.leaves), (1, 1, 1));
+    assert_eq!(row.total_duration_qpc, 40);
+    // 読んでも集計は続く。
+    rec.record_batch(&ctx(), &[event(3, EventKind::CallEnter, 0, vec![])])
+        .unwrap();
+    assert_eq!(rec.profile_summary().unwrap().total_events_seen, 3);
+}
