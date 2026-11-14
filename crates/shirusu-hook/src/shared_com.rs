@@ -389,16 +389,36 @@ pub unsafe fn install(rt: &Arc<HookRuntime>, object: usize) -> Result<Installati
             }
         }
     }
-    let index = registry
-        .iter()
-        .position(Option::is_none)
-        .unwrap_or(registry.len());
+    // A restored wrapper for the same table and originals (an earlier
+    // session in this process) keeps its identity: reuse it instead of
+    // spending another of the LIMIT slots (2026-11-14 review P3-6). A late
+    // caller holding the old wrapper still reaches the same originals.
+    let reusable = registry.iter().enumerate().find_map(|(index, entry)| {
+        let saved = entry.as_ref()?;
+        (saved.table == table
+            && saved.module == module
+            && saved.originals == originals
+            && saved.published.load(Ordering::Acquire)
+            && !pending(saved)
+            && MODULE_EPOCHS[index].load(Ordering::Acquire) & 1 == 0)
+            .then_some(index)
+    });
+    let index = reusable.unwrap_or_else(|| {
+        registry
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(registry.len())
+    });
     if index == LIMIT {
         return Err("iunknown-wrapper-limit");
     }
-    let epoch = (MODULE_EPOCHS[index].load(Ordering::Acquire) | 1)
-        .checked_add(1)
-        .ok_or("iunknown-wrapper-generation-exhausted")?;
+    let epoch = if reusable.is_some() {
+        MODULE_EPOCHS[index].load(Ordering::Acquire)
+    } else {
+        (MODULE_EPOCHS[index].load(Ordering::Acquire) | 1)
+            .checked_add(1)
+            .ok_or("iunknown-wrapper-generation-exhausted")?
+    };
     let mut saved = Box::new(Slot {
         table,
         module,
@@ -409,10 +429,15 @@ pub unsafe fn install(rt: &Arc<HookRuntime>, object: usize) -> Result<Installati
         protection: std::array::from_fn(|_| AtomicU32::new(0)),
     });
     let pointer = &mut *saved as *mut Slot;
+    if reusable.is_some() {
+        // The wrapper identity was already published once.
+        saved.published.store(true, Ordering::Release);
+    }
     if index == registry.len() {
         registry.push(Some(saved));
-    } else {
-        registry[index] = Some(saved);
+    } else if let Some(old) = registry[index].replace(saved) {
+        // A wrapper may have loaded the old pointer; never free it.
+        Box::leak(old);
     }
     MODULES[index].store(module, Ordering::Release);
     MODULE_EPOCHS[index].store(epoch, Ordering::Release);

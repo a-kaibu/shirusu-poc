@@ -413,8 +413,10 @@ pub(super) fn is_existing_detour(target: usize, detour: usize, bitness: u32, byt
     })
 }
 
-/// `target` の近く（±2GB）に実行可能メモリを確保する。近くに空きが
+/// `target` の近く（±2GB）にトランポリン用のメモリを確保する。近くに空きが
 /// 無ければ None（呼び出し側は全体確保＋絶対ジャンプへ切り替える）。
+/// 書き込み中だけ読み書き可能で、書き終えたら実行・読み取り専用にする
+/// （RWX のまま残さない。2026-11-14 レビュー P3-6）。
 pub(super) fn alloc_near(target: usize, size: usize) -> Option<usize> {
     const STEP: usize = 0x1_0000; // 64KB 境界
     const MAX_TRIES: usize = 256; // ±16MB まで探す
@@ -427,7 +429,7 @@ pub(super) fn alloc_near(target: usize, size: usize) -> Option<usize> {
                     cand as *const c_void,
                     size,
                     MEM_COMMIT | MEM_RESERVE,
-                    PAGE_EXECUTE_READWRITE,
+                    PAGE_READWRITE,
                 )
             };
             if !p.is_null() {
@@ -604,7 +606,52 @@ pub(super) static TRAMPOLINE_ALLOCATIONS: std::sync::atomic::AtomicUsize =
 
 pub(super) struct TrampolineAllocation {
     address: usize,
-    published: bool,
+    pub(super) published: bool,
+    /// Taken from [`RETIRED_TRAMPOLINES`]: already charged and already
+    /// executable. If not published again, it goes back to the pool.
+    reused_for: Option<usize>,
+}
+
+/// A trampoline whose hook was restored. Its page is never written again, so
+/// a late passthrough caller may still run it. A re-attach that would write
+/// the same bytes for the same target reuses it instead of allocating, so
+/// repeated attaches to one process do not exhaust the budget (2026-11-14
+/// review P3-6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RetiredTrampoline {
+    pub(super) target: usize,
+    pub(super) address: usize,
+}
+
+pub(super) static RETIRED_TRAMPOLINES: std::sync::Mutex<Vec<RetiredTrampoline>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Remember trampolines of restored hooks. Call only after threads resume.
+pub(super) fn retire_trampolines(retired: impl IntoIterator<Item = RetiredTrampoline>) {
+    let mut pool = RETIRED_TRAMPOLINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for t in retired {
+        if !pool.contains(&t) {
+            pool.push(t);
+        }
+    }
+}
+
+fn take_retired(target: usize) -> Vec<usize> {
+    let mut pool = RETIRED_TRAMPOLINES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = Vec::new();
+    pool.retain(|t| {
+        if t.target == target {
+            taken.push(t.address);
+            false
+        } else {
+            true
+        }
+    });
+    taken
 }
 
 impl TrampolineAllocation {
@@ -620,6 +667,7 @@ impl TrampolineAllocation {
                     return Ok(Self {
                         address: 0,
                         published: false,
+                        reused_for: None,
                     })
                 }
                 Err(actual) => count = actual,
@@ -630,6 +678,16 @@ impl TrampolineAllocation {
 
 impl Drop for TrampolineAllocation {
     fn drop(&mut self) {
+        if let Some(target) = self.reused_for {
+            if !self.published {
+                // Dropped after thread resume, like every prepared owner.
+                retire_trampolines([RetiredTrampoline {
+                    target,
+                    address: self.address,
+                }]);
+            }
+            return;
+        }
         if !self.published {
             if self.address != 0 {
                 // SAFETY: no original slot or patched entry has exposed this
@@ -644,13 +702,127 @@ impl Drop for TrampolineAllocation {
     }
 }
 
+const TRAMPOLINE_SIZE: usize = 0x1000;
+const RELAY_OFFSET: usize = 0xf00;
+
+/// Everything written into one trampoline page, and the patch for the target.
+struct TrampolineLayout {
+    code: Vec<u8>,
+    /// Entry stub or near relay at `RELAY_OFFSET`.
+    relay: Option<Vec<u8>>,
+    patch: Vec<u8>,
+    caller_boundary: bool,
+}
+
+/// Compute the page contents for a trampoline at `trampoline`. Pure: the
+/// same plan, address and Detour give the same bytes.
+fn trampoline_layout(
+    p: &PlannedInline,
+    trampoline: usize,
+    bitness: u32,
+) -> Result<TrampolineLayout, &'static str> {
+    let code = build_trampoline(&p.plan, trampoline as u64).map_err(|e| e.reason())?;
+    // L23: API-table hooks enter through a stub that hands the caller's return
+    // address to the Detour. It lives in this allocation, so it is retained with
+    // the trampoline. Without a reachable stub, fall back to the direct patch
+    // and record every caller, as before.
+    let relay_at = trampoline + RELAY_OFFSET;
+    let stub = match (&p.slot, crate::caller::entry_slot_offset()) {
+        (InlineOriginalSlot::Api(_), Some(slot)) => {
+            let entry = build_patch(p.target as u64, relay_at as u64, bitness);
+            let stub_code =
+                crate::caller::entry_stub_bytes(relay_at as u64, p.detour as u64, bitness, slot);
+            (entry.len() <= p.plan.patch_len
+                && code.len() <= RELAY_OFFSET
+                && RELAY_OFFSET + stub_code.len() <= TRAMPOLINE_SIZE)
+                .then_some((entry, stub_code))
+        }
+        _ => None,
+    };
+    let caller_boundary = stub.is_some();
+    let direct_patch = build_patch(p.target as u64, p.detour as u64, bitness);
+    let (patch, relay) = if let Some((entry, stub_code)) = stub {
+        (entry, Some(stub_code))
+    } else if direct_patch.len() > p.plan.patch_len {
+        let entry = build_patch(p.target as u64, relay_at as u64, bitness);
+        if bitness != 64 || entry.len() > p.plan.patch_len || code.len() > RELAY_OFFSET {
+            return Err("near-relay-unavailable");
+        }
+        (
+            entry,
+            Some(build_patch(relay_at as u64, p.detour as u64, bitness)),
+        )
+    } else {
+        (direct_patch, None)
+    };
+    if code.len() > RELAY_OFFSET {
+        return Err("trampoline-too-large");
+    }
+    Ok(TrampolineLayout {
+        code,
+        relay,
+        patch,
+        caller_boundary,
+    })
+}
+
+fn page_holds(trampoline: usize, layout: &TrampolineLayout) -> bool {
+    let holds = |at: usize, bytes: &[u8]| {
+        let mut seen = vec![0u8; bytes.len()];
+        ProcessMemory.read_exact(at as u64, &mut seen) && seen == bytes
+    };
+    holds(trampoline, &layout.code)
+        && layout
+            .relay
+            .as_ref()
+            .is_none_or(|relay| holds(trampoline + RELAY_OFFSET, relay))
+}
+
+fn inline_hook(p: &PlannedInline, trampoline: usize, layout: &TrampolineLayout) -> InlineHook {
+    InlineHook {
+        api_id: p.slot.report_id(),
+        target: p.target,
+        trampoline,
+        trampoline_size: TRAMPOLINE_SIZE,
+        stolen_len: p.plan.stolen_len,
+        original_bytes: p.original_bytes.clone(),
+        patched_len: layout.patch.len(),
+        installed_bytes: layout.patch.clone(),
+        restoration: InlineRestoration::default(),
+        caller_boundary: layout.caller_boundary,
+    }
+}
+
 /// Prepare the trampoline and patch bytes before suspending any thread.
 pub(super) fn prepare_inline(
     p: &PlannedInline,
     bitness: u32,
 ) -> Result<(InlineHook, Vec<u8>, TrampolineAllocation), &'static str> {
-    const TRAMPOLINE_SIZE: usize = 0x1000;
-    const RELAY_OFFSET: usize = 0xf00;
+    // Reuse a retired trampoline that already holds exactly these bytes.
+    let mut reused = None;
+    let mut unsuitable = Vec::new();
+    for address in take_retired(p.target) {
+        match trampoline_layout(p, address, bitness) {
+            Ok(layout) if reused.is_none() && page_holds(address, &layout) => {
+                reused = Some((address, layout));
+            }
+            _ => unsuitable.push(RetiredTrampoline {
+                target: p.target,
+                address,
+            }),
+        }
+    }
+    retire_trampolines(unsuitable);
+    if let Some((address, layout)) = reused {
+        let allocation = TrampolineAllocation {
+            address,
+            published: false,
+            reused_for: Some(p.target),
+        };
+        let patch = layout.patch.clone();
+        return Ok((inline_hook(p, address, &layout), patch, allocation));
+    }
+
     let mut allocation = TrampolineAllocation::reserve()?;
     let trampoline = match alloc_near(p.target, TRAMPOLINE_SIZE) {
         Some(t) => t,
@@ -661,7 +833,7 @@ pub(super) fn prepare_inline(
                     std::ptr::null(),
                     TRAMPOLINE_SIZE,
                     MEM_COMMIT | MEM_RESERVE,
-                    PAGE_EXECUTE_READWRITE,
+                    PAGE_READWRITE,
                 )
             };
             if t.is_null() {
@@ -671,57 +843,29 @@ pub(super) fn prepare_inline(
         }
     };
     allocation.address = trampoline;
-    let code = match build_trampoline(&p.plan, trampoline as u64) {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(e.reason());
-        }
-    };
-    // L23: API-table hooks enter through a stub that hands the caller's return
-    // address to the Detour. It lives in this allocation, so it is retained with
-    // the trampoline. Without a reachable stub, fall back to the direct patch
-    // and record every caller, as before.
-    let stub = match (&p.slot, crate::caller::entry_slot_offset()) {
-        (InlineOriginalSlot::Api(_), Some(slot)) => {
-            let stub = trampoline + RELAY_OFFSET;
-            let entry = build_patch(p.target as u64, stub as u64, bitness);
-            let stub_code =
-                crate::caller::entry_stub_bytes(stub as u64, p.detour as u64, bitness, slot);
-            (entry.len() <= p.plan.patch_len
-                && code.len() <= RELAY_OFFSET
-                && RELAY_OFFSET + stub_code.len() <= TRAMPOLINE_SIZE)
-                .then_some((stub, entry, stub_code))
-        }
-        _ => None,
-    };
-    let caller_boundary = stub.is_some();
-    let direct_patch = build_patch(p.target as u64, p.detour as u64, bitness);
-    let patch = if let Some((stub, entry, stub_code)) = stub {
-        // SAFETY: stub lies inside the freshly allocated executable region.
-        unsafe {
-            std::ptr::copy_nonoverlapping(stub_code.as_ptr(), stub as *mut u8, stub_code.len());
-        }
-        entry
-    } else if direct_patch.len() > p.plan.patch_len {
-        let relay = trampoline + RELAY_OFFSET;
-        let entry = build_patch(p.target as u64, relay as u64, bitness);
-        if bitness != 64 || entry.len() > p.plan.patch_len || code.len() > RELAY_OFFSET {
-            return Err("near-relay-unavailable");
-        }
-        let relay_code = build_patch(relay as u64, p.detour as u64, bitness);
-        unsafe {
-            std::ptr::copy_nonoverlapping(relay_code.as_ptr(), relay as *mut u8, relay_code.len());
-        }
-        entry
-    } else {
-        direct_patch
-    };
-    if code.len() > RELAY_OFFSET {
-        return Err("trampoline-too-large");
-    }
-    // SAFETY: 確保したての実行可能領域へ書き込む。
+    let layout = trampoline_layout(p, trampoline, bitness)?;
+    // SAFETY: 確保したての読み書き可能な領域へ書き込み、実行・読み取り専用へ
+    // 切り替える。まだ誰にも公開していない。
     unsafe {
-        std::ptr::copy_nonoverlapping(code.as_ptr(), trampoline as *mut u8, code.len());
+        std::ptr::copy_nonoverlapping(
+            layout.code.as_ptr(),
+            trampoline as *mut u8,
+            layout.code.len(),
+        );
+        if let Some(relay) = &layout.relay {
+            let at = (trampoline + RELAY_OFFSET) as *mut u8;
+            std::ptr::copy_nonoverlapping(relay.as_ptr(), at, relay.len());
+        }
+        let mut old = 0;
+        if VirtualProtect(
+            trampoline as *const c_void,
+            TRAMPOLINE_SIZE,
+            PAGE_EXECUTE_READ,
+            &mut old,
+        ) == 0
+        {
+            return Err("protect-failed");
+        }
         if FlushInstructionCache(
             GetCurrentProcess(),
             trampoline as *const c_void,
@@ -731,22 +875,8 @@ pub(super) fn prepare_inline(
             return Err("flush-failed");
         }
     }
-    Ok((
-        InlineHook {
-            api_id: p.slot.report_id(),
-            target: p.target,
-            trampoline,
-            trampoline_size: TRAMPOLINE_SIZE,
-            stolen_len: p.plan.stolen_len,
-            original_bytes: p.original_bytes.clone(),
-            patched_len: patch.len(),
-            installed_bytes: patch.clone(),
-            restoration: InlineRestoration::default(),
-            caller_boundary,
-        },
-        patch,
-        allocation,
-    ))
+    let patch = layout.patch.clone();
+    Ok((inline_hook(p, trampoline, &layout), patch, allocation))
 }
 
 /// Allocate/decode before suspension; the stopped interval only inspects IPs,
@@ -936,6 +1066,16 @@ pub(super) unsafe fn uninstall_inline_indices(installed: &[InlineHook]) -> Vec<u
         }
     }
     suspender.resume();
+    retire_trampolines(
+        installed
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !unrestored.contains(index))
+            .map(|(_, h)| RetiredTrampoline {
+                target: h.target,
+                address: h.trampoline,
+            }),
+    );
     unrestored
 }
 

@@ -911,6 +911,60 @@ fn unpublished_trampolines_release_memory_and_budget() {
 }
 
 #[test]
+fn retired_trampolines_are_reused_and_never_writable() {
+    // Review 2026-11-14 P3-6: a re-attach reuses the restored hook's
+    // trampoline instead of spending the budget, and pages are not RWX.
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+    let bitness = usize::BITS;
+    let target = alloc_filled_page(0x90) as usize;
+    let bytes = [0x90u8; 32];
+    let plan = plan_with_near_relay(&bytes, target as u64, (target + 256) as u64, bitness).unwrap();
+    let planned = PlannedInline {
+        slot: InlineOriginalSlot::Api(18),
+        target,
+        detour: target + 256,
+        original_bytes: bytes[..plan.stolen_len].to_vec(),
+        plan,
+    };
+    let (hook, _, mut allocation) = prepare_inline(&planned, bitness).unwrap();
+    let protection = |address: usize| {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                VirtualQuery(
+                    address as *const c_void,
+                    &mut info,
+                    std::mem::size_of_val(&info),
+                )
+            },
+            0
+        );
+        info.Protect
+    };
+    assert_eq!(protection(hook.trampoline), PAGE_EXECUTE_READ);
+    // Pretend it was published and then restored.
+    allocation.published = true;
+    drop(allocation);
+    retire_trampolines([RetiredTrampoline {
+        target,
+        address: hook.trampoline,
+    }]);
+    let (again, patch, allocation) = prepare_inline(&planned, bitness).unwrap();
+    assert_eq!(again.trampoline, hook.trampoline, "reused");
+    assert_eq!(patch, hook.installed_bytes);
+    // Not published again: it returns to the pool, not to the allocator.
+    drop(allocation);
+    assert!(RETIRED_TRAMPOLINES
+        .lock()
+        .unwrap()
+        .contains(&RetiredTrampoline {
+            target,
+            address: hook.trampoline
+        }));
+    unsafe { VirtualFree(target as *mut c_void, 0, MEM_RELEASE) };
+}
+
+#[test]
 fn iat_write_rejects_unaligned_slots_without_touching_memory() {
     let mut storage = [0x55usize; 2];
     let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<usize>() };
