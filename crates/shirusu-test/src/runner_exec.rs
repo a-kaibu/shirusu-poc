@@ -1432,6 +1432,101 @@ mod tests {
         }
     }
 
+    /// すべての対応シグネチャで、引数が順に正しい幅で渡り、戻り値の幅が
+    /// 保たれる（ポインタは全幅、DWORD・BOOL は 32bit、負の BOOL は符号拡張
+    /// しない）。引数の個数違いは未対応として呼ばない。
+    #[test]
+    fn raw_dispatch_passes_every_argument_for_every_signature() {
+        use std::cell::RefCell;
+        use std::ffi::c_void;
+        thread_local! {
+            static SEEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+        fn seen(v: &[u64]) {
+            SEEN.with(|s| s.borrow_mut().extend_from_slice(v));
+        }
+        fn take() -> Vec<u64> {
+            SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+        }
+        unsafe extern "system" fn create(
+            a: *const u16,
+            b: u32,
+            c: u32,
+            d: *mut c_void,
+            e: u32,
+            f: u32,
+            g: *mut c_void,
+        ) -> *mut c_void {
+            seen(&[a as u64, b as u64, c as u64, d as u64, e as u64, f as u64, g as u64]);
+            usize::MAX as *mut c_void
+        }
+        unsafe extern "system" fn rw(
+            a: *mut c_void,
+            b: *mut c_void,
+            c: u32,
+            d: *mut u32,
+            e: *mut c_void,
+        ) -> i32 {
+            seen(&[a as u64, b as u64, c as u64, d as u64, e as u64]);
+            -2
+        }
+        unsafe extern "system" fn one_handle(a: *mut c_void) -> i32 {
+            seen(&[a as u64]);
+            1
+        }
+        unsafe extern "system" fn size(a: *mut c_void, b: *mut u32) -> u32 {
+            seen(&[a as u64, b as u64]);
+            0xFFFF_FFFF
+        }
+        unsafe extern "system" fn one_path(a: *const u16) -> i32 {
+            seen(&[a as u64]);
+            0
+        }
+        unsafe extern "system" fn two(a: *const u16, b: *mut c_void) -> i32 {
+            seen(&[a as u64, b as u64]);
+            7
+        }
+        unsafe extern "system" fn sleep(a: u32) {
+            seen(&[a as u64]);
+        }
+        let wide = |i: usize| (0x1000_0000usize.wrapping_mul(i + 1)) | 0x10;
+        // (関数名, アドレス, 引数の数, 期待する戻り値, 引数を u32 に切る位置)
+        let cases: Vec<(&str, usize, usize, Option<u64>, &[usize])> = vec![
+            ("CreateFileW", create as *const () as usize, 7, Some(usize::MAX as u64), &[1, 2, 4, 5]),
+            ("ReadFile", rw as *const () as usize, 5, Some(0xFFFF_FFFE), &[2]),
+            ("WriteFile", rw as *const () as usize, 5, Some(0xFFFF_FFFE), &[2]),
+            ("CloseHandle", one_handle as *const () as usize, 1, Some(1), &[]),
+            ("FlushFileBuffers", one_handle as *const () as usize, 1, Some(1), &[]),
+            ("GetFileSize", size as *const () as usize, 2, Some(0xFFFF_FFFF), &[]),
+            ("DeleteFileW", one_path as *const () as usize, 1, Some(0), &[]),
+            ("RemoveDirectoryW", one_path as *const () as usize, 1, Some(0), &[]),
+            ("CreateDirectoryW", two as *const () as usize, 2, Some(7), &[]),
+            ("MoveFileW", two as *const () as usize, 2, Some(7), &[]),
+            ("Sleep", sleep as *const () as usize, 1, None, &[0]),
+        ];
+        for (function, addr, arity, ret, narrow) in cases {
+            let args: Vec<usize> = (0..arity).map(wide).collect();
+            let got = unsafe { call_raw(addr, function, &args) };
+            assert_eq!(got, Some(ret), "{function} return");
+            let expected: Vec<u64> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if narrow.contains(&i) {
+                        *a as u32 as u64
+                    } else {
+                        *a as u64
+                    }
+                })
+                .collect();
+            assert_eq!(take(), expected, "{function} arguments");
+            // 引数の数が合わなければ呼ばない。
+            let short: Vec<usize> = args[..arity - 1].to_vec();
+            assert_eq!(unsafe { call_raw(addr, function, &short) }, None, "{function} short");
+            assert!(take().is_empty());
+        }
+    }
+
     fn file_flow() -> Vec<Step> {
         vec![
             Step {

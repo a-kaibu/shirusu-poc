@@ -1609,3 +1609,157 @@ fn coverage_profile_counts_are_not_invented_event_records() {
     assert!(out.contains("\"enter\": 0"));
     assert!(out.contains("\"observation\": \"observed\""));
 }
+
+/// `coverage` のテキスト出力（JSON 以外）: 静的インポート・フック証拠・
+/// 観測数・profile 集計・取得状態を API ごとに分けて表示し、制限事項を
+/// 必ず先頭に出す。名前も序数も無いインポートは unknown-import とする。
+#[test]
+fn coverage_text_report_lists_each_evidence_kind() {
+    use shirusu_trace::proto::{ApiProfile, HookEvidence, ProfileSummary};
+    use shirusu_trace::static_dep::{StaticDependency, StaticImport};
+    let env = CaptureEnvironment {
+        session: SessionMetadata {
+            session_id: 7,
+            qpc_frequency: 10_000_000,
+            ..Default::default()
+        },
+        target_description: "fixture.exe".into(),
+        capture_config: "mode=full".into(),
+        static_dependencies: vec![StaticDependency {
+            module: "KERNEL32.DLL".into(),
+            imports: vec![
+                StaticImport::named("ReadFile"),
+                StaticImport::named("ReadFile"),
+                StaticImport {
+                    name: None,
+                    ordinal: None,
+                },
+            ],
+        }],
+        hook_evidence: vec![
+            HookEvidence {
+                api_id: 2,
+                module: "kernel32.dll".into(),
+                function: "ReadFile".into(),
+                method: "iat".into(),
+                outcome: "installed".into(),
+                reason: "ok".into(),
+                scope: "main-module".into(),
+                semantic_level: 2,
+                semantic_detail: "synchronous output only".into(),
+            },
+            HookEvidence {
+                api_id: 2,
+                module: "kernel32.dll".into(),
+                function: "ReadFile".into(),
+                method: "inline".into(),
+                outcome: "not-installed".into(),
+                reason: "thread-set-changed".into(),
+                scope: "exports".into(),
+                semantic_level: 2,
+                semantic_detail: "second evidence is listed but not repeated".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let mut writer = TraceWriter::new(Vec::new(), env).unwrap();
+    writer
+        .write_profile_summary(&ProfileSummary {
+            qpc_frequency: 10_000_000,
+            total_events_seen: 6,
+            apis: vec![
+                ApiProfile {
+                    api_id: 2,
+                    enters: 3,
+                    leaves: 2,
+                    calls: 3,
+                    ..Default::default()
+                },
+                // どの証拠にも結び付かない ID は今日の表で解釈しない。
+                ApiProfile {
+                    api_id: 4242,
+                    enters: 1,
+                    leaves: 1,
+                    calls: 1,
+                    ..Default::default()
+                },
+            ],
+        })
+        .unwrap();
+    let bytes = writer
+        .finish(FinalizationInfo {
+            event_integrity: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    let (out, err, code) = run_cli_bytes(&bytes, &["coverage", "sample.trace"]);
+    assert_eq!(code, Some(0), "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "API coverage evidence: sample.trace");
+    assert!(lines[1].contains("Zero observations never prove an API was unused"));
+    assert!(out.contains("capture_config: mode=full"), "{out}");
+    assert!(out.contains("finalized_cleanly=true event_integrity=Complete"), "{out}");
+    assert!(
+        out.contains(
+            "kernel32!ReadFile: static=detected enter=0 leave=0 other=0 decode_errors=0 \
+             hooks=[iat=installed (ok, main-module); inline=not-installed (thread-set-changed, exports)]"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("  profile aggregates: enter=3 leave=2 (separate from retained events)"));
+    // 同じインポート元は 1 回だけ。
+    assert_eq!(out.matches("  import source: main-executable: fixture.exe").count(), 2, "{out}");
+    assert!(out.contains("  declared semantics: L2 synchronous output only"));
+    assert!(!out.contains("second evidence is listed but not repeated"));
+    assert!(out.contains("kernel32!unknown-import: static=detected"), "{out}");
+    assert!(
+        out.contains("unknown-api-id:4242: static=not-detected-or-unavailable enter=0 leave=0 other=0 decode_errors=0 hooks=[unknown]"),
+        "{out}"
+    );
+    assert!(out.contains("  profile aggregates: enter=1 leave=1"));
+}
+
+/// 観測イベントのある Trace のテキスト出力と、Environment の無い Trace の
+/// 既定表示（capture_config・event_integrity が unknown）。
+#[test]
+fn coverage_text_report_for_observed_and_bare_traces() {
+    let (out, err, code) = run_cli_bytes(&sample_trace_bytes(), &["coverage", "sample.trace"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("enter=1"), "{out}");
+    assert!(out.contains("observed capture states: {\"captured\": "), "{out}");
+    let bare = TraceWriter::new(
+        Vec::new(),
+        CaptureEnvironment {
+            session: SessionMetadata {
+                session_id: 1,
+                qpc_frequency: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .finish(FinalizationInfo {
+        capture_coverage: 3,
+        event_integrity: 3,
+        semantic_completeness: 3,
+        notes: Vec::new(),
+    })
+    .unwrap();
+    // 完全性が Unknown の Trace は損失なしと言えないため終了 1。
+    let (out, err, code) = run_cli_bytes(&bare, &["coverage", "sample.trace"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(out.contains("capture_config: \n"), "{out}");
+    assert!(out.contains("event_integrity=Unknown"), "{out}");
+    // 損失のある Trace はテキストでも終了 1。
+    let lossy = trace_bytes_with(
+        FinalizationInfo {
+            event_integrity: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    let (_, err, code) = run_cli_bytes(&lossy, &["coverage", "sample.trace"]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("has event loss"), "{err}");
+}
