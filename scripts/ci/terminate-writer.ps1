@@ -78,6 +78,13 @@ try {
     if ($api.Count -ne 1 -or $api[0].enter -lt 1 -or $api[0].leave -lt 1) {
         throw "capture did not observe GetCurrentProcessId around terminated writers"
     }
+    # V8: the threads started after each termination round must all be
+    # recorded (48 rounds x 8 threads x 32 calls in terminate-writer.cpp).
+    # A Slot left owned by a terminated writer would leave them unrecorded.
+    $expected = 48 * 8 * 32
+    if ($api[0].enter -lt $expected -or $api[0].leave -lt $expected) {
+        throw "terminated-writer capture recorded $($api[0].enter) enters / $($api[0].leave) leaves, at least $expected expected from the threads started after terminations"
+    }
     # An event cut off inside a terminated writer is counted as lost, so the
     # Trace must not claim completeness while losses are recorded.
     $status = $summary.integrity.status

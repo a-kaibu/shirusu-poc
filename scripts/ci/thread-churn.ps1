@@ -42,7 +42,11 @@ try {
     $recorderProcess = [System.Diagnostics.Process]::Start($start)
     Wait-Marker "churn.trace"
     # Keep creating threads after initialization as well as during patching.
-    Start-Sleep -Milliseconds 200
+    # V8: from here the target counts the threads it starts; a second of
+    # churn starts far more threads than there are Slots, so every one is
+    # recorded only if Slots are reclaimed.
+    New-Item -ItemType File (Join-Path $work "count") | Out-Null
+    Start-Sleep -Milliseconds 1000
     New-Item -ItemType File (Join-Path $work "stop") | Out-Null
     if (-not $recorderProcess.WaitForExit(30000)) { throw "churn recorder did not finish" }
     if ($recorderProcess.ExitCode -notin @(0,2)) { throw "churn capture failed: $($recorderProcess.ExitCode)" }
@@ -56,6 +60,14 @@ try {
     if ($api.Count -ne 1 -or $api[0].enter -lt 1 -or $api[0].leave -lt 1) {
         throw "thread churn capture did not observe GetCurrentProcessId"
     }
+    # V8: each counted thread calls GetCurrentProcessId 32 times.
+    $counted = [double](Get-Content (Join-Path $work "counted.txt") -Raw)
+    $expected = 32 * $counted
+    if ($counted -lt 16) { throw "thread churn counted only $counted threads while recording" }
+    if ($api[0].enter -lt $expected -or $api[0].leave -lt $expected) {
+        throw "thread churn recorded $($api[0].enter) GetCurrentProcessId calls, $expected expected from $counted threads (loss records: $($summary.integrity.total_loss_count))"
+    }
+    Write-Host "Thread churn: $counted threads while recording, $($api[0].enter) calls recorded ($expected expected)"
     Write-Host "Thread creation during attach passed ($arch)"
 } finally {
     foreach ($process in @($recorderProcess, $targetProcess)) {
