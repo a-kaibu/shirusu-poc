@@ -35,10 +35,17 @@
    - HeavyFence = FALSE: the remote side's flush is missing.
    - TakeoverOnTimeout = TRUE: the waiting side proceeds after a timeout.
    - CheckLiveness = FALSE: the waiting side ignores termination (old code).
+   - LockLiveness = FALSE: a remote user waiting for the exclusive lock
+     ignores that its holder is the terminated owner (the lock was a Mutex,
+     so an owner cut off on its exclusive path blocked every remote user).
+
+   The exclusive lock is two flags in memory, lockO (held by the owner) and
+   lockR (held by the remote user). It is taken with a locked
+   compare-exchange, a full barrier that also drains the taker's buffer.
 *)
 EXTENDS Naturals, Sequences
 
-CONSTANTS HeavyFence, TakeoverOnTimeout, CheckLiveness, AllowTerminate,
+CONSTANTS HeavyFence, TakeoverOnTimeout, CheckLiveness, LockLiveness, AllowTerminate,
           Rounds, MaxBuf
 
 VARIABLES mem, obuf, tbuf, opc, rpc, tpc, cpc, rounds,
@@ -47,7 +54,7 @@ VARIABLES mem, obuf, tbuf, opc, rpc, tpc, cpc, rounds,
 vars == <<mem, obuf, tbuf, opc, rpc, tpc, cpc, rounds,
           poisoned, abandoned, freed, odead, tdead>>
 
-Vars == {"busy", "remote", "hz", "gate"}
+Vars == {"busy", "remote", "hz", "gate", "lockO", "lockR"}
 
 \* TSO load: the thread's newest buffered store to v, else memory.
 Read(buf, v) ==
@@ -75,8 +82,9 @@ Init ==
 
 -----------------------------------------------------------------------------
 (* WriterCell owner: try_owner / OwnerGuard::drop. "inside" is the use of
-   the writer. A backed-off owner takes the exclusive path, modeled as
-   waiting until the remote user is done. *)
+   the writer. A backed-off owner takes the exclusive path like any remote
+   user: lock, set remote, use ("xinside"), clear remote and unlock. Its own
+   owner_busy is false there, so it does not wait for itself. *)
 OSetBusy ==
   /\ ~odead /\ opc = "idle" /\ Len(obuf) < MaxBuf
   /\ obuf' = Append(obuf, St("busy", TRUE)) /\ opc' = "check"
@@ -90,9 +98,22 @@ OBackoff ==
   /\ obuf' = Append(obuf, St("busy", FALSE)) /\ opc' = "blocked"
   /\ UNCHANGED <<mem, tbuf, rpc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
 OBlocked ==
-  /\ ~odead /\ opc = "blocked" /\ ~Read(obuf, "remote")
-  /\ opc' = "idle"
+  /\ ~odead /\ opc = "blocked" /\ ~mem["lockO"] /\ ~mem["lockR"]
+  /\ mem' = [ApplyAll(mem, obuf) EXCEPT !["lockO"] = TRUE] /\ obuf' = <<>>
+  /\ opc' = "xset"
+  /\ UNCHANGED <<tbuf, rpc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
+\* remote = true; heavy fence (the owner's buffer is already empty).
+OXSet ==
+  /\ ~odead /\ opc = "xset" /\ obuf = <<>>
+  /\ mem' = [mem EXCEPT !["remote"] = TRUE] /\ opc' = "xinside"
+  /\ UNCHANGED <<obuf, tbuf, rpc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
+OXUse ==
+  /\ ~odead /\ opc = "xinside" /\ opc' = "xclear"
   /\ UNCHANGED <<mem, obuf, tbuf, rpc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
+OXClear ==
+  /\ ~odead /\ opc = "xclear"
+  /\ mem' = [mem EXCEPT !["remote"] = FALSE, !["lockO"] = FALSE] /\ opc' = "idle"
+  /\ UNCHANGED <<obuf, tbuf, rpc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
 OUse ==
   /\ ~odead /\ opc = "inside"
   /\ opc' = "leave"
@@ -108,12 +129,28 @@ OCommit ==
 \* TerminateThread at any step. Cut off while using the writer: poisoned.
 OTerminate ==
   /\ AllowTerminate /\ ~odead
-  /\ odead' = TRUE /\ opc' = "dead" /\ poisoned' = (opc \in {"inside", "leave"})
+  /\ odead' = TRUE /\ opc' = "dead"
+  /\ poisoned' = (opc \in {"inside", "leave", "xinside", "xclear"})
   /\ UNCHANGED <<mem, obuf, tbuf, rpc, tpc, cpc, rounds, abandoned, freed, tdead>>
 
 (* WriterCell::exclusive. *)
 RStart ==
-  /\ rpc = "idle" /\ rounds < Rounds
+  /\ rpc = "idle" /\ rounds < Rounds /\ rpc' = "lock"
+  /\ UNCHANGED <<mem, obuf, tbuf, opc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
+\* lock_exclusive: take the lock, or give up when its holder is the owner and
+\* the owner is proven terminated (then close the fast path for good).
+RLock ==
+  /\ rpc = "lock"
+  /\ \/ ~mem["lockO"] /\ ~mem["lockR"] /\ ~abandoned
+        /\ mem' = [mem EXCEPT !["lockR"] = TRUE] /\ rpc' = "set" /\ UNCHANGED abandoned
+     \/ ~mem["lockO"] /\ ~mem["lockR"] /\ abandoned
+        /\ rpc' = "abandoned" /\ UNCHANGED <<mem, abandoned>>
+     \/ mem["lockO"] /\ CheckLiveness /\ LockLiveness /\ OwnerTerminated
+        /\ mem' = [mem EXCEPT !["remote"] = TRUE]
+        /\ rpc' = "abandoned" /\ abandoned' = TRUE
+  /\ UNCHANGED <<obuf, tbuf, opc, tpc, cpc, rounds, poisoned, freed, odead, tdead>>
+RSet ==
+  /\ rpc = "set"
   /\ mem' = [mem EXCEPT !["remote"] = TRUE] /\ rpc' = "fence"
   /\ UNCHANGED <<obuf, tbuf, opc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
 RFence ==
@@ -134,7 +171,8 @@ RUse ==
   /\ UNCHANGED <<mem, obuf, tbuf, opc, tpc, cpc, rounds, poisoned, abandoned, freed, odead, tdead>>
 RClear ==
   /\ rpc = "clear"
-  /\ mem' = [mem EXCEPT !["remote"] = FALSE] /\ rpc' = "idle" /\ rounds' = rounds + 1
+  /\ mem' = [mem EXCEPT !["remote"] = FALSE, !["lockR"] = FALSE]
+  /\ rpc' = "idle" /\ rounds' = rounds + 1
   /\ UNCHANGED <<obuf, tbuf, opc, tpc, cpc, poisoned, abandoned, freed, odead, tdead>>
 
 -----------------------------------------------------------------------------
@@ -188,7 +226,8 @@ CScan ==
 
 -----------------------------------------------------------------------------
 OwnerSteps == OSetBusy \/ OCheck \/ OBackoff \/ OBlocked \/ OUse \/ OLeave
-RemoteSteps == RStart \/ RFence \/ RWait \/ RUse \/ RClear
+              \/ OXSet \/ OXUse \/ OXClear
+RemoteSteps == RStart \/ RLock \/ RSet \/ RFence \/ RWait \/ RUse \/ RClear
 HazardSteps == TPublish \/ TCheck \/ TUse \/ TClear
 ReclaimSteps == CClose \/ CFence \/ CScan
 
@@ -206,7 +245,7 @@ TypeOK ==
   /\ rounds \in 0..Rounds
 
 \* The owner and a remote user never use the writer at the same time.
-MutualExclusion == ~(opc \in {"inside", "leave"} /\ rpc = "inside")
+MutualExclusion == ~(opc \in {"inside", "leave", "xinside"} /\ rpc = "inside")
 \* A writer cut off mid-use is never used again.
 NoPoisonedUse == rpc = "inside" => ~poisoned
 \* An abandoned cell keeps the fast path closed (remote stays set).
@@ -215,6 +254,6 @@ AbandonedStaysClosed == abandoned => (mem["remote"] /\ rpc = "abandoned")
 HazardSafe == ~(freed /\ tpc = "use")
 
 \* Waiting never lasts forever, even when the owner was terminated.
-RemoteProgress == (rpc = "wait") ~> (rpc \in {"inside", "abandoned"})
+RemoteProgress == (rpc \in {"lock", "wait"}) ~> (rpc \in {"inside", "abandoned"})
 ReclaimProgress == (cpc = "scan") ~> (cpc = "freed")
 ==============================================================================

@@ -98,3 +98,4 @@ expect_violation AsymmetricHandshakeNoFenceHazard.cfg "Invariant HazardSafe is v
 expect_violation AsymmetricHandshakeTimeoutWriter.cfg "Invariant NoPoisonedUse is violated"
 expect_violation AsymmetricHandshakeTimeoutHazard.cfg "Invariant HazardSafe is violated"
 expect_violation AsymmetricHandshakeNoLiveness.cfg "Temporal propert(y|ies) RemoteProgress.* (was|were) violated"
+expect_violation AsymmetricHandshakeNoLockLiveness.cfg "Temporal propert(y|ies) RemoteProgress.* (was|were) violated"

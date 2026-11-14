@@ -20,6 +20,21 @@ $buildScript = Join-Path $work "build.cmd"
 Invoke-Native { cmd /d /c $buildScript } "terminate writer fixture ($arch)"
 $targetProcess = $null
 $recorderProcess = $null
+# Diagnostics for a hang: every thread's stack of the live target, read by a
+# noninvasive cdb attach (symbols from the debug build next to the DLL).
+function Write-TargetStacks {
+    $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\$arch\cdb.exe"
+    if (-not (Test-Path $kits) -or $null -eq $targetProcess -or $targetProcess.HasExited) {
+        Write-Host "target stacks: unavailable (cdb: $(Test-Path $kits))"
+        return
+    }
+    Write-Host "target stacks:"
+    $out = Join-Path $work "stacks.txt"
+    $cdb = Start-Process -FilePath $kits -NoNewWindow -PassThru -RedirectStandardOutput $out `
+        -ArgumentList @("-pv", "-p", "$($targetProcess.Id)", "-y", "`"$bin;$work`"", "-c", "`"~*kn 40;qd`"")
+    if (-not $cdb.WaitForExit(120000)) { $cdb.Kill(); Write-Host "cdb timed out" }
+    if (Test-Path $out) { Get-Content $out | Write-Host }
+}
 function Wait-Marker([string]$name) {
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while (-not (Test-Path (Join-Path $work $name))) {
@@ -28,7 +43,7 @@ function Wait-Marker([string]$name) {
             if (Test-Path $crash) { Write-Host "target crash report:"; Get-Content $crash | Write-Host }
             throw "attach target exited early: $($targetProcess.ExitCode)"
         }
-        if ([DateTime]::UtcNow -ge $deadline) { throw "timed out waiting for $name" }
+        if ([DateTime]::UtcNow -ge $deadline) { Write-TargetStacks; throw "timed out waiting for $name" }
         Start-Sleep -Milliseconds 20
     }
 }

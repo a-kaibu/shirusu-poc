@@ -33,12 +33,27 @@
 //! [`WriterCell::exclusive`] returns [`Access::OwnerTerminated`] without
 //! running its closure. The Ring keeps every event published before the
 //! termination; unpublished bytes are never published.
+//!
+//! The owner also reaches the writer through `exclusive` (after backing off
+//! from a pending remote user), so it can be terminated while holding the
+//! exclusive lock. That lock is therefore not a `Mutex` (an OS lock whose
+//! holder died stays held, blocking every later remote user): it records
+//! the holder's token, and a waiter that sees the terminated owner holding
+//! it abandons the cell the same way.
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Releases the exclusive lock on drop.
+struct ExclusiveGuard<'a>(&'a AtomicUsize);
+impl Drop for ExclusiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
 
 use shirusu_transport::ring::RingWriter;
 use shirusu_transport_win::ThreadLiveness;
@@ -58,8 +73,9 @@ pub(crate) struct WriterCell {
     owner: AtomicUsize,
     owner_busy: AtomicBool,
     remote: AtomicBool,
-    /// Serializes exclusive (non-owner) users among themselves.
-    exclusive: Mutex<()>,
+    /// Serializes `exclusive` users: the holder's thread token, 0 when free.
+    /// Not a `Mutex`, so a holder that was terminated can be recognized.
+    exclusive: AtomicUsize,
     /// The owner's liveness, set before `owner` is published (cold, once).
     /// Unset (taking it failed): the owner is treated as alive forever.
     owner_liveness: OnceLock<ThreadLiveness>,
@@ -95,7 +111,7 @@ const SPINS_PER_LIVENESS_CHECK: u32 = 64;
 
 // SAFETY: the writer is only reached through `try_owner` (its owning OS
 // thread, excluded from remote users by the handshake) or `exclusive`
-// (serialized by the mutex and the handshake). RingWriter is Send.
+// (serialized by the exclusive lock and the handshake). RingWriter is Send.
 unsafe impl Sync for WriterCell {}
 
 struct ClearOnDrop<'a>(&'a AtomicBool);
@@ -112,7 +128,7 @@ impl WriterCell {
             owner: AtomicUsize::new(0),
             owner_busy: AtomicBool::new(false),
             remote: AtomicBool::new(false),
-            exclusive: Mutex::new(()),
+            exclusive: AtomicUsize::new(0),
             owner_liveness: OnceLock::new(),
             claiming: Mutex::new(()),
             abandoned: AtomicBool::new(false),
@@ -193,7 +209,9 @@ impl WriterCell {
     #[cold]
     #[inline(never)]
     pub(crate) fn exclusive<R>(&self, f: impl FnOnce(&mut RingWriter) -> R) -> Access<R> {
-        let _serialized = self.exclusive.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_serialized) = self.lock_exclusive() else {
+            return Access::OwnerTerminated;
+        };
         if self.abandoned.load(Ordering::Acquire) {
             return Access::OwnerTerminated;
         }
@@ -214,6 +232,37 @@ impl WriterCell {
         // SAFETY: the mutex excludes other remote users and the handshake
         // excludes the owner until `remote` clears.
         Access::Done(f(unsafe { &mut *self.writer.get() }))
+    }
+
+    /// Take the exclusive lock. `None` when the terminated owner holds it: it
+    /// was cut off on its exclusive path, maybe inside the writer. The cell is
+    /// abandoned then and `remote` is set (the owner may have died before
+    /// setting it) so the fast path stays closed. A live holder is waited
+    /// for, however long it takes, as in the owner_busy wait.
+    fn lock_exclusive(&self) -> Option<ExclusiveGuard<'_>> {
+        let me = thread_token();
+        let mut spins = 0u32;
+        loop {
+            match self
+                .exclusive
+                .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(ExclusiveGuard(&self.exclusive)),
+                Err(0) => continue,
+                Err(holder) => {
+                    spins = spins.wrapping_add(1);
+                    if spins.is_multiple_of(SPINS_PER_LIVENESS_CHECK)
+                        && holder == self.owner.load(Ordering::Acquire)
+                        && self.owner_terminated()
+                    {
+                        self.remote.store(true, Ordering::Release);
+                        self.abandoned.store(true, Ordering::Release);
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// Fast path when possible, otherwise exclusive.
@@ -338,6 +387,56 @@ mod tests {
         // The fast path stays closed for any thread (TLS addresses recycle).
         assert!(cell.try_owner().is_none());
         assert_eq!(cell.exclusive(|_| ()), Access::OwnerTerminated);
+    }
+
+    /// The owner backs off to `exclusive` when a remote user is pending, so it
+    /// can be terminated holding the exclusive lock (seen on Windows CI: every
+    /// later remote user blocked on the lock, then the application hung).
+    #[test]
+    fn owner_terminated_holding_the_exclusive_lock_is_detected() {
+        let cell = cell();
+        let c = Arc::clone(&cell);
+        std::thread::spawn(move || {
+            drop(c.try_owner().expect("first user owns the cell"));
+            std::mem::forget(c.lock_exclusive().expect("lock is free"));
+        })
+        .join()
+        .unwrap();
+        let ran = AtomicBool::new(false);
+        assert_eq!(
+            cell.exclusive(|_| ran.store(true, Ordering::Relaxed)),
+            Access::OwnerTerminated
+        );
+        assert!(!ran.load(Ordering::Relaxed), "poisoned writer was used");
+        assert!(cell.is_abandoned());
+        assert!(cell.try_owner().is_none(), "fast path stays closed");
+    }
+
+    /// A live thread holding the exclusive lock is waited for, not overtaken.
+    #[test]
+    fn live_exclusive_holder_is_waited_for() {
+        let cell = cell();
+        cell.with(|_| ()); // the main thread owns the cell
+        let inside = Arc::new(AtomicBool::new(false));
+        let (c, i) = (Arc::clone(&cell), Arc::clone(&inside));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            c.exclusive(|_| {
+                i.store(true, Ordering::Release);
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                i.store(false, Ordering::Release);
+            })
+            .done()
+            .unwrap();
+        });
+        rx.recv().unwrap();
+        assert_eq!(
+            cell.exclusive(|_| inside.load(Ordering::Acquire)),
+            Access::Done(false)
+        );
+        holder.join().unwrap();
+        assert!(!cell.is_abandoned());
     }
 
     /// An owner that exited outside the fast path leaves a usable writer.

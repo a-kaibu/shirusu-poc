@@ -203,6 +203,7 @@ Ringを再利用できるのは、スレッドの終了をThread HandleのSignal
 - 所有者は最初に高速経路を取るとき（冷えた経路で1回）、自分のスレッドの複製Handle（`SYNCHRONIZE`のみ）を取る。Handleを持つ間はスレッドIDが再利用されないので、別のスレッドと取り違えない。
 - 排他取得は、所有者が生きている間は待つ。待つ間に所有者のHandleがSignal状態（終了済み）になったら待つのをやめる。終了したスレッドは二度と実行されず、その書き込みはすべて完了している。
 - 記録の途中で終了していた書き手は「放棄」とし、以後だれも使わない（書きかけのイベントの途中かもしれない）。`remote`を立てたままにして高速経路も閉じる。公開済みのイベントはそのままHostが回収し、書きかけの1件は`dropped_events`に数える。未公開のPayloadは公開しない。回収判定は公開済みDescriptorを読み終えたことだけで行う（Payloadの書き込み位置だけが先に進んでいることがあるため）。
+- 所有者は、重い側の操作（Hostが送るRingごとの通知の結び付けなど）が来ている間は、高速経路を降りて排他取得の経路で書く。この経路の排他ロックはMutexではなく、持ち主のスレッド識別子を記録する原子変数とする。所有者がロックを持ったまま終了すると、Mutexではロックが永久に解放されず、そのRingの以後の排他取得（スレッド終了の処理）がすべて止まるためである（v0.5の最初の実装で、WindowsのE2Eが停止した）。ロックを待つ側は、持ち主が所有者で、そのHandleが終了済みを示すときだけ待つのをやめ、書き手を放棄する（`remote`も立てる）。所有者でない持ち主は、生きている限り待つ。
 - 終了の検出は、新しいスレッドの初回記録でSlotが足りないとき、他のスレッドの終了通知のとき（50msに1回まで）、Shutdownのときに行う。生きているスレッド（一時停止中を含む）のRingには触れず、待ちもしない。
 - Hazard Slotも同様に所有者の複製Handleを持つ。終了したスレッドのHazardは走査時に取り下げてSlotを空ける。終了したスレッドはRuntimeを二度と参照しないので、Runtimeを解放してよい。
 
@@ -226,7 +227,7 @@ Ringを再利用できるのは、スレッドの終了をThread HandleのSignal
 3. ARM64でも、IPIが軽い側のプログラム順のある点にバリアを入れるという同じ論法が成り立つ。モデルが扱うのはStore→Loadの並べ替えだけであり、ARM64の実機検証は未実施である。
 4. Windows以外では軽い側も全順序フェンスを使う。したがってLinuxのテストやloomはWindowsの手順そのものを検査しない。
 
-性質（`tla/AsymmetricHandshake.tla`、TLCで検査）: 所有者と重い側が同時に書き手を使わない（MutualExclusion）、途中で止まった書き手を使わない（NoPoisonedUse）、放棄した書き手の高速経路は閉じたまま（AbandonedStaysClosed）、参照中のRuntimeを解放しない（HazardSafe）、所有者やHazardの持ち主が強制終了しても待ちは終わる（RemoteProgress、ReclaimProgress）。重い側のフラッシュを外した変種、時間切れで奪う変種、終了状態を見ない変種（v0.4の実装）では、それぞれ反例が出ることも`scripts/ci/tla.sh`で確かめる。Windows x86/x64の実機では、記録・Shutdown・再Attachを繰り返すストレステスト（`record_shutdown_reattach_stress`、最適化ビルド）を実行する。
+性質（`tla/AsymmetricHandshake.tla`、TLCで検査）: 所有者と重い側が同時に書き手を使わない（MutualExclusion）、途中で止まった書き手を使わない（NoPoisonedUse）、放棄した書き手の高速経路は閉じたまま（AbandonedStaysClosed）、参照中のRuntimeを解放しない（HazardSafe）、所有者やHazardの持ち主が強制終了しても待ちは終わる（RemoteProgress、ReclaimProgress）。重い側のフラッシュを外した変種、時間切れで奪う変種、終了状態を見ない変種（v0.4の実装）、排他ロックの持ち主の終了を見ない変種（v0.5の最初の実装）では、それぞれ反例が出ることも`scripts/ci/tla.sh`で確かめる。Windows x86/x64の実機では、記録・Shutdown・再Attachを繰り返すストレステスト（`record_shutdown_reattach_stress`、最適化ビルド）を実行する。
 
 ### 再入
 
