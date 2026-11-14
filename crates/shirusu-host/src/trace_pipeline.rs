@@ -128,6 +128,13 @@ fn record_losses<W: DurableWrite>(
 /// Conversion counts as behind once this fraction of the queue budget waits.
 const BACKLOG_FRACTION: usize = 8;
 
+/// How long collection waits on a worker that completes nothing before it
+/// reports the trace writer as stalled (review 2026-11-14 V9). Progress, not
+/// the total wait, is timed: a slow disk that keeps completing commands is
+/// waited for indefinitely; a disk or conversion that makes no progress at
+/// all for this long fails the session instead of hanging the Host.
+pub(crate) const WORKER_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Owned bytes the queue may hold before the collector waits. The Ring is
 /// released as soon as a chunk is copied, so this budget, not the Ring, absorbs
 /// a burst that conversion cannot keep up with. Waiting here back-pressures
@@ -269,6 +276,11 @@ pub(crate) struct TracePipeline<W: DurableWrite + Send + 'static> {
     /// Set while the worker runs at Normal priority because collection
     /// waited on it (see `boost_worker`).
     boosted: Arc<AtomicBool>,
+    /// See [`WORKER_STALL_TIMEOUT`].
+    stall_timeout: Duration,
+    /// Set once the worker was reported stalled. It cannot be interrupted
+    /// inside a blocked write, so it is detached instead of joined.
+    stalled: bool,
 }
 
 struct WorkerState {
@@ -515,6 +527,8 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             peak_queued_bytes: 0,
             drain_wait_ns: 0,
             boosted,
+            stall_timeout: WORKER_STALL_TIMEOUT,
+            stalled: false,
         })
     }
 
@@ -534,6 +548,11 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
 
     fn join(&mut self) -> Finished<W> {
         drop(self.sender.take());
+        if self.stalled {
+            // Joining would wait on the same stalled write.
+            drop(self.worker.take());
+            return Err(stall_failure(self.stall_timeout));
+        }
         let (recorder, mut report) = self
             .worker
             .take()
@@ -573,10 +592,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             self.queue_full_count = self.queue_full_count.saturating_add(1);
             self.boost_worker();
             let started = Instant::now();
-            while self.over_budget(bytes) {
-                self.check_health()?;
-                std::thread::sleep(Duration::from_micros(200));
-            }
+            self.wait_for_worker(|pipeline| !pipeline.over_budget(bytes))?;
             self.drain_wait_ns = self.drain_wait_ns.saturating_add(elapsed_ns(started));
         }
         let sender = self
@@ -590,6 +606,32 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             return Err(self.failed_worker());
         }
         Ok(())
+    }
+
+    /// Wait until `ready`, failing on a dead worker or on one that completes
+    /// no command for `stall_timeout` (see [`WORKER_STALL_TIMEOUT`]).
+    fn wait_for_worker(&mut self, mut ready: impl FnMut(&Self) -> bool) -> Result<(), TraceError> {
+        let mut progress = Instant::now();
+        let mut remaining = self.queued_commands.load(Ordering::Acquire);
+        while !ready(self) {
+            self.check_health()?;
+            let now = self.queued_commands.load(Ordering::Acquire);
+            if now < remaining {
+                progress = Instant::now();
+            }
+            remaining = now;
+            if progress.elapsed() >= self.stall_timeout {
+                self.stalled = true;
+                return Err(stall_failure(self.stall_timeout));
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stall_timeout(&mut self, timeout: Duration) {
+        self.stall_timeout = timeout;
     }
 
     #[cfg(test)]
@@ -633,7 +675,16 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
     pub(crate) fn barrier(&mut self) -> Result<(), TraceError> {
         let (reached, wait) = channel();
         self.send(Command::Barrier(reached))?;
-        if wait.recv().is_err() {
+        let mut outcome = None;
+        self.wait_for_worker(|_| {
+            match wait.try_recv() {
+                Ok(()) => outcome = Some(true),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => outcome = Some(false),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            outcome.is_some()
+        })?;
+        if outcome != Some(true) {
             return Err(self.failed_worker());
         }
         Ok(())
@@ -652,13 +703,25 @@ impl<W: DurableWrite + Send + 'static> Drop for TracePipeline<W> {
         // its owner returns. No Finalization is synthesized on this path.
         drop(self.sender.take());
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // A stalled worker is left detached (see `stalled`): it holds the
+            // only handle to the file and stops at its next write error or
+            // when the process exits.
+            if !self.stalled {
+                let _ = worker.join();
+            }
         }
     }
 }
 
 fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn stall_failure(timeout: Duration) -> TraceError {
+    failure(&format!(
+        "trace writer completed nothing for {}s: the disk or conversion is stalled",
+        timeout.as_secs_f64()
+    ))
 }
 
 fn failure(message: &str) -> TraceError {
@@ -1056,6 +1119,109 @@ mod tests {
                 .collect::<Vec<_>>(),
             (1..=BATCHES).flat_map(|c| [c, c]).collect::<Vec<_>>()
         );
+    }
+
+    /// V9: a writer that never completes fails the session within the
+    /// stall timeout instead of hanging collection, finish and drop.
+    #[test]
+    fn stalled_writer_fails_collection_instead_of_hanging() {
+        let (writer, blocked, _resume) = controlled();
+        let flag = writer.mode.clone();
+        let one = Command::Events(context(), events(1)).queued_bytes();
+        let mut pipeline =
+            TracePipeline::with_budget(recorder(writer, RecordMode::Full), one * 2).unwrap();
+        pipeline.set_stall_timeout(Duration::from_millis(100));
+        flag.store(3, Ordering::SeqCst);
+        pipeline.update_environment(&environment()).unwrap();
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let mut outcome = Ok(());
+        for call in 1..=8 {
+            outcome = pipeline.record_owned_batch_with_args(&context(), events(call));
+            if outcome.is_err() {
+                break;
+            }
+        }
+        let error = outcome.expect_err("a stalled writer must fail collection");
+        assert!(error.to_string().contains("stalled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Every later wait fails at once instead of joining the stuck worker.
+        assert!(pipeline.barrier().is_err());
+        let started = Instant::now();
+        assert!(pipeline.finish().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// V9: a stalled barrier is reported too, and dropping the pipeline
+    /// afterwards returns.
+    #[test]
+    fn stalled_barrier_fails_and_drop_returns() {
+        let (writer, blocked, _resume) = controlled();
+        let flag = writer.mode.clone();
+        let mut pipeline = TracePipeline::new(recorder(writer, RecordMode::Full)).unwrap();
+        pipeline.set_stall_timeout(Duration::from_millis(100));
+        flag.store(3, Ordering::SeqCst);
+        pipeline.update_environment(&environment()).unwrap();
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let error = pipeline.barrier().expect_err("stalled barrier");
+        assert!(error.to_string().contains("stalled"), "{error}");
+        drop(pipeline);
+    }
+
+    struct SlowWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        delay: Duration,
+    }
+    impl Write for SlowWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl DurableWrite for SlowWriter {
+        fn sync_all(&mut self) -> io::Result<()> {
+            std::thread::sleep(self.delay);
+            Ok(())
+        }
+        fn truncate_to(&mut self, len: u64) -> io::Result<bool> {
+            self.bytes.lock().unwrap().truncate(len as usize);
+            Ok(true)
+        }
+    }
+
+    /// V9: a slow disk that keeps completing commands is waited for however
+    /// long the whole backlog takes; only a lack of progress is a stall.
+    #[test]
+    fn slow_disk_is_waited_for_and_loses_nothing() {
+        const BATCHES: u64 = 64;
+        let writer = SlowWriter {
+            bytes: Default::default(),
+            delay: Duration::from_millis(5),
+        };
+        let one = Command::Events(context(), events(1)).queued_bytes();
+        let mut pipeline =
+            TracePipeline::with_budget(recorder(writer, RecordMode::Full), one).unwrap();
+        // Far shorter than the whole run, longer than one command.
+        pipeline.set_stall_timeout(Duration::from_millis(150));
+        pipeline.update_environment(&environment()).unwrap();
+        let started = Instant::now();
+        for call in 1..=BATCHES {
+            pipeline
+                .record_owned_batch_with_args(&context(), events(call))
+                .unwrap();
+            pipeline.barrier().unwrap();
+        }
+        let elapsed = started.elapsed();
+        let (recorder, stats) = pipeline.finish().unwrap();
+        assert!(elapsed > Duration::from_millis(150), "{elapsed:?}");
+        assert_eq!(stats.metrics.events_received, BATCHES * 2);
+        let bytes = recorder.finish(&IntegrityReport::default()).unwrap().bytes;
+        let trace = shirusu_trace::read_trace(&bytes.lock().unwrap()).unwrap();
+        assert_eq!(trace.finalization.unwrap().total_events, BATCHES * 2);
     }
 
     #[test]
