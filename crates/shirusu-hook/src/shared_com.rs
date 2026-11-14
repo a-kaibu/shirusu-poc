@@ -975,13 +975,17 @@ mod tests {
         assert_eq!(restore_all(), 0);
         assert_eq!(query_region(table).unwrap().Protect, PAGE_READONLY);
 
-        // A second session gets a new permanent wrapper identity. Restoration
-        // respects a later third-party slot update instead of overwriting it.
+        // A second session for the same table and originals reuses the
+        // restored wrapper identity instead of spending another of the LIMIT
+        // slots (2026-11-14 review P3-6). Restoration respects a later
+        // third-party slot update instead of overwriting it.
+        let used = REGISTRY.lock().unwrap().iter().flatten().count();
         let rt = runtime();
         let object = self::object(&rt);
         let ptr = Arc::as_ptr(&object) as usize;
         assert_eq!(unsafe { install(&rt, ptr) }, Ok(true));
-        assert_ne!(method(&object, 1), cached_add as usize);
+        assert_eq!(method(&object, 1), cached_add as usize);
+        assert_eq!(REGISTRY.lock().unwrap().iter().flatten().count(), used);
         let address = table + std::mem::size_of::<usize>();
         let mut old = 0;
         assert!(make_writable(address, &mut old));
