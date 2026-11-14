@@ -1066,6 +1066,13 @@ impl Agent {
         // The owner fast path inlines the write; the exclusive path is cold.
         let outcome = match state.writer.try_owner() {
             Some(mut writer) => self.write_locked(&mut writer, depth, input),
+            None if state.writer.unclaimed() => {
+                // The owner's liveness could not be taken, so its Ring is not
+                // used (a terminated owner could not be told apart from a
+                // long write). Counted as missing (Capture Coverage).
+                self.note_missing_call();
+                return RecordResult::NoSlot;
+            }
             None => state
                 .writer
                 .exclusive(|writer| self.write_locked(writer, depth, input))

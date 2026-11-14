@@ -1760,6 +1760,86 @@ impl ThreadLiveness {
     }
 }
 
+/// Key of the calling OS thread, usable by another thread to ask later
+/// whether it terminated ([`thread_key_terminated`]). Never 0. Windows: the
+/// thread ID (no call into the Heap or any lock).
+pub fn current_thread_key() -> u64 {
+    #[cfg(windows)]
+    {
+        // SAFETY: no preconditions.
+        u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
+    }
+    #[cfg(not(windows))]
+    {
+        THREAD_KEY.try_with(|k| k.0).unwrap_or(u64::MAX)
+    }
+}
+
+/// Whether the thread that had `key` terminated. Windows: the thread object
+/// is opened by ID; a failed open means no thread has that ID any more. An ID
+/// the OS already gave to a new thread reads as alive (the caller keeps
+/// waiting, as it would for a live holder).
+pub fn thread_key_terminated(key: u64) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, WaitForSingleObject, THREAD_SYNCHRONIZE,
+        };
+        let Ok(id) = u32::try_from(key) else {
+            return false;
+        };
+        // SAFETY: opens a handle with SYNCHRONIZE access only and closes it.
+        unsafe {
+            let handle = OpenThread(THREAD_SYNCHRONIZE, 0, id);
+            if handle.is_null() {
+                return true;
+            }
+            let done = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+            CloseHandle(handle);
+            done
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        !LIVE_THREAD_KEYS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+}
+
+#[cfg(not(windows))]
+static LIVE_THREAD_KEYS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+#[cfg(not(windows))]
+static NEXT_THREAD_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(not(windows))]
+struct ThreadKey(u64);
+#[cfg(not(windows))]
+impl ThreadKey {
+    fn new() -> Self {
+        let key = NEXT_THREAD_KEY.fetch_add(1, Ordering::Relaxed);
+        LIVE_THREAD_KEYS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(key);
+        Self(key)
+    }
+}
+#[cfg(not(windows))]
+impl Drop for ThreadKey {
+    fn drop(&mut self) {
+        LIVE_THREAD_KEYS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&k| k != self.0);
+    }
+}
+#[cfg(not(windows))]
+thread_local! {
+    static THREAD_KEY: ThreadKey = ThreadKey::new();
+}
+
 impl Drop for ThreadLiveness {
     fn drop(&mut self) {
         #[cfg(windows)]

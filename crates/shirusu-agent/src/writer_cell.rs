@@ -34,21 +34,27 @@
 //! running its closure. The Ring keeps every event published before the
 //! termination; unpublished bytes are never published.
 //!
-//! The owner also reaches the writer through `exclusive` (after backing off
-//! from a pending remote user), so it can be terminated while holding the
-//! exclusive lock. That lock is therefore not a `Mutex` (an OS lock whose
-//! holder died stays held, blocking every later remote user): it records
-//! the holder's token, and a waiter that sees the terminated owner holding
-//! it abandons the cell the same way.
+//! Any thread can be terminated while holding the exclusive lock: the owner
+//! (after backing off from a pending remote user), another thread recording
+//! for the same logical thread, or a management thread. That lock is
+//! therefore not a `Mutex` (an OS lock whose holder died stays held,
+//! blocking every later user): it records the holder's thread key, and a
+//! waiter that finds the holder terminated abandons the cell the same way
+//! (the holder may have been half way through the writer).
+//!
+//! An owner whose liveness cannot be taken is never published: a remote
+//! user could not tell its termination from a long write and would wait
+//! forever. The fast path is refused, and the record path counts the call
+//! as missing instead of recording it (review 2026-11-14 interim P1).
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Releases the exclusive lock on drop.
-struct ExclusiveGuard<'a>(&'a AtomicUsize);
+struct ExclusiveGuard<'a>(&'a AtomicU64);
 impl Drop for ExclusiveGuard<'_> {
     fn drop(&mut self) {
         self.0.store(0, Ordering::Release);
@@ -73,9 +79,9 @@ pub(crate) struct WriterCell {
     owner: AtomicUsize,
     owner_busy: AtomicBool,
     remote: AtomicBool,
-    /// Serializes `exclusive` users: the holder's thread token, 0 when free.
+    /// Serializes `exclusive` users: the holder's thread key, 0 when free.
     /// Not a `Mutex`, so a holder that was terminated can be recognized.
-    exclusive: AtomicUsize,
+    exclusive: AtomicU64,
     /// The owner's liveness, set before `owner` is published (cold, once).
     /// Unset (taking it failed): the owner is treated as alive forever.
     owner_liveness: OnceLock<ThreadLiveness>,
@@ -128,7 +134,7 @@ impl WriterCell {
             owner: AtomicUsize::new(0),
             owner_busy: AtomicBool::new(false),
             remote: AtomicBool::new(false),
-            exclusive: AtomicUsize::new(0),
+            exclusive: AtomicU64::new(0),
             owner_liveness: OnceLock::new(),
             claiming: Mutex::new(()),
             abandoned: AtomicBool::new(false),
@@ -169,11 +175,29 @@ impl WriterCell {
         // Liveness first: a remote user that sees this owner busy must be
         // able to tell whether it terminated. The Release store of `owner`
         // orders it before every later owner_busy store of this thread.
-        if let Some(liveness) = ThreadLiveness::current() {
-            let _ = self.owner_liveness.set(liveness);
-        }
+        // Without a liveness the owner's termination could never be told
+        // from a long write: refuse the fast path (the caller skips the call
+        // as missing) rather than risk a remote user waiting forever.
+        #[cfg(test)]
+        let liveness = if tests::FAIL_LIVENESS.with(std::cell::Cell::get) {
+            None
+        } else {
+            ThreadLiveness::current()
+        };
+        #[cfg(not(test))]
+        let liveness = ThreadLiveness::current();
+        let Some(liveness) = liveness else {
+            return false;
+        };
+        let _ = self.owner_liveness.set(liveness);
         self.owner.store(me, Ordering::Release);
         true
+    }
+
+    /// No thread owns the fast path yet. After `try_owner` failed, the caller's
+    /// claim was refused (its liveness could not be taken).
+    pub(crate) fn unclaimed(&self) -> bool {
+        self.owner.load(Ordering::Acquire) == 0
     }
 
     /// Whether the calling OS thread owns the fast path (no lock, no call).
@@ -245,7 +269,7 @@ impl WriterCell {
     /// setting it) so the fast path stays closed. A live holder is waited
     /// for, however long it takes, as in the owner_busy wait.
     fn lock_exclusive(&self) -> Option<ExclusiveGuard<'_>> {
-        let me = thread_token();
+        let me = shirusu_transport_win::current_thread_key();
         let mut spins = 0u32;
         loop {
             match self
@@ -257,9 +281,11 @@ impl WriterCell {
                 Err(holder) => {
                     spins = spins.wrapping_add(1);
                     if spins.is_multiple_of(SPINS_PER_LIVENESS_CHECK)
-                        && holder == self.owner.load(Ordering::Acquire)
-                        && self.owner_terminated()
+                        && shirusu_transport_win::thread_key_terminated(holder)
+                        && self.exclusive.load(Ordering::Acquire) == holder
                     {
+                        // The holder (owner or not) died inside the writer:
+                        // close the fast path and never use the writer again.
                         self.remote.store(true, Ordering::Release);
                         self.abandoned.store(true, Ordering::Release);
                         return None;
@@ -315,6 +341,11 @@ impl Drop for OwnerGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Test hook: the claiming thread's liveness cannot be taken.
+        pub(super) static FAIL_LIVENESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     use shirusu_transport::clock::system_clock;
     use shirusu_transport::ring::{SharedRegion, WriterPolicy};
     use shirusu_transport::RingConfig;
@@ -415,6 +446,37 @@ mod tests {
         assert!(!ran.load(Ordering::Relaxed), "poisoned writer was used");
         assert!(cell.is_abandoned());
         assert!(cell.try_owner().is_none(), "fast path stays closed");
+    }
+
+    /// A thread other than the owner terminated while holding the exclusive
+    /// lock (a management thread, or another thread recording for the same
+    /// logical thread): later users give up instead of waiting forever.
+    #[test]
+    fn non_owner_terminated_holding_the_exclusive_lock_is_detected() {
+        let cell = cell();
+        cell.with(|_| ()); // the main thread owns the cell and stays alive
+        let c = Arc::clone(&cell);
+        std::thread::spawn(move || {
+            std::mem::forget(c.lock_exclusive().expect("lock is free"));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(cell.exclusive(|_| ()), Access::OwnerTerminated);
+        assert!(cell.is_abandoned());
+        assert!(cell.try_owner().is_none(), "fast path stays closed");
+    }
+
+    /// An owner whose liveness cannot be taken is never published: nobody
+    /// could tell its termination from a long write.
+    #[test]
+    fn owner_without_liveness_is_refused() {
+        let cell = cell();
+        FAIL_LIVENESS.with(|f| f.set(true));
+        assert!(cell.try_owner().is_none());
+        assert!(cell.unclaimed());
+        FAIL_LIVENESS.with(|f| f.set(false));
+        assert!(cell.try_owner().is_some(), "claimed once liveness is taken");
+        assert!(!cell.unclaimed());
     }
 
     /// A live thread holding the exclusive lock is waited for, not overtaken.
