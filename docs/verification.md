@@ -175,7 +175,7 @@ overview 初期マイルストーンの段階 4。Win32 Metadata から幅広い
 | --- | --- |
 | PR | Unit、PBT（故障操作を含む）、短いloom、Kaniの主要Harness、短いFuzz、Windows x86・x64 E2E |
 | Nightly | 多数SeedのPBT・DST、Host・Agentの障害注入 |
-| 週次 | 拡大したloom、TLA+の状態探索、長時間Fuzz、長時間の負荷テスト |
+| 週次 | 拡大したloom、TLA+の状態探索、長時間Fuzz、長時間の負荷テスト（Linux の転送層と、Windows の実注入 10 分記録 `windows-stress-long.ps1`、x64 と x86） |
 | リリース前 | 全検証、Application Verifier、破損復旧、異なるWindows環境での確認 |
 
 PBTとDSTで見つけたSeed、Fuzzの最小入力、loomの失敗スケジュールは回帰テストに加える。テストが本当に不具合を検出できるかは、ReleaseをRelaxedにする、Generationの確認を外す、容量計算を壊すといった変更を加えて確かめる（Mutation Test）。

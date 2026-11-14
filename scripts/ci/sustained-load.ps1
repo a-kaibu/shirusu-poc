@@ -27,8 +27,12 @@
 # classified: lost (covered by loss records), not hooked (no event for an
 # API the workload called), or extra (calls outside the loop, from the CRT
 # or startup; allowed only for APIs the runtime also calls).
+#   V14: -Length long (weekly) records for 10 minutes, so problems that grow
+#       with time (index, loss records, open calls, Host memory) show up on
+#       Windows and not only in the Linux transport stress.
 param(
-    [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")][string]$Target = "x86_64-pc-windows-msvc"
+    [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")][string]$Target = "x86_64-pc-windows-msvc",
+    [ValidateSet("short", "long")][string]$Length = "short"
 )
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "native-step.ps1")
@@ -58,20 +62,33 @@ function Get-ConfigValue([string]$config, [string]$key) {
 }
 # (seconds, rate): paced runs at two rates and two durations, one unpaced run
 # with an uncaptured baseline for the throughput ratio.
-$runs = @(
-    @{ seconds = 10; rate = "50000"; threads = 1 },
-    @{ seconds = 30; rate = "50000"; threads = 1 },
-    @{ seconds = 10; rate = "200000"; threads = 1 },
-    @{ seconds = 10; rate = "200000"; threads = 4 },
-    @{ seconds = 10; rate = "max"; threads = 1 }
-)
+# The memory growth gate (V3) compares the pair in $growth.
+if ($Length -eq "long") {
+    # About 72 million and 144 million events: large enough for growth with
+    # time to show, small enough to read back within the job.
+    $runs = @(
+        @{ seconds = 60; rate = "20000"; threads = 1 },
+        @{ seconds = 600; rate = "20000"; threads = 1 },
+        @{ seconds = 600; rate = "40000"; threads = 4 }
+    )
+    $growth = @("60s-20000-t1", "600s-20000-t1")
+} else {
+    $runs = @(
+        @{ seconds = 10; rate = "50000"; threads = 1 },
+        @{ seconds = 30; rate = "50000"; threads = 1 },
+        @{ seconds = 10; rate = "200000"; threads = 1 },
+        @{ seconds = 10; rate = "200000"; threads = 4 },
+        @{ seconds = 10; rate = "max"; threads = 1 }
+    )
+    $growth = @("10s-50000-t1", "30s-50000-t1")
+}
 $results = @()
 $complete = $false
 $diagnostics = if ($env:SHIRUSU_DIAGNOSTIC_DIR) { $env:SHIRUSU_DIAGNOSTIC_DIR } else { Join-Path $work "diagnostics" }
-$reportPath = Join-Path $work "sustained-load-$arch.json"
+$reportPath = Join-Path $work $(if ($Length -eq "long") { "sustained-load-long-$arch.json" } else { "sustained-load-$arch.json" })
 function Write-Report([bool]$done) {
     $report = [ordered]@{
-        benchmark = "native-sustained-load"; target = $Target; measurement_complete = $done
+        benchmark = "native-sustained-load"; target = $Target; length = $Length; measurement_complete = $done
         os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
         commit = (git rev-parse HEAD); agent_configuration = "release, full, default ring sizes"
         scope = "GetCurrentProcessId + HeapAlloc + HeapFree in a loop for a fixed duration, paced (sleeping when ahead) or unpaced, on one or more threads. Expected counts the loop and its Sleep calls; startup/shutdown add a few hundred events."
@@ -130,7 +147,7 @@ try {
                 $traceBytes = (Get-Item $trace).Length
                 # V2: read the Trace back with the product's own Reader before
                 # deleting it (unpaced traces reach gigabytes).
-                $inspected = Invoke-NativeCaptured -FilePath $cli -ArgumentList @("inspect", "--json", $trace) -TimeoutSeconds 900 -DumpDirectory $diagnostics
+                $inspected = Invoke-NativeCaptured -FilePath $cli -ArgumentList @("inspect", "--json", $trace) -TimeoutSeconds ([Math]::Max(900, 3 * $run.seconds)) -DumpDirectory $diagnostics
                 if ($inspected.ExitCode -ne 0) { throw "inspect could not read the sustained trace ($($inspected.ExitCode))" }
                 $inspect = $inspected.Output | ConvertFrom-Json
                 Remove-Item $trace
@@ -207,12 +224,12 @@ try {
         }
     }
     # V3: the Host's memory must not grow with the recording length.
-    $short = $results | Where-Object { $_.run -eq "10s-50000-t1" }
-    $long = $results | Where-Object { $_.run -eq "30s-50000-t1" }
+    $short = $results | Where-Object { $_.run -eq $growth[0] }
+    $long = $results | Where-Object { $_.run -eq $growth[1] }
     if ($short -and $long -and $short.host_peak_private_bytes -and $long.host_peak_private_bytes) {
         $limit = 2.0 * $short.host_peak_private_bytes + 64MB
         if ($long.host_peak_private_bytes -gt $limit) {
-            throw ("host peak private memory grows with recording length: 10s {0:N0}B, 30s {1:N0}B" -f $short.host_peak_private_bytes, $long.host_peak_private_bytes)
+            throw ("host peak private memory grows with recording length: {0} {1:N0}B, {2} {3:N0}B" -f $growth[0], $short.host_peak_private_bytes, $growth[1], $long.host_peak_private_bytes)
         }
     }
     $complete = $true

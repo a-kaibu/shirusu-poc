@@ -31,7 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const unsigned kMaxSeconds = 120;
+// Weekly long runs record for 10 minutes (review 2026-11-14 V14).
+static const unsigned kMaxSeconds = 900;
 static const unsigned kMaxThreads = 16;
 static const unsigned kBatch = 64;
 
