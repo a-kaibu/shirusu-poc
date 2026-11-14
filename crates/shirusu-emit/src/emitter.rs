@@ -300,6 +300,10 @@ impl<W: DurableWrite> Emitter<W> {
         let spec = self.set.spec(api_id).expect("api_id from set");
         let types: Vec<Ty> = spec.enter_fields.iter().map(|(_, t, _, _)| *t).collect();
         let args = encode_args(&types, values)?;
+        // Flush a full buffer before changing any call state: a failed
+        // write then leaves the call unrecorded and every buffered event
+        // kept (2026-11-14 review P3-14).
+        self.flush_if_full(thread_id)?;
         let payload = self.resolve_payload(meta.payload)?;
         let state = self.threads.entry(thread_id).or_default();
         let call_id = state.next_call_id;
@@ -321,9 +325,6 @@ impl<W: DurableWrite> Emitter<W> {
             args,
             global_order: None,
         });
-        if state.pending.len() >= BATCH_FLUSH_EVENTS {
-            self.flush_thread(thread_id)?;
-        }
         Ok(CallToken {
             thread_id,
             call_id,
@@ -346,6 +347,7 @@ impl<W: DurableWrite> Emitter<W> {
             .ok_or_else(|| EmitError::UnknownApi(format!("api_id {}", token.api_id)))?;
         let types: Vec<Ty> = spec.leave_fields.iter().map(|(_, t, _, _)| *t).collect();
         let args = encode_args(&types, values)?;
+        self.flush_if_full(token.thread_id)?;
         let payload = self.resolve_payload(meta.payload)?;
         let state = self
             .threads
@@ -378,8 +380,16 @@ impl<W: DurableWrite> Emitter<W> {
             args,
             global_order: None,
         });
-        if state.pending.len() >= BATCH_FLUSH_EVENTS {
-            self.flush_thread(token.thread_id)?;
+        Ok(())
+    }
+
+    fn flush_if_full(&mut self, thread_id: u64) -> Result<()> {
+        if self
+            .threads
+            .get(&thread_id)
+            .is_some_and(|s| s.pending.len() >= BATCH_FLUSH_EVENTS)
+        {
+            self.flush_thread(thread_id)?;
         }
         Ok(())
     }
@@ -441,7 +451,14 @@ impl<W: DurableWrite> Emitter<W> {
             qpc_frequency: self.cfg.qpc_frequency,
             events,
         };
-        self.writer.write_batch(&batch)?;
+        if let Err(e) = self.writer.write_batch(&batch) {
+            // Keep the events: the Writer is back at a Block boundary, so a
+            // later flush (or finish) can still write them.
+            if let Some(state) = self.threads.get_mut(&thread_id) {
+                state.pending = batch.events;
+            }
+            return Err(e.into());
+        }
         Ok(())
     }
 

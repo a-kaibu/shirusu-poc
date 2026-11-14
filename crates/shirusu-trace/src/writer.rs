@@ -849,23 +849,26 @@ impl<W: DurableWrite> TraceWriter<W> {
         }
         let block_len = (HEADER_LEN + stored.len()) as u64;
         self.ensure_reserve(block_type, block_len)?;
+        // Bytes the destination accepted for this Block, so a failure
+        // before the first byte needs no truncation (P3-14).
+        let mut accepted = 0usize;
         let written = if stored.len() <= SMALL_BLOCK_COALESCE {
             // 小さい Block はヘッダーと合わせて 1 回で書く (P1-2: 直接
             // File へ書くため、Block ごとに syscall が 2 回だった)。
             let mut one = Vec::with_capacity(HEADER_LEN + stored.len());
             one.extend_from_slice(&header_bytes);
             one.extend_from_slice(&stored);
-            self.inner.write_all(&one)
+            write_counted(&mut self.inner, &one, &mut accepted)
         } else {
-            self.inner
-                .write_all(&header_bytes)
-                .and_then(|()| self.inner.write_all(&stored))
+            write_counted(&mut self.inner, &header_bytes, &mut accepted)
+                .and_then(|()| write_counted(&mut self.inner, &stored, &mut accepted))
         };
         if let Err(e) = written {
             // P2-10: drop the partial Block so the Writer stays at a Block
             // boundary (a retry, or Finalization, continues from there).
-            let restored = self.inner.flush().is_ok()
-                && matches!(self.inner.truncate_to(self.offset), Ok(true));
+            let restored = accepted == 0
+                || (self.inner.flush().is_ok()
+                    && matches!(self.inner.truncate_to(self.offset), Ok(true)));
             if restored && self.reserved_end > self.offset {
                 // Truncation released the reservation as well.
                 self.reserved_end = self.offset;
@@ -894,4 +897,29 @@ impl<W: DurableWrite> TraceWriter<W> {
         }
         Ok(())
     }
+}
+
+/// `write_all` that counts the bytes `w` accepted, also on failure.
+fn write_counted<W: std::io::Write>(
+    w: &mut W,
+    mut buf: &[u8],
+    accepted: &mut usize,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match w.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            Ok(n) => {
+                *accepted += n;
+                buf = &buf[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }

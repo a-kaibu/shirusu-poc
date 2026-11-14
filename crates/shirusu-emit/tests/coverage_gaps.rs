@@ -453,31 +453,11 @@ fn flush_with_failing_writer_is_trace_error() {
 
 #[test]
 fn auto_flush_on_begin_with_failing_writer_is_trace_error() {
-    let (mut em, fail) = failing_emitter();
-    fail.set(true);
-    // 256 件目で自動 flush が走り、書き込み失敗が返る。
-    let mut last = Ok(CallToken {
-        thread_id: 1,
-        call_id: 0,
-        api_id: 4,
-    });
-    for i in 0..256 {
-        last = em.begin_call(
-            1,
-            "kernel32!CloseHandle",
-            &close_handle_args(0x100 + i),
-            i,
-            EventMeta::default(),
-        );
-    }
-    assert!(matches!(last, Err(EmitError::Trace(_))));
-}
-
-#[test]
-fn auto_flush_on_end_with_failing_writer_is_trace_error() {
+    // P3-14: the full buffer is flushed before the 257th event. A failure
+    // records nothing and loses nothing, so the call can be retried.
     let (mut em, fail) = failing_emitter();
     let mut toks = Vec::new();
-    for i in 0..255 {
+    for i in 0..256 {
         toks.push(
             em.begin_call(
                 1,
@@ -490,12 +470,52 @@ fn auto_flush_on_end_with_failing_writer_is_trace_error() {
         );
     }
     fail.set(true);
-    // 255 件の enter + 1 件の leave で 256 件になり自動 flush が走る。
+    let failed = em.begin_call(
+        1,
+        "kernel32!CloseHandle",
+        &close_handle_args(0x999),
+        999,
+        EventMeta::default(),
+    );
+    assert!(matches!(failed, Err(EmitError::Trace(_))));
+    assert_eq!(em.open_call_count(1), 256, "the failed call is not open");
+    fail.set(false);
+    for tok in toks {
+        em.end_call(tok, &close_handle_leave(), 1000, EventMeta::default())
+            .unwrap();
+    }
+    em.finish(FinalizationInfo::default())
+        .expect("the buffered events survived the failed flush");
+}
+
+#[test]
+fn auto_flush_on_end_with_failing_writer_is_trace_error() {
+    let (mut em, fail) = failing_emitter();
+    let mut toks = Vec::new();
+    for i in 0..256 {
+        toks.push(
+            em.begin_call(
+                1,
+                "kernel32!CloseHandle",
+                &close_handle_args(0x100 + i),
+                i,
+                EventMeta::default(),
+            )
+            .unwrap(),
+        );
+    }
+    fail.set(true);
+    // 256 件たまった状態の leave は、記録の前に flush して失敗する。
+    // 呼び出しはオープンのままなので、書けるようになれば閉じられる。
     let tok = toks.pop().unwrap();
     assert!(matches!(
         em.end_call(tok, &close_handle_leave(), 999, EventMeta::default()),
         Err(EmitError::Trace(_))
     ));
+    assert_eq!(em.open_call_count(1), 256);
+    fail.set(false);
+    em.end_call(tok, &close_handle_leave(), 999, EventMeta::default())
+        .unwrap();
 }
 
 #[test]

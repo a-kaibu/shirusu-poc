@@ -359,9 +359,10 @@ fn write_loss_records_and_profile_write_errors_propagate() {
             apis: Vec::new(),
         })
         .expect_err("ProfileSummary block write must fail");
-    // P2-10: this sink cannot discard the partial Loss Block, so the Writer
-    // refuses to write after it rather than misplace later Blocks.
-    assert!(matches!(err, shirusu_trace::TraceError::WriterInvariant(_)));
+    // The sink accepted none of the Loss Block, so the Writer is still at a
+    // Block boundary and tries again (P3-14); only a partial Block that
+    // cannot be discarded stops it (P2-10).
+    assert!(matches!(err, shirusu_trace::TraceError::Io(_)));
 }
 
 #[test]
@@ -607,4 +608,63 @@ fn tiny_chunk_target_still_makes_progress_and_numbers_blocks() {
     assert!(read.batches.iter().all(|b| b.events.len() == 1));
     let seqs: Vec<u64> = read.blocks.iter().map(|b| b.sequence).collect();
     assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+}
+
+/// Accepts `budget` more bytes, then fails. Cannot truncate.
+struct PartialSink {
+    data: Vec<u8>,
+    budget: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl io::Write for PartialSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let room = self.budget.get();
+        if room == 0 {
+            return Err(io::Error::other("injected failure"));
+        }
+        let n = room.min(buf.len());
+        self.budget.set(room - n);
+        self.data.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl shirusu_trace::writer::DurableWrite for PartialSink {
+    fn sync_all(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn only_a_partial_block_that_cannot_be_discarded_stops_the_writer() {
+    let budget = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+    let sink = PartialSink {
+        data: Vec::new(),
+        budget: budget.clone(),
+    };
+    let mut w = TraceWriter::new(sink, env(42)).unwrap();
+    let loss = [LossRecord {
+        kind: 1,
+        count: 1,
+        ..Default::default()
+    }];
+    // Nothing accepted: still at a Block boundary, a retry works.
+    budget.set(0);
+    assert!(matches!(
+        w.write_loss_records(&loss),
+        Err(shirusu_trace::TraceError::Io(_))
+    ));
+    budget.set(usize::MAX);
+    w.write_loss_records(&loss).unwrap();
+    // Part of a Block accepted and not removable: the Writer stops.
+    budget.set(10);
+    assert!(w.write_loss_records(&loss).is_err());
+    budget.set(usize::MAX);
+    assert!(matches!(
+        w.write_loss_records(&loss),
+        Err(shirusu_trace::TraceError::WriterInvariant(_))
+    ));
 }
