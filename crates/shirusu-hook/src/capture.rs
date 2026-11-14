@@ -102,11 +102,19 @@ pub fn read_utf16_string(mem: &dyn MemoryReader, addr: u64) -> CapturedValue {
         return cap(TypedValue::Str16(Vec::new()), ValueCapture::Unreadable);
     }
     let mut units: Vec<u16> = Vec::new();
-    let mut buf = [0u8; 64]; // 32 units ずつ読む
+    // ページ境界までをまとめて読む（レビュー 2026-11-14 P2-5: 以前は
+    // 64 バイトずつで、260 文字のパスに 9 回の ReadProcessMemory を
+    // 要した）。1 ページの中は読めるか読めないかのどちらかなので、
+    // 境界を越えない限りまとめて読んでも前半を失わない。
+    let mut buf = [0u8; STRING_READ_CHUNK];
     loop {
         let chunk_addr = addr + (units.len() as u64) * 2;
-        if mem.read_exact(chunk_addr, &mut buf) {
-            for pair in buf.chunks_exact(2) {
+        let to_page_end = PAGE_SIZE - (chunk_addr % PAGE_SIZE);
+        // 奇数アドレスでページ末尾に 1 バイトだけ残る場合は 1 unit を読む。
+        let len = ((to_page_end as usize).min(STRING_READ_CHUNK) & !1).max(2);
+        let block = &mut buf[..len];
+        if mem.read_exact(chunk_addr, block) {
+            for pair in block.chunks_exact(2) {
                 let u = u16::from_le_bytes([pair[0], pair[1]]);
                 if u == 0 {
                     return cap(TypedValue::Str16(units), ValueCapture::Captured);
@@ -118,11 +126,11 @@ pub fn read_utf16_string(mem: &dyn MemoryReader, addr: u64) -> CapturedValue {
             }
             continue;
         }
-        // ブロック全体が読めない場合は 1 unit ずつ救済する（ブロックが
-        // ページ境界を跨いで後半だけ読めないケースや、終端 NUL の直後が
-        // 未マップなケースで、前半の文字列を失わないため）。
+        // ブロック全体が読めない場合は 1 unit ずつ救済する（読み手が
+        // ページ単位でない場合や、終端 NUL の直後が未マップなケースで、
+        // 前半の文字列を失わないため）。
         let mut salvaged_any = false;
-        for i in 0..32u64 {
+        for i in 0..(len as u64 / 2) {
             let mut b2 = [0u8; 2];
             if !mem.read_exact(chunk_addr + i * 2, &mut b2) {
                 break;
@@ -145,6 +153,10 @@ pub fn read_utf16_string(mem: &dyn MemoryReader, addr: u64) -> CapturedValue {
         };
     }
 }
+
+/// 文字列を読むときの 1 回の最大バイト数と、境界とみなすページの大きさ。
+const STRING_READ_CHUNK: usize = 1024;
+const PAGE_SIZE: u64 = 4096;
 
 /// バッファ内容を Bytes 値として取得する。上限を超える分は切り捨てて
 /// Truncated を付ける。1 バイトも読めなければ Unreadable。
@@ -392,7 +404,9 @@ pub struct OverlappedRegistry {
 /// failure. Cancellation is generation checked so an early completion may reuse
 /// the address while the original submitter is still unwinding/returning.
 pub struct PendingSubmission {
-    registry: OverlappedRegistry,
+    /// None for a synchronous call (no OVERLAPPED): nothing was registered,
+    /// so dropping it touches no shared state (review 2026-11-14 P2-5).
+    registry: Option<OverlappedRegistry>,
     address: u64,
     call_id: u64,
     keep: bool,
@@ -404,8 +418,8 @@ impl PendingSubmission {
 }
 impl Drop for PendingSubmission {
     fn drop(&mut self) {
-        if !self.keep {
-            self.registry.cancel(self.address, self.call_id);
+        if let (false, Some(registry)) = (self.keep, &self.registry) {
+            registry.cancel(self.address, self.call_id);
         }
     }
 }
@@ -417,7 +431,7 @@ impl OverlappedRegistry {
     pub fn submit(&self, address: u64, pending: PendingOverlapped) -> PendingSubmission {
         self.register(address, pending);
         PendingSubmission {
-            registry: self.clone(),
+            registry: (address != 0).then(|| self.clone()),
             address,
             call_id: pending.call_id,
             keep: false,
@@ -434,6 +448,9 @@ impl OverlappedRegistry {
     }
     /// Remove only this operation, never a newer reuse of the same address.
     pub fn cancel(&self, address: u64, call_id: u64) {
+        if address == 0 {
+            return;
+        }
         let mut pending = self.pending.lock().unwrap();
         if pending.get(&address).is_some_and(|p| p.call_id == call_id) {
             pending.remove(&address);
@@ -859,6 +876,102 @@ mod tests {
     use shirusu_trace::compact::{decode_values, encode_values};
     use shirusu_trace::schema::schema_types;
     use shirusu_trace::schema::Ty;
+
+    /// Page-granular reader that counts reads, like ReadProcessMemory.
+    struct PagedMemory {
+        mapped_pages: std::ops::Range<u64>,
+        bytes: MapMemory,
+        reads: std::cell::Cell<usize>,
+    }
+    impl MemoryReader for PagedMemory {
+        fn read_exact(&self, addr: u64, buf: &mut [u8]) -> bool {
+            self.reads.set(self.reads.get() + 1);
+            let last = addr + buf.len() as u64 - 1;
+            if !self.mapped_pages.contains(&(addr / PAGE_SIZE))
+                || !self.mapped_pages.contains(&(last / PAGE_SIZE))
+            {
+                return false;
+            }
+            for (i, b) in buf.iter_mut().enumerate() {
+                let mut one = [0u8];
+                *b = if self.bytes.read_exact(addr + i as u64, &mut one) {
+                    one[0]
+                } else {
+                    0xAA
+                };
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn strings_are_read_up_to_page_boundaries_in_few_calls() {
+        // P2-5: a 260-character path takes one read, not nine.
+        let path: Vec<u16> = std::iter::repeat_n(0x43u16, 259).chain([0]).collect();
+        let mut bytes = MapMemory::new();
+        bytes.write_u16s(0x10_000, &path);
+        let mem = PagedMemory {
+            mapped_pages: 0x10..0x12,
+            bytes,
+            reads: Default::default(),
+        };
+        let v = read_utf16_string(&mem, 0x10_000);
+        assert_eq!(v.capture, ValueCapture::Captured);
+        assert_eq!(v.value, TypedValue::Str16(path[..259].to_vec()));
+        assert_eq!(mem.reads.get(), 1);
+
+        // Ending right before an unmapped page: the read stops at the
+        // boundary and never touches the next page.
+        let tail: Vec<u16> = std::iter::repeat_n(0x44u16, 9).chain([0]).collect();
+        let at = 0x12_000 - 20;
+        let mut bytes = MapMemory::new();
+        bytes.write_u16s(at, &tail);
+        let mem = PagedMemory {
+            mapped_pages: 0x11..0x12,
+            bytes,
+            reads: Default::default(),
+        };
+        let v = read_utf16_string(&mem, at);
+        assert_eq!(v.capture, ValueCapture::Captured);
+        assert_eq!(v.value, TypedValue::Str16(tail[..9].to_vec()));
+        assert_eq!(mem.reads.get(), 1);
+
+        // Crossing into an unmapped page keeps what was read.
+        let cut: Vec<u16> = std::iter::repeat_n(0x45u16, 10).collect();
+        let mut bytes = MapMemory::new();
+        bytes.write_u16s(at, &cut);
+        let mem = PagedMemory {
+            mapped_pages: 0x11..0x12,
+            bytes,
+            reads: Default::default(),
+        };
+        let v = read_utf16_string(&mem, at);
+        assert_eq!(v.capture, ValueCapture::Truncated);
+        assert_eq!(v.value, TypedValue::Str16(cut));
+    }
+
+    #[test]
+    fn synchronous_submission_holds_no_registry() {
+        // P2-5: without an OVERLAPPED nothing is registered or cancelled.
+        let registry = OverlappedRegistry::new();
+        let pending = PendingOverlapped {
+            api_id: 1,
+            call_id: 7,
+            handle: 1,
+            buffer: 0,
+            requested_len: 0,
+            direction: OverlappedDirection::Read,
+            bytes_addr: 0,
+        };
+        let sync = registry.submit(0, pending);
+        assert!(sync.registry.is_none());
+        drop(sync);
+        let overlapped = registry.submit(0x40, pending);
+        assert!(overlapped.registry.is_some());
+        assert_eq!(registry.len(), 1);
+        drop(overlapped);
+        assert!(registry.is_empty());
+    }
 
     #[test]
     fn ansi_create_file_error_uses_original_disposition_or_stays_unsupported() {

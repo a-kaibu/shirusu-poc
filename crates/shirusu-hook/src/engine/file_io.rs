@@ -172,9 +172,13 @@ pub(super) fn prepare(api_id: u32) -> Prepare {
         PrepareInner::Passthrough { original } => return Prepare::Passthrough { original },
         PrepareInner::Unavailable => return Prepare::Unavailable,
     };
-    let rt = rt.to_arc(); // hand-written detours keep a shared reference
-    match crate::runtime::DetourFlight::begin(&rt) {
+    // Hand-written detours keep a shared reference for their guards; the
+    // flight takes over the detour reference itself, so a hazard reference
+    // costs no second shared count update (review 2026-11-14 P2-5).
+    let shared = rt.to_arc();
+    match crate::runtime::DetourFlight::begin_ref(rt) {
         Some(flight) => {
+            let rt = shared;
             let tid = crate::thread_id::current() as u64;
             rt.ensure_thread(tid);
             Prepare::Record {
