@@ -236,3 +236,30 @@ fn identity_is_reported_once_set() {
     r.worker.set_identity(id);
     assert_eq!(r.worker.identity(), Some(id));
 }
+
+#[test]
+fn each_loss_counter_alone_produces_a_counters_event() {
+    use shirusu_host::LossEvent;
+    // Descriptor 満杯で落とした Payload なしの Event だけ（落とした Payload
+    // バイトと劣化は 0）。
+    let mut r = rig();
+    for _ in 0..5 {
+        r.write(0);
+    }
+    r.worker.drain_all();
+    let counters: Vec<_> = r
+        .worker
+        .loss_events
+        .iter()
+        .filter(|e| matches!(e, LossEvent::Counters { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        counters,
+        vec![LossEvent::Counters {
+            dropped_events: 1,
+            dropped_payload_bytes: 0,
+            degraded_events: 0,
+        }]
+    );
+}
