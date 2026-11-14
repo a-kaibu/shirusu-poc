@@ -1019,6 +1019,10 @@ Schema を登録し、Agent DLL は自分のバイナリの Catalog で値を符
   WinRT・コールバック）の schema_id・名前・各フィールドの名前・型タグ・
   flags（意味種別・取得タイミング・LastError の意味条件）。説明文
   （`level_note` / `annotation`）は記録の意味を変えないため含めない。
+- 値はビルド時に決まるため、計算済みの値（`crates/shirusu-api-catalog/src/
+  catalog_fingerprint.inc`）を埋め込み、実行時には計算しない。表との一致は
+  テストで検査し、表を変えたら `SHIRUSU_BLESS=1 cargo test -p
+  shirusu-api-catalog --lib fingerprint` で更新する。
 - Host は Bootstrap の `api_catalog_fingerprint` に自分の値を入れる。Agent は
   自分の値を `result_api_catalog_fingerprint` へ書き戻し、一致しなければ
   フックを設置する前に状態 7（`INIT_CATALOG_MISMATCH`）を返す。Host は両方の

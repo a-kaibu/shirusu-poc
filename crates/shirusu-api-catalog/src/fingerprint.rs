@@ -37,7 +37,22 @@ fn put_str(h: &mut blake3::Hasher, s: &str) {
 }
 
 /// このバイナリに組み込まれた API Catalog の Fingerprint。
+///
+/// ビルド時に決まる値なので、計算済みの値（`catalog_fingerprint.inc`）を
+/// 返す。対象プロセス内でカタログ全体の Schema をヒープに組み立てずに済む
+/// （2026-11-14 レビュー P3-4）。表と値の一致はテスト
+/// `embedded_fingerprint_matches_the_tables` が保証する。表を変えたら
+/// `SHIRUSU_BLESS=1 cargo test -p shirusu-api-catalog --lib fingerprint`
+/// で値を更新する。
+#[inline]
 pub fn catalog_fingerprint() -> CatalogFingerprint {
+    EMBEDDED_FINGERPRINT
+}
+
+const EMBEDDED_FINGERPRINT: CatalogFingerprint = include!("catalog_fingerprint.inc");
+
+/// 表から Fingerprint を計算する（テストと検証用）。
+pub fn compute_catalog_fingerprint() -> CatalogFingerprint {
     let mut h = blake3::Hasher::new();
     h.update(b"shirusu-api-catalog");
     h.update(&FINGERPRINT_FORMAT.to_le_bytes());
@@ -78,9 +93,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_fingerprint_matches_the_tables() {
+        let computed = compute_catalog_fingerprint();
+        if computed != catalog_fingerprint() && std::env::var_os("SHIRUSU_BLESS").is_some() {
+            let body: Vec<String> = computed.iter().map(|b| format!("0x{b:02x}")).collect();
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/catalog_fingerprint.inc");
+            std::fs::write(path, format!("[{}]\n", body.join(", "))).unwrap();
+            return;
+        }
+        assert_eq!(
+            fingerprint_hex(&computed),
+            fingerprint_hex(&catalog_fingerprint()),
+            "the API tables changed: run `SHIRUSU_BLESS=1 cargo test -p shirusu-api-catalog --lib fingerprint`"
+        );
+    }
+
+    #[test]
     fn fingerprint_is_deterministic_and_nonzero() {
-        let a = catalog_fingerprint();
-        assert_eq!(a, catalog_fingerprint());
+        let a = compute_catalog_fingerprint();
+        assert_eq!(a, compute_catalog_fingerprint());
         assert_ne!(a, [0; FINGERPRINT_BYTES]);
         assert_eq!(fingerprint_hex(&a).len(), FINGERPRINT_BYTES * 2);
     }
