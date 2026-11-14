@@ -129,12 +129,20 @@ pub fn classify_caller_image(path: &str, is_main_module: bool, prefixes: &[Strin
 #[derive(Debug, Default)]
 pub struct CallerCache {
     ranges: Vec<ModuleRange>,
+    /// 登録中の Unknown (非イメージ) 範囲の数 (P2-2)。
+    unknown: usize,
 }
+
+/// Unknown (JIT など非イメージ) の範囲を覚える上限 (2026-11-14 レビュー
+/// P2-2)。JIT が領域を作り直すアプリでは無制限に増え、挿入のたびに配列を
+/// ずらしていた。超えたら Unknown の範囲だけを捨てて覚え直す。
+pub const MAX_UNKNOWN_RANGES: usize = 1024;
 
 impl CallerCache {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             ranges: Vec::with_capacity(capacity),
+            unknown: 0,
         }
     }
 
@@ -150,6 +158,14 @@ impl CallerCache {
         classify_address(&self.ranges, addr)
     }
 
+    /// `addr` を含む範囲。
+    pub fn range_of(&self, addr: usize) -> Option<ModuleRange> {
+        let a = addr as u64;
+        let idx = self.ranges.partition_point(|r| r.base <= a);
+        let r = *self.ranges.get(idx.checked_sub(1)?)?;
+        (a < r.end).then_some(r)
+    }
+
     /// 範囲を登録する。重なる既存の範囲は古い情報として取り除く。
     /// 空の範囲は登録しない。
     pub fn insert(&mut self, range: ModuleRange) {
@@ -157,13 +173,28 @@ impl CallerCache {
             return;
         }
         self.remove_overlapping(range.base, range.end);
+        if range.class == ModuleClass::Unknown {
+            if self.unknown >= MAX_UNKNOWN_RANGES {
+                self.ranges.retain(|r| r.class != ModuleClass::Unknown);
+                self.unknown = 0;
+            }
+            self.unknown += 1;
+        }
         let idx = self.ranges.partition_point(|r| r.base < range.base);
         self.ranges.insert(idx, range);
     }
 
     /// `[base, end)` と重なる範囲を取り除く（アンロード通知）。確保はしない。
     pub fn remove_overlapping(&mut self, base: u64, end: u64) {
-        self.ranges.retain(|r| r.end <= base || r.base >= end);
+        let mut removed_unknown = 0;
+        self.ranges.retain(|r| {
+            let keep = r.end <= base || r.base >= end;
+            if !keep && r.class == ModuleClass::Unknown {
+                removed_unknown += 1;
+            }
+            keep
+        });
+        self.unknown -= removed_unknown;
     }
 }
 
@@ -225,7 +256,20 @@ mod win {
     /// 0 = スタブ無効。TEB 内のスロットの位置。
     static ENTRY_SLOT_OFFSET: AtomicU32 = AtomicU32::new(0);
     static ENTRY_SLOT: OnceLock<Option<u32>> = OnceLock::new();
-    static CACHE: RwLock<CallerCache> = RwLock::new(CallerCache { ranges: Vec::new() });
+    static CACHE: RwLock<CallerCache> = RwLock::new(CallerCache {
+        ranges: Vec::new(),
+        unknown: 0,
+    });
+    /// 表を書き換えるたびに進む番号 (P2-2)。スレッドごとの直前の範囲は、
+    /// この番号が変わっていない間だけ使う。
+    static CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    thread_local! {
+        /// 直前に当たった範囲: (base, end, class code, generation)。
+        /// 共有 RwLock を呼び出しごとに取らない (読みロックでも共有
+        /// キャッシュラインへ書き込む)。Copy だけで解放処理を持たない。
+        static LAST_RANGE: std::cell::Cell<(u64, u64, u32, u64)> =
+            const { std::cell::Cell::new((0, 0, 0, u64::MAX)) };
+    }
     static BOUNDARY: OnceLock<Option<Boundary>> = OnceLock::new();
 
     struct Boundary {
@@ -426,9 +470,21 @@ mod win {
         if address == 0 {
             return None;
         }
+        use std::sync::atomic::Ordering;
+        let generation = CACHE_GENERATION.load(Ordering::Acquire);
+        let addr = address as u64;
+        if let Ok((base, end, class, seen)) = LAST_RANGE.try_with(std::cell::Cell::get) {
+            if seen == generation && base <= addr && addr < end {
+                return Some(ModuleClass::from_code(class));
+            }
+        }
+        let remember = |r: &ModuleRange| {
+            let _ = LAST_RANGE.try_with(|c| c.set((r.base, r.end, r.class.code(), generation)));
+        };
         if let Ok(cache) = CACHE.read() {
-            if let Some(class) = cache.classify(address) {
-                return Some(class);
+            if let Some(range) = cache.range_of(address) {
+                remember(&range);
+                return Some(range.class);
             }
         }
         let boundary = BOUNDARY.get()?.as_ref()?;
@@ -436,6 +492,7 @@ mod win {
         let range = resolve(address, boundary);
         if let Ok(mut cache) = CACHE.write() {
             cache.insert(range);
+            CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
         }
         Some(range.class)
     }
@@ -465,6 +522,7 @@ mod win {
         // the cache lock while waiting for the loader lock.
         if let Ok(mut cache) = CACHE.write() {
             cache.remove_overlapping(base, base + size.max(1));
+            CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -553,6 +611,35 @@ mod tests {
                 class: ModuleClass::Application,
             },
         ]
+    }
+
+    /// P2-2: Unknown の範囲は上限を超えたら捨てて覚え直し、イメージの
+    /// 範囲は残す。
+    #[test]
+    fn unknown_ranges_are_bounded() {
+        let mut c = CallerCache::default();
+        c.insert(ModuleRange {
+            base: 0x10,
+            end: 0x20,
+            class: ModuleClass::Windows,
+        });
+        for i in 0..(MAX_UNKNOWN_RANGES as u64 + 5) {
+            let base = 0x1_0000 + i * 0x100;
+            c.insert(ModuleRange {
+                base,
+                end: base + 0x10,
+                class: ModuleClass::Unknown,
+            });
+        }
+        assert!(c.len() <= MAX_UNKNOWN_RANGES + 1, "{}", c.len());
+        assert_eq!(c.classify(0x15), Some(ModuleClass::Windows));
+        let last = 0x1_0000 + (MAX_UNKNOWN_RANGES as u64 + 4) * 0x100;
+        assert_eq!(
+            c.range_of(last as usize + 1).map(|r| r.class),
+            Some(ModuleClass::Unknown)
+        );
+        c.remove_overlapping(0, u64::MAX);
+        assert!(c.is_empty());
     }
 
     #[test]
