@@ -1837,14 +1837,20 @@ mod tests {
             })
         };
         assert_eq!(main_rx.recv().unwrap(), RecordResult::NoSlot);
-        assert!(unsafe { a.thread_region_base(8) }.is_none(), "nothing built yet");
+        assert!(
+            unsafe { a.thread_region_base(8) }.is_none(),
+            "nothing built yet"
+        );
         // The first thread exits; once the Host drained its Ring, reclaiming
         // the Slot builds the waiting thread's Ring on this (management) path.
         assert!(a.thread_exit(7));
         let mut reader = unsafe { RingReader::new(base, cfg) };
         assert_eq!(reader.drain_all().events.len(), 1);
         assert_eq!(a.poll_reclaims(), 1);
-        assert!(unsafe { a.thread_region_base(8) }.is_some(), "built for the waiter");
+        assert!(
+            unsafe { a.thread_region_base(8) }.is_some(),
+            "built for the waiter"
+        );
         to_waiter.send(()).unwrap();
         assert!(matches!(main_rx.recv().unwrap(), RecordResult::Written(_)));
         waiter.join().unwrap();
