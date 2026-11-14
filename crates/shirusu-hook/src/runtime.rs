@@ -1812,15 +1812,17 @@ impl HookRuntime {
         thread_id: u64,
         call_id: u64,
         payload: &[u8],
+        capture_state: shirusu_transport::descriptor::CaptureState,
     ) -> RecordResult {
         let parent = current_parent_call();
-        let result = self.agent.record_enter(
+        let result = self.agent.record_enter_with_state(
             thread_id,
             WINRT_ACTIVATION_API_ID,
             WINRT_ACTIVATION_ENTER_SCHEMA_ID,
             call_id,
             parent,
             payload,
+            capture_state,
         );
         self.signal_if_needed(&result);
         result
@@ -3461,7 +3463,12 @@ mod tests {
         rt.ensure_thread(tid);
         let call_id = rt.alloc_call_id();
         assert!(matches!(
-            rt.record_winrt_activation_enter(tid, call_id, b"winrt-enter"),
+            rt.record_winrt_activation_enter(
+                tid,
+                call_id,
+                b"winrt-enter",
+                shirusu_transport::descriptor::CaptureState::Captured
+            ),
             RecordResult::Written(_)
         ));
         assert!(matches!(

@@ -376,7 +376,13 @@ pub(super) fn detour_winrt_activation(
     let call_id = rt.alloc_call_id();
     // HSTRING からクラス名を読む。読めなければ空のまま記録する
     // （クラス名の読み取り失敗で呼び出し自体を失敗させない）。
-    let class_name = crate::winrt::read_hstring_string(class_id).unwrap_or_default();
+    let class = crate::winrt::read_hstring_string(class_id).unwrap_or_default();
+    let capture_state = if class.truncated {
+        shirusu_transport::descriptor::CaptureState::CaptureLimitExceeded
+    } else {
+        shirusu_transport::descriptor::CaptureState::Captured
+    };
+    let class_name = class.text;
     let values = crate::winrt::winrt_activation_enter_values(
         0,
         &class_name,
@@ -384,7 +390,7 @@ pub(super) fn detour_winrt_activation(
         &crate::com::raw_arg_slots(&raw[..if iid.is_some() { 3 } else { 2 }]),
     );
     if let Ok(bytes) = crate::winrt::encode_winrt_activation_enter(&values) {
-        rt.record_winrt_activation_enter(tid, call_id, &bytes);
+        rt.record_winrt_activation_enter(tid, call_id, &bytes, capture_state);
     }
     drop(values);
     drop(class_name);

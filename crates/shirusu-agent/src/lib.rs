@@ -1104,6 +1104,30 @@ impl Agent {
         parent: u64,
         payload: &[u8],
     ) -> RecordResult {
+        self.record_enter_with_state(
+            thread_id,
+            api_id,
+            schema_id,
+            call_id,
+            parent,
+            payload,
+            CaptureState::Captured,
+        )
+    }
+    /// `record_enter` with a degraded capture state (for example a value cut
+    /// at its capture limit: `CaptureLimitExceeded`).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_enter_with_state(
+        &self,
+        thread_id: u64,
+        api_id: u32,
+        schema_id: u32,
+        call_id: u64,
+        parent: u64,
+        payload: &[u8],
+        capture_state: CaptureState,
+    ) -> RecordResult {
         self.record(
             thread_id,
             CallOrigin::Application,
@@ -1114,7 +1138,7 @@ impl Agent {
                 call_id,
                 parent_call_id: parent,
                 payload,
-                capture_state: CaptureState::Captured,
+                capture_state,
                 global_order: 0,
             },
         )

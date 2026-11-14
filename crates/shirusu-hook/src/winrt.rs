@@ -635,6 +635,14 @@ pub fn hstring_units_to_string(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
+/// 読み取った HSTRING。`truncated` は長さが [`MAX_HSTRING_UNITS`] を
+/// 超えて切り詰めたこと (記録は `CaptureLimitExceeded` になる)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HString {
+    pub text: String,
+    pub truncated: bool,
+}
+
 /// HSTRING ポインタから文字列を読む（Windows のみ）。
 ///
 /// `WindowsGetStringRawBuffer`（combase.dll）を遅延解決して呼ぶ。
@@ -643,7 +651,7 @@ pub fn hstring_units_to_string(units: &[u16]) -> String {
 /// アプリの状態を変えない。解決・読み取りに失敗したら None を返す
 /// （呼び出し自体はクラス名なしで記録を続ける）。
 #[cfg(windows)]
-pub fn read_hstring_string(hstring: usize) -> Option<String> {
+pub fn read_hstring_string(hstring: usize) -> Option<HString> {
     use std::sync::OnceLock;
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -697,7 +705,7 @@ pub fn read_hstring_with(
     mem: &dyn crate::capture::MemoryReader,
     hstring: u64,
     raw_buffer: impl FnOnce(u64) -> Option<(u64, u32)>,
-) -> Option<String> {
+) -> Option<HString> {
     if hstring == 0 {
         return None;
     }
@@ -706,6 +714,9 @@ pub fn read_hstring_with(
         return None;
     }
     let (ptr, len) = raw_buffer(hstring)?;
+    // The length comes from the HSTRING (UINT32): never copy or convert more
+    // than the limit, whatever it says.
+    let truncated = len as usize > MAX_HSTRING_UNITS;
     let units = (len as usize).min(MAX_HSTRING_UNITS);
     let mut bytes = vec![0u8; units * 2];
     if !mem.read_exact(ptr, &mut bytes) {
@@ -715,7 +726,10 @@ pub fn read_hstring_with(
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    Some(hstring_units_to_string(&units))
+    Some(HString {
+        text: hstring_units_to_string(&units),
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -733,7 +747,13 @@ mod tests {
         let text: Vec<u16> = "Windows.Foo".encode_utf16().collect();
         mem.write_u16s(0x2000, &text);
         let got = read_hstring_with(&mem, 0x1000, |_| Some((0x2000, text.len() as u32)));
-        assert_eq!(got.as_deref(), Some("Windows.Foo"));
+        assert_eq!(
+            got,
+            Some(HString {
+                text: "Windows.Foo".into(),
+                truncated: false
+            })
+        );
         // Unreadable header: the raw-buffer function is never called.
         assert_eq!(read_hstring_with(&mem, 0x9000, |_| unreachable!()), None);
         // A bogus length is capped, then the read fails instead of faulting.
@@ -744,7 +764,11 @@ mod tests {
         let long: Vec<u16> = vec![u16::from(b'a'); MAX_HSTRING_UNITS + 10];
         mem.write_u16s(0x8000, &long);
         let got = read_hstring_with(&mem, 0x1000, |_| Some((0x8000, long.len() as u32))).unwrap();
-        assert_eq!(got.len(), MAX_HSTRING_UNITS);
+        assert_eq!(got.text.len(), MAX_HSTRING_UNITS);
+        assert!(
+            got.truncated,
+            "cut at the limit: recorded as CaptureLimitExceeded"
+        );
         assert_eq!(read_hstring_with(&mem, 0, |_| unreachable!()), None);
     }
 
