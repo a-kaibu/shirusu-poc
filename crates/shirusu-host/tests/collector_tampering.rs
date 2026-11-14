@@ -139,14 +139,12 @@ fn last_descriptor_spanning_more_than_the_payload_capacity_stops_collection() {
     r.write(10);
     r.write(20);
     // 書込み済み位置を超えない範囲で、容量 (64) を超える長さの区間を作る。
-    unsafe {
-        layout::store(
-            r.region.base(),
-            layout::OFF_PAYLOAD_WRITE_POSITION,
-            200,
-            Ordering::Release,
-        )
-    };
+    layout::store(
+        r.region.base(),
+        layout::OFF_PAYLOAD_WRITE_POSITION,
+        200,
+        Ordering::Release,
+    );
     r.tamper(1, |d| d.payload_len = 100);
     r.expect_stop(0, 0);
 }
@@ -155,14 +153,12 @@ fn last_descriptor_spanning_more_than_the_payload_capacity_stops_collection() {
 fn write_cursor_beyond_the_capacity_stops_collection() {
     let mut r = rig();
     r.write(10);
-    unsafe {
-        layout::store(
-            r.region.base(),
-            layout::OFF_WRITE_CURSOR,
-            5,
-            Ordering::Release,
-        )
-    };
+    layout::store(
+        r.region.base(),
+        layout::OFF_WRITE_CURSOR,
+        5,
+        Ordering::Release,
+    );
     let chunk = r.collector.collect(|| {}).unwrap();
     assert!(r.collector.is_stopped());
     assert!(chunk.descriptors.is_empty());
