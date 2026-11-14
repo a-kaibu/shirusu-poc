@@ -9,7 +9,7 @@ on:
       suite:
         description: "実行するスイート"
         type: choice
-        options: [ci, nightly, weekly, all]
+        options: [ci, nightly, weekly, apps, all]
         default: ci
         required: true
   schedule:
@@ -112,6 +112,8 @@ jobs:
             target/ci-diagnostics/native-performance-*.json
             target/ci-diagnostics/native-performance-phases-*.txt
             target/ci-diagnostics/sustained-load-*.json
+            target/ci-diagnostics/real-apps-*.json
+            target/ci-diagnostics/real-*-compare.json
           if-no-files-found: ignore
           retention-days: 14
       - name: Preserve Windows reference corpus

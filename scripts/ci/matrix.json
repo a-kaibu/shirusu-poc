@@ -211,6 +211,21 @@
       "targets": "x86_64-pc-windows-msvc, i686-pc-windows-msvc",
       "timeout": 150,
       "toolchain": "stable"
+    },
+    {
+      "allow_failure": false,
+      "components": "",
+      "java": false,
+      "name": "windows-real-apps",
+      "os": "windows-latest",
+      "run": "pwsh -NoProfile -File scripts/ci/windows-real-apps.ps1",
+      "suites": [
+        "ci",
+        "apps"
+      ],
+      "targets": "x86_64-pc-windows-msvc, i686-pc-windows-msvc",
+      "timeout": 45,
+      "toolchain": "stable"
     }
   ]
 }
