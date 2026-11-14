@@ -124,6 +124,9 @@ pub struct TraceStream<R: Read + Seek> {
     /// （欠落と前方参照の判定用。Blob ID の種類数に比例する）。
     first_ref: HashMap<BlobId, u64>,
     reported_sessions: HashSet<u64>,
+    /// 最後に読めた Environment の session_id。全体読み込みと同じく、
+    /// 不一致は最後の Environment についてだけ終了時に記録する。
+    environment_session: Option<u64>,
     stored_index: Option<(u64, BlockIndex)>,
     total_events: u64,
     decoded_bytes: u64,
@@ -183,6 +186,7 @@ impl<R: Read + Seek> TraceStream<R> {
             updates: Vec::new(),
             first_ref: HashMap::new(),
             reported_sessions: HashSet::new(),
+            environment_session: None,
             stored_index: None,
             total_events: 0,
             decoded_bytes: 0,
@@ -224,6 +228,15 @@ impl<R: Read + Seek> TraceStream<R> {
     /// 残りを読み捨てて走査を終え、結果をまとめる。
     pub fn finish(mut self) -> Result<StreamSummary> {
         while self.next_item()?.is_some() {}
+        if let Some(found) = self.environment_session {
+            if found != self.header.session_id {
+                self.issues.push(RecoveryIssue::SessionMismatch {
+                    what: "environment",
+                    expected: self.header.session_id,
+                    found,
+                });
+            }
+        }
         let derived = self.fold_updates()?;
         let mut missing: Vec<BlobId> = self
             .first_ref
@@ -691,13 +704,7 @@ impl<R: Read + Seek> TraceStream<R> {
             }
             BlockType::Environment => match CaptureEnvironment::decode(&raw) {
                 Ok(env) => {
-                    if env.session.session_id != self.header.session_id {
-                        self.issues.push(RecoveryIssue::SessionMismatch {
-                            what: "environment",
-                            expected: self.header.session_id,
-                            found: env.session.session_id,
-                        });
-                    }
+                    self.environment_session = Some(env.session.session_id);
                     Some(StreamItem::Environment(env))
                 }
                 Err(e) => {
