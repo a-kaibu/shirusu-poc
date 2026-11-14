@@ -408,6 +408,12 @@ pub fn plan_steps(steps: &[Step]) -> Result<Vec<PlannedCall>, String> {
                     )
                 })?;
             check_value_kind(i, param, &value, &stored)?;
+            if sig.function == "Sleep" && !matches!(value, ArgValue::Int(ms) if ms <= MAX_SLEEP_MS)
+            {
+                return Err(format!(
+                    "step {i}: Sleep must be a literal of at most {MAX_SLEEP_MS} ms"
+                ));
+            }
             args.push(PlannedArg {
                 name: param.name.to_string(),
                 kind: param.kind,
@@ -487,6 +493,14 @@ fn checked_slot(value: u64, kind: ParamKind) -> Result<usize, String> {
     Ok(value as usize)
 }
 
+/// The longest `Sleep` a step may request. Every other call in the table
+/// works on files the spec created, so this bounds each step's duration.
+pub const MAX_SLEEP_MS: u64 = 10_000;
+
+fn is_inert_handle(value: u64) -> bool {
+    value == 0 || value == u64::MAX || value == u64::from(u32::MAX)
+}
+
 fn check_value_kind(
     i: usize,
     param: &ParamDef,
@@ -504,10 +518,20 @@ fn check_value_kind(
         (ParamKind::U64, ArgValue::Int(_)) => Ok(()),
         (ParamKind::Bool, ArgValue::Bool(_)) => Ok(()),
         (ParamKind::Bool, ArgValue::Int(v)) if *v <= 1 => Ok(()),
-        (ParamKind::Handle, ArgValue::Int(_)) => Ok(()),
+        // A literal handle may only be one no live handle can have: closing
+        // or reading an arbitrary value could hit the runner's own handles
+        // (2026-11-14 review P3-17). Real handles come from `$name`.
+        (ParamKind::Handle, ArgValue::Int(v)) if is_inert_handle(*v) => Ok(()),
+        (ParamKind::Handle, ArgValue::Int(_)) => {
+            Err(err("a literal handle other than 0 or INVALID_HANDLE_VALUE"))
+        }
         (ParamKind::WideStr, ArgValue::Text(_)) => Ok(()),
         (ParamKind::AnsiStr, ArgValue::Text(_)) => Ok(()),
-        (ParamKind::Ptr, ArgValue::Int(_)) => Ok(()),
+        // Raw addresses are not passed to Win32: only NULL or storage the
+        // runner owns (P3-17).
+        (ParamKind::Ptr, ArgValue::Int(0)) => Ok(()),
+        (ParamKind::Ptr, ArgValue::Int(_)) => Err(err("a raw address")),
+        (ParamKind::Ptr, ArgValue::Ref(_)) => Err(err("a stored value used as an address")),
         (ParamKind::Ptr, ArgValue::Buffer { size, fill }) => {
             check_buffer(i, param.name, *size, fill)?;
             Ok(())
@@ -1746,6 +1770,37 @@ mod tests {
             )],
         });
         assert!(plan_steps(&bad).is_err());
+    }
+
+    #[test]
+    fn plan_rejects_raw_addresses_live_handle_literals_and_long_sleeps() {
+        // P3-17: the runner no longer hands arbitrary values to Win32.
+        let mut bad = file_flow();
+        bad[0].args[3].1 = ArgValue::Int(0x7ff0_0000);
+        assert!(plan_steps(&bad).unwrap_err().contains("raw address"));
+        let mut bad = file_flow();
+        bad[0].args[3].1 = ArgValue::Ref("hFile".to_string());
+        assert!(plan_steps(&bad).is_err());
+        let mut bad = file_flow();
+        bad[2].args[0].1 = ArgValue::Int(0x44);
+        assert!(plan_steps(&bad).unwrap_err().contains("literal handle"));
+        for inert in [0, u64::MAX, u64::from(u32::MAX)] {
+            let mut ok = file_flow();
+            ok[2].args[0].1 = ArgValue::Int(inert);
+            assert!(plan_steps(&ok).is_ok(), "{inert:#x}");
+        }
+        let sleep = |ms| Step {
+            call: "kernel32!Sleep".to_string(),
+            args: vec![("dwMilliseconds".to_string(), ArgValue::Int(ms))],
+            store: None,
+            expect: None,
+        };
+        assert!(plan_steps(&[sleep(MAX_SLEEP_MS)]).is_ok());
+        assert!(plan_steps(&[sleep(MAX_SLEEP_MS + 1)]).is_err());
+        assert!(
+            plan_steps(&[sleep(u64::from(u32::MAX))]).is_err(),
+            "INFINITE"
+        );
     }
 
     #[test]
