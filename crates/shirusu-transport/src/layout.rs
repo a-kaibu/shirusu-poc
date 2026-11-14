@@ -37,6 +37,13 @@ pub const OFF_OWNER_THREAD_ID: usize = 168;
 // 待機の意思を示した後に全順序フェンスを打ち、空きを再確認する。Host はこの
 // フラグを見て、空きができたときに space_available を SetEvent する。
 pub const OFF_WRITER_WAITING: usize = 192;
+// 200: プロセス全体で Slot を取れずに記録しなかった呼び出しの下限値
+// (P1-1)。Agent は自分の全 Mapping へ単調に書き (fetch_max)、Host は全
+// Ring の最大値を Capture Coverage の欠落として扱う。Slot を持てない
+// スレッドには自分の Ring が無いため、他スレッドの Ring の Control を
+// プロセス共通の掲示板として使う。Slot 再利用の初期化で 0 に戻っても、
+// Host は観測した最大値を保持し、Agent は次の欠落で書き直す。
+pub const OFF_PROCESS_MISSING_CALLS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingConfig {
@@ -111,6 +118,20 @@ pub fn usage_percent(used: u64, capacity: u64) -> u64 {
 #[inline]
 pub fn writer_waiting(base: *const u8) -> bool {
     load(base, OFF_WRITER_WAITING, Ordering::Acquire) != 0
+}
+
+/// Agent 側: プロセス全体の欠落呼び出し数を掲示する（単調、P1-1）。
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // 呼び手が領域の有効性を保証する内部部品
+#[inline]
+pub fn publish_process_missing_calls(base: *mut u8, total: u64) {
+    // SAFETY: load/store と同じ前提（整列済みの有効な共有領域）。
+    unsafe { atomic_at(base, OFF_PROCESS_MISSING_CALLS) }.fetch_max(total, Ordering::Relaxed);
+}
+
+/// Host 側: 掲示された欠落呼び出し数を読む（信用しない参考値。下限として使う）。
+#[inline]
+pub fn process_missing_calls(base: *const u8) -> u64 {
+    load(base, OFF_PROCESS_MISSING_CALLS, Ordering::Relaxed)
 }
 
 /// # Safety

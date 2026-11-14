@@ -56,11 +56,22 @@ fn collection_low_water(cfg: shirusu_transport::RingConfig) -> usize {
 }
 
 impl LaunchConfig {
+    /// 既定の Ring 本数 (P1-1)。以前は 8 本固定で、9 本目以降のスレッドは
+    /// 記録されなかった。標準の Ring (約 1.25MiB) は Bootstrap の上限
+    /// 32 本 (Host と対象で各約 40MiB)、burst (約 5.25MiB) は 16 本。
+    pub fn default_ring_count(cfg: shirusu_transport::RingConfig) -> usize {
+        if cfg.required_len() > shirusu_transport::RingConfig::PRODUCTION.required_len() {
+            16
+        } else {
+            crate::MAX_RING_COUNT
+        }
+    }
     pub fn new(session: CaptureSessionConfig, dll_path: PathBuf) -> Self {
+        let ring_count = Self::default_ring_count(session.ring_config);
         Self {
             session,
             dll_path,
-            ring_count: 8,
+            ring_count,
             init_timeout: Duration::from_secs(30),
         }
     }

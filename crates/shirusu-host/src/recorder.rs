@@ -612,6 +612,16 @@ impl CaptureSession {
             }
         }
     }
+    /// Agent が全 Mapping の Control へ掲示したプロセス全体の欠落呼び出し
+    /// 数 (P1-1) を読み、観測した最大値を保持する。Slot を取れなかった
+    /// スレッドの呼び出しは Ring を持たないため、ここでしか見えない。
+    fn observe_process_missing_calls(&mut self) {
+        for ring in &self.rings {
+            // 未初期化の Mapping も 0 で埋まっているため、Magic を問わず読む。
+            let seen = layout::process_missing_calls(ring.mapping.base());
+            self.coverage_missing_calls = self.coverage_missing_calls.max(seen);
+        }
+    }
     /// 同一プロセス記録で判明している Slot 不足数を知らせる
     /// （Capture Coverage の劣化として Finalization に写す）。
     pub fn set_coverage_missing_calls(&mut self, n: u64) {
@@ -754,6 +764,7 @@ impl CaptureSession {
     pub fn poll_once(&mut self) -> Result<PollStats, SessionError> {
         self.ensure_state(SessionState::Recording, "poll_once")?;
         self.recorder.check_health()?;
+        self.observe_process_missing_calls();
         let mut stats = PollStats::default();
         for ring in &mut self.rings {
             // 世代交代の検出 (レビュー #6 P1-4): Agent が Slot を
@@ -864,6 +875,7 @@ impl CaptureSession {
         }
         // Every collected chunk must be validated before reading the workers.
         self.recorder.barrier()?;
+        self.observe_process_missing_calls();
         let mut reports = Vec::new();
         // 世代交代で確定済みの旧 Worker 分も集計へ含める (P1-4)。
         let mut total_loss_records = self.retired_loss_records;
@@ -906,6 +918,7 @@ impl CaptureSession {
         ));
         recorder.update_environment(&self.config.environment)?;
         reports.append(&mut self.retired_reports);
+        let reports_were_empty = reports.is_empty();
         let mut report = combine_reports(&reports);
         if args_stats.args_incomplete > 0 {
             report.semantic_completeness =
@@ -923,12 +936,13 @@ impl CaptureSession {
                 args_stats.args_fallback_blob
             ));
         }
-        if self.coverage_missing_calls == 0 {
-            report.notes.push(
-                "note: cross-process slot exhaustion is counted only inside the agent \
-                 and is not visible to the host in this version"
-                    .into(),
-            );
+        if self.coverage_missing_calls > 0 && reports_were_empty {
+            // どの Ring も記録を始めなかった場合も欠落を落とさない (P1-1)。
+            report.capture_coverage = worst(report.capture_coverage, IntegrityLevel::Degraded);
+            report.notes.push(format!(
+                "slot/coverage missing calls: {}",
+                self.coverage_missing_calls
+            ));
         }
         if let Some(outcome) = &self.shutdown_outcome {
             if let Some((level, note)) = shutdown_integrity_impact(outcome) {

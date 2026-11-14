@@ -22,10 +22,16 @@ Windows の `capture` / `attach` は `--buffer burst` を選べる。
 例えば `shirusu capture --buffer burst -- game.exe`。既定は
 `--buffer standard` で、記録する API や完全性の判定は変わらない。
 
-| 設定 | Ring ごとの Descriptor | Ring ごとの Payload | 初期8本の共有 Mapping |
-| --- | ---: | ---: | ---: |
-| standard | 4,096件 | 1 MiB | 約10 MiB |
-| burst | 65,536件 | 1 MiB | 約40 MiB |
+| 設定 | Ring ごとの Descriptor | Ring ごとの Payload | 既定の本数 | 既定本数の共有 Mapping |
+| --- | ---: | ---: | ---: | ---: |
+| standard | 4,096件 | 1 MiB | 32 | 約40 MiB |
+| burst | 65,536件 | 1 MiB | 16 | 約84 MiB |
+
+Ring の本数は同時に記録できるスレッドの数で、`--rings <1..32>` で変えられる
+（2026-11-14 レビュー P1-1。以前は 8 本固定）。Slot を取れなかったスレッドの
+呼び出しは記録されず、Agent が全 Ring の Control（オフセット 200）へ掲示する
+欠落数を Host が読んで Capture Coverage を Degraded にする。Slot が空くまで、
+そのスレッドは取得と登録を間引いてやり直す。
 
 これは共有 Mapping の容量であり RSS ではない。Host の検証用コピー、
 回収済みイベントのキュー、変換用バッファなどは別途必要になる。

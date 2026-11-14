@@ -128,6 +128,9 @@ pub struct SlotPool {
     /// 拡張要求が出ているか（登録はしない。非同期拡張側が消費する）。
     expansion_requested: AtomicBool,
     pub expansion_request_count: AtomicU64,
+    /// Slot が FREE になるたびに進む番号 (P1-1)。Slot を取れなかった
+    /// スレッドはこの値が変わるまで取得をやり直さない。
+    free_epoch: AtomicU64,
     pub low_watermark: usize,
     /// 総メモリ上限（設定時のみ）。Slot 拡張の可否を決める。None なら上限なし。
     pub memory_limit_bytes: Option<u64>,
@@ -147,6 +150,7 @@ impl SlotPool {
             process_missing_calls: AtomicU64::new(0),
             expansion_requested: AtomicBool::new(false),
             expansion_request_count: AtomicU64::new(0),
+            free_epoch: AtomicU64::new(0),
             low_watermark,
             memory_limit_bytes: None,
             slot_memory_bytes: SLOT_MEMORY_BYTES,
@@ -210,14 +214,19 @@ impl SlotPool {
         let Some(s) = slots.get(index) else {
             return false;
         };
-        s.state
+        let published = s
+            .state
             .compare_exchange(
                 SLOT_PREPARING,
                 SLOT_FREE,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if published {
+            self.free_epoch.fetch_add(1, Ordering::Release);
+        }
+        published
     }
     pub fn capacity(&self) -> usize {
         self.slots.read().unwrap().len()
@@ -348,7 +357,18 @@ impl SlotPool {
         s.generation.fetch_add(1, Ordering::AcqRel);
         s.owner_thread_id.store(0, Ordering::Release);
         s.state.store(SLOT_FREE, Ordering::Release);
+        self.free_epoch.fetch_add(1, Ordering::Release);
         true
+    }
+    /// Slot が FREE になった回数 (P1-1)。Slot 不足のスレッドが、空きが
+    /// 出る見込みのない間に取得を繰り返さないための目印。
+    pub fn free_epoch(&self) -> u64 {
+        self.free_epoch.load(Ordering::Acquire)
+    }
+    /// Slot を取らずに欠落を 1 件数える (取得をやり直さない高速経路)。
+    /// 更新後の累計を返す。
+    pub fn note_missing_call(&self) -> u64 {
+        self.process_missing_calls.fetch_add(1, Ordering::Relaxed) + 1
     }
     pub fn take_expansion_request(&self) -> bool {
         self.expansion_requested.swap(false, Ordering::Relaxed)

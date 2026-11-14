@@ -54,6 +54,8 @@ pub(crate) struct CaptureRequest {
     /// （`--follow-children`。capture 専用）。
     pub(crate) follow_children: bool,
     pub(crate) ring_config: shirusu_transport::RingConfig,
+    /// P1-1: `--rings`（同時に記録できるスレッド数）。None は既定値。
+    pub(crate) rings: Option<usize>,
 }
 
 /// capture / attach の共通オプション（`--output` / `--dll` /
@@ -76,6 +78,8 @@ pub(crate) struct CaptureOptions {
     /// L05: 子プロセスも追跡するか（`--follow-children`）。
     pub(crate) follow_children: bool,
     pub(crate) ring_config: shirusu_transport::RingConfig,
+    /// P1-1: `--rings`（同時に記録できるスレッド数）。None は既定値。
+    pub(crate) rings: Option<usize>,
 }
 
 impl CaptureOptions {
@@ -92,7 +96,22 @@ impl CaptureOptions {
             "api",
             "follow-children",
             "buffer",
+            "rings",
         ])?;
+        // P1-1: 同時に記録できるスレッドの数。足りない分は Capture
+        // Coverage の欠落として Trace に残る。
+        let rings = match parsed.opt("rings") {
+            None => None,
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) if (1..=shirusu_host::MAX_RING_COUNT).contains(&n) => Some(n),
+                _ => {
+                    return Err(ToolError::Usage(format!(
+                        "bad --rings: {v} (expected 1..={})",
+                        shirusu_host::MAX_RING_COUNT
+                    )))
+                }
+            },
+        };
         let ring_config = match parsed.opt("buffer") {
             None | Some("standard") => shirusu_transport::RingConfig::PRODUCTION,
             Some("burst") => shirusu_transport::RingConfig::BURST,
@@ -165,6 +184,7 @@ impl CaptureOptions {
             dll: parsed.opt("dll").map(PathBuf::from),
             timeout_secs,
             ring_config,
+            rings,
             order_global,
             module_classes,
             // L07: Runtime 独自の API を記録するか（既定は記録しない）。
@@ -360,6 +380,7 @@ pub(crate) fn cmd_capture(args: &[String]) -> Result<(), ToolError> {
         dll: opts.dll,
         timeout: Duration::from_secs(opts.timeout_secs),
         ring_config: opts.ring_config,
+        rings: opts.rings,
         order_global: opts.order_global,
         module_classes: opts.module_classes,
         record_runtime_apis: opts.record_runtime_apis,
@@ -409,6 +430,7 @@ pub(crate) fn cmd_attach(args: &[String]) -> Result<(), ToolError> {
         dll: opts.dll,
         timeout: Duration::from_secs(opts.timeout_secs),
         ring_config: opts.ring_config,
+        rings: opts.rings,
         order_global: opts.order_global,
         module_classes: opts.module_classes,
         record_runtime_apis: opts.record_runtime_apis,
@@ -459,6 +481,9 @@ pub(crate) fn run_capture(req: &CaptureRequest) -> Result<(), ToolError> {
     };
     let mut launch_cfg = LaunchConfig::new(session_cfg, dll);
     launch_cfg.init_timeout = req.timeout;
+    if let Some(n) = req.rings {
+        launch_cfg.ring_count = n;
+    }
     // L05: --follow-children のときは TreeCapture で子プロセスも追跡する。
     if req.follow_children {
         use shirusu_host::child_tree::child_trace_path;

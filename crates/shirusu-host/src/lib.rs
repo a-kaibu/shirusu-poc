@@ -12,6 +12,10 @@ pub mod static_dep;
 pub mod trace_convert;
 mod trace_pipeline;
 
+/// capture / attach で用意できる Ring の最大本数 (= Bootstrap が渡せる
+/// Mapping の数)。同時に記録できるスレッド数の上限になる (P1-1)。
+pub const MAX_RING_COUNT: usize = shirusu_hook::bootstrap::MAX_BOOTSTRAP_RINGS;
+
 use shirusu_transport::descriptor::EventKind;
 use shirusu_transport::layout::{self, LossCounters};
 use shirusu_transport::ring::{DrainBatch, ReceivedEvent, SharedRegion};

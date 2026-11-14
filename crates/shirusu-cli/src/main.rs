@@ -102,7 +102,9 @@ fn usage() -> &'static str {
      \n\
      capture / attach options:\n\
      \x20 --output <path>  --dll <path>  --timeout <secs> (init timeout, default 30)\n\
-     \x20 --buffer <standard|burst>  (burst uses ~40 MiB shared Rings/process; default: standard)\n\
+     \x20 --buffer <standard|burst>  (shared Ring size: standard ~1.25 MiB, burst ~5.25 MiB per Ring; default: standard)\n\
+     \x20 --rings <1..32>  (threads recorded at once; default: 32 standard, 16 burst; threads beyond it are\n\
+     \x20 \x20 counted as Capture Coverage loss)\n\
      \x20 --order=global  (record with a global observation order, L11)\n\
      \x20 --module-class <module>=<class>  (repeatable; windows/runtime/application/unknown, L07)\n\
      \x20 --record-runtime-apis  (also record the Runtime's own APIs, L07; default: off)\n\

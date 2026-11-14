@@ -173,6 +173,8 @@ Hostが共有メモリとRing Slotをあらかじめ用意し、Agentは初め�
 - 初期Poolは32 Slotとし、総メモリ上限を設定できるようにする。Slotごとに約1.25MiBなので、32 Slotで約40MiB、256 Slotで約320MiBになる。ページファイルを元にしたFile Mappingは既定でMapping全体のCommitを消費するので、システム全体のCommit使用量にも注意する。
 - 空きが低水位（例：残り8）を下回ったらAgentは待たずにHostへ知らせ、Hostが非同期に新しいMappingを作る。MappingのHandleと情報をAgentへ渡し、Agentの管理スレッドが登録を完了して初めて使える。この登録はHookの中では行わない。Mappingの追加中にHostが止まっても、Agentは既存のRingで続ける。
 - それでもSlotが無いスレッドの呼び出しは記録せず、Capture Coverageの欠落としてプロセス共通のカウンタ（`fetch_add`のみ）を更新して元のAPIへ戻る。
+- プロセス間ではこのカウンタをHostが直接読めないため、Agentは累計を全MappingのControl（Reserved line のオフセット200、`fetch_max`）へ掲示し、Hostは全Ringの最大値をCapture Coverageの欠落として扱う（2026-11-14 レビュー P1-1）。Slotを取れなかったスレッドは、SlotがFREEに戻る（free epochが進む）まで取得を繰り返さず、欠落だけを数える。
+- 現行のCLIは低水位時のMapping追加（A70の非同期拡張）を対象プロセスへ結線していない。代わりに起動時のRing本数を既定32本（burstは16本）とし、`--rings`で選べる。
 
 ### 予備Queue（保留）
 

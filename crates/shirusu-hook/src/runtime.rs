@@ -996,9 +996,16 @@ static NEXT_CALL_ID_SEED: AtomicU64 = AtomicU64::new(1);
 /// 2^40 needs 2^32 threads, and still leaves 2^24 sessions per process.
 const CALL_ID_RANGE: u64 = 1 << 40;
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+/// (runtime id, thread id, registration epoch)。
+type RegistrationKey = (u64, u64, u64);
+/// Slot 不足の登録をやり直す間隔 (呼び出し回数)。
+const REGISTER_RETRY_INTERVAL: u32 = 64;
 thread_local! {
     // Copy-only native TLS: no allocation or destructor registration in a Hook.
     static REGISTERED_THREAD: Cell<Option<(u64, u64, u64)>> = const { Cell::new(None) };
+    /// Slot を取れなかった登録の否定キャッシュ (P1-1): (キー, 以後の呼び出し数)。
+    /// 毎回の共有 Mutex・回収走査を避け、一定回数ごとにだけやり直す。
+    static REGISTER_FAILED: Cell<Option<(RegistrationKey, u32)>> = const { Cell::new(None) };
     /// Call IDs reserved by this thread: (runtime_id, next, end).
     static CALL_ID_BLOCK: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
 }
@@ -1402,6 +1409,18 @@ impl HookRuntime {
         {
             return;
         }
+        let skip = REGISTER_FAILED
+            .try_with(|c| match c.get() {
+                Some((k, n)) if k == key && n % REGISTER_RETRY_INTERVAL != 0 => {
+                    c.set(Some((k, n.wrapping_add(1))));
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if skip {
+            return;
+        }
         self.register_thread(thread_id, key);
     }
 
@@ -1423,8 +1442,13 @@ impl HookRuntime {
             self.agent.poll_reclaims();
             self.agent.thread_begin(thread_id)
         }) else {
-            return; // Slot 不足。記録時に NoSlot として数えられる
+            // Slot 不足。記録時に NoSlot として数えられる。次の数十回は
+            // 登録をやり直さない (P1-1: 記録されないスレッドが最も遅く
+            // なり、他スレッドとも共有 Mutex で競合していた)。
+            let _ = REGISTER_FAILED.try_with(|c| c.set(Some((key, 1))));
+            return;
         };
+        let _ = REGISTER_FAILED.try_with(|c| c.set(None));
         if let Some(notify) = self.space_notifies.get(handle.index) {
             self.agent
                 .attach_space_available_notify(thread_id, Arc::clone(notify));

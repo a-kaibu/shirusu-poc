@@ -281,6 +281,35 @@ fn setters_and_getters_flow_into_summary() {
     assert_eq!(session2.ring_count(), 1);
 }
 
+/// P1-1: Agent が Ring の Control へ掲示したプロセス全体の欠落数
+/// (Slot を取れなかったスレッドの呼び出し) を Host が読み、Capture
+/// Coverage を下げる。以前は Agent 内のカウンタにしか残らなかった。
+#[test]
+fn published_slot_exhaustion_degrades_capture_coverage() {
+    let path = temp_trace("published-missing");
+    let mut session = CaptureSession::create_file(&path, config()).unwrap();
+    let region = SharedRegion::new(RingConfig::new(64, 4096), 1, 1);
+    let base = region.base();
+    session.add_local_ring(region, spec(1)).unwrap();
+    session.start().unwrap();
+    session.poll_once().unwrap();
+    layout::publish_process_missing_calls(base, 3);
+    // 小さい値の掲示は最大値を下げない。
+    layout::publish_process_missing_calls(base, 1);
+    assert_eq!(layout::process_missing_calls(base), 3);
+    let summary = session.stop().unwrap();
+    assert_eq!(summary.integrity.capture_coverage, IntegrityLevel::Degraded);
+    assert!(
+        summary
+            .integrity
+            .notes
+            .iter()
+            .any(|n| n.contains("slot/coverage missing calls: 3")),
+        "{:?}",
+        summary.integrity.notes
+    );
+}
+
 /// `add_borrowed_ring` で小さすぎる Mapping は Config エラー。
 #[test]
 fn add_borrowed_ring_too_small_is_config_error() {

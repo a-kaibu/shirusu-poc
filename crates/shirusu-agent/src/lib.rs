@@ -171,7 +171,16 @@ thread_local! {
     /// OS スレッドごとに「直前に使った書き手」を 1 件だけキャッシュする。
     /// 借用は取得・格納の瞬間と、キャッシュ経由の 1 回の記録の間だけ。
     static TLS_STATE: TlsCache = const { TlsCache(RefCell::new(None)) };
+    /// Slot を取れなかったスレッドの否定キャッシュ (P1-1):
+    /// (agent id, thread id, 失敗時の free epoch, 以後の欠落数)。
+    /// 空きが出る (epoch が進む) まで登録表と Slot の走査を繰り返さない。
+    static NO_SLOT: Cell<(u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0)) };
 }
+
+/// 否定キャッシュ中でも、この回数ごとに 1 回は取得をやり直す。
+const NO_SLOT_RETRY_INTERVAL: u64 = 4096;
+/// 否定キャッシュ中の欠落を、この回数ごとに共有 Control へ掲示する。
+const NO_SLOT_PUBLISH_INTERVAL: u64 = 256;
 
 /// The cached writer state; its destructor tells the hook layer that this
 /// thread's capture TLS is going away (see [`set_thread_teardown_hook`]).
@@ -378,7 +387,32 @@ impl Agent {
         if let Some(s) = cached {
             return Some(s);
         }
-        let state = self.state_for_slow(thread_id)?;
+        let epoch = self.pool.free_epoch();
+        if let Ok((agent, tid, failed_epoch, misses)) = NO_SLOT.try_with(Cell::get) {
+            if agent == self.id
+                && tid == thread_id
+                && failed_epoch == epoch
+                && misses % NO_SLOT_RETRY_INTERVAL != 0
+            {
+                let total = self.pool.note_missing_call();
+                let misses = misses + 1;
+                let _ = NO_SLOT.try_with(|c| c.set((agent, tid, failed_epoch, misses)));
+                if misses % NO_SLOT_PUBLISH_INTERVAL == 0 {
+                    self.publish_missing_calls_total(total);
+                }
+                return None;
+            }
+        }
+        let Some(state) = self.state_for_slow(thread_id) else {
+            let _ = NO_SLOT.try_with(|c| c.set((self.id, thread_id, epoch, 1)));
+            self.publish_missing_calls();
+            return None;
+        };
+        let _ = NO_SLOT.try_with(|c| {
+            if c.get().0 == self.id && c.get().1 == thread_id {
+                c.set((0, 0, 0, 0));
+            }
+        });
         TLS_STATE
             .try_with(|c| {
                 *c.borrow_mut() = Some(CachedState {
@@ -450,6 +484,28 @@ impl Agent {
             return Err(());
         }
         Ok(index)
+    }
+    /// プロセス全体の欠落呼び出し数を、Host が読める全 Mapping の Control
+    /// へ掲示する (P1-1)。Slot を持てないスレッドには自分の Ring が無い
+    /// ため、Host はこの掲示から Capture Coverage の欠落を知る。
+    pub fn publish_missing_calls(&self) {
+        self.publish_missing_calls_total(self.pool.missing_calls());
+    }
+    fn publish_missing_calls_total(&self, total: u64) {
+        if total == 0 {
+            return;
+        }
+        let Ok(regions) = self.expanded_regions.try_lock() else {
+            // 登録中の管理パスと競合したら次の掲示に任せる (待たない)。
+            return;
+        };
+        for region in regions.values() {
+            let base = match region {
+                ExpandedRegion::Borrowed { base } => *base,
+                ExpandedRegion::Owned(mapping) => mapping.as_ptr(),
+            };
+            layout::publish_process_missing_calls(base, total);
+        }
     }
     /// 管理パス: Host から配送された Mapping を Slot として登録する公開
     /// 入口（本体は A70 の管理スレッド経路と同じ `register_expanded_mapping`）。

@@ -80,3 +80,54 @@ fn register_slot_mapping_rejects_bad_deliveries() {
     };
     assert_eq!(agent.register_slot_mapping(short), None);
 }
+
+/// P1-1: Slot を取れないスレッドの呼び出しは自分の Ring を持たない。
+/// Agent はプロセス全体の欠落数を全 Mapping の Control へ掲示し、Host は
+/// それを Capture Coverage の欠落として読む。否定キャッシュ中も欠落は
+/// 1 件ずつ数え、Slot が空けば取得をやり直す。
+#[test]
+fn slot_exhaustion_is_published_to_host_visible_control() {
+    let cfg = RingConfig::new(64, 4096);
+    let host_region = SharedRegion::new(cfg, 0, 0);
+    let base = host_region.base();
+    let pool = Arc::new(SlotPool::new(0));
+    let agent = Agent::new(
+        Arc::clone(&pool),
+        cfg,
+        Arc::new(HostMonitor::always_alive()),
+    )
+    .with_policy(WriterPolicy {
+        max_wait: std::time::Duration::ZERO,
+        ..Default::default()
+    });
+    let delivery = ExpansionDelivery {
+        len: cfg.required_len(),
+        base: Some(base),
+        handle_value: None,
+        generation: shirusu_transport::EXPANDED_SLOT_GENERATION,
+    };
+    assert_eq!(agent.register_slot_mapping(delivery), Some(0));
+    // スレッド 7 が唯一の Slot を持つ。
+    assert!(matches!(
+        agent.record_enter(7, 1, 1, 1, 0, b"x"),
+        RecordResult::Written(_)
+    ));
+    // スレッド 8 は別の OS スレッドから記録し、毎回 NoSlot になる。
+    let a = Arc::new(agent);
+    let a2 = Arc::clone(&a);
+    std::thread::spawn(move || {
+        for _ in 0..1000 {
+            assert_eq!(a2.record_enter(8, 1, 1, 1, 0, b"y"), RecordResult::NoSlot);
+        }
+    })
+    .join()
+    .unwrap();
+    assert_eq!(pool.missing_calls(), 1000, "every skipped call is counted");
+    let shown = shirusu_transport::layout::process_missing_calls(base);
+    assert!(
+        (1..=1000).contains(&shown),
+        "the first miss is published at once: {shown}"
+    );
+    a.publish_missing_calls();
+    assert_eq!(shirusu_transport::layout::process_missing_calls(base), 1000);
+}
