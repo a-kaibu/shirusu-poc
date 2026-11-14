@@ -63,7 +63,7 @@ Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (
 
 Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "attach-rollback.ps1"), "-Target", "i686-pc-windows-msvc")
 Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "thread-churn.ps1"), "-Target", "i686-pc-windows-msvc")
-Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "terminate-writer.ps1"), "-Target", "i686-pc-windows-msvc")
+Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "terminate-writer.ps1"), "-Target", "i686-pc-windows-msvc") -TimeoutSeconds 900
 
 Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1"), "-Target", "i686-pc-windows-msvc")
 Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 900 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "sustained-load.ps1"), "-Target", "i686-pc-windows-msvc")

@@ -21,6 +21,12 @@
 #       the report is rewritten after every run so a later hang keeps it.
 #   V5: one run records four threads at once (several Rings).
 #   V7: the backlog is the Host's time after it saw the target exit.
+# Interim review P1 (event accounting): the workload counts each API call
+# itself as it returns (measurement.json "calls"). Each counted API's enter
+# events in the Trace are compared with that count, and every difference is
+# classified: lost (covered by loss records), not hooked (no event for an
+# API the workload called), or extra (calls outside the loop, from the CRT
+# or startup; allowed only for APIs the runtime also calls).
 param(
     [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")][string]$Target = "x86_64-pc-windows-msvc"
 )
@@ -138,6 +144,31 @@ try {
                 $expected = 6.0 * $m.iterations + 2.0 * $sleeps
                 # V1: missing events with no loss record are a silent loss.
                 if ($lossRecords -eq 0 -and $events -lt $expected) { throw "silent loss: $events events, at least $expected expected, no loss record" }
+                # Independent accounting: workload's own per-API counts
+                # against the Trace's per-API enter counts.
+                $accounting = @()
+                if ($null -ne $m.calls) {
+                    foreach ($prop in $m.calls.PSObject.Properties) {
+                        $api = $prop.Name; $called = [double]$prop.Value
+                        $stat = @($inspect.api_stats | Where-Object { $_.api -match "(^|[!.:])$api$" })
+                        $entered = [double](($stat | Measure-Object -Property enter -Sum).Sum)
+                        $left = [double](($stat | Measure-Object -Property leave -Sum).Sum)
+                        $class = if ($stat.Count -eq 0 -or $entered -eq 0) { "not_hooked" }
+                            elseif ($entered -lt $called) { "lost" }
+                            elseif ($entered -gt $called) { "extra" }
+                            else { "exact" }
+                        # The CRT and startup also call the heap; nothing else
+                        # outside the loop calls GetCurrentProcessId or Sleep.
+                        $extraAllowed = if ($api -in @("HeapAlloc", "HeapFree")) { 100000 } else { 16 }
+                        $accounting += [ordered]@{ api = $api; called = $called; enter = $entered; leave = $left; class = $class; difference = $entered - $called }
+                        if ($class -eq "not_hooked") { throw "$name`: the workload called $api $called times but the trace has no event for it" }
+                        if ($class -eq "lost" -and $lossRecords -eq 0) { throw "$name`: silent loss on $api ($entered of $called calls recorded, no loss record)" }
+                        if ($class -eq "extra" -and ($entered - $called) -gt $extraAllowed) { throw "$name`: $api has $($entered - $called) more enter events than calls" }
+                        if ($lossRecords -eq 0 -and $left -ne $entered) { throw "$name`: $api enter/leave mismatch ($entered/$left) without loss" }
+                    }
+                } else {
+                    throw "measurement.json has no per-API call counts"
+                }
                 $result = [ordered]@{
                     run = $name; seconds = $run.seconds; rate = $run.rate
                     threads = $run.threads
@@ -150,6 +181,7 @@ try {
                     application_events_expected = $expected
                     missing_events_estimate = [Math]::Max(0, $expected - $events)
                     loss_records = $lossRecords; trace_bytes = $traceBytes
+                    api_accounting = $accounting
                     event_integrity = $integrity
                     host_events_per_second = $(if ($appSeconds -gt 0) { $events / $appSeconds } else { $null })
                     host_queue_peak_bytes = $queuePeak

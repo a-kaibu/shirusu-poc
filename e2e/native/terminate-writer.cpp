@@ -8,6 +8,12 @@
 // flag set. Before the fix, a later thread that reused the terminated
 // thread's ID waited for that flag forever. Spinners are terminated only
 // after warm-up, so they never hold the heap or Agent registration locks.
+//
+// Fixed kill point (interim review 2026-11-14 P0): when the environment has
+// SHIRUSU_TEST_WRITER_STALL_AFTER, a debug Agent stops one recording thread
+// inside the Writer's owner fast path and signals the event created here;
+// round 0 waits for it before terminating the spinners, so one of them is
+// certainly cut off inside the Writer.
 #include <windows.h>
 #include <dbghelp.h>
 
@@ -108,6 +114,25 @@ static bool marker(const wchar_t* name) {
 static bool exists(const wchar_t* name) {
     return GetFileAttributesW(name) != INVALID_FILE_ATTRIBUTES;
 }
+static HANDLE stall_event = nullptr;
+static void create_stall_event() {
+    wchar_t value[2];
+    if (GetEnvironmentVariableW(L"SHIRUSU_TEST_WRITER_STALL_AFTER", value, 2) == 0) return;
+    wchar_t name[64] = L"Local\\shirusu-writer-stall-";
+    unsigned at = 0;
+    while (name[at]) ++at;
+    const DWORD pid = GetCurrentProcessId();
+    bool started = false;
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        const unsigned digit = (pid >> shift) & 0xf;
+        if (!digit && !started && shift) continue;
+        started = true;
+        name[at++] = (wchar_t)(digit < 10 ? L'0' + digit : L'a' + digit - 10);
+    }
+    name[at] = 0;
+    stall_event = CreateEventW(nullptr, TRUE, FALSE, name);
+    if (!stall_event) ExitProcess(22);
+}
 static const unsigned kRounds = 48;
 static const unsigned kSpinners = 4;
 static const unsigned kFinite = 8;
@@ -115,6 +140,7 @@ static const unsigned kFinite = 8;
 extern "C" void __cdecl entry() {
     SetUnhandledExceptionFilter(crash_filter);
     expected_pid = GetCurrentProcessId();
+    create_stall_event();
     if (!marker(L"ready")) ExitProcess(10);
     const ULONGLONG deadline = GetTickCount64() + 120000;
     while (!exists(L"go")) {
@@ -131,6 +157,11 @@ extern "C" void __cdecl entry() {
         while (InterlockedCompareExchange(&warmed, 0, 0) != (LONG)kSpinners) {
             if (GetTickCount64() >= deadline) ExitProcess(13);
             Sleep(0);
+        }
+        if (round == 0 && stall_event) {
+            // A spinner is held inside the Writer by the Agent's test point.
+            if (WaitForSingleObject(stall_event, 60000) != WAIT_OBJECT_0) ExitProcess(21);
+            if (!marker(L"stalled")) ExitProcess(23);
         }
         Sleep(round % 3);
         for (unsigned i = 0; i < kSpinners; ++i) {

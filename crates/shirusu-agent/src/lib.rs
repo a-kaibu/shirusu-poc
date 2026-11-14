@@ -98,6 +98,11 @@ pub struct Agent {
     /// 置き、登録・終了・回収をする別のスレッドが Ring を作って置き、要求した
     /// スレッドがロックなしで受け取る。
     adoptions: Adoptions,
+    /// Test-only fixed termination point (debug builds): after this many
+    /// owner fast-path entries on one thread, call the hook while holding
+    /// the fast path, before writing. Used once per process.
+    #[cfg(debug_assertions)]
+    test_writer_stall: Option<(u64, fn())>,
     /// `--order=global` (L11) が有効かどうか。`with_order_global` で
     /// 構築時に設定し、以後は不変。Host は Bootstrap / セッション設定から
     /// 決める。無効な間は Descriptor の `global_order` は 0 のまま。
@@ -448,6 +453,8 @@ impl Agent {
             expanded_regions: Arc::new(Mutex::new(HashMap::new())),
             published_bases: PublishedBases::new(),
             adoptions: Adoptions::new(),
+            #[cfg(debug_assertions)]
+            test_writer_stall: None,
             order_global: false,
             next_global_order: AtomicU64::new(1),
             last_reap_ms: AtomicU64::new(0),
@@ -457,6 +464,35 @@ impl Agent {
     /// 全スレッド共通の番号を振り、Descriptor の `global_order` に刻む。
     /// 番号はアトミックカウンタの更新順であり、API 処理の完了順や
     /// メモリ操作全体の順序を保証しない。
+    /// Debug builds only: a fixed point where a test terminates a writer.
+    /// After `after` owner fast-path entries on one thread, `stall` runs with
+    /// the fast path held and before the event is written (it is expected not
+    /// to return; the test terminates the thread there). Fires once.
+    #[cfg(debug_assertions)]
+    pub fn with_test_writer_stall(mut self, after: u64, stall: fn()) -> Self {
+        self.test_writer_stall = (after > 0).then_some((after, stall));
+        self
+    }
+    #[cfg(debug_assertions)]
+    #[inline]
+    fn test_stall_point(&self) {
+        use std::sync::atomic::AtomicBool;
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        thread_local! {
+            static ENTRIES: Cell<u64> = const { Cell::new(0) };
+        }
+        let Some((after, stall)) = self.test_writer_stall else {
+            return;
+        };
+        let n = ENTRIES.try_with(|c| {
+            let n = c.get() + 1;
+            c.set(n);
+            n
+        });
+        if n == Ok(after) && !FIRED.swap(true, Ordering::AcqRel) {
+            stall();
+        }
+    }
     pub fn with_order_global(mut self, enabled: bool) -> Self {
         self.order_global = enabled;
         self
@@ -943,6 +979,8 @@ impl Agent {
             if writer.is_detached() {
                 return None;
             }
+            #[cfg(debug_assertions)]
+            self.test_stall_point();
             let _guard = PublishSection::enter(depth);
             match writer.write_captured(kind, api_id, schema_id, call_id, parent, 0, payload) {
                 WriteOutcome::Published { notify, .. } => Some(notify != NotifySignal::None),
@@ -1065,7 +1103,11 @@ impl Agent {
     ) -> RecordResult {
         // The owner fast path inlines the write; the exclusive path is cold.
         let outcome = match state.writer.try_owner() {
-            Some(mut writer) => self.write_locked(&mut writer, depth, input),
+            Some(mut writer) => {
+                #[cfg(debug_assertions)]
+                self.test_stall_point();
+                self.write_locked(&mut writer, depth, input)
+            }
             None if state.writer.unclaimed() => {
                 // The owner's liveness could not be taken, so its Ring is not
                 // used (a terminated owner could not be told apart from a

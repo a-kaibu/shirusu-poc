@@ -129,7 +129,7 @@ try {
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "attach-rollback.ps1")) } "native attach rollback and reattach"
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "thread-churn.ps1")) } "native thread creation during attach"
     # Review P0: writers terminated by TerminateThread mid-record (watchdog).
-    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "terminate-writer.ps1")) } "native terminated writers"
+    Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "terminate-writer.ps1")) -TimeoutSeconds 900 } "native terminated writers"
 
     Invoke-CaptureScenario { Invoke-NativeWithTimeout -FilePath pwsh -TimeoutSeconds 600 -ArgumentList @("-NoProfile", "-File", (Join-Path $PSScriptRoot "native-performance.ps1")) } "native injected performance"
     # Review P1: 10-30 s continuous capture (loss rate, Host queue, backlog).

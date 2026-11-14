@@ -20,6 +20,10 @@
 //   milliseconds sleeps instead of spinning, like an application that rests
 //   between bursts. Each Sleep is one captured call (two events); the count
 //   is reported so the expected event count stays exact.
+// - Interim review P1 (event accounting): every captured API call is also
+//   counted by the workload itself, per API, as it returns ("calls" in
+//   measurement.json). The script compares those counts with the Trace's
+//   per-API event counts instead of an estimate derived from iterations.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
@@ -42,12 +46,18 @@ struct Shared {
     volatile long long per_second[kMaxSeconds];
     volatile long long total;
     volatile long long sleeps;
+    // Independent per-API call counts (each incremented as the call returns).
+    volatile long long calls_pid;
+    volatile long long calls_alloc;
+    volatile long long calls_free;
+    volatile long long calls_sleep;
     volatile long checksum;
     volatile long failure;
 };
 
 static DWORD run_loop(Shared* s) {
     unsigned long long total = 0, sleeps = 0;
+    unsigned long long n_pid = 0, n_alloc = 0, n_free = 0;
     unsigned checksum = 0;
     // Sleep only when this far ahead: well above one timer tick of work.
     const unsigned long long sleep_ahead = s->unpaced ? 0 : s->rate / 200 + kBatch;
@@ -70,12 +80,17 @@ static DWORD run_loop(Shared* s) {
             }
         }
         for (unsigned i = 0; i < kBatch; ++i) {
-            if (GetCurrentProcessId() == 0) { s->failure = 5; return 5; }
+            const DWORD pid = GetCurrentProcessId();
+            ++n_pid;
+            if (pid == 0) { s->failure = 5; return 5; }
             auto* block = (volatile unsigned*)HeapAlloc(s->heap, 0, 64);
+            ++n_alloc;
             if (!block) { s->failure = 6; return 6; }
             *block = (unsigned)total + i;
             checksum ^= *block;
-            if (!HeapFree(s->heap, 0, (void*)block)) { s->failure = 7; return 7; }
+            const BOOL freed = HeapFree(s->heap, 0, (void*)block);
+            ++n_free;
+            if (!freed) { s->failure = 7; return 7; }
         }
         total += kBatch;
         const unsigned bucket = (unsigned)(elapsed / s->tsc_rate);
@@ -83,6 +98,10 @@ static DWORD run_loop(Shared* s) {
     }
     _InterlockedExchangeAdd64(&s->total, (long long)total);
     _InterlockedExchangeAdd64(&s->sleeps, (long long)sleeps);
+    _InterlockedExchangeAdd64(&s->calls_pid, (long long)n_pid);
+    _InterlockedExchangeAdd64(&s->calls_alloc, (long long)n_alloc);
+    _InterlockedExchangeAdd64(&s->calls_free, (long long)n_free);
+    _InterlockedExchangeAdd64(&s->calls_sleep, (long long)sleeps);
     _InterlockedXor(&s->checksum, (long)checksum);
     return 0;
 }
@@ -108,6 +127,7 @@ int main(int argc, char** argv) {
     const unsigned long long tsc_calibrate = __rdtsc();
     Sleep(100);
     if (!QueryPerformanceCounter(&calibrate_end)) return 3;
+    g_shared.calls_sleep = 1;  // the calibration Sleep is captured too
     const unsigned long long tsc_rate =
         (unsigned long long)((double)(__rdtsc() - tsc_calibrate) * (double)f /
                              (double)(calibrate_end.QuadPart - calibrate_start.QuadPart));
@@ -139,9 +159,11 @@ int main(int argc, char** argv) {
     if (fopen_s(&output, "measurement.json", "w") != 0) return 8;
     fprintf(output, "{\"seconds\":%u,\"rate\":%llu,\"threads\":%u,\"iterations\":%lld,"
                     "\"sleeps\":%lld,\"ticks\":%lld,\"qpc_frequency\":%lld,\"checksum\":%lu,"
-                    "\"per_second\":[",
+                    "\"calls\":{\"GetCurrentProcessId\":%lld,\"HeapAlloc\":%lld,"
+                    "\"HeapFree\":%lld,\"Sleep\":%lld},\"per_second\":[",
             seconds, rate, threads, s->total, s->sleeps, now.QuadPart - start.QuadPart, f,
-            (unsigned long)s->checksum);
+            (unsigned long)s->checksum, s->calls_pid, s->calls_alloc, s->calls_free,
+            s->calls_sleep);
     for (unsigned i = 0; i < seconds; ++i) {
         fprintf(output, i ? ",%lld" : "%lld", s->per_second[i]);
     }

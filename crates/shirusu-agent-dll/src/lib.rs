@@ -56,6 +56,42 @@ fn contain_panic(on_panic: u32, f: impl FnOnce() -> u32) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(on_panic)
 }
 
+/// Debug builds only (Windows E2E `terminate-writer.ps1`): the target's
+/// `SHIRUSU_TEST_WRITER_STALL_AFTER` makes one recording thread stop inside
+/// the Writer's owner fast path after that many entries, so the test can
+/// terminate it at a known point (interim review 2026-11-14 P0).
+#[cfg(all(debug_assertions, windows))]
+fn test_writer_stall_after() -> Option<u64> {
+    std::env::var("SHIRUSU_TEST_WRITER_STALL_AFTER")
+        .ok()?
+        .parse()
+        .ok()
+}
+/// Signals `Local\shirusu-writer-stall-<pid hex>` (created by the test
+/// target) and waits forever, holding the fast path.
+#[cfg(all(debug_assertions, windows))]
+fn test_writer_stall() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenEventW, SetEvent, Sleep, EVENT_MODIFY_STATE, INFINITE,
+    };
+    // SAFETY: no preconditions.
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut name: Vec<u16> = format!("Local\\shirusu-writer-stall-{pid:x}")
+        .encode_utf16()
+        .collect();
+    name.push(0);
+    // SAFETY: name is NUL-terminated; the handle is only signaled.
+    unsafe {
+        let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if !event.is_null() {
+            SetEvent(event);
+        }
+        loop {
+            Sleep(INFINITE);
+        }
+    }
+}
+
 /// Capture Policy の API 一覧を検証して記録対象の集合にする（純粋関数）。
 /// 未知の api_id を 1 つでも含めば None（Host と Agent の表の食い違いを
 /// 記録範囲の黙った縮小にしない）。
@@ -355,6 +391,14 @@ mod win {
                 // L11: Host が Bootstrap v4 で指定した --order=global を Agent へ渡す。
                 .with_order_global(b.order_global != 0),
         );
+        #[cfg(all(debug_assertions, windows))]
+        let agent = match test_writer_stall_after() {
+            Some(after) => match Arc::try_unwrap(agent) {
+                Ok(a) => Arc::new(a.with_test_writer_stall(after, test_writer_stall)),
+                Err(a) => a,
+            },
+            None => agent,
+        };
         for &mapping in b.mapping_handles.iter().take(b.ring_count as usize) {
             let delivery = ExpansionDelivery {
                 len: config.required_len(),
