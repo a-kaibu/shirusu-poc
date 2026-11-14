@@ -92,3 +92,24 @@ fn service_spawn_and_stop() {
     assert_eq!(service.mappings_held(), 1);
     let _ = stop.load(Ordering::Relaxed);
 }
+
+#[test]
+fn dropping_the_handle_asks_the_service_thread_to_stop() {
+    let (req_tx, req_rx) = mpsc::channel::<ExpansionRequest>();
+    let (del_tx, _del_rx) = mpsc::channel();
+    let service = ExpansionService::new(req_rx, Box::new(del_tx), cfg());
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = service.spawn(Arc::clone(&stop));
+    assert!(!stop.load(Ordering::Relaxed));
+    drop(handle);
+    assert!(stop.load(Ordering::Relaxed), "drop requests the stop");
+    // 要求元は生きたままでも、スレッドは停止要求で受け口を手放す。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while req_tx.send(ExpansionRequest::new()).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service thread kept running"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
