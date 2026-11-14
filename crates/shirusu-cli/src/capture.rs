@@ -603,13 +603,14 @@ pub(crate) fn print_summary(trace: &Path, summary: &shirusu_host::recorder::Sess
     );
     let pipeline = &summary.host_pipeline;
     println!(
-        "host pipeline: {} commands ({} merged), compression bypasses {}, queue full {}, drain wait {:.3}ms, conversion wall {:.3}ms",
+        "host pipeline: {} commands ({} merged), compression bypasses {}, queue full {}, drain wait {:.3}ms, conversion wall {:.3}ms, queue peak {} bytes",
         pipeline.commands_processed,
         pipeline.merged_event_commands,
         pipeline.compression_bypass_requests,
         pipeline.queue_full_count,
         pipeline.drain_wait_ns as f64 / 1_000_000.0,
         pipeline.conversion_wall_ns as f64 / 1_000_000.0,
+        pipeline.peak_queued_bytes,
     );
     if let Some((hooked, missing)) = summary.hook_coverage {
         println!("hook coverage: {hooked} hooked, {missing} missing");

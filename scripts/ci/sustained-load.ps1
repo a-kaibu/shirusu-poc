@@ -64,24 +64,31 @@ try {
                 if ($mode -eq "baseline") {
                     Invoke-NativeWithTimeout -FilePath $exe -ArgumentList $arguments -TimeoutSeconds 120
                 } else {
-                    & $cli capture --dll $dll --mode full --output $trace -- $exe @arguments | Out-Host
-                    if ($LASTEXITCODE -notin @(0,2)) { throw "sustained capture failed: $LASTEXITCODE" }
+                    $captureOutput = & $cli capture --dll $dll --mode full --output $trace -- $exe @arguments
+                    $captureExit = $LASTEXITCODE
+                    $captureOutput | Out-Host
+                    if ($captureExit -notin @(0,2)) { throw "sustained capture failed: $captureExit" }
                 }
                 $wall.Stop()
                 $m = Get-Content "measurement.json" -Raw | ConvertFrom-Json
                 $appSeconds = $m.ticks / $m.qpc_frequency
                 $itersPerSecond = $m.iterations / $appSeconds
                 if ($mode -eq "baseline") { $baselineRate = $itersPerSecond; continue }
-                $raw = & $cli inspect $trace --json
-                if ($LASTEXITCODE -notin @(0,1)) { throw "sustained trace inspection failed" }
-                $summary = ($raw -join "`n") | ConvertFrom-Json
-                $api = @($summary.api_stats | Where-Object { $_.api -eq "kernel32!HeapAlloc" -and $_.enter -gt 0 })
-                if ($api.Count -ne 1) { throw "sustained run did not capture HeapAlloc" }
-                $lossKinds = @($summary.integrity.loss_records | ForEach-Object { "$($_.kind):$($_.records)" }) -join ","
-                $losses = [double]$summary.integrity.total_loss_count
-                if ($losses -gt 0 -and $summary.integrity.status -eq "complete") { throw "sustained trace with losses finalized as complete" }
-                $config = $summary.environment.capture_config
-                # Expected events: two per call, three calls per iteration.
+                # Read the capture summary instead of `shirusu inspect`: an
+                # unpaced run records tens of millions of events, and inspect
+                # loads every event into memory.
+                $text = $captureOutput -join "`n"
+                if ($text -notmatch 'events: (\d+) \(loss records: (\d+)\)') { throw "capture summary missing events" }
+                $events = [double]$Matches[1]; $lossRecords = [double]$Matches[2]
+                if ($text -notmatch 'queue full (\d+), drain wait ([\d.]+)ms, conversion wall ([\d.]+)ms, queue peak (\d+) bytes') { throw "capture summary missing host pipeline" }
+                $queueFull = [double]$Matches[1]; $drainWaitMs = [double]$Matches[2]; $conversionMs = [double]$Matches[3]; $queuePeak = [double]$Matches[4]
+                if ($text -notmatch 'event_integrity=(\w+)') { throw "capture summary missing integrity" }
+                $integrity = $Matches[1]
+                $traceBytes = (Get-Item $trace).Length
+                Remove-Item $trace  # unpaced traces reach gigabytes
+                if ($lossRecords -gt 0 -and $integrity -eq "Complete") { throw "sustained trace with losses finalized as complete" }
+                # Two events per call, three calls per iteration; startup and
+                # shutdown add a few hundred more.
                 $expected = 6.0 * $m.iterations
                 $result = [ordered]@{
                     run = $name; seconds = $run.seconds; rate = $run.rate
@@ -90,23 +97,21 @@ try {
                     app_iterations_per_second_by_second = $m.per_second
                     baseline_iterations_per_second = $baselineRate
                     throughput_ratio = $(if ($baselineRate) { $baselineRate / $itersPerSecond } else { $null })
-                    trace_events = $summary.events
+                    trace_events = $events
                     application_events_expected = $expected
-                    captured_fraction = $(if ($expected -gt 0) { [Math]::Min($summary.events, $expected) / $expected } else { $null })
-                    loss_count = $losses; loss_kinds = $lossKinds
-                    loss_rate = $(if ($expected -gt 0) { $losses / $expected } else { $null })
-                    integrity = $summary.integrity.status
-                    host_events_received = Get-ConfigValue $config "host_events_received"
-                    host_events_per_second = $(if ($appSeconds -gt 0) { (Get-ConfigValue $config "host_events_received") / $appSeconds } else { $null })
-                    host_queue_peak_bytes = Get-ConfigValue $config "host_queue_peak_bytes"
-                    host_queue_full = Get-ConfigValue $config "host_queue_full"
-                    host_drain_wait_ms = (Get-ConfigValue $config "host_drain_wait_ns") / 1e6
-                    host_conversion_wall_ms = (Get-ConfigValue $config "host_conversion_wall_ns") / 1e6
+                    missing_events_estimate = [Math]::Max(0, $expected - $events)
+                    loss_records = $lossRecords; trace_bytes = $traceBytes
+                    event_integrity = $integrity
+                    host_events_per_second = $(if ($appSeconds -gt 0) { $events / $appSeconds } else { $null })
+                    host_queue_peak_bytes = $queuePeak
+                    host_queue_full = $queueFull
+                    host_drain_wait_ms = $drainWaitMs
+                    host_conversion_wall_ms = $conversionMs
                     backlog_after_exit_ms = $wall.Elapsed.TotalMilliseconds - 1000.0 * $appSeconds
                 }
                 $results += $result
                 $perSecond = ($m.per_second | ForEach-Object { "{0:N0}" -f $_ }) -join " "
-                Write-Host ("Sustained {0} ({1}): app {2:N0} it/s, events={3} expected~{4:N0} losses={5} ({6:P4}) [{13}] integrity={7}, queue peak={8:N0}B full={9} drain wait={10:N1}ms, backlog after exit={11:N0}ms, ratio={12}" -f $name, $arch, $itersPerSecond, $summary.events, $expected, $losses, $result.loss_rate, $result.integrity, $result.host_queue_peak_bytes, $result.host_queue_full, $result.host_drain_wait_ms, $result.backlog_after_exit_ms, $(if ($result.throughput_ratio) { "{0:N2}x" -f $result.throughput_ratio } else { "n/a" }), $lossKinds)
+                Write-Host ("Sustained {0} ({1}): app {2:N0} it/s, events={3:N0} expected~{4:N0} missing~{5:N0} loss records={6} integrity={7}, queue peak={8:N0}B full={9} drain wait={10:N1}ms, backlog after exit={11:N0}ms, ratio={12}" -f $name, $arch, $itersPerSecond, $events, $expected, $result.missing_events_estimate, $lossRecords, $integrity, $queuePeak, $queueFull, $drainWaitMs, $result.backlog_after_exit_ms, $(if ($result.throughput_ratio) { "{0:N2}x" -f $result.throughput_ratio } else { "n/a" }))
                 Write-Host "  per-second iterations: $perSecond"
             } finally { Pop-Location }
         }

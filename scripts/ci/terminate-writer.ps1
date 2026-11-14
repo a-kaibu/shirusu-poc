@@ -14,7 +14,7 @@ if (-not $vs) { throw "MSVC compiler not found" }
 $dev = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
 $source = Join-Path $repo "e2e\native\terminate-writer.cpp"
 $exe = Join-Path $work "terminate-writer.exe"
-$compile = "`"$dev`" -arch=$arch && cl /nologo /W4 /WX /O2 /GS- /Fe:`"$exe`" /Fo:`"$work\fixture.obj`" `"$source`" /link /ENTRY:entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib"
+$compile = "`"$dev`" -arch=$arch && cl /nologo /W4 /WX /O2 /GS- /Fe:`"$exe`" /Fo:`"$work\fixture.obj`" `"$source`" /link /ENTRY:entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib dbghelp.lib"
 $buildScript = Join-Path $work "build.cmd"
 @("@echo off", "call $compile") | Set-Content -Encoding ascii $buildScript
 Invoke-Native { cmd /d /c $buildScript } "terminate writer fixture ($arch)"
@@ -23,7 +23,11 @@ $recorderProcess = $null
 function Wait-Marker([string]$name) {
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while (-not (Test-Path (Join-Path $work $name))) {
-        if ($targetProcess.HasExited) { throw "attach target exited early: $($targetProcess.ExitCode)" }
+        if ($targetProcess.HasExited) {
+            $crash = Join-Path $work "crash.txt"
+            if (Test-Path $crash) { Write-Host "target crash report:"; Get-Content $crash | Write-Host }
+            throw "attach target exited early: $($targetProcess.ExitCode)"
+        }
         if ([DateTime]::UtcNow -ge $deadline) { throw "timed out waiting for $name" }
         Start-Sleep -Milliseconds 20
     }

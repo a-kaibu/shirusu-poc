@@ -75,15 +75,18 @@ echo "OK: CAS を外した変種で NoStaleRetire の違反を検出した"
 # 非対称同期 (WriterCell / Hazard Slot、レビュー P0/P1): Store→Load の並べ替えと
 # 強制終了を含めて、排他・寿命・進行性が成り立つ。重い側のフェンスを外した変種、
 # タイムアウトで奪う変種、終了状態を見ない変種 (旧実装) では反例が必須。
-java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -config AsymmetricHandshake.cfg AsymmetricHandshake
+# -lncheck final: TLC's periodic liveness check on a partly explored graph
+# reported a spurious stuttering counterexample on the 2-core CI runner (a
+# state whose successors were still queued). Check liveness on the full graph.
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -lncheck final -workers auto -config AsymmetricHandshake.cfg AsymmetricHandshake
 expect_violation() {
   local cfg="$1" pattern="$2"
-  if java -cp tla2tools.jar tlc2.TLC -config "$cfg" AsymmetricHandshake >"$buggy_log" 2>&1; then
+  if java -cp tla2tools.jar tlc2.TLC -lncheck final -config "$cfg" AsymmetricHandshake >"$buggy_log" 2>&1; then
     echo "ERROR: $cfg で違反が検出されなかった" >&2
     cat "$buggy_log" >&2
     exit 1
   fi
-  if ! grep -q "$pattern" "$buggy_log"; then
+  if ! grep -Eq "$pattern" "$buggy_log"; then
     echo "ERROR: $cfg で期待した違反 ($pattern) が見つからない" >&2
     cat "$buggy_log" >&2
     exit 1
@@ -94,4 +97,4 @@ expect_violation AsymmetricHandshakeNoFenceWriter.cfg "Invariant MutualExclusion
 expect_violation AsymmetricHandshakeNoFenceHazard.cfg "Invariant HazardSafe is violated"
 expect_violation AsymmetricHandshakeTimeoutWriter.cfg "Invariant NoPoisonedUse is violated"
 expect_violation AsymmetricHandshakeTimeoutHazard.cfg "Invariant HazardSafe is violated"
-expect_violation AsymmetricHandshakeNoLiveness.cfg "Temporal property RemoteProgress was violated"
+expect_violation AsymmetricHandshakeNoLiveness.cfg "Temporal propert(y|ies) RemoteProgress.* (was|were) violated"

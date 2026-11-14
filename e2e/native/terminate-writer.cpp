@@ -9,6 +9,78 @@
 // thread's ID waited for that flag forever. Spinners are terminated only
 // after warm-up, so they never hold the heap or Agent registration locks.
 #include <windows.h>
+#include <dbghelp.h>
+
+// Crash report (diagnostics only): an unhandled exception writes its code,
+// address and symbolized stack to crash.txt, which the CI script prints.
+static HANDLE crash_file = INVALID_HANDLE_VALUE;
+static void put(const char* text) {
+    DWORD written = 0;
+    DWORD length = 0;
+    while (text[length]) ++length;
+    WriteFile(crash_file, text, length, &written, nullptr);
+}
+static void put_hex(ULONG64 value) {
+    char buffer[19] = "0x";
+    for (int i = 0; i < 16; ++i) {
+        const unsigned digit = (unsigned)(value >> (60 - 4 * i)) & 0xf;
+        buffer[2 + i] = (char)(digit < 10 ? '0' + digit : 'a' + digit - 10);
+    }
+    buffer[18] = 0;
+    put(buffer);
+}
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* info) {
+    crash_file = CreateFileW(L"crash.txt", GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (crash_file == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
+    put("code ");
+    put_hex(info->ExceptionRecord->ExceptionCode);
+    put(" address ");
+    put_hex((ULONG64)info->ExceptionRecord->ExceptionAddress);
+    if (info->ExceptionRecord->NumberParameters >= 2) {
+        put(" access ");
+        put_hex(info->ExceptionRecord->ExceptionInformation[0]);
+        put(" at ");
+        put_hex(info->ExceptionRecord->ExceptionInformation[1]);
+    }
+    put(" thread ");
+    put_hex(GetCurrentThreadId());
+    put("\r\n");
+    HANDLE process = GetCurrentProcess();
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+    const BOOL symbols = SymInitialize(process, nullptr, TRUE);
+    void* frames[62];
+    const USHORT count = RtlCaptureStackBackTrace(0, 62, frames, nullptr);
+    alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 512];
+    for (USHORT i = 0; i < count; ++i) {
+        const DWORD64 address = (DWORD64)frames[i];
+        put_hex(address);
+        HMODULE module = nullptr;
+        char path[MAX_PATH];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)frames[i], &module) &&
+            GetModuleFileNameA(module, path, MAX_PATH)) {
+            const char* name = path;
+            for (const char* c = path; *c; ++c) if (*c == '\\') name = c + 1;
+            put(" ");
+            put(name);
+            put("+");
+            put_hex(address - (DWORD64)module);
+        }
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)storage;
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 511;
+        DWORD64 displacement = 0;
+        if (symbols && SymFromAddr(process, address, &displacement, symbol)) {
+            put(" ");
+            put(symbol->Name);
+        }
+        put("\r\n");
+    }
+    CloseHandle(crash_file);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 static DWORD expected_pid;
 static volatile LONG warmed;
@@ -41,6 +113,7 @@ static const unsigned kSpinners = 4;
 static const unsigned kFinite = 8;
 
 extern "C" void __cdecl entry() {
+    SetUnhandledExceptionFilter(crash_filter);
     expected_pid = GetCurrentProcessId();
     if (!marker(L"ready")) ExitProcess(10);
     const ULONGLONG deadline = GetTickCount64() + 120000;
