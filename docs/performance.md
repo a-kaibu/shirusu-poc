@@ -441,6 +441,33 @@ full モードでは、この fixture の 3倍はハードウェアの下限で�
 エンコードと2記録 86 ns、呼出スタック 2 ns。1記録は Ring Writer 単体 17 ns に対し
 Agent 経由 30 ns。3倍（追加 約 20 ns / 呼び出し）までは、まだ約 6 倍の開きがある。
 
+### Agent 中継の省略（`dfb9091`、CI run 43559909476）
+
+生成 Detour とファイル I/O の Detour は `Agent::record`（`EventInput` を組んで汎用の
+判定を通る）を経由せず、`Agent::record_captured` を直接呼ぶ。高速経路は Agent の
+TLS キャッシュを1回借り、書き手セルの所有者確認と publish 区間だけを通って
+`write_captured` に書く。Host の起床が要るかは戻り値で返し、通知は cold な関数で
+送る。異常な書き込み結果と高速経路に乗らない状態は従来の `record` に落とす。
+
+| ランナー | `layer_ring_writer_write` | `layer_hook_runtime_record`（従来） | `layer_hook_runtime_emit`（新） | Native high-load | 欠落 |
+| --- | --- | --- | --- | --- | --- |
+| x64 latest | 37.01 ns | 58.24 ns | 37.57 ns | 28.977倍 | 3試行とも0 |
+| x64 Server 2022 | 36.00 ns | 65.33 ns | 36.62 ns | 21.514倍 | 3試行とも0 |
+| x86 WoW64 | 55.14 ns | 78.61 ns | 93.07 ns | 27.042倍 | 3試行とも0 |
+
+x64 では1記録あたり Agent 中継の約 21〜29 ns が消え、Ring Writer 単体と同じ費用に
+なった。WoW64 の行は `layer_agent_record`（107 ns）が、それを内包する
+`layer_hook_runtime_record`（79 ns）より遅く、この run の部品計測が乱れているため
+判断に使わない。
+
+この run の `floor_call_two_tsc_two_records` は 20.7〜24.0 ns（`49fe41f` の latest
+x64 は 16.8 ns）で、ランナーが遅かった。また同じ期間に別の変更（`d7e7b0f`、
+Windows 内部からの呼び出しを境界で除外する判定）が Detour 入口に入り、
+`detour_stage_prepare` は 57〜67 ns だった。Native high-load の倍率は 21.5〜29.0 倍で、
+前回（26.3〜30.7 倍）からランナーのぶれを超える改善は見えない。高負荷の1呼び出しは
+記録以外（入口の判定、エンコード、元 API）の費用が大きく、記録の短縮だけでは
+3倍に届かない。
+
 ## 持続負荷の測定（外部レビュー `4ab9601` の P1、2026-11-14）
 
 `native-performance.ps1` の高負荷ワークロードは有限のバースト（5 万回）であり、Host はアプリの終了後も変換と保存を続けられる。そのため、そこでの「欠落 0」から長時間の連続記録でも欠落 0 になるとは言えない。`scripts/ci/sustained-load.ps1`（`e2e/native/sustained-load.cpp`）は同じ 3 つの呼び出しを一定時間続け、次の指標を別々に記録する。
