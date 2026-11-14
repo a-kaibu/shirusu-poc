@@ -507,6 +507,15 @@ impl Agent {
     /// プロセス全体の欠落呼び出し数を、Host が読める全 Mapping の Control
     /// へ掲示する (P1-1)。Slot を持てないスレッドには自分の Ring が無い
     /// ため、Host はこの掲示から Capture Coverage の欠落を知る。
+    /// 記録できなかった呼び出しを 1 件数える（Slot 不足以外の理由。
+    /// 例: 確保失敗後の素通し、レビュー 2026-11-14 P2-9）。Host へは
+    /// Slot 不足と同じ掲示で届く。
+    pub fn note_missing_call(&self) {
+        let total = self.pool.note_missing_call();
+        if total == 1 || total.is_multiple_of(NO_SLOT_PUBLISH_INTERVAL) {
+            self.publish_missing_calls_total(total);
+        }
+    }
     pub fn publish_missing_calls(&self) {
         self.publish_missing_calls_total(self.pool.missing_calls());
     }

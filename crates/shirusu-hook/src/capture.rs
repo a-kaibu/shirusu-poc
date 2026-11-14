@@ -515,7 +515,10 @@ impl OverlappedRegistry {
         if overlapped_addr == 0 {
             return;
         }
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pending.len() >= MAX_PENDING_OVERLAPPED && !pending.contains_key(&overlapped_addr) {
             // Completed through a path without a Detour: drop the oldest.
             let mut ids: Vec<u64> = pending.values().map(|e| e.op.call_id).collect();
@@ -530,7 +533,10 @@ impl OverlappedRegistry {
         if address == 0 {
             return;
         }
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pending
             .get(&address)
             .is_some_and(|p| p.op.call_id == call_id)
@@ -541,7 +547,7 @@ impl OverlappedRegistry {
     pub fn take(&self, overlapped_addr: u64) -> Option<PendingOverlapped> {
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&overlapped_addr)
             .map(|e| e.op)
     }
@@ -555,7 +561,11 @@ impl OverlappedRegistry {
         handle: Option<u64>,
         signature: Option<OverlappedSignature>,
     ) -> Option<PendingOverlapped> {
-        let entry = self.pending.lock().unwrap().remove(&overlapped_addr)?;
+        let entry = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&overlapped_addr)?;
         if handle.is_some_and(|h| h != entry.op.handle) {
             return None;
         }
@@ -567,7 +577,10 @@ impl OverlappedRegistry {
         Some(entry.op)
     }
     pub fn len(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0

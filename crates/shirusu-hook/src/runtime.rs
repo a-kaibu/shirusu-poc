@@ -600,6 +600,13 @@ impl DetourFlight {
         if !rt.recording_enabled.load(Ordering::SeqCst) {
             return None;
         }
+        // P2-9: once an allocation has failed (the reserve was used), every
+        // Detour passes through without recording: recording allocates, and
+        // a failed allocation would abort the target. Counted as missing.
+        if crate::alloc_reserve::low_memory() {
+            rt.agent.note_missing_call();
+            return None;
+        }
         if let RuntimeRef::Shared(shared) = &rt {
             shared.in_flight.fetch_add(1, Ordering::SeqCst);
             if !shared.recording_enabled.load(Ordering::SeqCst) {
@@ -784,7 +791,10 @@ impl RuntimeSlot {
     /// アクティブなセッションが無ければ登録する。ある場合は、
     /// 渡したランタイムをそのまま `Err` で返す。
     pub fn register(&self, rt: Arc<HookRuntime>) -> Result<(), Arc<HookRuntime>> {
-        let mut cur = self.current.write().unwrap();
+        let mut cur = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cur.active.is_some() {
             return Err(rt);
         }
@@ -821,7 +831,11 @@ impl RuntimeSlot {
 
     /// 現在のセッションのランタイム（Detour の入口が掴む）。
     pub fn current(&self) -> Option<Arc<HookRuntime>> {
-        self.current.read().unwrap().active.clone()
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .clone()
     }
 
     /// Late detours retain a disabled runtime even after IAT restoration.
@@ -868,7 +882,10 @@ impl RuntimeSlot {
                 return Some(rt);
             }
         }
-        let state = self.current.read().unwrap();
+        let state = self
+            .current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .active
             .as_ref()
@@ -910,7 +927,10 @@ impl RuntimeSlot {
 
     #[cold]
     fn fill_cache(&self, cache: &mut RuntimeCache) -> Option<RuntimeRef> {
-        let state = self.current.read().unwrap();
+        let state = self
+            .current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rt = state.active.as_ref().or(state.retired.as_ref())?.clone();
         // Load under the lock: the revision must describe this snapshot.
         let revision = self.revision.load(Ordering::Relaxed);
@@ -930,14 +950,21 @@ impl RuntimeSlot {
         // re-check the revision after publishing (see `crate::hazard`).
         graveyard.retain(|rt| crate::hazard::count(Arc::as_ptr(rt)) > 0);
         if !graveyard.is_empty() {
-            self.current.write().unwrap().graveyard.extend(graveyard);
+            self.current
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .graveyard
+                .extend(graveyard);
         }
     }
 
     /// 登録解除は「自分が登録したランタイム」に対してだけ行う
     /// （後継セッションの登録を誤って消さない）。解除したら true。
     pub fn unregister(&self, rt: &Arc<HookRuntime>) -> bool {
-        let mut cur = self.current.write().unwrap();
+        let mut cur = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cur.active.as_ref().is_some_and(|c| Arc::ptr_eq(c, rt)) {
             rt.shutdown_recording();
             let retired = cur.active.take();
@@ -1162,7 +1189,7 @@ impl HookRuntime {
     pub fn with_diagnostic_query_interface(self, enabled: bool) -> Self {
         self.com_tracker
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .set_diagnostic_query_interface(enabled);
         self
     }
@@ -1172,7 +1199,10 @@ impl HookRuntime {
     /// （記録経路はこのロックを取らないため、デッドロックはしないが、
     /// 長時間の保持は他の Detour を止める）。
     pub fn with_com_tracker<R>(&self, f: impl FnOnce(&mut ComTracker) -> R) -> R {
-        f(&mut self.com_tracker.lock().unwrap())
+        f(&mut self
+            .com_tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// COM Factory 関数の元関数ポインタを格納する（L02）。
@@ -1450,7 +1480,10 @@ impl HookRuntime {
     #[inline(never)]
     fn register_thread(&self, thread_id: u64, key: (u64, u64, u64)) {
         {
-            let seen = self.seen_threads.lock().unwrap();
+            let seen = self
+                .seen_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if seen.contains(&thread_id) {
                 let _ = REGISTERED_THREAD.try_with(|cache| cache.set(Some(key)));
                 return;
@@ -1475,7 +1508,10 @@ impl HookRuntime {
             self.agent
                 .attach_space_available_notify(thread_id, Arc::clone(notify));
         }
-        self.seen_threads.lock().unwrap().insert(thread_id);
+        self.seen_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread_id);
         // P1-4: このスレッドの終了通知 (FLS デストラクタ) を武装する。
         // 武装は呼び出しスレッド自身に対して行う (FLS はスレッド
         // ごとの格納域であり、ensure_thread は記録するスレッドの
@@ -1490,7 +1526,10 @@ impl HookRuntime {
     /// も新しい状態で始められる)、Agent へ終了を伝え、ついでに
     /// 回収可能な他の Slot の回収も試みる (管理パス)。
     pub fn thread_exit(&self, thread_id: u64) {
-        self.seen_threads.lock().unwrap().remove(&thread_id);
+        self.seen_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&thread_id);
         self.agent.thread_exit(thread_id);
         if self.agent.reap_due() {
             self.reap_terminated_threads();
@@ -1510,7 +1549,10 @@ impl HookRuntime {
         if reaped.is_empty() {
             return 0;
         }
-        let mut seen = self.seen_threads.lock().unwrap();
+        let mut seen = self
+            .seen_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for tid in &reaped {
             seen.remove(tid);
         }

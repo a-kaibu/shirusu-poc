@@ -26,6 +26,7 @@
 pub use shirusu_api_catalog::api;
 /// このバイナリの API Catalog Fingerprint（Bootstrap v13 の照合に使う）。
 pub use shirusu_api_catalog::fingerprint::catalog_fingerprint as api_catalog_fingerprint;
+pub mod alloc_reserve;
 pub mod bootstrap;
 pub mod callback;
 pub mod caller;

@@ -23,6 +23,12 @@
 
 use shirusu_hook::bootstrap::AgentBootstrap;
 
+/// 確保に失敗しても対象プロセスを abort させず、記録を止めて素通しへ
+/// 切り替える（2026-11-14 レビュー P2-9、`shirusu_hook::alloc_reserve`）。
+#[global_allocator]
+static ALLOCATOR: shirusu_hook::alloc_reserve::ReserveAllocator =
+    shirusu_hook::alloc_reserve::ReserveAllocator;
+
 #[cfg(windows)]
 mod diagnostics;
 

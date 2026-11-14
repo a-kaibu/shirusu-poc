@@ -1026,7 +1026,7 @@ impl ComCloneRegistry {
     pub fn register(clone_addr: u64, original_methods: Vec<u64>) {
         Self::global()
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clones
             .insert(clone_addr, original_methods);
     }
@@ -1035,7 +1035,7 @@ impl ComCloneRegistry {
     pub fn original(clone_addr: u64, index: u32) -> Option<u64> {
         Self::global()
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clones
             .get(&clone_addr)
             .and_then(|m| m.get(index as usize).copied())
@@ -1045,7 +1045,7 @@ impl ComCloneRegistry {
     pub fn originals(clone_addr: u64) -> Option<Vec<u64>> {
         Self::global()
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clones
             .get(&clone_addr)
             .cloned()
@@ -1053,13 +1053,21 @@ impl ComCloneRegistry {
 
     /// 登録済みの複製 vtable の数（テスト用）。
     pub fn len() -> usize {
-        Self::global().lock().unwrap().clones.len()
+        Self::global()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clones
+            .len()
     }
 
     /// テスト用に登録を消す（実運用では呼ばない）。
     #[cfg(test)]
     pub fn clear_for_test() {
-        Self::global().lock().unwrap().clones.clear();
+        Self::global()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clones
+            .clear();
     }
 }
 
