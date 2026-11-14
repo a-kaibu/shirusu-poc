@@ -746,7 +746,7 @@ mod pbt {
     #[test]
     fn every_issue_variant_is_formatted_and_reported() {
         let id = BlobId::of_content(b"x");
-        let issues = vec![
+        let issues = [
             RecoveryIssue::TruncatedTail { offset: 1 },
             RecoveryIssue::CorruptBlock {
                 offset: 2,
