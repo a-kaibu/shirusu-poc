@@ -537,7 +537,10 @@ fn check_enter_leave_pairing(trace: &ReadTrace, view: &TraceView) -> CheckFindin
             continue;
         }
         let key = thread_key(trace.header.session_id, rec.process_id, rec.thread_id);
-        if let Some(n) = open.get_mut(&key).and_then(|calls| calls.get_mut(&rec.call_id)) {
+        if let Some(n) = open
+            .get_mut(&key)
+            .and_then(|calls| calls.get_mut(&rec.call_id))
+        {
             *n = n.saturating_sub(1);
         }
     }

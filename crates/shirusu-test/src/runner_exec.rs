@@ -1457,7 +1457,9 @@ mod tests {
             f: u32,
             g: *mut c_void,
         ) -> *mut c_void {
-            seen(&[a as u64, b as u64, c as u64, d as u64, e as u64, f as u64, g as u64]);
+            seen(&[
+                a as u64, b as u64, c as u64, d as u64, e as u64, f as u64, g as u64,
+            ]);
             usize::MAX as *mut c_void
         }
         unsafe extern "system" fn rw(
@@ -1491,16 +1493,71 @@ mod tests {
         }
         let wide = |i: usize| (0x1000_0000usize.wrapping_mul(i + 1)) | 0x10;
         // (関数名, アドレス, 引数の数, 期待する戻り値, 引数を u32 に切る位置)
-        let cases: Vec<(&str, usize, usize, Option<u64>, &[usize])> = vec![
-            ("CreateFileW", create as *const () as usize, 7, Some(usize::MAX as u64), &[1, 2, 4, 5]),
-            ("ReadFile", rw as *const () as usize, 5, Some(0xFFFF_FFFE), &[2]),
-            ("WriteFile", rw as *const () as usize, 5, Some(0xFFFF_FFFE), &[2]),
-            ("CloseHandle", one_handle as *const () as usize, 1, Some(1), &[]),
-            ("FlushFileBuffers", one_handle as *const () as usize, 1, Some(1), &[]),
-            ("GetFileSize", size as *const () as usize, 2, Some(0xFFFF_FFFF), &[]),
-            ("DeleteFileW", one_path as *const () as usize, 1, Some(0), &[]),
-            ("RemoveDirectoryW", one_path as *const () as usize, 1, Some(0), &[]),
-            ("CreateDirectoryW", two as *const () as usize, 2, Some(7), &[]),
+        type Case<'a> = (&'a str, usize, usize, Option<u64>, &'a [usize]);
+        let cases: Vec<Case> = vec![
+            (
+                "CreateFileW",
+                create as *const () as usize,
+                7,
+                Some(usize::MAX as u64),
+                &[1, 2, 4, 5],
+            ),
+            (
+                "ReadFile",
+                rw as *const () as usize,
+                5,
+                Some(0xFFFF_FFFE),
+                &[2],
+            ),
+            (
+                "WriteFile",
+                rw as *const () as usize,
+                5,
+                Some(0xFFFF_FFFE),
+                &[2],
+            ),
+            (
+                "CloseHandle",
+                one_handle as *const () as usize,
+                1,
+                Some(1),
+                &[],
+            ),
+            (
+                "FlushFileBuffers",
+                one_handle as *const () as usize,
+                1,
+                Some(1),
+                &[],
+            ),
+            (
+                "GetFileSize",
+                size as *const () as usize,
+                2,
+                Some(0xFFFF_FFFF),
+                &[],
+            ),
+            (
+                "DeleteFileW",
+                one_path as *const () as usize,
+                1,
+                Some(0),
+                &[],
+            ),
+            (
+                "RemoveDirectoryW",
+                one_path as *const () as usize,
+                1,
+                Some(0),
+                &[],
+            ),
+            (
+                "CreateDirectoryW",
+                two as *const () as usize,
+                2,
+                Some(7),
+                &[],
+            ),
             ("MoveFileW", two as *const () as usize, 2, Some(7), &[]),
             ("Sleep", sleep as *const () as usize, 1, None, &[0]),
         ];
@@ -1522,7 +1579,11 @@ mod tests {
             assert_eq!(take(), expected, "{function} arguments");
             // 引数の数が合わなければ呼ばない。
             let short: Vec<usize> = args[..arity - 1].to_vec();
-            assert_eq!(unsafe { call_raw(addr, function, &short) }, None, "{function} short");
+            assert_eq!(
+                unsafe { call_raw(addr, function, &short) },
+                None,
+                "{function} short"
+            );
             assert!(take().is_empty());
         }
     }

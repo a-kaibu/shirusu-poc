@@ -9,17 +9,31 @@
 
 use proptest::prelude::*;
 use shirusu_conformance::check::check_trace;
-use shirusu_emit::{file_io_api_set, ApiSet, CallToken, Emitter, EventMeta, PayloadData, SessionConfig};
+use shirusu_emit::{
+    file_io_api_set, ApiSet, CallToken, Emitter, EventMeta, PayloadData, SessionConfig,
+};
 use shirusu_trace::reader::RecoveryIssue;
 use shirusu_trace::schema::{CapturedValue, Ty, TypedValue};
 use shirusu_trace::writer::FinalizationInfo;
 
 #[derive(Debug, Clone)]
 enum Op {
-    Begin { thread: u64, api: usize, seed: u64, payload: u8 },
-    End { thread: u64, seed: u64 },
-    Abandon { thread: u64 },
-    Flush { thread: u64 },
+    Begin {
+        thread: u64,
+        api: usize,
+        seed: u64,
+        payload: u8,
+    },
+    End {
+        thread: u64,
+        seed: u64,
+    },
+    Abandon {
+        thread: u64,
+    },
+    Flush {
+        thread: u64,
+    },
     Loss(u64),
 }
 
@@ -53,11 +67,25 @@ fn value(ty: Ty, seed: u64) -> CapturedValue {
     CapturedValue::captured(v)
 }
 
-fn values(fields: &[(String, Ty, shirusu_trace::schema::ValueKind, shirusu_trace::schema::CaptureTiming)], seed: u64) -> Vec<CapturedValue> {
+fn values(
+    fields: &[(
+        String,
+        Ty,
+        shirusu_trace::schema::ValueKind,
+        shirusu_trace::schema::CaptureTiming,
+    )],
+    seed: u64,
+) -> Vec<CapturedValue> {
     fields
         .iter()
         .enumerate()
-        .map(|(i, f)| value(f.1, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(i as u64)))
+        .map(|(i, f)| {
+            value(
+                f.1,
+                seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(i as u64),
+            )
+        })
         .collect()
 }
 
@@ -77,7 +105,12 @@ fn emit(ops: &[Op]) -> Vec<u8> {
     for op in ops {
         ts += 1;
         match op {
-            Op::Begin { thread, api, seed, payload } => {
+            Op::Begin {
+                thread,
+                api,
+                seed,
+                payload,
+            } => {
                 let name = &apis[api % apis.len()];
                 let spec = em.api_set().spec_by_name(name).unwrap().clone();
                 let meta = EventMeta {
@@ -98,8 +131,13 @@ fn emit(ops: &[Op]) -> Vec<u8> {
                     continue;
                 };
                 let spec = em.api_set().spec_by_name(&name).unwrap().clone();
-                em.end_call(token, &values(&spec.leave_fields, *seed), ts, EventMeta::default())
-                    .unwrap();
+                em.end_call(
+                    token,
+                    &values(&spec.leave_fields, *seed),
+                    ts,
+                    EventMeta::default(),
+                )
+                .unwrap();
             }
             Op::Abandon { thread } => {
                 // 契約（Emitter::abandon_call）: 痕跡は呼び出し側が
@@ -128,16 +166,23 @@ fn emit(ops: &[Op]) -> Vec<u8> {
         }
     }
     // 開いたままの呼び出しは内側から閉じる。
-    for (_, calls) in open.iter_mut() {
+    for calls in open.values_mut() {
         while let Some((token, name)) = calls.pop() {
             ts += 1;
             let spec = em.api_set().spec_by_name(&name).unwrap().clone();
-            em.end_call(token, &values(&spec.leave_fields, ts), ts, EventMeta::default())
-                .unwrap();
+            em.end_call(
+                token,
+                &values(&spec.leave_fields, ts),
+                ts,
+                EventMeta::default(),
+            )
+            .unwrap();
         }
     }
     // 完全性の 3 指標は呼び出し側が正直に決める契約（Emitter::finish）。
-    let lossy = ops.iter().any(|o| matches!(o, Op::Loss(_) | Op::Abandon { .. }));
+    let lossy = ops
+        .iter()
+        .any(|o| matches!(o, Op::Loss(_) | Op::Abandon { .. }));
     em.finish(FinalizationInfo {
         event_integrity: if lossy { 1 } else { 0 },
         ..Default::default()
@@ -146,7 +191,10 @@ fn emit(ops: &[Op]) -> Vec<u8> {
 }
 
 fn damaging(issue: &RecoveryIssue) -> bool {
-    !matches!(issue, RecoveryIssue::Resync { .. } | RecoveryIssue::MissingBlob { .. })
+    !matches!(
+        issue,
+        RecoveryIssue::Resync { .. } | RecoveryIssue::MissingBlob { .. }
+    )
 }
 
 proptest! {
@@ -199,9 +247,19 @@ fn unknown_termination_closes_only_its_own_open_call() {
     let pairing = |records: &[(u64, u64)]| {
         let set = file_io_api_set();
         let mut em = Emitter::new(Vec::new(), set, SessionConfig::new(3, "t")).unwrap();
-        let spec = em.api_set().spec_by_name("kernel32!CloseHandle").unwrap().clone();
+        let spec = em
+            .api_set()
+            .spec_by_name("kernel32!CloseHandle")
+            .unwrap()
+            .clone();
         let token = em
-            .begin_call(5, "kernel32!CloseHandle", &values(&spec.enter_fields, 1), 1, EventMeta::default())
+            .begin_call(
+                5,
+                "kernel32!CloseHandle",
+                &values(&spec.enter_fields, 1),
+                1,
+                EventMeta::default(),
+            )
             .unwrap();
         em.abandon_call(token).unwrap();
         let process_id = em.session_config().process_id;
@@ -222,7 +280,13 @@ fn unknown_termination_closes_only_its_own_open_call() {
             })
             .unwrap();
         let trace = shirusu_trace::read_trace(&bytes).unwrap();
-        (token.call_id, check_trace(&trace).finding("enter-leave-pairing").unwrap().status)
+        (
+            token.call_id,
+            check_trace(&trace)
+                .finding("enter-leave-pairing")
+                .unwrap()
+                .status,
+        )
     };
     let (call, status) = pairing(&[]);
     assert_eq!(status, CheckStatus::Fail);

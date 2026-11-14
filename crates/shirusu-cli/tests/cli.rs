@@ -1698,7 +1698,10 @@ fn coverage_text_report_lists_each_evidence_kind() {
     assert_eq!(lines[0], "API coverage evidence: sample.trace");
     assert!(lines[1].contains("Zero observations never prove an API was unused"));
     assert!(out.contains("capture_config: mode=full"), "{out}");
-    assert!(out.contains("finalized_cleanly=true event_integrity=Complete"), "{out}");
+    assert!(
+        out.contains("finalized_cleanly=true event_integrity=Complete"),
+        "{out}"
+    );
     assert!(
         out.contains(
             "kernel32!ReadFile: static=detected enter=0 leave=0 other=0 decode_errors=0 \
@@ -1708,10 +1711,18 @@ fn coverage_text_report_lists_each_evidence_kind() {
     );
     assert!(out.contains("  profile aggregates: enter=3 leave=2 (separate from retained events)"));
     // 同じインポート元は 1 回だけ。
-    assert_eq!(out.matches("  import source: main-executable: fixture.exe").count(), 2, "{out}");
+    assert_eq!(
+        out.matches("  import source: main-executable: fixture.exe")
+            .count(),
+        2,
+        "{out}"
+    );
     assert!(out.contains("  declared semantics: L2 synchronous output only"));
     assert!(!out.contains("second evidence is listed but not repeated"));
-    assert!(out.contains("kernel32!unknown-import: static=detected"), "{out}");
+    assert!(
+        out.contains("kernel32!unknown-import: static=detected"),
+        "{out}"
+    );
     assert!(
         out.contains("unknown-api-id:4242: static=not-detected-or-unavailable enter=0 leave=0 other=0 decode_errors=0 hooks=[unknown]"),
         "{out}"
@@ -1726,7 +1737,10 @@ fn coverage_text_report_for_observed_and_bare_traces() {
     let (out, err, code) = run_cli_bytes(&sample_trace_bytes(), &["coverage", "sample.trace"]);
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("enter=1"), "{out}");
-    assert!(out.contains("observed capture states: {\"captured\": "), "{out}");
+    assert!(
+        out.contains("observed capture states: {\"captured\": "),
+        "{out}"
+    );
     let bare = TraceWriter::new(
         Vec::new(),
         CaptureEnvironment {

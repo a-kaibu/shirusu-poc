@@ -423,9 +423,20 @@ mod model_based {
     enum Op {
         Payload(Vec<u8>),
         /// 既知の Blob（index は既知集合の中の位置に丸める）への更新。
-        Update { target: usize, offset: usize, data: Vec<u8> },
-        Batch { thread: u64, refs: Vec<usize>, inline: Option<Vec<u8>> },
-        Uncompressed { thread: u64, refs: Vec<usize> },
+        Update {
+            target: usize,
+            offset: usize,
+            data: Vec<u8>,
+        },
+        Batch {
+            thread: u64,
+            refs: Vec<usize>,
+            inline: Option<Vec<u8>>,
+        },
+        Uncompressed {
+            thread: u64,
+            refs: Vec<usize>,
+        },
         Loss(u64),
         Checkpoint,
         Profile,
@@ -588,7 +599,10 @@ mod model_based {
     #[derive(Debug, Clone)]
     enum Damage {
         None,
-        Flip { at: usize, mask: u8 },
+        Flip {
+            at: usize,
+            mask: u8,
+        },
         Truncate(usize),
         /// Block（Header 以外）を 1 つ複製して末尾に足す。
         DuplicateBlock(usize),
@@ -742,7 +756,10 @@ fn later_successful_declaration_of_a_version_is_loaded() {
         full.issues.as_slice(),
         [RecoveryIssue::BlobUpdateHashMismatch { .. }]
     ));
-    assert_eq!(full.blobs.get(&c).map(Vec::as_slice), Some(&b"\x06\x00"[..]));
+    assert_eq!(
+        full.blobs.get(&c).map(Vec::as_slice),
+        Some(&b"\x06\x00"[..])
+    );
     let mut stream = TraceStream::open(Cursor::new(&bytes)).unwrap();
     while stream.next_item().unwrap().is_some() {}
     assert_eq!(
@@ -803,6 +820,9 @@ fn malformed_blob_chunk_entries_are_isolated_like_the_full_reader() {
         while stream.next_item().unwrap().is_some() {}
         assert!(!full.registry.ids().is_empty());
         assert_eq!(stream.registry().ids(), full.registry.ids());
-        assert!(stream.issues().iter().any(|i| matches!(i, RecoveryIssue::CorruptBlock { .. })));
+        assert!(stream
+            .issues()
+            .iter()
+            .any(|i| matches!(i, RecoveryIssue::CorruptBlock { .. })));
     }
 }

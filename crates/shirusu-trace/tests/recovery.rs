@@ -958,20 +958,41 @@ fn each_file_header_field_is_checked_on_its_own() {
     let mut long = good_payload.to_vec();
     long.push(0);
     let cases: Vec<(&str, Vec<u8>)> = vec![
-        ("header_len", build(&|h| h[6..8].copy_from_slice(&40u16.to_le_bytes()), &good_payload)),
+        (
+            "header_len",
+            build(
+                &|h| h[6..8].copy_from_slice(&40u16.to_le_bytes()),
+                &good_payload,
+            ),
+        ),
         ("reserved", build(&|h| h[28] = 1, &good_payload)),
-        ("block_type", build(&|h| h[4] = BlockType::Environment.code(), &good_payload)),
-        ("compression", build(&|h| h[5] = Compression::Zstd.code(), &good_payload)),
-        ("stored_len", build(&|h| h[16..20].copy_from_slice(&25u32.to_le_bytes()), &long)),
-        ("raw_len", build(&|h| h[20..24].copy_from_slice(&25u32.to_le_bytes()), &good_payload)),
+        (
+            "block_type",
+            build(&|h| h[4] = BlockType::Environment.code(), &good_payload),
+        ),
+        (
+            "compression",
+            build(&|h| h[5] = Compression::Zstd.code(), &good_payload),
+        ),
+        (
+            "stored_len",
+            build(&|h| h[16..20].copy_from_slice(&25u32.to_le_bytes()), &long),
+        ),
+        (
+            "raw_len",
+            build(
+                &|h| h[20..24].copy_from_slice(&25u32.to_le_bytes()),
+                &good_payload,
+            ),
+        ),
         ("both lengths", build(&|_| {}, &long)),
         ("container_version", {
-            let mut p = good_payload.clone();
+            let mut p = good_payload;
             p[10] ^= 0x02;
             build(&|_| {}, &p)
         }),
         ("schema_version", {
-            let mut p = good_payload.clone();
+            let mut p = good_payload;
             p[12] ^= 0x02;
             build(&|_| {}, &p)
         }),
@@ -1046,11 +1067,19 @@ fn corruption_of_the_last_blocks_resyncs_to_the_end() {
     let layout = block_layout(&bytes);
     for &(start, _, stored) in layout.iter().skip(1).rev().take(3) {
         // payload の最後のバイト（payload が無ければ CRC 欄）を壊す。
-        let at = if stored > 0 { start + 32 + stored - 1 } else { start + 24 };
+        let at = if stored > 0 {
+            start + 32 + stored - 1
+        } else {
+            start + 24
+        };
         let mut data = bytes.clone();
         data[at] ^= 0x5a;
         let read = read_trace(&data).unwrap();
-        assert!(has_corrupt_at(&read, start as u64), "{start}: {:?}", read.issues);
+        assert!(
+            has_corrupt_at(&read, start as u64),
+            "{start}: {:?}",
+            read.issues
+        );
         // 末尾に 32 バイト以上の SBLK を含まないごみを足しても同じ。
         let mut tail = data.clone();
         tail.extend_from_slice(b"SBL\0garbage-without-a-block-header-at-all");

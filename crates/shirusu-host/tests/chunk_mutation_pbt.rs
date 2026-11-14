@@ -190,7 +190,9 @@ fn produce(steps: &[Step]) -> Produced {
         match s {
             Step::Write(len) => {
                 call += 1;
-                let body: Vec<u8> = (0..*len).map(|i| (call as u8).wrapping_mul(31) ^ i).collect();
+                let body: Vec<u8> = (0..*len)
+                    .map(|i| (call as u8).wrapping_mul(31) ^ i)
+                    .collect();
                 let outcome = writer.write(EventInput {
                     kind: EventKind::CallEnter,
                     api_id: 1,
@@ -215,7 +217,6 @@ fn produce(steps: &[Step]) -> Produced {
             }
         }
     }
-    drop(collector);
     drop(writer);
     drop(region);
     Produced {
@@ -275,7 +276,12 @@ proptest! {
 /// 同じ Chunk を 2 度与える（対象が回収済みの範囲を再提示する）と止まる。
 #[test]
 fn replayed_chunk_stops_the_ring() {
-    let p = produce(&[Step::Write(4), Step::Write(4), Step::Collect, Step::Write(1)]);
+    let p = produce(&[
+        Step::Write(4),
+        Step::Write(4),
+        Step::Collect,
+        Step::Write(1),
+    ]);
     assert!(p.chunks.len() >= 2);
     let mut worker = DrainWorker::for_chunks(p.cfg, 1);
     let first = worker.ingest_chunk(&p.chunks[0]);

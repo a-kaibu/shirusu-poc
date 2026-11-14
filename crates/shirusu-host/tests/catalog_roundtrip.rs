@@ -42,7 +42,13 @@ fn recorder() -> TraceRecorder<Vec<u8>> {
     rec
 }
 
-fn event(api: &ApiDef, seq: u64, kind: EventKind, schema_id: u32, payload: Vec<u8>) -> ReceivedEvent {
+fn event(
+    api: &ApiDef,
+    seq: u64,
+    kind: EventKind,
+    schema_id: u32,
+    payload: Vec<u8>,
+) -> ReceivedEvent {
     let mut d = EventDescriptor::new(kind, seq);
     d.payload_len = payload.len() as u32;
     d.schema_id = schema_id;
@@ -66,12 +72,26 @@ fn roundtrip(calls: &[(&'static ApiDef, Vec<u64>, u64, u32)]) {
     let mut expected = Vec::new();
     for (i, (api, args, ret, err)) in calls.iter().enumerate() {
         let seq = 2 * i as u64 + 1;
-        let enter = capture::encode_generic_enter::<32>(api, args).as_bytes().to_vec();
+        let enter = capture::encode_generic_enter::<32>(api, args)
+            .as_bytes()
+            .to_vec();
         let leave = capture::encode_generic_leave_with_inputs(api, *ret, *err, args)
             .as_bytes()
             .to_vec();
-        events.push(event(api, seq, EventKind::CallEnter, api.enter_schema_id(), enter));
-        events.push(event(api, seq + 1, EventKind::CallLeave, api.leave_schema_id(), leave));
+        events.push(event(
+            api,
+            seq,
+            EventKind::CallEnter,
+            api.enter_schema_id(),
+            enter,
+        ));
+        events.push(event(
+            api,
+            seq + 1,
+            EventKind::CallLeave,
+            api.leave_schema_id(),
+            leave,
+        ));
         expected.push(capture::generic_enter(api, args));
         // generic_leave は入力に依存する意味を解決しない（DependsOnInputs）。
         // 入力付きの符号化と比べるため、値と取得状態は個別に確かめる。
@@ -80,7 +100,10 @@ fn roundtrip(calls: &[(&'static ApiDef, Vec<u64>, u64, u32)]) {
     let stats = rec.record_batch_with_args(&ctx(), &events).unwrap();
     // 空の値列（引数なしの enter）は Payload を持たず、args も付かない。
     let non_empty = events.iter().filter(|e| !e.payload.is_empty()).count();
-    assert_eq!(stats.args_attached as usize, non_empty, "every payload decodes as args");
+    assert_eq!(
+        stats.args_attached, non_empty,
+        "every payload decodes as args"
+    );
     assert_eq!(stats.args_fallback_blob, 0);
     let bytes = rec.finish(&IntegrityReport::default()).unwrap();
     let trace = shirusu_trace::read_trace(&bytes).unwrap();
@@ -115,7 +138,14 @@ fn roundtrip(calls: &[(&'static ApiDef, Vec<u64>, u64, u32)]) {
 fn every_generated_api_roundtrips_through_host_and_trace() {
     let all: Vec<&'static ApiDef> = generated().collect();
     assert!(all.len() > 5_000, "{} generated APIs", all.len());
-    for raw in [0u64, 1, u32::MAX as u64, u64::MAX, i64::MIN as u64, 0x8000_0000] {
+    for raw in [
+        0u64,
+        1,
+        u32::MAX as u64,
+        u64::MAX,
+        i64::MIN as u64,
+        0x8000_0000,
+    ] {
         // 1 Trace に数百件ずつ（遅延登録が多数の Schema に跨っても成り立つ）。
         for chunk in all.chunks(512) {
             let calls: Vec<_> = chunk
@@ -130,7 +160,14 @@ fn every_generated_api_roundtrips_through_host_and_trace() {
 #[test]
 fn broad_stack_encoding_matches_reference_for_every_api() {
     for api in BROAD_API_TABLE {
-        for raw in [0, 1, u32::MAX as u64, u64::MAX, i64::MIN as u64, 0x7ff8_0000_0000_1234] {
+        for raw in [
+            0,
+            1,
+            u32::MAX as u64,
+            u64::MAX,
+            i64::MIN as u64,
+            0x7ff8_0000_0000_1234,
+        ] {
             let args = vec![raw; api.enter_fields.len()];
             assert_eq!(
                 capture::encode_generic_enter::<32>(api, &args).as_bytes(),

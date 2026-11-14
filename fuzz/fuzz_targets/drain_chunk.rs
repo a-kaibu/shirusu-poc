@@ -58,7 +58,6 @@ fuzz_target!(|data: &[u8]| {
     if let Some(c) = collector.collect(|| {}) {
         chunks.push(c);
     }
-    drop(collector);
     drop(writer);
     drop(region);
     if chunks.is_empty() {

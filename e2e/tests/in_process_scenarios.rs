@@ -88,12 +88,15 @@ fn run_all_reports_every_scenario_once() {
 #[test]
 fn production_sync_points_never_fire() {
     let s = SyncPoints::production();
-    s.pause_host.store(true, std::sync::atomic::Ordering::Relaxed);
-    s.drop_notifications.store(true, std::sync::atomic::Ordering::Relaxed);
+    s.pause_host
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    s.drop_notifications
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(!s.host_paused());
     assert!(!s.notifications_dropped());
     let t = SyncPoints::test_enabled();
     assert!(!t.host_paused());
-    t.pause_host.store(true, std::sync::atomic::Ordering::Relaxed);
+    t.pause_host
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(t.host_paused());
 }

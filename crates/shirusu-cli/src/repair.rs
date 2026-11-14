@@ -397,10 +397,7 @@ mod pbt {
     #[derive(Debug, Clone)]
     enum Op {
         Payload(Vec<u8>),
-        Batch {
-            thread: u64,
-            refs: Vec<usize>,
-        },
+        Batch { thread: u64, refs: Vec<usize> },
         Loss(u64),
     }
 
@@ -426,8 +423,12 @@ mod pbt {
 
     fn write(ops: &[Op], finish: bool, integrity: u32) -> Vec<u8> {
         let mut w = TraceWriter::new(Vec::new(), env()).unwrap();
-        w.register_schema(make_schema(1, "k32!T/enter", vec![("x".into(), Ty::U32, 0)]))
-            .unwrap();
+        w.register_schema(make_schema(
+            1,
+            "k32!T/enter",
+            vec![("x".into(), Ty::U32, 0)],
+        ))
+        .unwrap();
         let mut blobs: Vec<BlobId> = Vec::new();
         let mut seq: HashMap<u64, u64> = HashMap::new();
         for op in ops {
@@ -640,10 +641,7 @@ mod pbt {
             },
         ];
         let texts: Vec<String> = issues.iter().map(format_issue).collect();
-        let mut prefixes: Vec<&str> = texts
-            .iter()
-            .map(|t| t.split('(').next().unwrap())
-            .collect();
+        let mut prefixes: Vec<&str> = texts.iter().map(|t| t.split('(').next().unwrap()).collect();
         prefixes.sort_unstable();
         prefixes.dedup();
         assert_eq!(prefixes.len(), issues.len(), "{texts:?}");
@@ -664,7 +662,10 @@ mod pbt {
         assert_eq!(report.lost, 6);
         assert_eq!(
             report.lost_by_cause,
-            vec![("missing_blob".to_string(), 5), ("write_failed".to_string(), 1)]
+            vec![
+                ("missing_blob".to_string(), 5),
+                ("write_failed".to_string(), 1)
+            ]
         );
         report.schemas_skipped = 1;
         let lines = repair_lines(&report);
