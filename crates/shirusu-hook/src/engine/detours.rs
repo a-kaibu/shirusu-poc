@@ -278,6 +278,35 @@ pub(super) fn generic_detour_with<const N: usize>(
             .runtime()
             .record_enter(tid, api, call_id, bytes.as_bytes());
     }
+    if crate::api::is_conditional_no_return_api(api.api_id) && terminates_caller(api.api_id, args) {
+        // Self-termination (review N1): release recorder ownership before the
+        // OS ends this thread or process, as for ExitThread. TerminateThread
+        // skips TLS teardown, so the thread is not marked exiting: if the
+        // original fails and returns (for example without THREAD_TERMINATE
+        // access), capture continues and the call gets its Leave.
+        drop(flight);
+        drop(guard);
+        le.restore_before_original();
+        let ret = invoke(original);
+        let last_error = le.capture_after_original();
+        if let GenericPrepare::Record {
+            tid,
+            api,
+            flight,
+            guard,
+            ..
+        } = prepare_generic(api_id)
+        {
+            let bytes = capture::encode_generic_leave_with_inputs(api, ret, last_error, args);
+            flight
+                .runtime()
+                .record_leave(tid, api, call_id, bytes.as_bytes());
+            drop(flight);
+            drop(guard);
+        }
+        le.restore_for_return();
+        return ret;
+    }
     if crate::api::is_no_return_api(api.api_id) {
         // ExitThread (the generated no-return API) does not unwind Rust
         // frames. Release recorder ownership before entering the OS;
@@ -326,6 +355,40 @@ pub(super) fn generic_detour_with<const N: usize>(
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();
     ret
+}
+
+/// Whether a conditionally non-returning API terminates the calling thread
+/// with these arguments (review N1). TerminateThread on the calling thread
+/// (its pseudo handle or a real handle to it) and TerminateJobObject on a job
+/// that contains this process do not return; the Detour then releases its
+/// flight like ExitThread instead of leaving it in flight forever. An invalid
+/// handle is treated as returning (the original fails normally).
+#[cold]
+fn terminates_caller(api_id: u32, args: &[u64]) -> bool {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThreadId, GetThreadId,
+    };
+    let Some(&handle) = args.first() else {
+        return false;
+    };
+    let handle = handle as usize as windows_sys::Win32::Foundation::HANDLE;
+    if api_id == crate::api::TERMINATE_THREAD_API_ID {
+        // SAFETY: GetThreadId only queries the handle; an invalid one yields 0.
+        let target = unsafe { GetThreadId(handle) };
+        return target != 0 && target == unsafe { GetCurrentThreadId() };
+    }
+    if api_id == crate::api::TERMINATE_JOB_OBJECT_API_ID {
+        if handle.is_null() {
+            return false;
+        }
+        let mut in_job = 0;
+        // SAFETY: queries membership of the current process; an invalid job
+        // handle makes the call fail, which is treated as not terminating.
+        let ok = unsafe { IsProcessInJob(GetCurrentProcess(), handle, &mut in_job) };
+        return ok != 0 && in_job != 0;
+    }
+    false
 }
 
 /// Typed invoker emitted for one generated API: restores the native argument

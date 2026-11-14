@@ -93,6 +93,16 @@ pub(crate) fn clear(index: u32) {
 /// hazard stored before their re-check visible here.
 pub(crate) fn count(rt: *const HookRuntime) -> usize {
     shirusu_transport_win::asymmetric_fence_heavy();
+    count_published(rt)
+}
+
+/// [`count`] without the heavy fence, for re-scans after one fenced scan.
+/// Once the gate or revision changed and a fenced scan ran, every later entry
+/// observes the change and withdraws, so only hazards already counted can
+/// remain; their Release clears become visible to these Acquire loads. A
+/// polling waiter therefore pays the process-wide fence once, not per poll
+/// (review N2).
+pub(crate) fn count_published(rt: *const HookRuntime) -> usize {
     SLOTS
         .iter()
         .filter(|s| std::ptr::eq(s.runtime.load(Ordering::Acquire), rt))

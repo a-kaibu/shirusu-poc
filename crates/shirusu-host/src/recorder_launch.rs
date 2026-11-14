@@ -615,10 +615,6 @@ impl TreeCapture {
 
 /// Bootstrap の初期化結果（設置数・欠落数・復元失敗数・COM Factory 設置数）。
 struct BootstrapResult {
-    /// Agent が書き戻した自分の API Catalog Fingerprint（v15）。
-    catalog_fingerprint: [u8; 32],
-    /// Agent が実際に記録対象とした API 表の API 数（v15）。
-    captured_api_count: usize,
     hook_evidence: Vec<shirusu_trace::proto::HookEvidence>,
     hooked: usize,
     missing: usize,
@@ -708,8 +704,6 @@ fn read_bootstrap_result(
         return None;
     }
     Some(BootstrapResult {
-        catalog_fingerprint: buf.result_api_catalog_fingerprint,
-        captured_api_count: buf.result_capture_api_count as usize,
         hook_evidence,
         hooked: hooked as usize,
         missing: missing as usize,
@@ -719,6 +713,28 @@ fn read_bootstrap_result(
         internal_hooks: internal_hooks as usize,
         callback_hooks: callback_hooks as usize,
     })
+}
+
+/// Agent が書き戻した API Catalog Fingerprint と記録対象 API 数だけを読む
+/// (v15)。Coverage の件数が範囲外で [`read_bootstrap_result`] が結果全体を
+/// 捨てる場合でも、Host 側の照合は省かない（review N6）。読めなければ None。
+fn read_catalog_report(
+    process: win::HandleValue,
+    remote: usize,
+) -> Option<(shirusu_api_catalog::fingerprint::CatalogFingerprint, usize)> {
+    let mut buf = AgentBootstrap::default();
+    // SAFETY: AgentBootstrap は repr(C) の値型。バイト列として読み込む。
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            &mut buf as *mut AgentBootstrap as *mut u8,
+            std::mem::size_of::<AgentBootstrap>(),
+        )
+    };
+    win::read_process_memory(process, remote, bytes.as_mut_ptr(), bytes.len()).ok()?;
+    Some((
+        buf.result_api_catalog_fingerprint,
+        buf.result_capture_api_count as usize,
+    ))
 }
 
 /// Mapping とイベントを用意し、DLL を注入して初期化を確認する。
@@ -967,10 +983,13 @@ fn inject_and_init(
     // （レビュー #4 の #8）。失敗時も読み戻す: 設置失敗の詳細
     // （復元失敗スロット数）が書き戻されている場合がある
     // （レビュー第5回 #8）。
-    let outcome = if status.is_ok() {
-        read_bootstrap_result(process, remote, evidence_capacity)
+    let (outcome, catalog_report) = if status.is_ok() {
+        (
+            read_bootstrap_result(process, remote, evidence_capacity),
+            read_catalog_report(process, remote),
+        )
     } else {
-        None
+        (None, None)
     };
     if !matches!(status, Err(win::WinError::RemoteCallPending { .. })) {
         win::remote_free(process, remote);
@@ -978,9 +997,9 @@ fn inject_and_init(
     let status = status?;
     if status == shirusu_hook::bootstrap::INIT_CATALOG_MISMATCH {
         // フック設置前に拒否されている。対象は再開しない（呼び出し側が終了させる）。
-        let detail = match &outcome {
-            Some(result) => {
-                crate::capture_policy::check_catalog(&host_catalog, &result.catalog_fingerprint)
+        let detail = match &catalog_report {
+            Some((fingerprint, _)) => {
+                crate::capture_policy::check_catalog(&host_catalog, fingerprint)
                     .err()
                     .unwrap_or_else(|| "agent reported a catalog mismatch".into())
             }
@@ -1034,27 +1053,26 @@ fn inject_and_init(
     }
     // v15: 成功を返した Agent の Fingerprint と記録範囲も確かめる。食い違う
     // 場合は、誤った Schema で解釈する Trace を作らない。
-    let verified = match &outcome {
-        Some(result) => {
-            crate::capture_policy::check_catalog(&host_catalog, &result.catalog_fingerprint)
+    let verified = match &catalog_report {
+        Some((fingerprint, captured_api_count)) => {
+            crate::capture_policy::check_catalog(&host_catalog, fingerprint)
                 .and_then(|()| {
                     let expected = selected_ids
                         .as_ref()
                         .map(|ids| ids.len())
                         .unwrap_or_else(|| shirusu_hook::api::api_table().count());
-                    if result.captured_api_count == expected {
+                    if *captured_api_count == expected {
                         Ok(())
                     } else {
                         Err(format!(
-                            "agent applied a capture policy of {} API(s), expected {expected}",
-                            result.captured_api_count
+                            "agent applied a capture policy of {captured_api_count} API(s), expected {expected}"
                         ))
                     }
                 })
         }
-        // 読み戻せない場合は従来どおり Coverage を不明のままにする。照合自体は
-        // Agent が Host の Fingerprint で済ませている（不一致なら status 7）。
-        None => Ok(()),
+        // 読み戻せなければ Agent の Fingerprint も記録範囲も確かめられない。
+        // Agent 自身の照合だけを根拠に、誤った Schema の Trace を作らない。
+        None => Err("agent bootstrap result could not be read back to verify the API catalog".into()),
     };
     if let Err(message) = verified {
         return Err(SessionError::PostInitialization {

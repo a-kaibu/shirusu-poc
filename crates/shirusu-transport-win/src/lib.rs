@@ -1388,6 +1388,9 @@ pub enum ThreadPriority {
     Highest,
     /// Throughput work that must not compete with the target or collection.
     BelowNormal,
+    /// Default priority. Throughput work is raised to it while collection
+    /// waits on it, so a CPU-bound target cannot starve it (review N3).
+    Normal,
 }
 
 /// Set the calling thread's priority. Returns whether it was applied.
@@ -1396,22 +1399,52 @@ pub enum ThreadPriority {
 pub fn set_current_thread_priority(priority: ThreadPriority) -> bool {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-            THREAD_PRIORITY_HIGHEST,
-        };
-        let value = match priority {
-            ThreadPriority::Highest => THREAD_PRIORITY_HIGHEST,
-            ThreadPriority::BelowNormal => THREAD_PRIORITY_BELOW_NORMAL,
-        };
+        use windows_sys::Win32::System::Threading::GetCurrentThread;
         // SAFETY: the pseudo handle names the calling thread.
-        unsafe { SetThreadPriority(GetCurrentThread(), value) != 0 }
+        unsafe { set_priority_of_handle(GetCurrentThread(), priority) }
     }
     #[cfg(not(windows))]
     {
         let _ = priority;
         false
     }
+}
+
+/// Set another Host thread's priority (for example, raise a starved worker
+/// from the thread waiting on it). Returns whether it was applied.
+pub fn set_thread_priority<T>(
+    thread: &std::thread::JoinHandle<T>,
+    priority: ThreadPriority,
+) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the JoinHandle owns a valid thread handle while borrowed.
+        unsafe { set_priority_of_handle(thread.as_raw_handle(), priority) }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (thread, priority);
+        false
+    }
+}
+
+#[cfg(windows)]
+unsafe fn set_priority_of_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    priority: ThreadPriority,
+) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_HIGHEST,
+        THREAD_PRIORITY_NORMAL,
+    };
+    let value = match priority {
+        ThreadPriority::Highest => THREAD_PRIORITY_HIGHEST,
+        ThreadPriority::BelowNormal => THREAD_PRIORITY_BELOW_NORMAL,
+        ThreadPriority::Normal => THREAD_PRIORITY_NORMAL,
+    };
+    // SAFETY: caller passes a valid thread handle (or the pseudo handle).
+    unsafe { SetThreadPriority(handle, value) != 0 }
 }
 
 /// Owner side of an asymmetric Dekker handshake: orders the owner's flag

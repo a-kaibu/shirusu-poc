@@ -209,6 +209,16 @@ pub fn parse_raw_header(bytes: &[u8]) -> Option<RawBlockHeader> {
     })
 }
 
+/// Block の CRC をヘッダー部分から始める（格納 CRC 欄は 0 とみなす）。
+/// payload は `shirusu_crc32c::crc32c_update` で続けて足す。payload を
+/// 一度に持たずに検証するための入口で、結果は [`raw_header_crc_matches`]
+/// と同じ。
+pub fn header_crc_seed(header_bytes: &[u8; HEADER_LEN]) -> u32 {
+    let mut zeroed = *header_bytes;
+    zeroed[24..28].copy_from_slice(&[0; 4]);
+    shirusu_crc32c::crc32c(&zeroed)
+}
+
 /// 生ヘッダーと payload に対する CRC の一致を確かめる。
 pub fn raw_header_crc_matches(raw: &RawBlockHeader, header_bytes: &[u8], payload: &[u8]) -> bool {
     if header_bytes.len() < HEADER_LEN {

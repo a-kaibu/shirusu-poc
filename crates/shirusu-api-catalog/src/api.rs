@@ -491,6 +491,47 @@ pub const EXIT_THREAD_API_ID: u32 = {
     found
 };
 
+/// Compile-time API ID of `module!function` in any table (0 if absent).
+const fn const_api_id(module: &str, function: &str) -> u32 {
+    let tables = API_TABLES;
+    let mut table = 0;
+    while table < tables.len() {
+        let mut entry = 0;
+        while entry < tables[table].len() {
+            let api = &tables[table][entry];
+            if const_str_eq(api.module, module) && const_str_eq(api.function, function) {
+                return api.api_id;
+            }
+            entry += 1;
+        }
+        table += 1;
+    }
+    0
+}
+
+/// `kernel32.dll!TerminateThread`: does not return when the handle names the
+/// calling thread. Resolved at compile time (the build fails if absent).
+pub const TERMINATE_THREAD_API_ID: u32 = {
+    let id = const_api_id("kernel32.dll", "TerminateThread");
+    assert!(id != 0);
+    id
+};
+/// `kernel32.dll!TerminateJobObject`: does not return when the calling
+/// process belongs to the job (the job terminates it).
+pub const TERMINATE_JOB_OBJECT_API_ID: u32 = {
+    let id = const_api_id("kernel32.dll", "TerminateJobObject");
+    assert!(id != 0);
+    id
+};
+
+/// APIs that return or not depending on their arguments (self-termination).
+/// The Detour decides per call ([`is_no_return_api`] covers the APIs that
+/// never return).
+#[inline]
+pub fn is_conditional_no_return_api(api_id: u32) -> bool {
+    api_id == TERMINATE_THREAD_API_ID || api_id == TERMINATE_JOB_OBJECT_API_ID
+}
+
 #[inline]
 pub fn api_by_id(api_id: u32) -> Option<&'static ApiDef> {
     API_BY_ID.get(api_id as usize).copied().flatten()
@@ -606,6 +647,25 @@ pub fn is_hook_schema(schema_id: u32) -> bool {
         || schema_id == crate::com::COM_METHOD_LEAVE_SCHEMA_ID
         || schema_id == crate::com::COM_FACTORY_ENTER_SCHEMA_ID
         || schema_id == crate::com::COM_FACTORY_LEAVE_SCHEMA_ID
+}
+
+#[cfg(test)]
+mod conditional_no_return_tests {
+    use super::*;
+
+    #[test]
+    fn self_terminating_apis_are_known_and_distinct_from_no_return_apis() {
+        for (id, function) in [
+            (TERMINATE_THREAD_API_ID, "TerminateThread"),
+            (TERMINATE_JOB_OBJECT_API_ID, "TerminateJobObject"),
+        ] {
+            let api = api_by_id(id).expect("in the table");
+            assert_eq!((api.module, api.function), ("kernel32.dll", function));
+            assert!(is_conditional_no_return_api(id));
+            assert!(!is_no_return_api(id), "decided per call, not always");
+        }
+        assert!(!is_conditional_no_return_api(EXIT_THREAD_API_ID));
+    }
 }
 
 #[cfg(test)]

@@ -983,11 +983,17 @@ pub fn runtime_slot() -> &'static RuntimeSlot {
     &RUNTIME_SLOT
 }
 
-/// Call ID のセッション別シード。セッションごとに 2^32 の範囲を
+/// Call ID のセッション別シード。セッションごとに [`CALL_ID_RANGE`] の範囲を
 /// 割り当てることで、終了間際に残ったスレッドローカルの呼出
 /// スタックフレーム（旧セッションの Call ID）が、次セッションの
 /// ID と衝突して親子関係を誤らせることを防ぐ。
 static NEXT_CALL_ID_SEED: AtomicU64 = AtomicU64::new(1);
+/// Call IDs per session. Threads reserve [`CALL_ID_BLOCK_LEN`] at a time and
+/// abandon the rest of a block when they exit, so a session can consume up to
+/// 256 IDs per thread. 2^32 per session ran out after about 16.7 million
+/// short-lived threads and then overlapped the next session (review N4);
+/// 2^40 needs 2^32 threads, and still leaves 2^24 sessions per process.
+const CALL_ID_RANGE: u64 = 1 << 40;
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     // Copy-only native TLS: no allocation or destructor registration in a Hook.
@@ -997,7 +1003,7 @@ thread_local! {
 }
 /// Call IDs a thread reserves at once. A shared atomic add per call was a
 /// read-modify-write on a cache line every recording thread writes; one per
-/// block amortizes it. IDs stay unique within the session's 2^32 range; they
+/// block amortizes it. IDs stay unique within the session's range; they
 /// are not ordered across threads (nothing orders them, `global_order` does).
 const CALL_ID_BLOCK_LEN: u64 = 256;
 
@@ -1079,7 +1085,9 @@ impl HookRuntime {
                 .collect(),
             capture_excluded: vec![false; MAX_API_ID + 1].into_boxed_slice(),
             suppressed: vec![false; MAX_API_ID + 1].into_boxed_slice(),
-            next_call_id: AtomicU64::new(NEXT_CALL_ID_SEED.fetch_add(1 << 32, Ordering::Relaxed)),
+            next_call_id: AtomicU64::new(
+                NEXT_CALL_ID_SEED.fetch_add(CALL_ID_RANGE, Ordering::Relaxed),
+            ),
             seen_threads: Mutex::new(HashSet::new()),
             recording_enabled: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
@@ -1271,15 +1279,37 @@ impl HookRuntime {
     }
 
     /// 記録区間の Detour が全て完了するまで待つ。タイムアウトで false。
+    ///
+    /// Only the first check pays the process-wide fence of [`Self::in_flight`]
+    /// (`FlushProcessWriteBuffers` on Windows). A Detour blocked in a wait is
+    /// common at shutdown; polling with a fence each time interrupted every
+    /// processor running the target for the whole timeout (review N2). After
+    /// recording is disabled and one fenced scan ran, later scans only need to
+    /// see hazards clear (see [`crate::hazard::count_published`]).
     pub fn wait_in_flight_drained(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
-        while self.in_flight() != 0 {
+        if self.in_flight() == 0 {
+            return true;
+        }
+        let mut polls = 0u32;
+        loop {
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            std::thread::yield_now();
+            // Brief yields first, then back off: a long-blocked Detour should
+            // not keep a core busy for the whole timeout.
+            if polls < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            polls = polls.saturating_add(1);
+            let remaining =
+                self.in_flight.load(Ordering::SeqCst) + crate::hazard::count_published(self);
+            if remaining == 0 {
+                return true;
+            }
         }
-        true
     }
 
     pub fn agent(&self) -> &Arc<Agent> {
@@ -2458,7 +2488,7 @@ mod tests {
         let first1 = rt1.alloc_call_id();
         let first2 = rt2.alloc_call_id();
         assert_ne!(first1, first2);
-        assert!(first2 >= 1 << 32 || first1 >= 1 << 32);
+        assert!(first1.abs_diff(first2) >= CALL_ID_RANGE);
     }
 
     #[derive(Clone, Copy)]

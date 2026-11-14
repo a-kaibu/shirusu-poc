@@ -8,7 +8,7 @@ use crate::{DrainWorker, LossEvent};
 use shirusu_trace::{proto::CaptureEnvironment, DurableWrite, TraceError};
 use shirusu_transport::ring::ReceivedEvent;
 use shirusu_transport::validate::CommittedChunk;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -116,12 +116,17 @@ pub(crate) struct TracePipeline<W: DurableWrite + Send + 'static> {
     byte_budget: usize,
     queue_full_count: u64,
     drain_wait_ns: u64,
+    /// Set while the worker runs at Normal priority because collection
+    /// waited on it (see `boost_worker`).
+    boosted: Arc<AtomicBool>,
 }
 
 struct WorkerState {
     receiver: Receiver<Queued>,
     queued_bytes: Arc<AtomicUsize>,
     queued_commands: Arc<AtomicUsize>,
+    boosted: Arc<AtomicBool>,
+    byte_budget: usize,
 }
 
 impl WorkerState {
@@ -129,6 +134,19 @@ impl WorkerState {
     fn release(&self, bytes: usize) {
         self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
         self.queued_commands.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Return to below-normal priority once a boost has drained the queue
+    /// to half the budget (the worker only runs boosted while it is behind).
+    fn settle_priority(&self) {
+        if self.boosted.load(Ordering::Acquire)
+            && self.queued_bytes.load(Ordering::Acquire) <= self.byte_budget / 2
+            && self.boosted.swap(false, Ordering::AcqRel)
+        {
+            shirusu_transport_win::set_current_thread_priority(
+                shirusu_transport_win::ThreadPriority::BelowNormal,
+            );
+        }
     }
 }
 
@@ -169,15 +187,21 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
         let (sender, receiver) = channel::<Queued>();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let queued_commands = Arc::new(AtomicUsize::new(0));
+        let boosted = Arc::new(AtomicBool::new(false));
         let state = WorkerState {
             receiver,
             queued_bytes: queued_bytes.clone(),
             queued_commands: queued_commands.clone(),
+            boosted: boosted.clone(),
+            byte_budget,
         };
         let worker = std::thread::Builder::new()
             .name("shirusu-trace-writer".into())
             .spawn(move || {
-                // Conversion uses spare CPU; Ring collection and the target come first.
+                // Conversion uses spare CPU; Ring collection and the target come
+                // first. When collection has to wait on a full queue it raises this
+                // thread to Normal (a CPU-bound target would otherwise starve it
+                // and the Ring would overflow), and it settles back here.
                 shirusu_transport_win::set_current_thread_priority(
                     shirusu_transport_win::ThreadPriority::BelowNormal,
                 );
@@ -280,6 +304,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     // Acknowledge only after the barrier's own accounting is
                     // released: a caller reading the queue after the barrier
                     // must see it empty.
+                    state.settle_priority();
                     if let Some(reached) = barrier_reached.take() {
                         let _ = reached.send(());
                     }
@@ -300,7 +325,22 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
             byte_budget,
             queue_full_count: 0,
             drain_wait_ns: 0,
+            boosted,
         })
+    }
+
+    /// Collection is about to wait for the worker: make sure it is not left
+    /// below the target's threads (review N3). Flag first, so a worker that
+    /// settles concurrently can at worst leave itself at Normal.
+    fn boost_worker(&self) {
+        if !self.boosted.swap(true, Ordering::AcqRel) {
+            if let Some(worker) = &self.worker {
+                shirusu_transport_win::set_thread_priority(
+                    worker,
+                    shirusu_transport_win::ThreadPriority::Normal,
+                );
+            }
+        }
     }
 
     fn join(&mut self) -> Finished<W> {
@@ -341,6 +381,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
         let bytes = command.queued_bytes();
         if self.over_budget(bytes) {
             self.queue_full_count = self.queue_full_count.saturating_add(1);
+            self.boost_worker();
             let started = Instant::now();
             while self.over_budget(bytes) {
                 self.check_health()?;
@@ -652,6 +693,39 @@ mod tests {
     }
 
     #[test]
+    fn waiting_on_a_full_queue_boosts_the_worker_until_it_drains() {
+        let (writer, blocked, resume) = controlled();
+        let flag = writer.mode.clone();
+        let one = Command::Events(context(), events(1)).queued_bytes();
+        let mut pipeline =
+            TracePipeline::with_budget(recorder(writer, RecordMode::Full), one * 2).unwrap();
+        flag.store(3, Ordering::SeqCst);
+        pipeline.update_environment(&environment()).unwrap();
+        blocked
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        for call in 1..=2 {
+            pipeline
+                .record_owned_batch_with_args(&context(), events(call))
+                .unwrap();
+        }
+        assert!(!pipeline.boosted.load(Ordering::Acquire), "no wait yet");
+        let resumer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            resume.send(()).unwrap();
+        });
+        // Over budget: the collector boosts the worker before it waits.
+        pipeline
+            .record_owned_batch_with_args(&context(), events(3))
+            .unwrap();
+        assert!(pipeline.queue_full_count >= 1);
+        resumer.join().unwrap();
+        pipeline.barrier().unwrap();
+        assert!(!pipeline.boosted.load(Ordering::Acquire));
+        pipeline.finish().unwrap();
+    }
+
+    #[test]
     fn slow_writer_bounds_queue_and_preserves_every_accepted_batch() {
         const BATCHES: u64 = 16;
         let (writer, blocked, resume) = controlled();
@@ -681,7 +755,14 @@ mod tests {
                 .unwrap();
         }
         resumer.join().unwrap();
+        // Waiting on a full queue boosted the worker (N3); once it drained
+        // the queue it settled back.
+        let boosted = pipeline.boosted.clone();
         let (recorder, stats) = pipeline.finish().unwrap();
+        assert!(
+            !boosted.load(Ordering::Acquire),
+            "drained worker returns to below-normal"
+        );
         assert!(stats.metrics.queue_full_count >= 1);
         assert_eq!(stats.args.args_attached, BATCHES as usize * 2);
         assert_eq!(stats.metrics.events_received, BATCHES * 2);

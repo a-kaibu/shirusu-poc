@@ -291,14 +291,36 @@ impl<R: Read + Seek> TraceStream<R> {
             .iter()
             .map(|u| (u.offset, u.resource_id))
             .collect();
+        // Lengths of stored bases already read. The base content is read only
+        // for a resource's first update (later ones fold into `current`), so
+        // a long update chain no longer re-reads its base Blob Block per
+        // update (review N5). A base that cannot be read is remembered too.
+        let mut base_lens: HashMap<BlobId, Option<u64>> = HashMap::new();
         for (offset, resource) in updates {
-            let base: Vec<u8> = match derived.get(&resource) {
-                Some(content) => content.clone(),
+            let base_len = match derived.get(&resource) {
+                Some(content) => {
+                    current.entry(resource).or_insert_with(|| content.clone());
+                    content.len() as u64
+                }
                 None => match self.blob_offsets.get(&resource).copied() {
-                    Some(at) => match self.read_blob_at(at, &resource)? {
-                        Some(content) => content,
-                        None => continue,
-                    },
+                    Some(at) => {
+                        let known = match base_lens.get(&resource) {
+                            Some(&len) => len,
+                            None => {
+                                let content = self.read_blob_at(at, &resource)?;
+                                let len = content.as_ref().map(|c| c.len() as u64);
+                                base_lens.insert(resource, len);
+                                if let Some(content) = content {
+                                    current.entry(resource).or_insert(content);
+                                }
+                                len
+                            }
+                        };
+                        match known {
+                            Some(len) => len,
+                            None => continue,
+                        }
+                    }
                     None => {
                         if missing_base_reported.insert(resource) {
                             self.issues.push(RecoveryIssue::BlobUpdateMissingBase {
@@ -325,7 +347,6 @@ impl<R: Read + Seek> TraceStream<R> {
                 self.issues
                     .push(RecoveryIssue::ForwardBlobReference { id: resource });
             }
-            let base_len = base.len() as u64;
             let known = self.blob_offsets.contains_key(&update.new_version_id)
                 || derived.contains_key(&update.new_version_id);
             if !known {
@@ -347,7 +368,9 @@ impl<R: Read + Seek> TraceStream<R> {
                     break;
                 }
             }
-            let working = current.entry(resource).or_insert(base);
+            let working = current
+                .get_mut(&resource)
+                .expect("the first update of a resource seeds its working copy");
             match apply_update_to(working, update.offset, &update.data) {
                 None => self.issues.push(RecoveryIssue::BlobUpdateOutOfRange {
                     resource_id: resource,
@@ -462,11 +485,12 @@ impl<R: Read + Seek> TraceStream<R> {
         Ok(decode_payload(compression, raw.raw_len, &payload).ok())
     }
 
-    /// `offset` の Block を検証付きで読む（長さ上限・CRC）。成立しなければ None。
-    fn read_verified(
+    /// `offset` の Block ヘッダーを読み、長さ上限と配置だけを検査する
+    /// （CRC は未検査）。成立しなければ None。読み位置は payload の先頭に残る。
+    fn read_candidate_header(
         &mut self,
         offset: u64,
-    ) -> Result<Option<(container::RawBlockHeader, Vec<u8>)>> {
+    ) -> Result<Option<(container::RawBlockHeader, [u8; HEADER_LEN])>> {
         if self.len.saturating_sub(offset) < HEADER_LEN as u64 {
             return Ok(None);
         }
@@ -485,6 +509,38 @@ impl<R: Read + Seek> TraceStream<R> {
         {
             return Ok(None);
         }
+        Ok(Some((raw, head)))
+    }
+
+    /// 再同期の候補が完全な Block か（[`Self::read_verified`] と同じ判定）。
+    /// payload は固定長の窓で読みながら CRC を計算し、確保しない。候補ごとに
+    /// 宣言長（最大 512 MiB）の領域を確保していたため、Magic を並べた入力で
+    /// 確保量が膨らんでいた（review N5）。
+    fn verifies_at(&mut self, offset: u64) -> Result<bool> {
+        const CHUNK: usize = 64 * 1024;
+        let Some((raw, head)) = self.read_candidate_header(offset)? else {
+            return Ok(false);
+        };
+        let mut crc = container::header_crc_seed(&head);
+        let mut left = raw.stored_len as usize;
+        let mut buf = vec![0u8; left.min(CHUNK)];
+        while left > 0 {
+            let n = left.min(CHUNK);
+            self.inner.read_exact(&mut buf[..n])?;
+            crc = shirusu_crc32c::crc32c_update(crc, &buf[..n]);
+            left -= n;
+        }
+        Ok(crc == raw.stored_crc)
+    }
+
+    /// `offset` の Block を検証付きで読む（長さ上限・CRC）。成立しなければ None。
+    fn read_verified(
+        &mut self,
+        offset: u64,
+    ) -> Result<Option<(container::RawBlockHeader, Vec<u8>)>> {
+        let Some((raw, head)) = self.read_candidate_header(offset)? else {
+            return Ok(None);
+        };
         let mut payload = vec![0u8; raw.stored_len as usize];
         self.inner.read_exact(&mut payload)?;
         if !container::raw_header_crc_matches(&raw, &head, &payload) {
@@ -584,7 +640,7 @@ impl<R: Read + Seek> TraceStream<R> {
             while i + 4 <= n {
                 if window[i..i + 4] == container::BLOCK_MAGIC {
                     let candidate = q + i as u64;
-                    if self.read_verified(candidate)?.is_some() {
+                    if self.verifies_at(candidate)? {
                         return Ok(Some(candidate));
                     }
                 }
