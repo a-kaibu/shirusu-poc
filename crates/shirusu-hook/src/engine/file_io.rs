@@ -295,7 +295,7 @@ pub(super) unsafe extern "system-unwind" fn detour_create_file_w(
         template_file as u64,
     );
     if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+        rt.emit_enter(tid, api, call_id, &bytes);
     }
     drop(values);
     push_call(call_id);
@@ -328,7 +328,7 @@ pub(super) unsafe extern "system-unwind" fn detour_create_file_w(
     pop_call(call_id);
     let values = capture::create_file_w_leave(ret as u64, last_error, creation_disposition);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
+        rt.emit_leave(tid, api, call_id, &bytes);
     }
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。
     le.restore_for_return();
@@ -365,7 +365,7 @@ pub(super) unsafe extern "system-unwind" fn detour_read_file(
     let values =
         capture::read_file_enter(file as u64, buffer as u64, bytes_to_read, overlapped as u64);
     if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+        rt.emit_enter(tid, api, call_id, &bytes);
     }
     drop(values);
     push_call(call_id);
@@ -437,7 +437,7 @@ pub(super) unsafe extern "system-unwind" fn detour_read_file(
         )
     };
     if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
+        rt.emit_leave(tid, api, call_id, &bytes);
     }
     pending_submission.finish(ret == 0 && last_error == capture::ERROR_IO_PENDING);
     // SAFETY: LastError を復元する。
@@ -481,7 +481,7 @@ pub(super) unsafe extern "system-unwind" fn detour_write_file(
         overlapped as u64,
     );
     if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+        rt.emit_enter(tid, api, call_id, &bytes);
     }
     drop(values);
     push_call(call_id);
@@ -541,7 +541,7 @@ pub(super) unsafe extern "system-unwind" fn detour_write_file(
         )
     };
     if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
+        rt.emit_leave(tid, api, call_id, &bytes);
     }
     pending_submission.finish(ret == 0 && last_error == capture::ERROR_IO_PENDING);
     // SAFETY: LastError を復元する。
@@ -572,7 +572,7 @@ pub(super) unsafe extern "system-unwind" fn detour_close_handle(object: Handle) 
     let call_id = rt.alloc_call_id();
     let values = capture::close_handle_enter(object as u64);
     if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+        rt.emit_enter(tid, api, call_id, &bytes);
     }
     drop(values);
     push_call(call_id);
@@ -594,7 +594,7 @@ pub(super) unsafe extern "system-unwind" fn detour_close_handle(object: Handle) 
     pop_call(call_id);
     let values = capture::close_handle_leave(ret, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
+        rt.emit_leave(tid, api, call_id, &bytes);
     }
     // SAFETY: LastError を復元する。
     le.restore_for_return();
@@ -635,7 +635,7 @@ pub(super) unsafe extern "system-unwind" fn detour_get_overlapped_result(
     let call_id = rt.alloc_call_id();
     let values = capture::get_overlapped_result_enter(file as u64, overlapped as u64, wait);
     if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+        rt.emit_enter(tid, api, call_id, &bytes);
     }
     drop(values);
     push_call(call_id);
@@ -663,7 +663,7 @@ pub(super) unsafe extern "system-unwind" fn detour_get_overlapped_result(
     );
     let values = capture::get_overlapped_result_leave(ret, transferred, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
+        rt.emit_leave(tid, api, call_id, &bytes);
     }
     if ret != 0 {
         if let Some(pending) = rt.take_pending_overlapped(overlapped as u64) {
@@ -729,7 +729,7 @@ pub(super) unsafe extern "system-unwind" fn detour_get_queued_completion_status(
         milliseconds,
     );
     if let Ok(bytes) = capture::encode_enter(api, &values) {
-        rt.record_enter(tid, api, call_id, &bytes);
+        rt.emit_enter(tid, api, call_id, &bytes);
     }
     drop(values);
     push_call(call_id);
@@ -767,7 +767,7 @@ pub(super) unsafe extern "system-unwind" fn detour_get_queued_completion_status(
         capture::read_overlapped_transferred(&ProcessMemory, bytes_transferred as u64, dequeued);
     let values = capture::get_queued_completion_status_leave(ret, transferred, last_error);
     if let Ok(bytes) = capture::encode_leave(api, &values) {
-        rt.record_leave(tid, api, call_id, &bytes);
+        rt.emit_leave(tid, api, call_id, &bytes);
     }
     if dequeued != 0 {
         if let Some(pending) = rt.take_pending_overlapped(dequeued) {

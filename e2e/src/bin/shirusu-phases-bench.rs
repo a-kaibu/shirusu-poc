@@ -86,8 +86,8 @@ fn main() {
     ));
     let agent = Arc::new(
         Agent::new(
-            // Threads 1-3: batch phases and the record layers.
-            Arc::new(SlotPool::new(4)),
+            // Threads 1-4: batch phases and the record layers.
+            Arc::new(SlotPool::new(5)),
             cfg,
             Arc::new(HostMonitor::always_alive()),
         )
@@ -437,6 +437,19 @@ fn record_layers(
         Box::new(|id| {
             published(rt.record_enter(3, api, id, enter.as_bytes()));
             published(rt.record_leave(3, api, id, leave.as_bytes()));
+        }),
+    );
+    // The detours' path: the same two events without returning the outcome.
+    rt.ensure_thread(4);
+    agent.thread_begin(4).expect("slot");
+    // SAFETY: thread 4's Ring stays registered for this function.
+    let base = unsafe { agent.thread_region_base(4) }.unwrap();
+    rounds(
+        "layer_hook_runtime_emit",
+        base,
+        Box::new(|id| {
+            rt.emit_enter(4, api, id, enter.as_bytes());
+            rt.emit_leave(4, api, id, leave.as_bytes());
         }),
     );
 }

@@ -22,6 +22,7 @@ use shirusu_transport::context::{should_record, CallOrigin, HostMonitor, Publish
 use shirusu_transport::descriptor::{CaptureState, EventKind};
 use shirusu_transport::expansion::{ExpansionDelivery, EXPANDED_SLOT_GENERATION};
 use shirusu_transport::layout;
+use shirusu_transport::notify::NotifySignal;
 use shirusu_transport::ring::{
     EventInput, LoaderLockProbe, LoaderLockState, RingWriter, SharedRegion, WriteOutcome,
     WriterPolicy,
@@ -578,6 +579,107 @@ impl Agent {
         self.record_uncached(thread_id, input)
     }
 
+    /// Record one captured Application event and report only whether the
+    /// Host should be woken: the hot path of the hook's detours.
+    ///
+    /// Same semantics as [`Agent::record`] with `CallOrigin::Application` and
+    /// `CaptureState::Captured`, without building an [`EventInput`] or
+    /// returning a [`RecordResult`] through memory on the common path (cached
+    /// writer, owner fast path, room in the Ring). Everything else goes
+    /// through `record`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_captured(
+        &self,
+        thread_id: u64,
+        kind: EventKind,
+        api_id: u32,
+        schema_id: u32,
+        call_id: u64,
+        parent: u64,
+        payload: &[u8],
+    ) -> bool {
+        let fast = TLS_STATE.try_with(|c| {
+            let c = c.try_borrow().ok()?;
+            let c = c.as_ref()?;
+            if c.agent != self.id
+                || c.thread_id != thread_id
+                || c.state.retired.load(Ordering::Acquire)
+            {
+                return None;
+            }
+            // SAFETY: this thread's counter, stored with its cache.
+            let depth = unsafe { &*c.publish_depth };
+            if depth.get() > 0 {
+                return Some(false); // nested inside a publication: skipped
+            }
+            if !self.host_monitor.recording_enabled() || self.order_global {
+                return None;
+            }
+            let mut writer = c.state.writer.try_owner()?;
+            if writer.is_detached() {
+                return None;
+            }
+            let _guard = PublishSection::enter(depth);
+            match writer.write_captured(kind, api_id, schema_id, call_id, parent, 0, payload) {
+                WriteOutcome::Published { notify, .. } => Some(notify != NotifySignal::None),
+                // Degraded and dropped writes already happened; the Host
+                // liveness check that `record` adds for them follows below.
+                other => Some(self.after_abnormal_write(&other)),
+            }
+        });
+        match fast {
+            Ok(Some(notify)) => notify,
+            _ => self
+                .record_captured_slow(thread_id, kind, api_id, schema_id, call_id, parent, payload),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn after_abnormal_write(&self, outcome: &WriteOutcome) -> bool {
+        let _ = self.host_monitor.check_on_abnormal_path();
+        matches!(
+            outcome,
+            WriteOutcome::PublishedDegraded { notify, .. } if *notify != NotifySignal::None
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn record_captured_slow(
+        &self,
+        thread_id: u64,
+        kind: EventKind,
+        api_id: u32,
+        schema_id: u32,
+        call_id: u64,
+        parent: u64,
+        payload: &[u8],
+    ) -> bool {
+        let result = self.record(
+            thread_id,
+            CallOrigin::Application,
+            EventInput {
+                kind,
+                api_id,
+                schema_id,
+                call_id,
+                parent_call_id: parent,
+                payload,
+                capture_state: CaptureState::Captured,
+                global_order: 0,
+            },
+        );
+        matches!(
+            result,
+            RecordResult::Written(
+                WriteOutcome::Published { notify, .. }
+                    | WriteOutcome::PublishedDegraded { notify, .. }
+            ) if notify != NotifySignal::None
+        )
+    }
+
     /// First record of a thread, or one after its cached state retired.
     #[cold]
     #[inline(never)]
@@ -963,8 +1065,53 @@ mod tests {
                 w.write_captured(EventKind::CallEnter, 1, 1, i, 0, 0, black_box(&payload))
             }));
         });
+        // The same captured write on a plain heap region, outside the Agent:
+        // separates the Agent's own cost from the Ring writer's.
+        let plain = SharedRegion::new(cfg, 1, 9);
+        let mut plain_writer = unsafe {
+            plain.writer_with_timestamps(
+                WriterPolicy::default(),
+                system_clock(),
+                Arc::new(shirusu_transport_win::QpcTimestampSource::new()),
+            )
+        };
+        let mut plain_reader = unsafe { RingReader::new(plain.base(), cfg) };
+        {
+            let mut samples = Vec::new();
+            for round in 0..=ROUNDS {
+                let start = Instant::now();
+                for i in 0..2 * CALLS as u64 {
+                    black_box(plain_writer.write_captured(
+                        EventKind::CallEnter,
+                        1,
+                        1,
+                        i,
+                        0,
+                        0,
+                        black_box(&payload),
+                    ));
+                }
+                let ns = start.elapsed().as_nanos() as f64 / (2 * CALLS) as f64;
+                black_box(plain_reader.drain_all());
+                if round > 0 {
+                    samples.push(ns);
+                }
+            }
+            report("agent_part_plain_region_write_captured", samples);
+        }
         time("agent_part_record_enter", &mut |i| {
             black_box(a.record_enter(tid, 1, 1, i, 0, black_box(&payload)));
+        });
+        time("agent_part_record_captured", &mut |i| {
+            black_box(a.record_captured(
+                tid,
+                EventKind::CallEnter,
+                1,
+                1,
+                i,
+                0,
+                black_box(&payload),
+            ));
         });
     }
 
@@ -1321,6 +1468,67 @@ mod tests {
         assert!(!a.host_monitor().recording_enabled());
         assert_eq!(
             a.record_enter(1, 1, 1, 999, 0, b"x"),
+            RecordResult::PassthroughHostStopped
+        );
+    }
+
+    #[test]
+    fn record_captured_writes_what_record_writes() {
+        use shirusu_transport::ring::RingReader;
+        let cfg = RingConfig::new(16, 512);
+        let a = agent(2);
+        let tid = 1;
+        a.thread_begin(tid).unwrap();
+        // First call is uncached (slow path), the rest take the fast path.
+        for i in 1..=3u64 {
+            let _ = a.record_captured(tid, EventKind::CallEnter, 7, 8, i, 40 + i, b"args");
+        }
+        let _ = a.record_enter(tid, 7, 8, 4, 44, b"args");
+        let base = unsafe { a.thread_region_base(tid) }.unwrap();
+        let events = unsafe { RingReader::new(base, cfg) }.drain_all().events;
+        assert_eq!(events.len(), 4);
+        for (i, e) in events.iter().enumerate() {
+            let d = &e.descriptor;
+            assert_eq!(d.kind_enum(), Some(EventKind::CallEnter));
+            assert_eq!((d.api_id, d.schema_id), (7, 8));
+            assert_eq!((d.call_id, d.parent_call_id), (i as u64 + 1, 41 + i as u64));
+            assert_eq!(d.sequence, events[0].descriptor.sequence + i as u64);
+            assert_eq!(e.payload, b"args");
+        }
+    }
+
+    #[test]
+    fn record_captured_skips_inside_a_publication_and_after_host_stop() {
+        use shirusu_transport::ring::RingReader;
+        let cfg = RingConfig::new(16, 512);
+        let a = agent(2);
+        let tid = 1;
+        let _ = a.record_captured(tid, EventKind::CallEnter, 1, 1, 1, 0, b"");
+        {
+            let _inside = PublishGuard::enter();
+            assert!(!a.record_captured(tid, EventKind::CallEnter, 1, 1, 2, 0, b""));
+        }
+        let base = unsafe { a.thread_region_base(tid) }.unwrap();
+        assert_eq!(
+            unsafe { RingReader::new(base, cfg) }
+                .drain_all()
+                .events
+                .len(),
+            1
+        );
+
+        let monitor = Arc::new(HostMonitor::new(|| false));
+        let stopped = Agent::new(Arc::new(SlotPool::new(2)), RingConfig::new(4, 64), monitor)
+            .with_policy(WriterPolicy {
+                max_wait: std::time::Duration::ZERO,
+                ..Default::default()
+            });
+        for i in 0..40u64 {
+            let _ = stopped.record_captured(tid, EventKind::CallEnter, 1, 1, i, 0, b"0123456789");
+        }
+        assert!(!stopped.host_monitor().recording_enabled());
+        assert_eq!(
+            stopped.record_enter(tid, 1, 1, 999, 0, b"x"),
             RecordResult::PassthroughHostStopped
         );
     }

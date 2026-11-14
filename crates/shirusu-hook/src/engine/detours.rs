@@ -276,7 +276,7 @@ pub(super) fn generic_detour_with<const N: usize>(
         let bytes = capture::encode_generic_enter::<N>(api, args);
         flight
             .runtime()
-            .record_enter(tid, api, call_id, bytes.as_bytes());
+            .emit_enter(tid, api, call_id, bytes.as_bytes());
     }
     if crate::api::is_conditional_no_return_api(api.api_id) && terminates_caller(api.api_id, args) {
         // Self-termination (review N1): release recorder ownership before the
@@ -300,7 +300,7 @@ pub(super) fn generic_detour_with<const N: usize>(
             let bytes = capture::encode_generic_leave_with_inputs(api, ret, last_error, args);
             flight
                 .runtime()
-                .record_leave(tid, api, call_id, bytes.as_bytes());
+                .emit_leave(tid, api, call_id, bytes.as_bytes());
             drop(flight);
             drop(guard);
         }
@@ -349,7 +349,7 @@ pub(super) fn generic_detour_with<const N: usize>(
     let bytes = capture::encode_generic_leave_with_inputs(api, ret, last_error, args);
     call_guard
         .runtime()
-        .record_leave(tid, api, call_id, bytes.as_bytes());
+        .emit_leave(tid, api, call_id, bytes.as_bytes());
     drop(call_guard);
     drop(guard);
     // SAFETY: 呼び出し側へ戻る直前に LastError を復元する。

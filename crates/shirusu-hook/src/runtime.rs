@@ -31,6 +31,7 @@ use crate::winrt::{
     WINRT_ACTIVATION_LEAVE_SCHEMA_ID,
 };
 use shirusu_agent::{Agent, RecordResult};
+use shirusu_transport::descriptor::EventKind;
 use shirusu_transport::notify::NotifySignal;
 use shirusu_transport::ring::WriteOutcome;
 use shirusu_transport_win::{ProcessNotify, RingNotify};
@@ -1445,6 +1446,60 @@ impl HookRuntime {
                     let _ = n.notify_data_ready();
                 }
             }
+        }
+    }
+
+    /// Detour hot path for an Enter: [`HookRuntime::record_enter`] without
+    /// returning the outcome (detours ignore it).
+    #[inline]
+    pub fn emit_enter(&self, thread_id: u64, api: &ApiDef, call_id: u64, payload: &[u8]) {
+        self.emit(
+            thread_id,
+            EventKind::CallEnter,
+            api.api_id,
+            api.enter_schema_id(),
+            call_id,
+            payload,
+        );
+    }
+
+    /// Detour hot path for a Leave (see [`HookRuntime::emit_enter`]).
+    #[inline]
+    pub fn emit_leave(&self, thread_id: u64, api: &ApiDef, call_id: u64, payload: &[u8]) {
+        self.emit(
+            thread_id,
+            EventKind::CallLeave,
+            api.api_id,
+            api.leave_schema_id(),
+            call_id,
+            payload,
+        );
+    }
+
+    #[inline(always)]
+    fn emit(
+        &self,
+        thread_id: u64,
+        kind: EventKind,
+        api_id: u32,
+        schema_id: u32,
+        call_id: u64,
+        payload: &[u8],
+    ) {
+        let parent = current_parent_call();
+        if self
+            .agent
+            .record_captured(thread_id, kind, api_id, schema_id, call_id, parent, payload)
+        {
+            self.notify_data_ready();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn notify_data_ready(&self) {
+        if let Some(n) = &self.data_ready {
+            let _ = n.notify_data_ready();
         }
     }
 
