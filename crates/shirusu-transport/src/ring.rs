@@ -6,7 +6,6 @@
 //!         `read_cursor` / `payload_read_position` を Release 更新。
 //! 通常経路にプロセス共通ロックも全順序フェンスも使わない。
 
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,6 +246,11 @@ unsafe fn copy_payload_read(
 /// ため、u32 を超える場合は切り捨てて小さく見せず u32::MAX へ飽和させる
 /// (R6: Host 側の受理上限 MAX_DROPPED_ORIGINAL_LEN と対になる決め)。
 /// 正確な欠落バイト数は u64 の Loss カウンタで別途数える。
+/// Dropped Enters tracked without growing: deeper than any normal call stack.
+const DROPPED_ENTER_PREALLOC: usize = 256;
+/// Hard bound on tracked dropped Enters.
+const MAX_DROPPED_ENTER_CALLS: usize = 4096;
+
 fn payload_len_u32(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
@@ -262,7 +266,11 @@ pub struct RingWriter {
     next_sequence: u64,
     payload_write_position: u64,
     state: OverflowState,
-    dropped_enter_calls: HashSet<u64>,
+    /// Call IDs whose Enter was dropped, oldest first. Outstanding entries
+    /// follow the writer thread's call stack, so the buffer is preallocated
+    /// and searched from the newest end: no hashing and no allocation in the
+    /// Detour (review 2026-11-14 P3-3).
+    dropped_enter_calls: Vec<u64>,
     notify_tracker: PublishNotifyTracker,
     payload_notify_tracker: PublishNotifyTracker,
     /// Host read positions loaded at the start of the current write. The
@@ -329,7 +337,7 @@ impl RingWriter {
             next_sequence: 1,
             payload_write_position: load(base, OFF_PAYLOAD_WRITE_POSITION, Ordering::Relaxed),
             state: OverflowState::Normal,
-            dropped_enter_calls: HashSet::new(),
+            dropped_enter_calls: Vec::with_capacity(DROPPED_ENTER_PREALLOC),
             notify_tracker: PublishNotifyTracker::new(),
             payload_notify_tracker: PublishNotifyTracker::new(),
             cached_read_cursor: load(base, OFF_READ_CURSOR, Ordering::Acquire),
@@ -710,7 +718,7 @@ impl RingWriter {
         // normal path (every Leave would otherwise pay a SipHash lookup).
         if matches!(input.kind, EventKind::CallLeave | EventKind::CallAborted)
             && !self.dropped_enter_calls.is_empty()
-            && self.dropped_enter_calls.remove(&input.call_id)
+            && self.forget_dropped_enter(input.call_id)
         {
             fetch_add(self.base, OFF_DROPPED_EVENTS, 1);
             fetch_add(self.base, OFF_DROPPED_PAYLOAD_BYTES, payload_len);
@@ -803,11 +811,30 @@ impl RingWriter {
         fetch_add(self.base, OFF_DROPPED_EVENTS, 1);
         fetch_add(self.base, OFF_DROPPED_PAYLOAD_BYTES, payload_len);
         if input.kind == EventKind::CallEnter {
-            self.dropped_enter_calls.insert(input.call_id);
+            self.remember_dropped_enter(input.call_id);
         }
         WriteOutcome::Dropped {
             sequence: seq,
             reason: CaptureState::DroppedByBackpressure,
+        }
+    }
+
+    fn remember_dropped_enter(&mut self, call_id: u64) {
+        if self.dropped_enter_calls.len() >= MAX_DROPPED_ENTER_CALLS {
+            // A Leave that never came (thread killed mid-call). Forgetting the
+            // oldest only lets its Leave through as an orphan.
+            self.dropped_enter_calls.remove(0);
+        }
+        self.dropped_enter_calls.push(call_id);
+    }
+
+    fn forget_dropped_enter(&mut self, call_id: u64) -> bool {
+        match self.dropped_enter_calls.iter().rposition(|&c| c == call_id) {
+            Some(i) => {
+                self.dropped_enter_calls.remove(i);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1155,6 +1182,26 @@ mod tests {
             capture_state: CaptureState::Captured,
             global_order: 0,
         }
+    }
+
+    #[test]
+    fn dropped_enter_tracking_is_preallocated_and_bounded() {
+        let (_region, mut w, _r) = test_writer_reader(4, 64);
+        let cap = w.dropped_enter_calls.capacity();
+        assert!(cap >= DROPPED_ENTER_PREALLOC);
+        for call in 1..=DROPPED_ENTER_PREALLOC as u64 {
+            w.remember_dropped_enter(call);
+        }
+        assert_eq!(w.dropped_enter_calls.capacity(), cap, "no growth");
+        assert!(w.forget_dropped_enter(DROPPED_ENTER_PREALLOC as u64));
+        assert!(w.forget_dropped_enter(3));
+        assert!(!w.forget_dropped_enter(3));
+        for call in 0..2 * MAX_DROPPED_ENTER_CALLS as u64 {
+            w.remember_dropped_enter(10_000 + call);
+        }
+        assert_eq!(w.dropped_enter_calls.len(), MAX_DROPPED_ENTER_CALLS);
+        assert!(!w.forget_dropped_enter(1), "the oldest are forgotten");
+        assert!(w.forget_dropped_enter(10_000 + 2 * MAX_DROPPED_ENTER_CALLS as u64 - 1));
     }
 
     #[test]
