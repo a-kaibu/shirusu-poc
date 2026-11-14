@@ -32,7 +32,7 @@ use shirusu_transport::RingConfig;
 use shirusu_transport_win::{EventClock, EventObject, HandleValue, RingNotify, SharedMapping};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +87,11 @@ pub struct Agent {
     /// フィールドの破棄順に注意: `threads` より後に宣言し、書き手状態が
     /// 先に破棄されてから Mapping の保持を解く。
     expanded_regions: Arc<Mutex<HashMap<usize, ExpandedRegion>>>,
+    /// 公開済み追加 Slot の Mapping base の追記専用リスト。記録経路
+    /// (Slot を持てないスレッドの欠落掲示) はロックを取らずにここを読む。
+    /// TerminateThread されたスレッドがロックを握ったまま消えると、そのロックは
+    /// 二度と解けないため (外部レビュー S1)。
+    published_bases: PublishedBases,
     /// `--order=global` (L11) が有効かどうか。`with_order_global` で
     /// 構築時に設定し、以後は不変。Host は Bootstrap / セッション設定から
     /// 決める。無効な間は Descriptor の `global_order` は 0 のまま。
@@ -111,6 +116,67 @@ enum ExpandedRegion {
 // `Owned` の SharedMapping は Send である。紐付け表は Mutex の内側でのみ
 // 触り、base へのアクセスは SPSC の公開プロトコル経由に限る。
 unsafe impl Send for ExpandedRegion {}
+
+/// 追加 Slot の Mapping base を並べた追記専用の連結リスト。管理スレッドが
+/// CAS で先頭へ足し、記録経路は Acquire で辿るだけ (ロックなし)。要素は
+/// Agent の破棄まで外さない。base は `expanded_regions` (Owned) または Host
+/// のサービス (Borrowed) が Agent より長く保持する。
+struct PublishedBases {
+    head: AtomicPtr<PublishedBase>,
+}
+struct PublishedBase {
+    base: *mut u8,
+    next: *mut PublishedBase,
+}
+impl PublishedBases {
+    fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+    /// 管理パス専用 (Heap 確保を伴う)。
+    fn push(&self, base: *mut u8) {
+        let node = Box::into_raw(Box::new(PublishedBase {
+            base,
+            next: std::ptr::null_mut(),
+        }));
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: node は直前に確保した未公開の要素で、この関数だけが触る。
+            unsafe { (*node).next = head };
+            match self
+                .head
+                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(current) => head = current,
+            }
+        }
+    }
+    /// ロックも確保もしない走査。
+    fn for_each(&self, mut f: impl FnMut(*mut u8)) {
+        let mut cur = self.head.load(Ordering::Acquire);
+        while !cur.is_null() {
+            // SAFETY: 公開された要素は Agent の破棄まで解放されない。
+            let node = unsafe { &*cur };
+            f(node.base);
+            cur = node.next;
+        }
+    }
+}
+impl Drop for PublishedBases {
+    fn drop(&mut self) {
+        let mut cur = *self.head.get_mut();
+        while !cur.is_null() {
+            // SAFETY: &mut self により他の参照は無く、各要素は push の Box。
+            let node = unsafe { Box::from_raw(cur) };
+            cur = node.next;
+        }
+    }
+}
+// SAFETY: base は共有 Mapping のビューで、アクセスは layout の原子操作に限る。
+unsafe impl Send for PublishedBases {}
+unsafe impl Sync for PublishedBases {}
 
 /// スレッドの Ring の裏付け。初期 Slot は Agent が作るローカル領域、
 /// 追加 Slot は Host から配送された Mapping (A70)。
@@ -261,6 +327,7 @@ impl Agent {
             threads: RwLock::new(HashMap::new()),
             pending_reclaim: Mutex::new(Vec::new()),
             expanded_regions: Arc::new(Mutex::new(HashMap::new())),
+            published_bases: PublishedBases::new(),
             order_global: false,
             next_global_order: AtomicU64::new(1),
             last_reap_ms: AtomicU64::new(0),
@@ -494,6 +561,10 @@ impl Agent {
             }
             (None, None) => return Err(()),
         };
+        let base = match &region {
+            ExpandedRegion::Borrowed { base } => *base,
+            ExpandedRegion::Owned(mapping) => mapping.as_ptr(),
+        };
         let index = self.pool.add_slot().ok_or(())?;
         self.expanded_regions.lock().unwrap().insert(index, region);
         if !self.pool.publish_slot(index) {
@@ -502,6 +573,7 @@ impl Agent {
             self.expanded_regions.lock().unwrap().remove(&index);
             return Err(());
         }
+        self.published_bases.push(base);
         Ok(index)
     }
     /// プロセス全体の欠落呼び出し数を、Host が読める全 Mapping の Control
@@ -523,17 +595,10 @@ impl Agent {
         if total == 0 {
             return;
         }
-        let Ok(regions) = self.expanded_regions.try_lock() else {
-            // 登録中の管理パスと競合したら次の掲示に任せる (待たない)。
-            return;
-        };
-        for region in regions.values() {
-            let base = match region {
-                ExpandedRegion::Borrowed { base } => *base,
-                ExpandedRegion::Owned(mapping) => mapping.as_ptr(),
-            };
-            layout::publish_process_missing_calls(base, total);
-        }
+        // ロックを取らない: このメソッドは Slot を持てない記録スレッドから
+        // 呼ばれ、そのスレッドが強制終了されてもロックが残らないようにする。
+        self.published_bases
+            .for_each(|base| layout::publish_process_missing_calls(base, total));
     }
     /// 管理パス: Host から配送された Mapping を Slot として登録する公開
     /// 入口（本体は A70 の管理スレッド経路と同じ `register_expanded_mapping`）。
