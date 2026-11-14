@@ -193,6 +193,7 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                     let started = Instant::now();
                     // Accounting released once this group's work is done.
                     let mut group_bytes = vec![bytes];
+                    let mut barrier_reached: Option<Sender<()>> = None;
                     match command {
                         Command::Events(context, mut events) => {
                             let mut coalesced = false;
@@ -270,11 +271,17 @@ impl<W: DurableWrite + Send + 'static> TracePipeline<W> {
                             recorder.update_environment(&environment)?;
                         }
                         Command::Barrier(reached) => {
-                            let _ = reached.send(());
+                            barrier_reached = Some(reached);
                         }
                     }
                     for bytes in group_bytes {
                         state.release(bytes);
+                    }
+                    // Acknowledge only after the barrier's own accounting is
+                    // released: a caller reading the queue after the barrier
+                    // must see it empty.
+                    if let Some(reached) = barrier_reached.take() {
+                        let _ = reached.send(());
                     }
                     totals.metrics.commands_processed =
                         totals.metrics.commands_processed.saturating_add(1);
