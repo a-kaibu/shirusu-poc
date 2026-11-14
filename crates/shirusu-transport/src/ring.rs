@@ -280,7 +280,14 @@ pub struct RingWriter {
     /// 呼び出し側が申告した Loader Lock の保持状態。既定は NotHeld
     /// （従来の挙動を保つ。Windows の Agent は分からない経路で Unknown を申告する）。
     loader_lock_state: LoaderLockState,
+    /// `Unknown` のとき待機の直前に呼ぶ判定。true なら保持中（待たない）。
+    /// 満杯で待つときだけ呼ばれるので、通常の書き込みには費用がない。
+    loader_lock_probe: Option<LoaderLockProbe>,
 }
+
+/// 呼び出しスレッドが今 Loader Lock を保持しているかを返す判定。
+/// 判定できないときは true（保持中とみなし、待たない）を返すこと。
+pub type LoaderLockProbe = fn() -> bool;
 // SPSC: 書き手は 1 スレッドだけが使う。共有領域自体は Host スレッドと共有される。
 unsafe impl Send for RingWriter {}
 
@@ -334,6 +341,7 @@ impl RingWriter {
             wait_count: 0,
             detached: false,
             loader_lock_state: LoaderLockState::NotHeld,
+            loader_lock_probe: None,
         }
     }
     pub fn state(&self) -> OverflowState {
@@ -362,6 +370,11 @@ impl RingWriter {
     }
     pub fn loader_lock_state(&self) -> LoaderLockState {
         self.loader_lock_state
+    }
+    /// `Unknown` の申告を、待機の直前に `probe` で確かめるようにする。
+    /// 保持していないと分かった書き込みは `max_wait` まで空きを待てる。
+    pub fn set_loader_lock_probe(&mut self, probe: Option<LoaderLockProbe>) {
+        self.loader_lock_probe = probe;
     }
     pub fn next_sequence_peek(&self) -> u64 {
         self.next_sequence
@@ -648,7 +661,8 @@ impl RingWriter {
             || self.policy.max_wait.is_zero()
             || self.loader_lock_state == LoaderLockState::Held
             || (self.loader_lock_state == LoaderLockState::Unknown
-                && self.policy.zero_wait_when_loader_lock_unknown)
+                && self.policy.zero_wait_when_loader_lock_unknown
+                && self.loader_lock_probe.is_none_or(|held| held()))
         {
             return false;
         }
@@ -1279,6 +1293,25 @@ mod tests {
         let _ = w.write(input(EventKind::CallEnter, 3, b"c"));
         assert_eq!(w.wait_count, 1);
         assert!(!crate::layout::writer_waiting(region.base()));
+    }
+
+    #[test]
+    fn loader_lock_probe_decides_whether_unknown_waits() {
+        // 既定ポリシー (Unknown は待たない) でも、判定が「保持していない」と
+        // 答えた書き込みは待ち、「保持中」と答えた書き込みは待たない。
+        for (held, waits) in [(false, 1), (true, 0)] {
+            let cfg = RingConfig::new(2, 64);
+            let region = SharedRegion::new(cfg, 1, 100);
+            let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+            let mut w = unsafe { region.writer(WriterPolicy::default(), clock) };
+            w.write(input(EventKind::CallEnter, 1, b"a"));
+            w.write(input(EventKind::CallEnter, 2, b"b"));
+            w.set_loader_lock_state(LoaderLockState::Unknown);
+            w.set_loader_lock_probe(Some(if held { || true } else { || false }));
+            let _ = w.write(input(EventKind::CallEnter, 3, b"c"));
+            assert_eq!(w.wait_count, waits, "probe held={held}");
+            assert!(!crate::layout::writer_waiting(region.base()));
+        }
     }
 
     #[test]

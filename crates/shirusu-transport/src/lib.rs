@@ -34,7 +34,7 @@ pub use descriptor::{CaptureState, EventDescriptor, EventKind};
 pub use expansion::{ExpansionDelivery, ExpansionRequest, EXPANDED_SLOT_GENERATION};
 pub use layout::{LossCounters, RingConfig};
 pub use ring::{
-    DrainBatch, EventInput, LoaderLockState, OverflowState, ReceivedEvent, RingReader, RingWriter,
-    SharedRegion, WriteOutcome, WriterPolicy,
+    DrainBatch, EventInput, LoaderLockProbe, LoaderLockState, OverflowState, ReceivedEvent,
+    RingReader, RingWriter, SharedRegion, WriteOutcome, WriterPolicy,
 };
 pub use slot::{SlotHandle, SlotPool, SlotState};

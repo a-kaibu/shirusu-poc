@@ -1882,3 +1882,59 @@ mod path_tests {
         ));
     }
 }
+
+/// Whether the calling thread owns the process Loader Lock right now.
+///
+/// Reads `PEB.LoaderLock` (the `RTL_CRITICAL_SECTION` the loader holds while
+/// it runs `DllMain` and TLS callbacks) and compares its `OwningThread` with
+/// the thread id in the TEB. Only the owner can see its own id there, so a
+/// `false` answer is exact for the calling thread. Returns `true` (held, do
+/// not wait) when the lock pointer is missing and on non-Windows builds.
+///
+/// Called by a Ring writer only before it would wait for space, never on the
+/// normal write path.
+#[inline(never)]
+pub fn loader_lock_held_by_current_thread() -> bool {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    // SAFETY: gs:[0x60] is the PEB and gs:[0x48] ClientId.UniqueThread on
+    // x64 Windows; PEB+0x110 is LoaderLock; OwningThread is at +0x10.
+    unsafe {
+        let peb: *const u8;
+        let tid: usize;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags, readonly));
+        core::arch::asm!("mov {}, gs:[0x48]", out(reg) tid, options(nostack, preserves_flags, readonly));
+        let cs = core::ptr::read_volatile(peb.add(0x110) as *const *const u8);
+        if cs.is_null() {
+            return true;
+        }
+        core::ptr::read_volatile(cs.add(0x10) as *const usize) == tid
+    }
+    #[cfg(all(windows, target_arch = "x86"))]
+    // SAFETY: fs:[0x30] is the PEB and fs:[0x24] ClientId.UniqueThread on
+    // x86 (and WOW64) Windows; PEB+0xA0 is LoaderLock; OwningThread at +0x0C.
+    unsafe {
+        let peb: *const u8;
+        let tid: usize;
+        core::arch::asm!("mov {}, fs:[0x30]", out(reg) peb, options(nostack, preserves_flags, readonly));
+        core::arch::asm!("mov {}, fs:[0x24]", out(reg) tid, options(nostack, preserves_flags, readonly));
+        let cs = core::ptr::read_volatile(peb.add(0xA0) as *const *const u8);
+        if cs.is_null() {
+            return true;
+        }
+        core::ptr::read_volatile(cs.add(0x0C) as *const usize) == tid
+    }
+    #[cfg(not(all(windows, any(target_arch = "x86_64", target_arch = "x86"))))]
+    {
+        true
+    }
+}
+
+#[cfg(all(test, windows))]
+mod loader_lock_tests {
+    #[test]
+    fn ordinary_thread_does_not_hold_loader_lock() {
+        assert!(!super::loader_lock_held_by_current_thread());
+        let other = std::thread::spawn(super::loader_lock_held_by_current_thread);
+        assert!(!other.join().unwrap());
+    }
+}

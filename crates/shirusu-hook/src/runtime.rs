@@ -44,7 +44,28 @@ thread_local! {
     /// 呼出スタック（Call ID の列）。フックした呼び出しの入れ子を
     /// 親子関係として記録するために使う。元の API がコールバック等で
     /// 再入した場合も、同じスレッドなら自然に入れ子になる。
-    static CALL_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    static CALL_STACK: RefCell<CallStack> = const { RefCell::new(CallStack(Vec::new())) };
+}
+
+/// The call stack's storage; its destructor ends [`CAPTURE_TLS_LIVE`].
+struct CallStack(Vec<u64>);
+impl std::ops::Deref for CallStack {
+    type Target = Vec<u64>;
+    #[inline(always)]
+    fn deref(&self) -> &Vec<u64> {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for CallStack {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0
+    }
+}
+impl Drop for CallStack {
+    fn drop(&mut self) {
+        capture_tls_teardown();
+    }
 }
 
 pub fn current_parent_call() -> u64 {
@@ -79,6 +100,26 @@ thread_local! {
     /// Detour の再入ガードの深さ (G15)。0 = 記録経路の外、1 = 記録経路の実行中。
     static REENTRANCY_DEPTH: Cell<u32> = const { Cell::new(0) };
     static THREAD_EXITING: Cell<bool> = const { Cell::new(false) };
+    /// Every destructor-bearing TLS the capture path needs (the call stack,
+    /// the runtime cache and the Agent's writer cache) is registered and
+    /// alive, the runtime cache is ready, and exit has not begun. Set by a
+    /// full [`ReentrancyGuard::try_enter`]; cleared when any of those keys
+    /// starts destruction or the thread is marked exiting. While set, entry
+    /// skips re-checking each key (several TLS lookups and a cross-crate
+    /// call per Detour).
+    static CAPTURE_TLS_LIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A capture TLS key is being destroyed: take the full entry checks again.
+fn capture_tls_teardown() {
+    if native_tls_available() {
+        let _ = CAPTURE_TLS_LIVE.try_with(|live| live.set(false));
+    }
+}
+
+#[inline(always)]
+fn capture_tls_live() -> bool {
+    CAPTURE_TLS_LIVE.with(Cell::get)
 }
 
 /// Loader heap operations can enter an inline hook before allocation or after
@@ -138,7 +179,32 @@ pub struct ReentrancyGuard {
 
 impl ReentrancyGuard {
     /// Detour 入口で呼ぶ。再入中なら `None` を返す。
+    #[inline]
     pub fn try_enter() -> Option<Self> {
+        if !native_tls_available() {
+            return None;
+        }
+        // Fast path: the full checks below already passed on this thread and
+        // nothing they cover has been torn down since.
+        let entered = REENTRANCY_DEPTH.with(|d| {
+            if d.get() > 0 {
+                return Some(false);
+            }
+            capture_tls_live().then(|| {
+                d.set(1);
+                true
+            })
+        });
+        match entered {
+            Some(true) => Some(Self { suspended: false }),
+            Some(false) => None,
+            None => Self::try_enter_full(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_enter_full() -> Option<Self> {
         let guard = Self::try_enter_with(|| {
             CALL_STACK.try_with(|_| ()).is_ok() && shirusu_agent::current_thread_capture_available()
         })?;
@@ -156,7 +222,17 @@ impl ReentrancyGuard {
                 true
             })
             .unwrap_or(false);
-        ready.then_some(guard)
+        if !ready {
+            return None;
+        }
+        // Everything above is alive and initialized. Each destructor-bearing
+        // key clears the shortcut when it starts destruction (the Agent's
+        // through its teardown hook), and so does marking the thread exiting.
+        shirusu_agent::set_thread_teardown_hook(capture_tls_teardown);
+        if !THREAD_EXITING.try_with(Cell::get).unwrap_or(true) {
+            let _ = CAPTURE_TLS_LIVE.try_with(|live| live.set(true));
+        }
+        Some(guard)
     }
 
     fn try_enter_with(available: impl FnOnce() -> bool) -> Option<Self> {
@@ -186,6 +262,7 @@ impl ReentrancyGuard {
             return;
         }
         let _ = THREAD_EXITING.try_with(|exiting| exiting.set(true));
+        let _ = CAPTURE_TLS_LIVE.try_with(|live| live.set(false));
     }
 
     /// 記録経路の実行中か。
@@ -654,6 +731,7 @@ impl RuntimeCache {
 }
 impl Drop for RuntimeCache {
     fn drop(&mut self) {
+        capture_tls_teardown();
         if let Some(slot) = self.hazard_slot() {
             crate::hazard::release(slot);
         }
@@ -760,9 +838,18 @@ impl RuntimeSlot {
         // The cache never keeps a session's Agent/mappings alive: its pointer
         // is uncounted and used only behind a hazard after the revision
         // re-check; a replaced runtime is freed once no hazard publishes it.
+        // With every capture key alive the cache's TLS is already registered,
+        // so its access needs no registration guard (nested borrows are still
+        // refused by the RefCell below).
         if let Some(_access) = (ReentrancyGuard::is_active()
             && RUNTIME_CACHE_READY.try_with(Cell::get).unwrap_or(false))
-        .then(RuntimeCacheAccess::enter)
+        .then(|| {
+            if capture_tls_live() {
+                Some(None)
+            } else {
+                RuntimeCacheAccess::enter().map(Some)
+            }
+        })
         .flatten()
         {
             if let Ok(Some(rt)) = DETOUR_RUNTIME.try_with(|cache| {

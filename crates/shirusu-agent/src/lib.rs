@@ -23,14 +23,15 @@ use shirusu_transport::descriptor::{CaptureState, EventKind};
 use shirusu_transport::expansion::{ExpansionDelivery, EXPANDED_SLOT_GENERATION};
 use shirusu_transport::layout;
 use shirusu_transport::ring::{
-    EventInput, LoaderLockState, RingWriter, SharedRegion, WriteOutcome, WriterPolicy,
+    EventInput, LoaderLockProbe, LoaderLockState, RingWriter, SharedRegion, WriteOutcome,
+    WriterPolicy,
 };
 use shirusu_transport::slot::{SlotHandle, SlotPool};
 use shirusu_transport::RingConfig;
 use shirusu_transport_win::{EventClock, EventObject, HandleValue, RingNotify, SharedMapping};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub struct Agent {
     config: RingConfig,
     policy: WriterPolicy,
     loader_lock_state: LoaderLockState,
+    loader_lock_probe: Option<LoaderLockProbe>,
     /// 書き手の既定 Clock (Ring ごとの `space_available` が結ばれていない
     /// Ring で使う)。`with_clock` で構築時に設定し、以後は不変。
     default_clock: Arc<dyn Clock>,
@@ -165,7 +167,37 @@ static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     /// OS スレッドごとに「直前に使った書き手」を 1 件だけキャッシュする。
     /// 借用は取得・格納の瞬間と、キャッシュ経由の 1 回の記録の間だけ。
-    static TLS_STATE: RefCell<Option<CachedState>> = const { RefCell::new(None) };
+    static TLS_STATE: TlsCache = const { TlsCache(RefCell::new(None)) };
+}
+
+/// The cached writer state; its destructor tells the hook layer that this
+/// thread's capture TLS is going away (see [`set_thread_teardown_hook`]).
+struct TlsCache(RefCell<Option<CachedState>>);
+impl std::ops::Deref for TlsCache {
+    type Target = RefCell<Option<CachedState>>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for TlsCache {
+    fn drop(&mut self) {
+        let hook = TEARDOWN_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: only `set_thread_teardown_hook` stores here, from a `fn()`.
+            let hook: fn() = unsafe { std::mem::transmute::<usize, fn()>(hook) };
+            hook();
+        }
+    }
+}
+
+static TEARDOWN_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Run `hook` on a thread when its Agent writer cache starts destruction,
+/// before [`current_thread_capture_available`] turns false there. The hook
+/// layer uses it to drop a per-thread "all capture TLS alive" shortcut.
+pub fn set_thread_teardown_hook(hook: fn()) {
+    TEARDOWN_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// The thread's last-used writer: (Agent ID, logical thread ID, state), plus
@@ -209,6 +241,7 @@ impl Agent {
             config,
             policy: WriterPolicy::default(),
             loader_lock_state: LoaderLockState::NotHeld,
+            loader_lock_probe: None,
             default_clock: system_clock(),
             timestamps: system_timestamp_source(),
             space_clocks: RwLock::new(HashMap::new()),
@@ -237,6 +270,12 @@ impl Agent {
     /// zero-wait-on-unknown policy applies even when the Ring is full.
     pub fn with_loader_lock_state(mut self, state: LoaderLockState) -> Self {
         self.loader_lock_state = state;
+        self
+    }
+    /// With `Unknown`, ask `probe` before a full Ring waits for space, so a
+    /// write proven outside Loader Lock can wait instead of dropping.
+    pub fn with_loader_lock_probe(mut self, probe: LoaderLockProbe) -> Self {
+        self.loader_lock_probe = Some(probe);
         self
     }
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -461,6 +500,7 @@ impl Agent {
             )
         };
         writer.set_loader_lock_state(self.loader_lock_state);
+        writer.set_loader_lock_probe(self.loader_lock_probe);
         let state = Arc::new(ThreadSlotState {
             handle,
             region,

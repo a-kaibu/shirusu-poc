@@ -287,10 +287,14 @@ mod win {
                 // A detour can run from someone else's DllMain. Initialization
                 // outside Loader Lock does not prove later callers are outside.
                 .with_loader_lock_state(shirusu_transport::LoaderLockState::Unknown)
+                // A full Ring checks the PEB Loader Lock owner before waiting:
+                // writes proven outside Loader Lock wait (up to max_wait) for
+                // the Host to collect instead of dropping events.
+                .with_loader_lock_probe(shirusu_transport_win::loader_lock_held_by_current_thread)
                 .with_timestamp_source(Arc::new(QpcTimestampSource::new()))
-                // Wake the Host at a quarter full: the writer cannot wait
-                // (Loader Lock state unknown), so the remaining three quarters
-                // are all the margin collection has.
+                // Wake the Host at a quarter full: a writer inside Loader Lock
+                // cannot wait, so the remaining three quarters are all the
+                // margin collection has there.
                 .with_policy(shirusu_transport::ring::WriterPolicy {
                     notify_threshold_percent: 25,
                     ..Default::default()
