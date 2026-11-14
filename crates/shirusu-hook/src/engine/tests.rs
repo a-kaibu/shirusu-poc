@@ -274,6 +274,44 @@ fn measure_generic_detour() {
             .all(|e| e.descriptor.api_id == api.api_id && !e.descriptor.payload_dropped()));
         assert_eq!(rt.in_flight(), 0);
     }
+    // The same detour in stages, to place its cost outside the two records.
+    let args = [0u64, 0, 64];
+    let mut stage = |f: &mut dyn FnMut()| {
+        let mut samples = Vec::new();
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                f();
+            }
+            samples.push(started.elapsed().as_nanos() as f64 / CALLS as f64);
+            black_box(reader.drain_all());
+        }
+        samples
+    };
+    let prepare = stage(&mut || {
+        black_box(prepare_generic(black_box(api.api_id)));
+    });
+    let encode = stage(&mut || {
+        black_box(capture::encode_generic_enter::<3>(api, black_box(&args)));
+        black_box(capture::encode_generic_leave_with_inputs(
+            api,
+            black_box(64),
+            0,
+            &args,
+        ));
+    });
+    let records = stage(&mut || {
+        let _guard = ReentrancyGuard::try_enter().unwrap();
+        let enter = capture::encode_generic_enter::<3>(api, &args);
+        let leave = capture::encode_generic_leave_with_inputs(api, 64, 0, &args);
+        let id = rt.alloc_call_id();
+        black_box(rt.record_enter(tid, api, id, black_box(enter.as_bytes())));
+        black_box(rt.record_leave(tid, api, id, black_box(leave.as_bytes())));
+    });
+    let call_stack = stage(&mut || {
+        push_call(black_box(7));
+        pop_call(black_box(7));
+    });
     assert_eq!(reader.loss_counters(), Default::default());
     assert!(clear_runtime(&rt));
     println!("scope=typed-detour-with-stub-original; no patch, real heap work, Host, notification or disk; per-call includes two events; components overlap");
@@ -281,6 +319,10 @@ fn measure_generic_detour() {
         ("stub_original", baseline),
         ("seh_stub_original", boundary),
         ("typed_detour_two_events", captured),
+        ("detour_stage_prepare", prepare),
+        ("detour_stage_encode_pair", encode),
+        ("detour_stage_encode_and_two_records", records),
+        ("detour_stage_call_stack_push_pop", call_stack),
     ] {
         samples.sort_by(f64::total_cmp);
         println!(

@@ -628,11 +628,13 @@ impl<const FIELDS: usize> GenericPayload<FIELDS> {
         &self.bytes.as_flattened()[..self.len]
     }
 
+    #[cfg(test)]
     fn byte(&mut self, byte: u8) {
         self.bytes.as_flattened_mut()[self.len] = byte;
         self.len += 1;
     }
 
+    #[cfg(test)]
     fn uleb(&mut self, mut value: u64) {
         loop {
             let byte = (value & 0x7f) as u8;
